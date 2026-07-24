@@ -10,7 +10,6 @@
 use anyrender::PaintScene;
 use kurbo::Affine;
 use log::{debug, error};
-use std::collections::HashMap;
 
 use vello::{
     AaConfig, AaSupport, RenderParams, Renderer as VelloRenderer, RendererOptions,
@@ -93,6 +92,7 @@ impl GpuRenderer {
         self.render_tex = Some((tex, width, height));
     }
 
+    #[allow(dead_code)]
     fn ensure_readback_buffer(&mut self, width: u32, height: u32) -> Option<&wgpu::Buffer> {
         Self::ensure_readback_buffer_inner(
             &mut self.readback_buffer,
@@ -108,7 +108,10 @@ impl GpuRenderer {
         width: u32,
         height: u32,
     ) -> Option<&'a wgpu::Buffer> {
-        let size = (width * height * 4) as u64;
+        // bytes_per_row must be a multiple of COPY_BYTES_PER_ROW_ALIGNMENT (256).
+        let alignment = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+        let bytes_per_row = ((width * 4 + alignment - 1) / alignment) * alignment;
+        let size = (bytes_per_row * height) as u64;
         // Check if existing buffer matches size (drop the borrow before mutation).
         let needs_new = match readback_buffer {
             Some((_, w, h)) => *w != width || *h != height,
@@ -179,6 +182,9 @@ impl GpuRenderer {
                     label: Some("surface-readback"),
                 });
         let (src_tex, _, _) = render_tex.as_ref()?;
+        // bytes_per_row must be a multiple of COPY_BYTES_PER_ROW_ALIGNMENT.
+        let alignment = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+        let aligned_bytes_per_row = ((width * 4 + alignment - 1) / alignment) * alignment;
         encoder.copy_texture_to_buffer(
             TexelCopyTextureInfo {
                 texture: src_tex,
@@ -190,7 +196,7 @@ impl GpuRenderer {
                 buffer: readback_buf,
                 layout: TexelCopyBufferLayout {
                     offset: 0,
-                    bytes_per_row: Some(width * 4),
+                    bytes_per_row: Some(aligned_bytes_per_row),
                     rows_per_image: Some(height),
                 },
             },
@@ -216,7 +222,16 @@ impl GpuRenderer {
             return None;
         }
         let data = buf_slice.get_mapped_range();
-        let pixels = data.to_vec();
+        // Strip alignment padding — return only the actual pixel data.
+        let pixel_count = (width * height * 4) as usize;
+        let padded_bytes_per_row = ((width * 4 + 255) / 256) * 256;
+        let pixels: Vec<u8> = if padded_bytes_per_row == width * 4 {
+            data[..pixel_count].to_vec()
+        } else {
+            data.chunks(padded_bytes_per_row as usize)
+                .flat_map(|row| row[..(width * 4) as usize].iter().copied())
+                .collect()
+        };
         drop(data);
         readback_buf.unmap();
 

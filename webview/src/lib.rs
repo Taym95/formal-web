@@ -2,10 +2,8 @@ pub mod ui_event;
 
 use blitz_traits::events::UiEvent;
 use blitz_traits::shell::ColorScheme;
-use crossbeam_channel::{Receiver, unbounded};
 use ipc_messages::content::{
     FrameId, NavigableId, NavigateRequest, UserNavigationInvolvement, WebviewId,
-    WebviewProviderMessage,
 };
 use log::{debug, error, trace};
 use std::collections::HashMap;
@@ -46,13 +44,6 @@ impl Default for WebviewState {
     }
 }
 
-#[derive(Clone, Copy)]
-struct ChildNavigableHost {
-    parent_traversable_id: WebviewId,
-    #[allow(dead_code)]
-    content_frame_id: FrameId,
-}
-
 fn startup_destination_url(startup_url: Option<&str>) -> Result<String, String> {
     match startup_url {
         Some(url) => Ok(url.to_owned()),
@@ -77,13 +68,10 @@ fn input_debug_enabled() -> bool {
 
 pub struct WebviewProvider {
     webviews: HashMap<WebviewId, WebviewState>,
-    child_navigable_hosts_by_webview: HashMap<WebviewId, ChildNavigableHost>,
-    child_host_webviews_by_content_navigable: HashMap<FrameId, WebviewId>,
     #[allow(dead_code)]
     viewport_snapshot: Option<(u32, u32, f32, ColorScheme)>,
     embedder: Arc<dyn Embedder>,
     user_agent: UserAgent,
-    provider_message_receiver: Receiver<WebviewProviderMessage>,
 }
 
 impl WebviewProvider {
@@ -91,69 +79,14 @@ impl WebviewProvider {
         embedder: Arc<dyn Embedder>,
         trace_sender: Option<TraceSender>,
     ) -> Result<Self, String> {
-        let (provider_message_sender, provider_message_receiver) = unbounded();
-        let user_agent = UserAgent::start(embedder.clone(), provider_message_sender, trace_sender)?;
+        let user_agent = UserAgent::start(embedder.clone(), trace_sender)?;
 
         Ok(Self {
             webviews: HashMap::new(),
-            child_navigable_hosts_by_webview: HashMap::new(),
-            child_host_webviews_by_content_navigable: HashMap::new(),
             viewport_snapshot: None,
             embedder,
             user_agent,
-            provider_message_receiver,
         })
-    }
-
-    /// Process ALL pending provider messages in one batch.
-    ///
-    /// Processes one message from the pending queue. The caller (`WebviewProviderSync`)
-    /// is dispatched once per enqueued message, so we process exactly one message here.
-    ///
-    /// NOTE: We deliberately do NOT drain additional messages via `try_recv()`. While
-    /// draining would let us batch multiple PaintFrames (e.g. during iframe viewport
-    /// convergence), it creates a hang when the user-agent queues two
-    /// `WebviewProviderSync` events before the embedder processes the first one.
-    /// The first sync drains both messages, leaving the second sync with nothing and
-    /// blocking `recv()` forever. Processing one message per sync avoids this.
-    pub fn sync_pending_messages(&mut self) -> Result<(), String> {
-        let message = self
-            .provider_message_receiver
-            .recv()
-            .map_err(|error| format!("failed to receive webview provider message: {error}"))?;
-        self.handle_provider_message(message)?;
-
-        Ok(())
-    }
-
-    fn handle_provider_message(&mut self, message: WebviewProviderMessage) -> Result<(), String> {
-        match message {
-            WebviewProviderMessage::PaintFrame { .. } => {
-                // PaintFrames go directly to the graphics process.
-                // The UA receives PaintReady for bookkeeping only.
-                Ok(())
-            }
-            WebviewProviderMessage::RegisterChildNavigableHost {
-                child_webview_id,
-                parent_traversable_id,
-                content_frame_id,
-            } => {
-                self.register_child_navigable_host(
-                    child_webview_id,
-                    parent_traversable_id,
-                    content_frame_id,
-                );
-                Ok(())
-            }
-            WebviewProviderMessage::NewWebview { webview_id } => {
-                self.on_new_webview(webview_id);
-                Ok(())
-            }
-            WebviewProviderMessage::VideoFrameReady { .. } => {
-                // Video frames go directly to the graphics process.
-                Ok(())
-            }
-        }
     }
 
     pub fn start(&self, startup_url: Option<&str>) -> Result<(), String> {
@@ -186,22 +119,13 @@ impl WebviewProvider {
     pub fn send_ui_event(&self, webview_id: WebviewId, event: UiEvent) -> Result<(), String> {
         match ui_event::serialize_ui_event(&event) {
             Ok(event_message) => {
-                if let Err(error) = self.user_agent.send_ui_event(webview_id, event_message) {
-                    error!("failed to send ui event: {error}");
-                }
+                let _ = self.user_agent.send_ui_event(webview_id, event_message);
             }
             Err(error) => {
                 error!("failed to serialize ui event: {error}");
             }
         }
         Ok(())
-    }
-
-    pub fn note_rendering_opportunity(&self, webview_id: WebviewId, reason: &str) {
-        let _ = reason;
-        if let Err(error) = self.user_agent.note_rendering_opportunity(webview_id.0) {
-            error!("failed to note rendering opportunity for webview {webview_id:?}: {error}");
-        }
     }
 
     pub fn set_default_viewport(
@@ -255,35 +179,8 @@ impl WebviewProvider {
         self.user_agent.click_element(traversable_id.0, selector)
     }
 
-    pub fn register_child_navigable_host(
-        &mut self,
-        child_host_webview_id: WebviewId,
-        parent_traversable_id: WebviewId,
-        content_frame_id: FrameId,
-    ) {
-        self.child_navigable_hosts_by_webview.insert(
-            child_host_webview_id,
-            ChildNavigableHost {
-                parent_traversable_id,
-                content_frame_id,
-            },
-        );
-        self.child_host_webviews_by_content_navigable
-            .insert(content_frame_id, child_host_webview_id);
-
-        // The parent may not have a composed frame tree yet when the child host registers.
-        // Force parent+child rendering opportunities so embed-site geometry becomes
-        // available and child viewport publication does not wait for later input.
-        self.note_rendering_opportunity(parent_traversable_id, "child_host_registered");
-        self.note_rendering_opportunity(child_host_webview_id, "child_host_registered");
-    }
-
-    pub fn on_new_webview(&mut self, webview_id: WebviewId) {
-        if self.webviews.contains_key(&webview_id) {
-            return;
-        }
+    pub fn on_new_webview(&self, webview_id: WebviewId) {
         debug!("[webview] new webview {:?}", webview_id);
-        self.webviews.insert(webview_id, WebviewState::default());
     }
 
     pub fn current_navigable_id(&self, webview_id: WebviewId) -> Option<NavigableId> {
@@ -293,30 +190,13 @@ impl WebviewProvider {
     }
 
     pub fn on_navigation_committed(&mut self, webview_id: WebviewId) {
-        if let Some(child_navigable_host) = self.child_navigable_hosts_by_webview.get(&webview_id) {
-            let parent_traversable_id = child_navigable_host.parent_traversable_id;
-            if input_debug_enabled() {
-                trace!(
-                    "[input-debug][webview] navigation_committed child_webview={} parent_webview={}",
-                    webview_id.0, parent_traversable_id.0,
-                );
-            }
-
-            // Child frame navigation is handled by the graphics process.
-            // Request rendering opportunities so the new content appears promptly.
-            // Also request parent rendering so updated child geometry is visible.
-            self.note_rendering_opportunity(webview_id, "child_navigation_committed");
-            self.note_rendering_opportunity(parent_traversable_id, "child_navigation_committed");
-            self.embedder.request_redraw(parent_traversable_id);
-            return;
-        }
-
         if input_debug_enabled() {
             trace!(
-                "[input-debug][webview] navigation_committed top_level_webview={}",
+                "[input-debug][webview] navigation_committed webview={}",
                 webview_id.0
             );
         }
+        self.embedder.request_redraw(webview_id);
     }
 
     pub fn append_web_content_scene(

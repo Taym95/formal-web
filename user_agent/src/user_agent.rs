@@ -11,7 +11,7 @@ use ipc_messages::content::{
     BrowsingContextId, Command as ContentCommand, DispatchEventEntry, DocumentId, EventLoopId,
     FetchResponse as ContentFetchResponse, FinalizeNavigation as ContentFinalizeNavigation,
     FrameId, LoadedDocumentResponse, NavigableId, NavigateRequest, NavigationFetchId, NavigationId,
-    NewTraversableInfo, UserNavigationInvolvement, WebviewId, WebviewProviderMessage,
+    NewTraversableInfo, UserNavigationInvolvement, WebviewId,
     WindowTimerKey, iframe_target_name,
 };
 use log::{debug, error, trace};
@@ -122,7 +122,6 @@ pub trait Embedder: Send + Sync {
     ) -> Result<(), String>;
     fn navigation_completed(&self, completed: NavigationCompleted) -> Result<(), String>;
     fn new_webview(&self, webview_id: WebviewId, target_name: String) -> Result<(), String>;
-    fn webview_provider_sync(&self) -> Result<(), String>;
     fn new_frame_rendered(&self) -> Result<(), String>;
     fn request_redraw(&self, webview_id: WebviewId);
     fn viewport_scale_factor(&self) -> f32;
@@ -951,7 +950,6 @@ impl UserAgent {
     /// spawning the dedicated user-agent thread owned by the webview layer.
     pub fn start(
         host: Arc<dyn Embedder>,
-        webview_provider_sender: Sender<WebviewProviderMessage>,
         trace_sender: Option<TraceSender>,
     ) -> Result<Self, String> {
         let (command_sender, command_receiver) = unbounded();
@@ -959,7 +957,6 @@ impl UserAgent {
             command_sender.clone(),
             command_receiver,
             host,
-            webview_provider_sender,
             trace_sender,
         );
         let join_handle = thread::Builder::new()
@@ -1300,10 +1297,12 @@ struct UserAgentWorker {
 
     /// Host integration used to surface navigation, paint, clipboard, and viewport state.
     host: Arc<dyn Embedder>,
-    /// Sender for webview-provider updates that must be drained by host sync calls.
-    webview_provider_sender: Sender<WebviewProviderMessage>,
     /// Trace logger for the Navigation TLA+ spec.
-    navigation_tracer: TLATracer,
+    tla_tracer: TLATracer,
+    /// Tracks which traversables have a pending render in flight (TLA spec pending field).
+    pending_renders: HashSet<NavigableId>,
+    /// Queued opportunities accumulated while a render was pending (TLA spec opp field).
+    queued_opps: HashSet<NavigableId>,
     /// Sender cloned into child workers and sidecars when TLA tracing is enabled.
     trace_sender: Option<TraceSender>,
     /// request ids for automation round-trips across the user-agent and
@@ -1317,7 +1316,6 @@ impl UserAgentWorker {
         user_agent_command_sender: Sender<UserAgentCommand>,
         command_receiver: Receiver<UserAgentCommand>,
         host: Arc<dyn Embedder>,
-        webview_provider_sender: Sender<WebviewProviderMessage>,
         trace_sender: Option<TraceSender>,
     ) -> Self {
         let net_connection = crate::fetch::NetConnection::new(trace_sender.clone())
@@ -1367,12 +1365,9 @@ impl UserAgentWorker {
             graphics_event_receiver,
             graphics_child,
             host,
-            webview_provider_sender,
-            navigation_tracer: TLATracer::new(
-                "Navigation",
-                "formal-web:user-agent",
-                trace_sender.clone(),
-            ),
+            tla_tracer: TLATracer::new("Navigation", "formal-web:user-agent", trace_sender.clone()),
+            pending_renders: HashSet::new(),
+            queued_opps: HashSet::new(),
             trace_sender,
             next_automation_request_id: 1,
         }
@@ -1445,7 +1440,7 @@ impl UserAgentWorker {
                         self.handle_dispatch_event_for(traversable_id, event);
                     }
                     UserAgentCommand::RenderingOpportunityFor { traversable_id } => {
-                        self.handle_rendering_opportunity_for(traversable_id);
+                        self.note_rendering_opportunity(traversable_id);
                     }
                     UserAgentCommand::NavigationFetchCompleted { fetch_id, response } => {
                         self.handle_navigation_fetch_completed(fetch_id, response);
@@ -1496,6 +1491,12 @@ impl UserAgentWorker {
                     recv(self.graphics_event_receiver) -> event => {
                         let Ok(mut incoming) = event else { break; };
                         self.handle_graphics_event(&mut incoming);
+                        // Drain any additional graphics events that arrived during
+                        // processing, preventing bursts when commands flood the
+                        // select! loop and graphics messages pile up.
+                        while let Ok(mut next) = self.graphics_event_receiver.try_recv() {
+                            self.handle_graphics_event(&mut next);
+                        }
                     }
 
                 }
@@ -1720,7 +1721,7 @@ impl UserAgentWorker {
                 }],
             },
         );
-        verification::tla_log!(self.navigation_tracer, "CreateNavigable", traversable_id);
+        verification::tla_log!(self.tla_tracer, "CreateNavigable", traversable_id);
         if target_name_keeps_browser_ui_focus(&target_name) {
             self.state.set_active_top_level_traversable(traversable_id);
         }
@@ -1747,13 +1748,6 @@ impl UserAgentWorker {
         }
         self.host
             .new_webview(WebviewId(traversable_id), target_name.clone())?;
-        self.webview_provider_sender
-            .send(WebviewProviderMessage::NewWebview {
-                webview_id: WebviewId(traversable_id),
-            })
-            .map_err(|error| {
-                format!("failed to enqueue webview-provider new-webview message: {error}")
-            })?;
         // Register the webview with the graphics process.
         if let Some(graphics_sender) = &self.graphics_extension_sender {
             if let Err(error) =
@@ -1764,7 +1758,6 @@ impl UserAgentWorker {
                 error!("failed to register webview with graphics process: {error}");
             }
         }
-        self.host.webview_provider_sync()?;
         // Step 13: Return traversable.
         Ok(traversable_id)
     }
@@ -1881,7 +1874,7 @@ impl UserAgentWorker {
             },
         );
         verification::tla_log!(
-            self.navigation_tracer,
+            self.tla_tracer,
             "CreateChildNavigable",
             traversable_id,
             parent_navigable_id
@@ -1893,17 +1886,7 @@ impl UserAgentWorker {
             .traversable_ids
             .insert(traversable_id);
 
-        self.webview_provider_sender
-            .send(WebviewProviderMessage::RegisterChildNavigableHost {
-                child_webview_id: WebviewId(traversable_id),
-                parent_traversable_id: WebviewId(parent_navigable_id),
-                content_frame_id,
-            })
-            .map_err(|error| {
-                format!(
-                    "failed to enqueue webview-provider child-host registration message: {error}"
-                )
-            })?;
+
         // Register the child navigable with the graphics process.
         if let Some(graphics_sender) = &self.graphics_extension_sender {
             if let Err(error) = graphics_sender.send(
@@ -1931,8 +1914,6 @@ impl UserAgentWorker {
             .entry(WebviewId(parent_navigable_id))
             .or_default()
             .insert(content_frame_id, WebviewId(traversable_id));
-        self.host.webview_provider_sync()?;
-
         Ok(traversable_id)
     }
 
@@ -2118,7 +2099,7 @@ impl UserAgentWorker {
     ) -> Result<(), String> {
         let traversable_id = self.traversable_id_for_navigable(navigable_id)?;
         verification::tla_log!(
-            self.navigation_tracer,
+            self.tla_tracer,
             "CreateNavigation",
             navigation_id,
             navigable_id
@@ -2129,7 +2110,7 @@ impl UserAgentWorker {
         // Step 19: "Set the ongoing navigation for navigable to navigationId."
         self.state
             .set_navigable_ongoing_navigation(traversable_id, Some(navigation_id));
-        verification::tla_log!(self.navigation_tracer, "StartNavigating", navigation_id);
+        verification::tla_log!(self.tla_tracer, "StartNavigating", navigation_id);
 
         // Note: The implementation always runs the beforeunload check through content,
         // even for initial about:blank documents.  This ensures the trace always contains
@@ -2533,7 +2514,7 @@ impl UserAgentWorker {
             },
         );
 
-        verification::tla_log!(self.navigation_tracer, "CreateNavigable", traversable_id);
+        verification::tla_log!(self.tla_tracer, "CreateNavigable", traversable_id);
 
         if target_name_keeps_browser_ui_focus(target_name) {
             self.state.set_active_top_level_traversable(traversable_id);
@@ -2565,13 +2546,7 @@ impl UserAgentWorker {
         if is_new_top_level {
             self.host
                 .new_webview(WebviewId(navigable_id), navigable.target_name.clone())?;
-            self.webview_provider_sender
-                .send(WebviewProviderMessage::NewWebview {
-                    webview_id: WebviewId(navigable_id),
-                })
-                .map_err(|error| {
-                    format!("failed to enqueue webview-provider new-webview message: {error}")
-                })?;
+
             // Register the webview with the graphics process.
             if let Some(graphics_sender) = &self.graphics_extension_sender {
                 if let Err(error) =
@@ -2582,8 +2557,7 @@ impl UserAgentWorker {
                     error!("failed to register webview with graphics process: {error}");
                 }
             }
-            self.host.webview_provider_sync()?;
-        }
+            }
         Ok(())
     }
 
@@ -2881,7 +2855,7 @@ impl UserAgentWorker {
         {
             if pending.canceled {
                 verification::tla_log!(
-                    self.navigation_tracer,
+                    self.tla_tracer,
                     "ContinueNavigation",
                     pending.navigation_id,
                     "aborted"
@@ -3005,7 +2979,7 @@ impl UserAgentWorker {
             pending.history_handling,
         );
         verification::tla_log!(
-            self.navigation_tracer,
+            self.tla_tracer,
             "ContinueNavigation",
             pending.navigation_id,
             "finalized"
@@ -3016,7 +2990,7 @@ impl UserAgentWorker {
             document.url = finalized.url.clone();
             document.is_initial_about_blank = finalized.url == "about:blank";
         }
-        self.handle_rendering_opportunity_for(pending.traversable_id);
+        self.note_rendering_opportunity(pending.traversable_id);
         // Notify the graphics process that a top-level navigation finalized.
         // This sets replace_root_on_next_paint so the next PaintFrame replaces
         // the old about:blank scene with the new page's scene.
@@ -3167,6 +3141,10 @@ impl UserAgentWorker {
         if let Err(error) = send_result {
             let _ = error_reply.send(Err(error));
         }
+
+        // Note a rendering opportunity so the content renders the clicked state.
+        // Automation click is a NoteRenderingOpportunity per the TLA spec.
+        self.note_rendering_opportunity(traversable_id);
     }
 
     /// applying the default viewport to the active traversable and its descendants.
@@ -3215,6 +3193,10 @@ impl UserAgentWorker {
         let _ = entry
             .command_sender
             .send(EventLoopCommand::FireAndForget { command });
+
+        // Viewport changes require a re-render — note a rendering opportunity
+        // directly rather than waiting for the next UI event.
+        self.note_rendering_opportunity(traversable_id);
     }
 
     /// Track which frame was last focused via pointer-down, for routing
@@ -3276,12 +3258,10 @@ impl UserAgentWorker {
             self.handle_dispatch_event_for(target_webview_id.0, routed_message);
         }
 
-        // Send a rendering opportunity to the target traversable only.
-        // The graphics process handles composition across frames, so only
-        // the frame that received the event needs to re-render. Rendering
-        // ALL frames on every input event floods the pipeline (each render
-        // triggers PaintFrame → graphics compose → ComposedSceneReady → IPC).
-        self.handle_rendering_opportunity_for(target_webview_id.0);
+        // Per the TLA spec: every UI event is a NoteRenderingOpportunity.
+        // The gate handles batching — if a task is already queued (pending),
+        // this just increments opp for the next frame_rendered to pick up.
+        self.note_rendering_opportunity(target_webview_id.0);
     }
 
     /// Route a UI event to the correct frame using frame hit info from the
@@ -3409,9 +3389,30 @@ impl UserAgentWorker {
             .send(EventLoopCommand::FireAndForget { command });
     }
 
-    /// <https://html.spec.whatwg.org/multipage/#update-the-rendering>
-    fn handle_rendering_opportunity_for(&mut self, traversable_id: NavigableId) {
+    /// <https://html.spec.whatwg.org/#rendering-opportunity>
+    fn note_rendering_opportunity(&mut self, traversable_id: NavigableId) {
+        verification::tla_log!(
+            self.tla_tracer,
+            -> "RenderingOpportunity",
+            "NoteRenderingOpportunity",
+            traversable_id
+        );
+        // TLA spec: NoteRenderingOpportunity(w)
+        //   IF pending[w] = 0 THEN pending[w] = 1 (start render)
+        //   ELSE opp[w] += 1 (queue opportunity)
+        if self.pending_renders.contains(&traversable_id) {
+            // Render already pending — queue the opportunity per spec.
+            self.queued_opps.insert(traversable_id);
+            trace!(
+                "[user-agent] SKIP rendering opportunity traversable={} (pending)",
+                traversable_id
+            );
+            return;
+        }
+        self.pending_renders.insert(traversable_id);
+
         let Some(handle) = self.state.traversable_handles.get(&traversable_id).copied() else {
+            self.pending_renders.remove(&traversable_id);
             return;
         };
         let Some(document_id) = self
@@ -3419,6 +3420,7 @@ impl UserAgentWorker {
             .active_documents_by_traversable
             .get(&traversable_id)
         else {
+            self.pending_renders.remove(&traversable_id);
             return;
         };
         let Some(entry) = self.state.event_loops.get(&handle) else {
@@ -3427,7 +3429,7 @@ impl UserAgentWorker {
 
         if input_debug_enabled() {
             trace!(
-                "[input-debug][user-agent] rendering_opportunity traversable={} event_loop={} document={}",
+                "[input-debug][user-agent] note_rendering_opportunity traversable={} event_loop={} document={}",
                 traversable_id, handle, document_id,
             );
         }
@@ -3436,6 +3438,11 @@ impl UserAgentWorker {
             "send rendering opportunity traversable={} document={} event_loop={}",
             traversable_id, document_id, handle,
         ));
+
+        trace!(
+            "[user-agent] send rendering opportunity traversable={} document={} event_loop={}",
+            traversable_id, document_id, handle,
+        );
         let command = ContentCommand::UpdateTheRendering {
             traversable_id,
             document_id: *document_id,
@@ -3443,6 +3450,33 @@ impl UserAgentWorker {
         let _ = entry
             .command_sender
             .send(EventLoopCommand::FireAndForget { command });
+
+        // Propagate to child navigables so they send their scenes to the
+        // graphics process. The graphics process buffers child frames and
+        // only produces one texture when the root frame arrives.
+        for child_id in descendant_navigable_ids(&self.state, traversable_id) {
+            self.note_rendering_opportunity(child_id);
+        }
+    }
+
+    /// Called when a SurfaceFrameReady arrives — the composite frame completed.
+    /// Corresponds to the TLA spec's FrameRendered action: clears the pending
+    /// gate and re-notes the root if any opportunities were queued while the
+    /// frame was in flight.
+    /// <https://html.spec.whatwg.org/#rendering-opportunity>
+    fn frame_rendered(&mut self, root_webview_id: WebviewId, animating: bool) {
+        verification::tla_log!(
+            self.tla_tracer,
+            -> "RenderingOpportunity",
+            "FrameRendered",
+            root_webview_id.0
+        );
+
+        self.pending_renders.clear();
+        if !self.queued_opps.is_empty() || animating {
+            self.queued_opps.clear();
+            self.note_rendering_opportunity(root_webview_id.0);
+        }
     }
 
     /// resuming an event-loop-local document fetch after the fetch worker succeeds.
@@ -3801,91 +3835,11 @@ impl UserAgentWorker {
     ) {
         use ipc_messages::graphics::GraphicsEvent;
         match &incoming.payload {
-            GraphicsEvent::ComposedSceneReady {
-                webview_id,
-                scene_shmem_key,
-                font_registrations,
-                frame_hit_info,
-                child_viewports,
-                child_frame_to_webview,
-            } => {
-                debug!(
-                    "[graphics] received composed scene for webview {:?} key={} fonts={} hit_info={}",
-                    webview_id,
-                    scene_shmem_key,
-                    font_registrations.len(),
-                    frame_hit_info.len(),
-                );
 
-                // Extract scene bytes from shared memory.
-                let scene_bytes = incoming
-                    .shmem_regions
-                    .get(scene_shmem_key)
-                    .map(|region| region.as_slice().to_vec())
-                    .unwrap_or_default();
-
-                // Extract font data from shared memory.
-                let mut font_data: std::collections::HashMap<usize, Vec<u8>> =
-                    std::collections::HashMap::new();
-                for font in font_registrations {
-                    if let Some(region) = incoming.shmem_regions.get(&font.data_shmem_key) {
-                        font_data.insert(font.data_shmem_key, region.as_slice().to_vec());
-                    }
-                }
-
-                // Store hit-testing info for ui event routing.
-                self.state
-                    .frame_hit_info
-                    .insert(*webview_id, frame_hit_info.clone());
-                // Store child frame -> webview mapping for iframe event routing.
-                self.state
-                    .child_frame_to_webview
-                    .insert(*webview_id, child_frame_to_webview.clone());
-
-                // Forward the scene to the embedder host with font data.
-                // The frame hit info stays in the user agent for UI event routing.
-                if let Err(error) = self.host.new_web_content_scene(
-                    *webview_id,
-                    scene_bytes,
-                    font_registrations.clone(),
-                    font_data,
-                ) {
-                    error!("[graphics] failed to forward composed scene: {error}");
-                }
-
-                // Publish child viewports so child traversables know their
-                // visible viewport dimensions (iframe size and position).
-                // Skip unchanged viewports to avoid render cascades:
-                // set_traversable_viewport → request_render_update → PaintFrame
-                // → Compose → ComposedSceneReady → handle_graphics_event → ...
-                for cv in child_viewports {
-                    let child_traversable_id = cv.child_webview_id.0;
-                    let width = (cv.root_clip_bounds[2] - cv.root_clip_bounds[0]) as u32;
-                    let height = (cv.root_clip_bounds[3] - cv.root_clip_bounds[1]) as u32;
-                    if let Some(&((_vw, _vh, scale, ref cs), _ox, _oy)) =
-                        self.state.traversable_viewports.get(&webview_id.0)
-                    {
-                        let viewport_scale = scale.max(1.0);
-                        let offset_x = (cv.root_clip_bounds[0] as f32) / viewport_scale;
-                        let offset_y = (cv.root_clip_bounds[1] as f32) / viewport_scale;
-                        let key = (width.max(1), height.max(1), offset_x, offset_y);
-                        let child_wv = ipc_messages::content::WebviewId(child_traversable_id);
-                        if self.state.published_child_viewports.get(&child_wv) == Some(&key) {
-                            continue;
-                        }
-                        self.state.published_child_viewports.insert(child_wv, key);
-                        self.handle_set_traversable_viewport(
-                            child_traversable_id,
-                            (width.max(1), height.max(1), scale, cs.clone()),
-                            offset_x,
-                            offset_y,
-                        );
-                    }
-                }
-            }
             GraphicsEvent::SurfaceFrameReady {
                 webview_id,
-                pixels,
+                surface_shmem_key,
+                animating,
                 width,
                 height,
                 generation,
@@ -3893,7 +3847,30 @@ impl UserAgentWorker {
                 child_viewports,
                 child_frame_to_webview,
             } => {
-                debug!("[graphics] received surface frame for {:?} ({}x{}, {}B)", webview_id, width, height, pixels.len());
+                debug!(
+                    "[graphics] received surface frame for {:?} ({}x{}, {}B)",
+                    webview_id,
+                    width,
+                    height,
+                    incoming
+                        .shmem_regions
+                        .get(&surface_shmem_key)
+                        .map(|region| region.as_slice().len())
+                        .unwrap_or_default()
+                );
+                let pixels = incoming
+                    .shmem_regions
+                    .get(&surface_shmem_key)
+                    .map(|region| region.as_slice().to_vec())
+                    .unwrap_or_default();
+                debug!(
+                    "[graphics] received surface frame for {:?} ({}x{}, {}B)",
+                    webview_id,
+                    width,
+                    height,
+                    pixels.len()
+                );
+                self.frame_rendered(*webview_id, *animating);
                 self.state
                     .frame_hit_info
                     .insert(*webview_id, frame_hit_info.clone());

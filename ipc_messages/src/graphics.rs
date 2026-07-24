@@ -1,4 +1,4 @@
-use crate::content::{FrameId, PaintFrame, RegisteredFont, WebviewId};
+use crate::content::{FrameId, PaintFrame, WebviewId};
 use crate::media::{MediaPipelineId, VideoPaintId};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -108,10 +108,14 @@ pub struct FrameHitInfo {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum GraphicsEvent {
     /// A rendered surface frame is ready for one webview.
-    /// Carries RGBA pixel data rendered by the graphics process.
     SurfaceFrameReady {
         webview_id: WebviewId,
-        pixels: Vec<u8>,
+        /// Key into the IPC shared memory map for the rendered RGBA pixel buffer.
+        surface_shmem_key: usize,
+        /// True when the composed scene contains animated content (video)
+        /// that requires the UA to re-note a rendering opportunity even
+        /// without user input.
+        animating: bool,
         width: u32,
         height: u32,
         generation: u64,
@@ -119,24 +123,7 @@ pub enum GraphicsEvent {
         child_viewports: Vec<ChildViewport>,
         child_frame_to_webview: HashMap<FrameId, WebviewId>,
     },
-    /// A composed scene is ready for one webview. The scene bytes and font data
-    /// are placed in the IPC shared memory map under the provided keys.
-    ComposedSceneReady {
-        webview_id: WebviewId,
-        /// Key into the IPC shared memory map for the serialized scene bytes.
-        scene_shmem_key: usize,
-        /// Font registrations for the scene's glyph runs. Each font's data
-        /// is in the shared memory map under its `data_shmem_key`.
-        font_registrations: Vec<RegisteredFont>,
-        /// Hit-testing info for the frame tree.
-        frame_hit_info: Vec<FrameHitInfo>,
-        /// Viewport data for child frames (iframes), used by the UA to
-        /// publish viewport dimensions to child traversables.
-        child_viewports: Vec<ChildViewport>,
-        /// Mapping from content_frame_id to child WebviewId, used by the UA
-        /// to route UI events to the correct child traversable.
-        child_frame_to_webview: HashMap<FrameId, WebviewId>,
-    },
+
     /// The graphics process is shutting down.
     ShutdownComplete,
 }

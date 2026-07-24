@@ -26,6 +26,10 @@ pub struct ComposedScene {
     /// to the child webview_id. Used by the UA to route UI events to the
     /// correct child traversable instead of the root.
     pub child_frame_to_webview: HashMap<FrameId, WebviewId>,
+    /// True when the composed scene contains animated content (video)
+    /// that requires the UA to re-note a rendering opportunity even
+    /// without user input.
+    pub animating: bool,
 }
 
 struct WebviewCompositorSlot {
@@ -152,9 +156,14 @@ fn handle_media_event(
                 data: pixel_bytes,
             };
             if let Some(slot) = webviews.get_mut(&webview_id) {
-                slot.compositor.update_video_frame(cf);
-                // Compose and send the scene so the video appears immediately.
-                if slot.compositor.committed_root_frame_id().is_some() {
+                // First video frame arrival: wake the UA up by composing once so
+                // the SurfaceFrameReady carries animating=true, restarting the
+                // render cycle. Subsequent frames never trigger composition.
+                let was_idle = slot.compositor.update_video_frame(cf);
+                if was_idle
+                    && slot.compositor.committed_root_frame_id().is_some()
+                    && slot.compositor.has_valid_viewport()
+                {
                     if let Some(mut composed) = slot
                         .compositor
                         .compose_scene(&slot.font_receiver, webview_id)
@@ -166,6 +175,7 @@ fn handle_media_event(
                         );
                         composed.child_viewports = cv;
                         composed.child_frame_to_webview = cftw;
+                        composed.animating = true;
                         let _ = send_composed_scene(composed_scene_sender.clone(), slot, composed);
                     }
                 }
@@ -173,6 +183,13 @@ fn handle_media_event(
         }
         MediaBackendEvent::Eos { pipeline_id } => {
             debug!("[graphics] pipeline {:?} end of stream", pipeline_id);
+            // Remove the video frame so has_animated_content() returns false
+            // and the UA stops re-noting rendering opportunities for video.
+            if let Some(&(webview_id, paint_id)) = pipeline_webview_map.get(&pipeline_id) {
+                if let Some(slot) = webviews.get_mut(&webview_id) {
+                    slot.compositor.remove_video_frame(paint_id);
+                }
+            }
         }
         MediaBackendEvent::Error {
             pipeline_id,
@@ -231,6 +248,7 @@ fn handle_command<B: MediaBackend + 'static>(
             let viewport_width = frame.viewport_width;
             let viewport_height = frame.viewport_height;
             let frame_id = actual_frame_id;
+            let animating = frame.animating;
             let recorded_scene =
                 match frame.into_recorded_scene(&mut slot.font_receiver, shmem_regions) {
                     Ok(s) => s,
@@ -247,11 +265,14 @@ fn handle_command<B: MediaBackend + 'static>(
                 recorded_scene,
                 is_root_candidate,
             );
-            // Compose and send when the root frame is updated or any child frame
-            // arrives. Child frames are remapped into the parent's compositor slot;
-            // when the root exists, every new frame triggers a re-composition so
-            // the updated scene is pushed back to the user agent.
-            let should_compose = slot.compositor.committed_root_frame_id().is_some();
+            // Skip composition for zero-sized viewports (e.g. during resize).
+            let has_valid_viewport = viewport_width > 0 && viewport_height > 0;
+            // Only compose and produce a texture when the top-level (root)
+            // frame arrives. Child PaintFrames and video frames are buffered
+            // locally — their LATEST data is included when the root triggers
+            // composition. This ensures exactly one texture per render cycle
+            // regardless of how many embedded frames exist.
+            let should_compose = is_root_candidate && has_valid_viewport;
             if should_compose {
                 if let Some(mut composed) = slot
                     .compositor
@@ -265,6 +286,10 @@ fn handle_command<B: MediaBackend + 'static>(
                     );
                     composed.child_viewports = cv;
                     composed.child_frame_to_webview = cftw;
+                    // animating comes from the content-process PaintFrame flag.
+                    // When content doesn't set it (yet), fall back to the
+                    // compositor detecting active video frames.
+                    composed.animating = animating || slot.compositor.has_animated_content();
                     let _ = send_composed_scene(composed_scene_sender.clone(), slot, composed);
                 }
             }
@@ -403,6 +428,7 @@ fn send_composed_scene(
         frame_hit_info,
         child_viewports,
         child_frame_to_webview,
+        animating,
     } = composed;
 
     let width = frame_hit_info
@@ -414,8 +440,6 @@ fn send_composed_scene(
         .map(|h| h.viewport_height)
         .unwrap_or(0);
     if width == 0 || height == 0 {
-        eprintln!("[TRACE] send_composed_scene: zero viewport for {:?}", webview_id);
-        error!("[graphics] zero viewport for {:?}", webview_id);
         return Err(());
     }
     let (_iosurface_id, generation, pixels) =
@@ -435,17 +459,26 @@ fn send_composed_scene(
         })
         .collect();
 
+    // Place pixel data in shared memory to avoid copying across IPC.
+    let surface_shmem_key = generation as usize;
+    let mut shmem_map = std::collections::HashMap::new();
+    shmem_map.insert(surface_shmem_key, ipc::IpcSharedRegion::from_bytes(&pixels));
+
     if sender
-        .send(GraphicsEvent::SurfaceFrameReady {
-            webview_id,
-            pixels,
-            width,
-            height,
-            generation,
-            frame_hit_info,
-            child_viewports: child_ports,
-            child_frame_to_webview,
-        })
+        .send_with_shmem_map(
+            GraphicsEvent::SurfaceFrameReady {
+                webview_id,
+                surface_shmem_key,
+                animating,
+                width,
+                height,
+                generation,
+                frame_hit_info,
+                child_viewports: child_ports,
+                child_frame_to_webview,
+            },
+            shmem_map,
+        )
         .is_err()
     {
         return Err(());

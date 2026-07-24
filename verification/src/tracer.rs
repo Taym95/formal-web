@@ -62,25 +62,33 @@ impl TLATracer {
 
     pub fn log_with_location(
         &mut self,
+        spec: Option<&str>,
         event: impl Into<String>,
         args: Vec<String>,
         file: &str,
         line: u32,
     ) {
-        self.flush(Some(event.into()), args, file, line);
+        self.flush(spec, Some(event.into()), args, file, line);
     }
 
-    pub fn log_silent_with_location(&mut self, file: &str, line: u32) {
-        self.flush(None, Vec::new(), file, line);
+    pub fn log_silent_with_location(&mut self, spec: Option<&str>, file: &str, line: u32) {
+        self.flush(spec, None, Vec::new(), file, line);
     }
 
-    fn flush(&mut self, event: Option<String>, event_args: Vec<String>, file: &str, line: u32) {
+    fn flush(
+        &mut self,
+        spec: Option<&str>,
+        event: Option<String>,
+        event_args: Vec<String>,
+        file: &str,
+        line: u32,
+    ) {
         let Some(sender) = &self.sender else {
             return;
         };
 
         let entry = LogEntry {
-            spec: self.spec.clone(),
+            spec: spec.unwrap_or(&self.spec).to_owned(),
             producer: self.producer.clone(),
             updates: mem::take(&mut self.pending_updates),
             event,
@@ -130,5 +138,24 @@ mod tests {
             vec![String::from("nk-1"), String::from("nav-1")]
         );
         assert_eq!(entry.updates.len(), 1);
+    }
+
+    #[test]
+    fn per_event_spec_override() {
+        let (sender, receiver) =
+            ipc::channel().expect("failed to create verification test channel");
+        let mut tracer = TLATracer::new("Navigation", "test", Some(sender));
+
+        tracer.log_with_location(
+            Some("RenderingOpportunity"),
+            "NoteRenderingOpportunity",
+            vec![String::from("w1")],
+            file!(),
+            line!(),
+        );
+
+        let entry = receiver.recv().expect("expected one trace entry");
+        assert_eq!(entry.spec, "RenderingOpportunity");
+        assert_eq!(entry.event.as_deref(), Some("NoteRenderingOpportunity"));
     }
 }

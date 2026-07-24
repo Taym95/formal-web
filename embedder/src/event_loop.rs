@@ -91,11 +91,6 @@ impl Embedder for EventLoopEmbedder {
             .send(FormalWebUserEvent::NewWebview(webview_id, target_name))
     }
 
-    fn webview_provider_sync(&self) -> Result<(), String> {
-        self.dispatcher
-            .send(FormalWebUserEvent::WebviewProviderSync)
-    }
-
     fn new_frame_rendered(&self) -> Result<(), String> {
         self.dispatcher.send(FormalWebUserEvent::NewFrameRendered)
     }
@@ -184,7 +179,6 @@ pub enum FormalWebUserEvent {
     NavigationCompleted(NavigationCompleted),
     #[allow(dead_code)]
     NewWebview(WebviewId, String),
-    WebviewProviderSync,
     NewFrameRendered,
     CreateWindow,
     Automation(AutomationCommand),

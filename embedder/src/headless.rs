@@ -258,7 +258,6 @@ impl AutomationHost for HeadlessEmbedderApp {
         match self.provider.as_ref().zip(self.current_webview_id) {
             Some((p, wid)) => {
                 p.click_element(wid, selector)?;
-                p.note_rendering_opportunity(wid, "automation_element_click");
                 Ok(())
             }
             None => Err(String::from("no webview")),
@@ -310,13 +309,7 @@ impl ApplicationHandler<FormalWebUserEvent> for HeadlessEmbedderApp {
 
     fn user_event(&mut self, el: &ActiveEventLoop, event: FormalWebUserEvent) {
         match event {
-            FormalWebUserEvent::WebviewProviderSync => {
-                if let Some(p) = self.provider.as_mut()
-                    && let Err(e) = p.sync_pending_messages()
-                {
-                    error!("provider sync error: {e}");
-                }
-            }
+
             FormalWebUserEvent::NewFrameRendered => {
                 self.with_automation(|a, app| a.note_rendering_update(app));
             }
@@ -331,9 +324,6 @@ impl ApplicationHandler<FormalWebUserEvent> for HeadlessEmbedderApp {
             FormalWebUserEvent::NewWebview(wid, _) => {
                 self.current_webview_id = Some(wid);
                 self.apply_viewport_snapshot();
-                if let Some(p) = self.provider.as_ref() {
-                    p.note_rendering_opportunity(wid, "request_redraw");
-                }
             }
             FormalWebUserEvent::CreateWindow => {}
             FormalWebUserEvent::Automation(cmd) => {

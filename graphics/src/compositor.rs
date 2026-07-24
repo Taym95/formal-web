@@ -93,12 +93,18 @@ pub struct Compositor {
 impl Compositor {
     pub fn note_navigation_finalized(&mut self) {
         self.pending_frames.clear();
+        self.video_frames.clear();
         self.replace_root_on_next_paint = true;
         self.resolved_tree_dirty = true;
     }
 
-    pub fn update_video_frame(&mut self, frame: CompositorVideoFrame) {
+    /// Insert a decoded video frame. Returns `true` when this is the first
+    /// video frame arriving (transition from idle to animated), which the
+    /// graphics process can use to trigger a one-time wakeup composition.
+    pub fn update_video_frame(&mut self, frame: CompositorVideoFrame) -> bool {
+        let was_idle = self.video_frames.is_empty();
         self.video_frames.insert(frame.video_paint_id, frame);
+        was_idle
     }
 
     pub fn remove_video_frame(&mut self, paint_id: VideoPaintId) {
@@ -176,6 +182,43 @@ impl Compositor {
         self.root_frame_id
     }
 
+    /// True when the compositor has active video content that requires
+    /// continuous re-rendering even without user input.
+    /// True when the compositor has active video content that requires
+    /// continuous re-rendering even without user input.
+    pub fn has_animated_content(&self) -> bool {
+        !self.video_frames.is_empty()
+    }
+
+    pub fn has_valid_viewport(&self) -> bool {
+        self.root_frame_id
+            .and_then(|id| self.committed_frames.get(&id))
+            .map(|frame| frame.viewport_width > 0 && frame.viewport_height > 0)
+            .unwrap_or(false)
+    }
+
+    /// True when the root frame is committed and all child frames listed in
+    /// the root's embed sites have also been received. Used by the graphics
+    /// process to delay composition until all embedded content is available.
+    pub fn all_children_received(&self) -> bool {
+        let root_id = match self.root_frame_id {
+            Some(id) => id,
+            None => return false,
+        };
+        let root = match self.committed_frames.get(&root_id) {
+            Some(frame) => frame,
+            None => return false,
+        };
+        for site in &root.composition.embed_sites {
+            if let EmbedSite::Frame(iframe) = site {
+                if !self.committed_frames.contains_key(&iframe.child_frame_id) {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
     /// Compose the final scene for this compositor and return it with
     /// hit-testing info. Caller is responsible for resetting state.
     pub fn compose_scene(
@@ -199,6 +242,7 @@ impl Compositor {
             frame_hit_info,
             child_viewports: HashMap::new(),
             child_frame_to_webview: HashMap::new(),
+            animating: false,
         })
     }
 

@@ -675,6 +675,10 @@ pub struct PaintFrame {
     /// reads the bytes from the shmem map using this key and passes them to
     /// `into_recorded_scene()`.
     pub scene_shmem_key: usize,
+    /// True when the rendered scene contains animated content (e.g. video,
+    /// CSS animations). The graphics process forwards this to the UA so it
+    /// can keep re-noting rendering opportunities without user input.
+    pub animating: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -698,6 +702,7 @@ impl PaintFrame {
         composition: FrameCompositionMetadata,
         scene: PreparedScene,
         next_shmem_key: &mut usize,
+        animating: bool,
     ) -> Result<(Self, HashMap<usize, ipc::IpcSharedRegion>), String> {
         let PreparedScene {
             scene,
@@ -722,6 +727,7 @@ impl PaintFrame {
                 composition,
                 font_registrations: registered_fonts,
                 scene_shmem_key,
+                animating,
             },
             shmem_map,
         ))
@@ -1059,6 +1065,7 @@ mod tests {
             FrameCompositionMetadata::default(),
             prepared,
             &mut next_shmem_key,
+            false,
         )
         .expect("paint frame should serialize into shared memory");
 
@@ -1090,6 +1097,7 @@ mod tests {
             FrameCompositionMetadata::default(),
             first_prepared,
             &mut next_shmem_key,
+            false,
         )
         .expect("first frame should serialize");
         let first_summary = first_frame.transport_summary(&first_shmem_regions);
@@ -1120,6 +1128,7 @@ mod tests {
             FrameCompositionMetadata::default(),
             second_prepared,
             &mut next_shmem_key,
+            false,
         )
         .expect("second frame should serialize");
         let second_summary = second_frame.transport_summary(&second_shmem_regions);

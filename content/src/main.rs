@@ -397,7 +397,7 @@ pub(crate) struct ContentProcess {
     active_documents_by_traversable: HashMap<NavigableId, DocumentId>,
     font_namespace: u64,
     font_sender: FontTransportSender,
-    navigation_tracer: TLATracer,
+    tla_tracer: TLATracer,
     /// Shared clipboard cache. The embedder writes prefetched clipboard text
     /// here before dispatching paste events; `ShellProvider::get_clipboard_text`
     /// reads from this cache instead of doing a blocking IPC round-trip.
@@ -446,7 +446,7 @@ impl ContentProcess {
             active_documents_by_traversable: HashMap::new(),
             font_namespace: new_font_namespace(),
             font_sender: FontTransportSender::default(),
-            navigation_tracer: TLATracer::new("Navigation", "formal-web:content", trace_sender),
+            tla_tracer: TLATracer::new("Navigation", "formal-web:content", trace_sender),
             clipboard_cache: clipboard_cache.clone(),
             new_document_registry: Rc::new(RefCell::new(HashMap::new())),
             video_paint_registry: Rc::new(RefCell::new(HashMap::new())),
@@ -1335,7 +1335,7 @@ impl ContentProcess {
         if let Some(navigable_id) = navigable_id {
             let outcome = if canceled { "Aborted" } else { "Approved" };
             verification::tla_log!(
-                self.navigation_tracer,
+                self.tla_tracer,
                 "RunBeforeUnload",
                 navigable_id,
                 navigation_id,
@@ -1463,6 +1463,8 @@ impl ContentProcess {
                     "emit paint traversable={} document={} size=({}, {})",
                     traversable_id, document_id, width, height,
                 ));
+                // TODO: set animating=true when the page has active video,
+                // CSS animations, or other continuous visual changes.
                 let (paint_frame, shmem_data) = PaintFrame::new(
                     WebviewId(traversable_id),
                     document.frame_id,
@@ -1471,6 +1473,7 @@ impl ContentProcess {
                     composition,
                     scene,
                     &mut next_shmem_key,
+                    false,
                 )?;
                 (paint_frame, shmem_data)
             };

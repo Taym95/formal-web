@@ -286,15 +286,8 @@ impl WindowedApp {
         }
     }
 
-    fn request_visible_redraw(
-        window_state: &WindowState,
-        provider: Option<&WebviewProvider>,
-        reason: &str,
-    ) {
+    fn request_visible_redraw(window_state: &WindowState) {
         Self::request_window_redraw(window_state);
-        if let Some((provider, webview_id)) = provider.zip(window_state.active_tab) {
-            provider.note_rendering_opportunity(webview_id, reason);
-        }
     }
 
     fn tab_display_url(window_state: &WindowState) -> String {
@@ -448,13 +441,17 @@ impl WindowedApp {
                 .resume(window_handle, size.width, size.height, || {});
             state.renderer.complete_resume();
         }
-        let active_tab = state.active_tab;
+        let Some(webview_id) = state.active_tab else {
+            return;
+        };
+        let Some(image_data) = state.surface_images.remove(&webview_id) else {
+            return;
+        };
+        window.pre_present_notify();
+
         state.renderer.render(|scene| {
-            if let Some(webview_id) = active_tab
-                && let Some(image_data) = state.surface_images.get(&webview_id)
-            {
-                let w = image_data.width;
-                let h = image_data.height;
+            let w = image_data.width;
+            let h = image_data.height;
                 debug!(
                     "[embedder] paint_frame drawing surface webview={:?} {}x{}",
                     webview_id, w, h
@@ -464,13 +461,12 @@ impl WindowedApp {
                     peniko::Fill::NonZero,
                     content_transform,
                     Paint::Image(peniko::ImageBrushRef {
-                        image: image_data,
+                        image: &image_data,
                         sampler: Default::default(),
                     }),
                     None,
                     &kurbo::Rect::new(0.0, 0.0, f64::from(w), f64::from(h)),
                 );
-            }
             if let Some(chrome_scene) = chrome_scene.clone() {
                 scene.append_scene(chrome_scene, Affine::IDENTITY);
             }
@@ -531,20 +527,16 @@ impl WindowedApp {
     }
 
     fn dispatch_to_content(&mut self, window_id: WindowId, event: UiEvent) {
-        let webview_id = self
+        let Some(webview_id) = self
             .windows
             .get(&window_id)
-            .and_then(|window_state| window_state.active_tab);
-        let Some(webview_id) = webview_id else {
+            .and_then(|window_state| window_state.active_tab)
+        else {
             return;
         };
-        let needs_render = matches!(event, UiEvent::KeyDown(_) | UiEvent::Ime(_));
         self.with_provider(|provider| {
             if let Err(error) = provider.send_ui_event(webview_id, event) {
                 error!("content event error: {error}");
-            }
-            if needs_render {
-                provider.note_rendering_opportunity(webview_id, "keyboard_event");
             }
         });
         if let Some(window_state) = self.windows.get(&window_id) {
@@ -995,13 +987,7 @@ impl ApplicationHandler<FormalWebUserEvent> for WindowedApp {
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: FormalWebUserEvent) {
         match event {
-            FormalWebUserEvent::WebviewProviderSync => {
-                if let Some(provider) = self.provider.as_mut()
-                    && let Err(error) = provider.sync_pending_messages()
-                {
-                    error!("provider sync error: {error}");
-                }
-            }
+
             FormalWebUserEvent::NewFrameRendered => {
                 self.try_run_automation(|automation, app| automation.note_rendering_update(app));
             }
@@ -1062,13 +1048,7 @@ impl ApplicationHandler<FormalWebUserEvent> for WindowedApp {
                         // Clear compositor first so new paint frames populate it.
                         if let Some(provider) = self.provider.as_mut() {
                             provider.on_navigation_committed(completion.webview_id);
-                            // Request a rendering opportunity so the content process
-                            // sends a new paint frame. on_navigation_committed only does
-                            // this for child navigables, not the top-level traversable.
-                            provider.note_rendering_opportunity(
-                                completion.webview_id,
-                                "navigation_committed",
-                            );
+
                         }
                         if is_current {
                             if let Some(state) = self.windows.get_mut(&window) {
@@ -1103,7 +1083,7 @@ impl ApplicationHandler<FormalWebUserEvent> for WindowedApp {
                     Self::add_tab(state, webview_id);
                     Self::sync_chrome(state);
                     Self::update_provider_viewport(state, &mut self.provider);
-                    Self::request_visible_redraw(state, self.provider.as_ref(), "request_redraw");
+                    Self::request_visible_redraw(state);
                 }
             }
             FormalWebUserEvent::CreateWindow => {
@@ -1168,6 +1148,10 @@ impl ApplicationHandler<FormalWebUserEvent> for WindowedApp {
                 height,
                 generation: _generation,
             } => {
+                debug!(
+                    "[embedder] NewWebContentSurface webview={:?} size={}x{}",
+                    webview_id, width, height
+                );
                 // Store the rendered pixel data as ImageData for the active tab.
                 let width = width;
                 let height = height;
@@ -1187,7 +1171,7 @@ impl ApplicationHandler<FormalWebUserEvent> for WindowedApp {
                 }
                 // Trigger redraw so paint_frame picks up the new image.
                 if let Some(window) = Self::window_for_webview(self, webview_id)
-                    && let Some(state) = self.windows.get(&window)
+                    && let Some(state) = self.windows.get_mut(&window)
                 {
                     Self::request_window_redraw(state);
                 }
@@ -1376,7 +1360,6 @@ impl AutomationHost for WindowedApp {
             .ok_or_else(|| String::from("no tab"))?;
         self.with_provider(|provider| {
             provider.click_element(webview_id, selector).ok();
-            provider.note_rendering_opportunity(webview_id, "automation_element_click");
         })
         .ok_or_else(|| String::from("no provider"))
     }
