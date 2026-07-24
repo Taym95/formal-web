@@ -182,13 +182,14 @@ fn handle_media_event(
             }
         }
         MediaBackendEvent::Eos { pipeline_id } => {
-            debug!("[graphics] pipeline {:?} end of stream", pipeline_id);
-            // Remove the video frame so has_animated_content() returns false
-            // and the UA stops re-noting rendering opportunities for video.
             if let Some(&(webview_id, paint_id)) = pipeline_webview_map.get(&pipeline_id) {
                 if let Some(slot) = webviews.get_mut(&webview_id) {
                     slot.compositor.remove_video_frame(paint_id);
                 }
+                let _ = composed_scene_sender.send(GraphicsEvent::VideoEnded {
+                    webview_id,
+                    video_paint_id: paint_id,
+                });
             }
         }
         MediaBackendEvent::Error {
@@ -287,9 +288,9 @@ fn handle_command<B: MediaBackend + 'static>(
                     composed.child_viewports = cv;
                     composed.child_frame_to_webview = cftw;
                     // animating comes from the content-process PaintFrame flag.
-                    // When content doesn't set it (yet), fall back to the
-                    // compositor detecting active video frames.
-                    composed.animating = animating || slot.compositor.has_animated_content();
+                    // Content knows what's animating (video, CSS animations)
+                    // and sets this. Graphics just passes it through.
+                    composed.animating = animating;
                     let _ = send_composed_scene(composed_scene_sender.clone(), slot, composed);
                 }
             }

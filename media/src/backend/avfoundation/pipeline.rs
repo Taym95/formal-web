@@ -24,6 +24,9 @@ pub struct AvfPipeline {
     event_tx: Sender<MediaBackendEvent>,
     destroyed: Cell<bool>,
     duration_reported: Cell<bool>,
+    /// True when the player was playing (rate > 0) and then stopped (rate = 0),
+    /// indicating the video reached end of stream.
+    eos_sent: Cell<bool>,
 }
 
 impl AvfPipeline {
@@ -57,6 +60,7 @@ impl AvfPipeline {
             event_tx,
             destroyed: Cell::new(false),
             duration_reported: Cell::new(false),
+            eos_sent: Cell::new(false),
         })
     }
 }
@@ -99,6 +103,21 @@ impl PipelineHandle for AvfPipeline {
                     log::info!("[avf] p{}: duration = {secs}s", self.id.0);
                 }
                 self.duration_reported.set(true);
+            }
+        }
+
+        // Detect end of stream: rate dropped to 0 after playing.
+        if !self.eos_sent.get() && self.duration_reported.get() {
+            let rate = self.player.rate();
+            if rate == 0.0 && self.item.status() == objc2_av_foundation::AVPlayerItemStatus::ReadyToPlay {
+                // The player stopped. Check if we're at or past the duration.
+                let current = self.item.current_time_secs();
+                let duration = self.item.duration_secs();
+                if duration > 0.0 && current >= duration - 0.1 {
+                    log::info!("[avf] p{}: end of stream (t={current:.2}s / d={duration:.2}s)", self.id.0);
+                    self.eos_sent.set(true);
+                    let _ = self.event_tx.send(MediaBackendEvent::Eos { pipeline_id: self.id });
+                }
             }
         }
 

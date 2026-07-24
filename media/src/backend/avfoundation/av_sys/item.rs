@@ -18,6 +18,17 @@ impl AvPlayerItem {
         unsafe { self.inner.status() }
     }
 
+    /// Current playback position in seconds.
+    pub(crate) fn current_time_secs(&self) -> f64 {
+        let t = unsafe { self.inner.currentTime() };
+        let secs = unsafe { t.seconds() };
+        if secs.is_finite() && secs >= 0.0 {
+            secs
+        } else {
+            0.0
+        }
+    }
+
     /// Duration in seconds, or 0.0 if not yet known.
     pub(crate) fn duration_secs(&self) -> f64 {
         let d = unsafe { self.inner.duration() };

@@ -124,6 +124,13 @@ pub enum GraphicsEvent {
         child_frame_to_webview: HashMap<FrameId, WebviewId>,
     },
 
+    /// A media pipeline reached end of stream. The UA should forward
+    /// this to the relevant content process so it can unset any
+    /// animating flags.
+    VideoEnded {
+        webview_id: WebviewId,
+        video_paint_id: VideoPaintId,
+    },
     /// The graphics process is shutting down.
     ShutdownComplete,
 }

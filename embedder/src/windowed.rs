@@ -365,10 +365,10 @@ impl WindowedApp {
         );
         update_window_viewport_snapshot(Some(viewport));
         if let Some(provider) = provider.as_mut() {
+            // set_default_viewport broadcasts the viewport to all existing
+            // traversables and stores it for future ones. Content handles
+            // the viewport change by calling request_render_update internally.
             let _ = provider.set_default_viewport(Some(viewport));
-            if let Some(webview_id) = window_state.active_tab {
-                let _ = provider.set_traversable_viewport(webview_id, viewport, 0.0, 0.0);
-            }
         }
     }
 

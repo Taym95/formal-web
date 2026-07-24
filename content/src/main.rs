@@ -42,7 +42,7 @@ use js_engine::ExecutionContext;
 use ipc_messages::content::Command::{
     ClickElement, CompleteDocumentFetch, ContentBootstrap, CreateEmptyDocument,
     CreateLoadedDocument, DestroyDocument, DispatchEvent, EvaluateScript, FailDocumentFetch,
-    RunWindowTimer, SetTraversableViewport, SetViewport, Shutdown, UpdateTheRendering,
+    NotifyVideoEnded, RunWindowTimer, SetTraversableViewport, SetViewport, Shutdown, UpdateTheRendering,
 };
 use ipc_messages::content::{
     BeforeUnloadCheckId, ClipboardWriteRequested, ColorScheme as MessageColorScheme, Command,
@@ -127,6 +127,9 @@ struct LocalContentState {
 }
 
 pub(crate) type LocalContentStateRef = Arc<Mutex<LocalContentState>>;
+
+/// Tracks the playback state of a video element across paints.
+/// Stored in the paint registry instead of on the element for now.
 
 pub(crate) fn new_document_fetch_id() -> DocumentFetchId {
     DocumentFetchId::new()
@@ -414,6 +417,10 @@ pub(crate) struct ContentProcess {
     wasm: crate::wasm::ContentWasmState,
 
     video_paint_registry: Rc<RefCell<HashMap<(DocumentId, usize), VideoPaintId>>>,
+    /// (DocumentId, node_id) pairs of video elements that have reached
+    /// end-of-stream. Checked alongside the registry to determine whether
+    /// the document has active (non-ended) video.
+    ended_video_nodes: HashSet<(DocumentId, usize)>,
     /// Direct sender to the net extension. Set during DirectChannelsSetup.
     network_extension_sender: ipc::IpcSender<ipc_messages::network::Request>,
     /// Direct sender to the graphics process (composition + media). Set during ContentBootstrap.
@@ -450,6 +457,7 @@ impl ContentProcess {
             clipboard_cache: clipboard_cache.clone(),
             new_document_registry: Rc::new(RefCell::new(HashMap::new())),
             video_paint_registry: Rc::new(RefCell::new(HashMap::new())),
+            ended_video_nodes: HashSet::new(),
             #[cfg(all(boa_backend, feature = "wasm"))]
             wasm: crate::wasm::ContentWasmState::new(_wasm_signal_sender),
             network_extension_sender,
@@ -1463,8 +1471,18 @@ impl ContentProcess {
                     "emit paint traversable={} document={} size=({}, {})",
                     traversable_id, document_id, width, height,
                 ));
-                // TODO: set animating=true when the page has active video,
-                // CSS animations, or other continuous visual changes.
+                // Set animating=true when this document has video elements.
+                // Graphics forwards this to the UA which keeps re-noting
+                // rendering opportunities to drive video animation.
+                let has_video = video_paint_registry
+                    .borrow()
+                    .keys()
+                    .any(|(doc_id, node_id)| {
+                        let ended = self.ended_video_nodes.contains(&(*doc_id, *node_id));
+                        if ended {
+                        }
+                        *doc_id == document_id && !ended
+                    });
                 let (paint_frame, shmem_data) = PaintFrame::new(
                     WebviewId(traversable_id),
                     document.frame_id,
@@ -1473,7 +1491,7 @@ impl ContentProcess {
                     composition,
                     scene,
                     &mut next_shmem_key,
-                    false,
+                    has_video,
                 )?;
                 (paint_frame, shmem_data)
             };
@@ -2227,6 +2245,20 @@ impl ContentProcess {
             ContentBootstrap { .. } => {
                 // Handled before the event loop in run_content_process.
                 debug_assert!(false, "ContentBootstrap should not reach handle_command");
+                Ok(true)
+            }
+            NotifyVideoEnded { video_paint_id } => {
+                let ended_key: Vec<(DocumentId, usize)> = self
+                    .video_paint_registry
+                    .borrow()
+                    .iter()
+                    .filter(|(_, existing_id)| **existing_id == video_paint_id)
+                    .map(|((doc_id, node_id), _)| (*doc_id, *node_id))
+                    .collect();
+                for key in ended_key {
+                    self.video_paint_registry.borrow_mut().remove(&key);
+                    self.ended_video_nodes.insert(key);
+                }
                 Ok(true)
             }
             Shutdown => {

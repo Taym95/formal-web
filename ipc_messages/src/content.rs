@@ -1,4 +1,4 @@
-use crate::media::VideoEmbedData;
+use crate::media::{VideoEmbedData, VideoPaintId};
 use anyrender::{
     Scene,
     recording::{GlyphRunCommand, RenderCommand},
@@ -887,6 +887,11 @@ pub enum Command {
         /// TLA trace sender for logging spec-level events from the content process
         /// (e.g. RunBeforeUnload).
         trace_sender: Option<TraceSender>,
+    },
+    /// A video pipeline reached end of stream. Content should unset any
+    /// animating flags associated with this pipeline.
+    NotifyVideoEnded {
+        video_paint_id: VideoPaintId,
     },
     Shutdown,
 }

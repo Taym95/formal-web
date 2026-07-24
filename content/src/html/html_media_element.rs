@@ -37,6 +37,9 @@ pub struct HTMLMediaElement {
     /// <https://html.spec.whatwg.org/#dom-media-paused>
     paused: bool,
 
+    /// <https://html.spec.whatwg.org/#dom-media-ended>
+    ended: bool,
+
     /// <https://html.spec.whatwg.org/#dom-media-seeking>
     seeking: bool,
 
@@ -129,6 +132,7 @@ impl HTMLMediaElement {
             current_src: String::new(),
             error: None,
             paused: true,
+            ended: false,
             seeking: false,
             current_playback_position: 0.0,
             official_playback_position: 0.0,
@@ -190,6 +194,12 @@ impl HTMLMediaElement {
     /// <https://html.spec.whatwg.org/#dom-media-paused>
     pub(crate) fn paused(&self) -> bool {
         self.paused
+    }
+
+    /// <https://html.spec.whatwg.org/#dom-media-ended>
+    #[allow(dead_code)]
+    pub(crate) fn ended(&self) -> bool {
+        self.ended
     }
 
     /// <https://html.spec.whatwg.org/#dom-media-seeking>

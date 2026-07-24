@@ -3193,10 +3193,9 @@ impl UserAgentWorker {
         let _ = entry
             .command_sender
             .send(EventLoopCommand::FireAndForget { command });
-
-        // Viewport changes require a re-render — note a rendering opportunity
-        // directly rather than waiting for the next UI event.
-        self.note_rendering_opportunity(traversable_id);
+        // Content handles the viewport change by calling request_render_update
+        // internally, which triggers a render. No need for an explicit
+        // rendering opportunity from here.
     }
 
     /// Track which frame was last focused via pointer-down, for routing
@@ -3913,6 +3912,25 @@ impl UserAgentWorker {
                         );
                     }
                 }
+            }
+            GraphicsEvent::VideoEnded {
+                webview_id,
+                video_paint_id,
+            } => {
+                let _ = self
+                    .state
+                    .traversable_handles
+                    .get(&webview_id.0)
+                    .and_then(|handle| self.state.event_loops.get(handle))
+                    .map(|entry| {
+                        entry.command_sender.send(
+                            EventLoopCommand::FireAndForget {
+                                command: ContentCommand::NotifyVideoEnded {
+                                    video_paint_id: *video_paint_id,
+                                },
+                            },
+                        )
+                    });
             }
             GraphicsEvent::ShutdownComplete => {
                 debug!("[graphics] graphics process shutdown complete");
