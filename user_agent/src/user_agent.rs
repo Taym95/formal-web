@@ -3452,12 +3452,88 @@ impl UserAgentWorker {
             .command_sender
             .send(EventLoopCommand::FireAndForget { command });
 
+        // If this is a child traversable, ensure the root also renders so the
+        // graphics process composes this child's paint frame into the scene.
+        // Only note the root if it's NOT already pending — if it were, the root
+        // would already render and compose this child's paint frame eventually.
+        let is_root = self
+            .state
+            .navigables
+            .get(&traversable_id)
+            .and_then(|n| n.parent_navigable_id)
+            .is_none();
+        if !is_root {
+            if let Some(root_id) = self.state.top_level_traversable_id(traversable_id) {
+                if root_id != traversable_id && !self.pending_renders.contains(&root_id) {
+                    self.note_rendering_opportunity(root_id);
+                }
+            }
+        }
+
         // Propagate to child navigables so they send their scenes to the
         // graphics process. The graphics process buffers child frames and
         // only produces one texture when the root frame arrives.
+        //
+        // Skip children that already have a pending render to avoid queuing
+        // redundant opportunities — the child's own UpdateTheRendering is
+        // already in flight and will produce a paint frame for composition.
+        //
+        // Also skip invisible child frames (zero-area clips) to avoid
+        // unnecessary rendering work for offscreen or display:none iframes.
+        // When no hit-test info exists yet (first render), default to visible.
         for child_id in descendant_navigable_ids(&self.state, traversable_id) {
-            self.note_rendering_opportunity(child_id);
+            if self.pending_renders.contains(&child_id) {
+                continue;
+            }
+            if self.is_child_frame_visible(child_id) {
+                self.note_rendering_opportunity(child_id);
+            }
         }
+    }
+
+    /// Check whether a child navigable's frame is visible, using the most recent
+    /// frame hit info from the graphics process. A frame is invisible when its
+    /// clip rectangle has zero area (hidden/offscreen) or no hit test info exists.
+    fn is_child_frame_visible(&self, child_traversable_id: NavigableId) -> bool {
+        // Find the root traversable for the hit test info lookup.
+        let Some(root_traversable_id) = self.state.top_level_traversable_id(child_traversable_id)
+        else {
+            // No root means no hit test info yet — default to visible to
+            // ensure the first render happens.
+            return true;
+        };
+
+        let Some(child_navigable) = self.state.navigables.get(&child_traversable_id) else {
+            return false;
+        };
+        let Some(child_frame_id) = child_navigable.frame_id else {
+            // No frame id means this is a top-level traversable, not a child.
+            return true;
+        };
+
+        let Some(hit_info_list) = self
+            .state
+            .frame_hit_info
+            .get(&WebviewId(root_traversable_id))
+        else {
+            // No hit test info yet — default to visible.
+            return true;
+        };
+
+        // Find this child frame in the hit info list and check its clip bounds.
+        let Some(hit_info) = hit_info_list
+            .iter()
+            .find(|info| info.frame_id == child_frame_id)
+        else {
+            // Frame not in hit test info — might be newly created, default to visible.
+            return true;
+        };
+
+        let [x0, y0, x1, y1] = hit_info.root_clip_bounds;
+        // A frame is invisible when its clip rectangle has zero area.
+        let width = x1 - x0;
+        let height = y1 - y0;
+        width > 0.0 && height > 0.0
     }
 
     /// Called when a SurfaceFrameReady arrives — the composite frame completed.
