@@ -117,6 +117,14 @@ pub trait PipelineHandle: Send + 'static {
     fn play(&self) -> Result<(), String>;
     fn pause(&self) -> Result<(), String>;
     fn seek(&self, position_secs: f64) -> Result<(), String>;
+    /// Called at ≈120 Hz by the select loop. Backends pump run loops,
+    /// poll for frames, etc. Default is a no-op.
+    fn sample(&self) {}
+    /// Returns true when the pipeline reached end-of-stream and no
+    /// longer needs sampling. Default returns false (always sample).
+    /// When all pipelines return true, the sample tick is switched to
+    /// never() to avoid waking the select loop at all.
+    fn is_done(&self) -> bool { false }
     fn destroy(self) -> Result<(), String>;
 }
 ```
@@ -197,19 +205,35 @@ media process).  No background thread is used.
 
 Frame polling happens inside `PipelineHandle::sample()`, which is called
 at ≈120 Hz via a `crossbeam_channel::tick(8ms)` timer arm in the generic
-`select!` loop:
+`select!` loop.  The tick is **dynamically switched**: when no pipelines
+need sampling (idle or all reached end-of-stream), the receiver is replaced
+with `crossbeam_channel::never()` so the `select!` loop does not wake at
+all for sampling.  It switches back to `tick(8ms)` when a pipeline that
+needs sampling is registered.
 
 ```rust
-// lib.rs: the select loop drives sampling independently of message traffic
-let sample_tick = crossbeam_channel::tick(Duration::from_millis(8));
+// graphics/src/lib.rs: dynamic sample tick
+let mut sample_tick: Receiver<Instant> = crossbeam_channel::never();
+let mut had_active_pipelines = false;
 
 loop {
-    crossbeam_channel::select! {
+    let has_active = pipelines.values().any(|p| !p.is_done());
+    if has_active && !had_active_pipelines {
+        sample_tick = tick(Duration::from_millis(8));
+        had_active_pipelines = true;
+    } else if !has_active && had_active_pipelines {
+        sample_tick = crossbeam_channel::never();
+        had_active_pipelines = false;
+    }
+
+    select! {
         recv(cmd_rx) -> cmd => { ... },
         recv(backend_event_rx) -> event => { ... },
         recv(sample_tick) -> _ => {
             for pipeline in pipelines.values() {
-                pipeline.sample();
+                if !pipeline.is_done() {
+                    pipeline.sample();
+                }
             }
         },
     }

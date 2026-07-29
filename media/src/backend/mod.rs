@@ -51,6 +51,12 @@ pub trait PipelineHandle: Send + 'static {
     /// pump run loops, poll for frames, etc.  Default is a no-op.
     fn sample(&self) {}
 
+    /// Returns true when the pipeline has reached end-of-stream and no
+    /// longer needs sampling. Default returns false (always sample).
+    fn is_done(&self) -> bool {
+        false
+    }
+
     /// Tear down cleanly. Takes self by value so the backend's drop logic applies
     /// without Option gymnastics in the pipeline map.
     fn destroy(self) -> Result<(), String>;

@@ -75,9 +75,14 @@ pub fn run_graphics_process<B: MediaBackend + 'static>(
 
     // Media pipeline state.
     let mut pipelines: HashMap<MediaPipelineId, B::Pipeline> = HashMap::new();
-    let sample_tick = tick(std::time::Duration::from_millis(8));
     let mut pipeline_webview_map: HashMap<MediaPipelineId, (WebviewId, VideoPaintId)> =
         HashMap::new();
+    // Sample tick: dynamically switches between never() (no active pipelines)
+    // and tick(8ms) (at least one pipeline needs sampling). This avoids waking
+    // the select! loop every 8ms when everything is idle.
+    let mut sample_tick: crossbeam_channel::Receiver<std::time::Instant> =
+        crossbeam_channel::never();
+    let mut had_active_pipelines = false;
 
     // Reverse mapping from child webview -> (parent webview, content_frame_id).
     // Populated by RegisterChildNavigableHost and used in PaintFrame to remap
@@ -95,6 +100,18 @@ pub fn run_graphics_process<B: MediaBackend + 'static>(
     };
 
     loop {
+        // Dynamically switch the sample tick: when at least one pipeline
+        // needs sampling, use an 8ms tick. When none do, use never() so the
+        // select! loop doesn't wake up at all for sampling.
+        let has_active_pipelines = pipelines.values().any(|p| !p.is_done());
+        if has_active_pipelines && !had_active_pipelines {
+            sample_tick = tick(std::time::Duration::from_millis(8));
+            had_active_pipelines = true;
+        } else if !has_active_pipelines && had_active_pipelines {
+            sample_tick = crossbeam_channel::never();
+            had_active_pipelines = false;
+        }
+
         select! {
             recv(cmd_rx) -> cmd => {
                 let Ok(incoming) = cmd else { break };
@@ -122,8 +139,13 @@ pub fn run_graphics_process<B: MediaBackend + 'static>(
                 );
             }
             recv(sample_tick) -> _ => {
+                // Only sample pipelines that haven't reached end-of-stream.
+                // Sampling an idle pipeline burns CPU running the AVFoundation
+                // run loop drain (NSRunLoop::runUntilDate with 8ms timeout).
                 for pipeline in pipelines.values() {
-                    pipeline.sample();
+                    if !pipeline.is_done() {
+                        pipeline.sample();
+                    }
                 }
             }
         }

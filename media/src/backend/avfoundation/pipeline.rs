@@ -84,6 +84,10 @@ impl PipelineHandle for AvfPipeline {
         Ok(())
     }
 
+    fn is_done(&self) -> bool {
+        self.eos_sent.get()
+    }
+
     fn sample(&self) {
         if self.destroyed.get() {
             return;
