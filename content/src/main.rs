@@ -2249,6 +2249,9 @@ impl ContentProcess {
                 Ok(true)
             }
             NotifyVideoEnded { video_paint_id } => {
+                // Keep the paint ID in the registry so the last video frame is
+                // still rendered as part of the composition. Just mark the node
+                // as ended so the animating flag is set to false.
                 let ended_key: Vec<(DocumentId, usize)> = self
                     .video_paint_registry
                     .borrow()
@@ -2257,7 +2260,6 @@ impl ContentProcess {
                     .map(|((doc_id, node_id), _)| (*doc_id, *node_id))
                     .collect();
                 for key in ended_key {
-                    self.video_paint_registry.borrow_mut().remove(&key);
                     self.ended_video_nodes.insert(key);
                 }
                 Ok(true)

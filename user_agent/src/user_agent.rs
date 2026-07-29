@@ -3396,10 +3396,6 @@ impl UserAgentWorker {
         if self.pending_renders.contains(&traversable_id) {
             // Render already pending — queue the opportunity per spec.
             self.queued_opps.insert(traversable_id);
-            println!(
-                "[user-agent] SKIP rendering opportunity traversable={} (pending)",
-                traversable_id
-            );
             trace!(
                 "[user-agent] SKIP rendering opportunity traversable={} (pending)",
                 traversable_id
@@ -3438,10 +3434,6 @@ impl UserAgentWorker {
 
         trace!(
             "[user-agent] send rendering opportunity traversable={} document={} event_loop={}",
-            traversable_id, document_id, handle,
-        );
-        println!(
-            "[user-agent] SEND rendering opportunity traversable={} document={} event_loop={}",
             traversable_id, document_id, handle,
         );
         let command = ContentCommand::UpdateTheRendering {
@@ -3923,17 +3915,6 @@ impl UserAgentWorker {
                 child_viewports,
                 child_frame_to_webview,
             } => {
-                println!(
-                    "[graphics] received surface frame for {:?} ({}x{}, {}B)",
-                    webview_id,
-                    width,
-                    height,
-                    incoming
-                        .shmem_regions
-                        .get(&surface_shmem_key)
-                        .map(|region| region.as_slice().len())
-                        .unwrap_or_default()
-                );
                 debug!(
                     "[graphics] received surface frame for {:?} ({}x{}, {}B)",
                     webview_id,

@@ -183,9 +183,10 @@ fn handle_media_event(
         }
         MediaBackendEvent::Eos { pipeline_id } => {
             if let Some(&(webview_id, paint_id)) = pipeline_webview_map.get(&pipeline_id) {
-                if let Some(slot) = webviews.get_mut(&webview_id) {
-                    slot.compositor.remove_video_frame(paint_id);
-                }
+                // Keep the last video frame in the compositor so it continues
+                // to render as a static image. The PaintFrame from content will
+                // carry animating=false, so the UA stops re-noting rendering
+                // opportunities for video animation.
                 let _ = composed_scene_sender.send(GraphicsEvent::VideoEnded {
                     webview_id,
                     video_paint_id: paint_id,
