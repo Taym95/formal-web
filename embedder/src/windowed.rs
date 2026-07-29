@@ -366,8 +366,8 @@ impl WindowedApp {
         update_window_viewport_snapshot(Some(viewport));
         if let Some(provider) = provider.as_mut() {
             // set_default_viewport broadcasts the viewport to all existing
-            // traversables and stores it for future ones. Content handles
-            // the viewport change by calling request_render_update internally.
+            // traversables and stores it for future ones. The UA notes a
+            // rendering opportunity after setting the viewport.
             let _ = provider.set_default_viewport(Some(viewport));
         }
     }
@@ -452,21 +452,21 @@ impl WindowedApp {
         state.renderer.render(|scene| {
             let w = image_data.width;
             let h = image_data.height;
-                debug!(
-                    "[embedder] paint_frame drawing surface webview={:?} {}x{}",
-                    webview_id, w, h
-                );
-                let content_transform = Affine::translate((0.0, chrome_height));
-                scene.fill(
-                    peniko::Fill::NonZero,
-                    content_transform,
-                    Paint::Image(peniko::ImageBrushRef {
-                        image: &image_data,
-                        sampler: Default::default(),
-                    }),
-                    None,
-                    &kurbo::Rect::new(0.0, 0.0, f64::from(w), f64::from(h)),
-                );
+            debug!(
+                "[embedder] paint_frame drawing surface webview={:?} {}x{}",
+                webview_id, w, h
+            );
+            let content_transform = Affine::translate((0.0, chrome_height));
+            scene.fill(
+                peniko::Fill::NonZero,
+                content_transform,
+                Paint::Image(peniko::ImageBrushRef {
+                    image: &image_data,
+                    sampler: Default::default(),
+                }),
+                None,
+                &kurbo::Rect::new(0.0, 0.0, f64::from(w), f64::from(h)),
+            );
             if let Some(chrome_scene) = chrome_scene.clone() {
                 scene.append_scene(chrome_scene, Affine::IDENTITY);
             }
@@ -611,8 +611,6 @@ impl ApplicationHandler<FormalWebUserEvent> for WindowedApp {
         if let Some(provider) = self.provider.as_ref() {
             let _ = provider.navigate(None, &destination);
         }
-
-
 
         self.windows.insert(window_id, state);
         if let Some(window_state) = self.windows.get(&window_id) {
@@ -987,7 +985,6 @@ impl ApplicationHandler<FormalWebUserEvent> for WindowedApp {
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: FormalWebUserEvent) {
         match event {
-
             FormalWebUserEvent::NewFrameRendered => {
                 self.try_run_automation(|automation, app| automation.note_rendering_update(app));
             }
@@ -1048,7 +1045,6 @@ impl ApplicationHandler<FormalWebUserEvent> for WindowedApp {
                         // Clear compositor first so new paint frames populate it.
                         if let Some(provider) = self.provider.as_mut() {
                             provider.on_navigation_committed(completion.webview_id);
-
                         }
                         if is_current {
                             if let Some(state) = self.windows.get_mut(&window) {

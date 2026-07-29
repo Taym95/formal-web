@@ -309,7 +309,6 @@ impl ApplicationHandler<FormalWebUserEvent> for HeadlessEmbedderApp {
 
     fn user_event(&mut self, el: &ActiveEventLoop, event: FormalWebUserEvent) {
         match event {
-
             FormalWebUserEvent::NewFrameRendered => {
                 self.with_automation(|a, app| a.note_rendering_update(app));
             }
@@ -361,10 +360,7 @@ impl ApplicationHandler<FormalWebUserEvent> for HeadlessEmbedderApp {
                 height: _height,
                 generation: _generation,
             } => {
-                debug!(
-                    "[embedder] headless NewWebContentSurface {:?}",
-                    webview_id
-                );
+                debug!("[embedder] headless NewWebContentSurface {:?}", webview_id);
             }
             FormalWebUserEvent::Exit => {
                 self.with_automation(|a, _| {

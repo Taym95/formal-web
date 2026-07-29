@@ -42,7 +42,8 @@ use js_engine::ExecutionContext;
 use ipc_messages::content::Command::{
     ClickElement, CompleteDocumentFetch, ContentBootstrap, CreateEmptyDocument,
     CreateLoadedDocument, DestroyDocument, DispatchEvent, EvaluateScript, FailDocumentFetch,
-    NotifyVideoEnded, RunWindowTimer, SetTraversableViewport, SetViewport, Shutdown, UpdateTheRendering,
+    NotifyVideoEnded, RunWindowTimer, SetTraversableViewport, SetViewport, Shutdown,
+    UpdateTheRendering,
 };
 use ipc_messages::content::{
     BeforeUnloadCheckId, ClipboardWriteRequested, ColorScheme as MessageColorScheme, Command,
@@ -585,9 +586,10 @@ impl ContentProcess {
         document.viewport_offset_x = viewport_state.offset_x;
         document.viewport_offset_y = viewport_state.offset_y;
 
-        // Repaint immediately so embed-site geometry (including iframe clip/transform)
-        // reflects the new viewport instead of waiting for a later scroll/input tick.
-        self.request_render_update(traversable_id, document_id, "traversable_viewport")
+        // The UA notes a rendering opportunity after sending this command,
+        // so embed-site geometry (including iframe clip/transform) will be
+        // repainted on the next UpdateTheRendering cycle.
+        Ok(())
     }
 
     fn register_pending_handler(
@@ -920,8 +922,9 @@ impl ContentProcess {
                 },
             ))
             .map_err(|error| format!("failed to send finalize-navigation event: {error}"))?;
-
-        self.update_the_rendering(traversable_id, document_id)
+        // The UA handles the rendering opportunity upon receiving
+        // FinalizeNavigation, so we don't request one here.
+        Ok(())
     }
 
     /// <https://html.spec.whatwg.org/#creating-a-new-browsing-context>
@@ -1366,21 +1369,12 @@ impl ContentProcess {
         traversable_id: NavigableId,
         document_id: DocumentId,
     ) -> Result<(), String> {
-        self.request_render_update(traversable_id, document_id, "command")
-    }
-
-    fn request_render_update(
-        &mut self,
-        traversable_id: NavigableId,
-        document_id: DocumentId,
-        reason: &str,
-    ) -> Result<(), String> {
         let Some(document) = self.documents.get_mut(&document_id) else {
             return Ok(());
         };
         log_render_state_debug(format!(
-            "queue update-the-rendering traversable={} document={} reason={}",
-            traversable_id, document_id, reason,
+            "process update-the-rendering traversable={} document={}",
+            traversable_id, document_id,
         ));
         document.pending_update_the_rendering = true;
         self.continue_updating_the_rendering(traversable_id, document_id)
@@ -1479,8 +1473,7 @@ impl ContentProcess {
                     .keys()
                     .any(|(doc_id, node_id)| {
                         let ended = self.ended_video_nodes.contains(&(*doc_id, *node_id));
-                        if ended {
-                        }
+                        if ended {}
                         *doc_id == document_id && !ended
                     });
                 let (paint_frame, shmem_data) = PaintFrame::new(
@@ -1747,7 +1740,11 @@ impl ContentProcess {
                     response_url,
                 ));
                 self.continue_document_load(document_id)?;
-                self.request_render_update(traversable_id, document_id, "resource_fetch_complete")?;
+                self.event_sender
+                    .send(ContentEvent::RenderingOpRequested(traversable_id))
+                    .map_err(|error| {
+                        format!("failed to request rendering op for resource fetch: {error}")
+                    })?;
                 Ok(())
             }
             PendingNetworkHandler::DeferredScript {
@@ -1781,11 +1778,11 @@ impl ContentProcess {
                     response_url,
                 ));
                 self.continue_document_load(document_id)?;
-                self.request_render_update(
-                    traversable_id,
-                    document_id,
-                    "deferred_script_fetch_complete",
-                )?;
+                self.event_sender
+                    .send(ContentEvent::RenderingOpRequested(traversable_id))
+                    .map_err(|error| {
+                        format!("failed to request rendering op for deferred script fetch: {error}")
+                    })?;
                 Ok(())
             }
         }
@@ -1821,7 +1818,13 @@ impl ContentProcess {
                     handler_id, traversable_id, document_id,
                 ));
                 self.continue_document_load(document_id)?;
-                self.request_render_update(traversable_id, document_id, "resource_fetch_failed")?;
+                self.event_sender
+                    .send(ContentEvent::RenderingOpRequested(traversable_id))
+                    .map_err(|error| {
+                        format!(
+                            "failed to request rendering op for resource fetch failure: {error}"
+                        )
+                    })?;
                 Ok(())
             }
             PendingNetworkHandler::DeferredScript {
@@ -1841,11 +1844,9 @@ impl ContentProcess {
                     handler_id, traversable_id, document_id, script_index,
                 ));
                 self.continue_document_load(document_id)?;
-                self.request_render_update(
-                    traversable_id,
-                    document_id,
-                    "deferred_script_fetch_failed",
-                )?;
+                self.event_sender
+                    .send(ContentEvent::RenderingOpRequested(traversable_id))
+                    .map_err(|error| format!("failed to request rendering op for deferred script fetch failure: {error}"))?;
                 Ok(())
             }
         }

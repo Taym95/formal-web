@@ -910,6 +910,8 @@ pub enum Event {
     /// This is fire-and-forget — no reply is sent.
     ClipboardWriteRequested(ClipboardWriteRequested),
     CommandCompleted,
+    /// Content requests a rendering opportunity, e.g. after a network fetch completes.
+    RenderingOpRequested(NavigableId),
     RegisterMediaPipeline(RegisterMediaPipeline),
     PaintReady(PaintFrame),
     ShutdownCompleted,

@@ -536,6 +536,13 @@ impl EventLoopWorker {
                     request.url
                 );
             }
+            ContentEvent::RenderingOpRequested(traversable_id) => {
+                // Content requests a rendering opportunity (e.g. after a network fetch
+                // completes). Forward to the UA so it can batch and schedule.
+                self.user_agent_command_sender
+                    .send(UserAgentCommand::RenderingOpportunityFor { traversable_id })
+                    .map_err(|error| format!("failed to forward rendering op request: {error}"))?;
+            }
 
             ContentEvent::ShutdownCompleted => return Ok(false),
         }

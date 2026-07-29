@@ -109,14 +109,21 @@ impl PipelineHandle for AvfPipeline {
         // Detect end of stream: rate dropped to 0 after playing.
         if !self.eos_sent.get() && self.duration_reported.get() {
             let rate = self.player.rate();
-            if rate == 0.0 && self.item.status() == objc2_av_foundation::AVPlayerItemStatus::ReadyToPlay {
+            if rate == 0.0
+                && self.item.status() == objc2_av_foundation::AVPlayerItemStatus::ReadyToPlay
+            {
                 // The player stopped. Check if we're at or past the duration.
                 let current = self.item.current_time_secs();
                 let duration = self.item.duration_secs();
                 if duration > 0.0 && current >= duration - 0.1 {
-                    log::info!("[avf] p{}: end of stream (t={current:.2}s / d={duration:.2}s)", self.id.0);
+                    log::info!(
+                        "[avf] p{}: end of stream (t={current:.2}s / d={duration:.2}s)",
+                        self.id.0
+                    );
                     self.eos_sent.set(true);
-                    let _ = self.event_tx.send(MediaBackendEvent::Eos { pipeline_id: self.id });
+                    let _ = self.event_tx.send(MediaBackendEvent::Eos {
+                        pipeline_id: self.id,
+                    });
                 }
             }
         }

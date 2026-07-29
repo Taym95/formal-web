@@ -297,7 +297,6 @@ impl<T: IpcSerialize + IpcDeserialize> IpcReceiver<T> {
     pub(crate) fn into_inner(self) -> ipc_channel::ipc::IpcReceiver<IpcChannelMessage<T>> {
         self.inner
     }
-
 }
 
 #[cfg(feature = "ipc-channel-backend")]

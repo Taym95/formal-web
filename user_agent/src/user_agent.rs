@@ -11,8 +11,7 @@ use ipc_messages::content::{
     BrowsingContextId, Command as ContentCommand, DispatchEventEntry, DocumentId, EventLoopId,
     FetchResponse as ContentFetchResponse, FinalizeNavigation as ContentFinalizeNavigation,
     FrameId, LoadedDocumentResponse, NavigableId, NavigateRequest, NavigationFetchId, NavigationId,
-    NewTraversableInfo, UserNavigationInvolvement, WebviewId,
-    WindowTimerKey, iframe_target_name,
+    NewTraversableInfo, UserNavigationInvolvement, WebviewId, WindowTimerKey, iframe_target_name,
 };
 use log::{debug, error, trace};
 use std::collections::{HashMap, HashSet};
@@ -465,8 +464,8 @@ pub struct UserAgentState {
     /// Cached child viewport publications to avoid re-publishing unchanged
     /// viewports. Each entry is (width, height, offset_x, offset_y).
     /// Without this cache, every ComposedSceneReady triggers
-    /// set_traversable_viewport → request_render_update → PaintFrame →
-    /// Compose → ComposedSceneReady → ... creating a render cascade.
+    /// set_traversable_viewport → note_rendering_opportunity → UpdateTheRendering →
+    /// PaintFrame → Compose → ComposedSceneReady → ... creating a render cascade.
     published_child_viewports: HashMap<WebviewId, (u32, u32, f32, f32)>,
     /// queue of navigations paused while content runs `beforeunload`.
     pub pending_before_unload_navigations:
@@ -953,12 +952,8 @@ impl UserAgent {
         trace_sender: Option<TraceSender>,
     ) -> Result<Self, String> {
         let (command_sender, command_receiver) = unbounded();
-        let mut worker = UserAgentWorker::new(
-            command_sender.clone(),
-            command_receiver,
-            host,
-            trace_sender,
-        );
+        let mut worker =
+            UserAgentWorker::new(command_sender.clone(), command_receiver, host, trace_sender);
         let join_handle = thread::Builder::new()
             .name(String::from("formal-web:user-agent"))
             .spawn(move || worker.run())
@@ -1886,7 +1881,6 @@ impl UserAgentWorker {
             .traversable_ids
             .insert(traversable_id);
 
-
         // Register the child navigable with the graphics process.
         if let Some(graphics_sender) = &self.graphics_extension_sender {
             if let Err(error) = graphics_sender.send(
@@ -2557,7 +2551,7 @@ impl UserAgentWorker {
                     error!("failed to register webview with graphics process: {error}");
                 }
             }
-            }
+        }
         Ok(())
     }
 
@@ -3193,9 +3187,9 @@ impl UserAgentWorker {
         let _ = entry
             .command_sender
             .send(EventLoopCommand::FireAndForget { command });
-        // Content handles the viewport change by calling request_render_update
-        // internally, which triggers a render. No need for an explicit
-        // rendering opportunity from here.
+        // The UA notes a rendering opportunity so the content process will
+        // receive UpdateTheRendering and repaint with the new viewport.
+        self.note_rendering_opportunity(traversable_id);
     }
 
     /// Track which frame was last focused via pointer-down, for routing
@@ -3402,6 +3396,10 @@ impl UserAgentWorker {
         if self.pending_renders.contains(&traversable_id) {
             // Render already pending — queue the opportunity per spec.
             self.queued_opps.insert(traversable_id);
+            println!(
+                "[user-agent] SKIP rendering opportunity traversable={} (pending)",
+                traversable_id
+            );
             trace!(
                 "[user-agent] SKIP rendering opportunity traversable={} (pending)",
                 traversable_id
@@ -3440,6 +3438,10 @@ impl UserAgentWorker {
 
         trace!(
             "[user-agent] send rendering opportunity traversable={} document={} event_loop={}",
+            traversable_id, document_id, handle,
+        );
+        println!(
+            "[user-agent] SEND rendering opportunity traversable={} document={} event_loop={}",
             traversable_id, document_id, handle,
         );
         let command = ContentCommand::UpdateTheRendering {
@@ -3834,7 +3836,6 @@ impl UserAgentWorker {
     ) {
         use ipc_messages::graphics::GraphicsEvent;
         match &incoming.payload {
-
             GraphicsEvent::SurfaceFrameReady {
                 webview_id,
                 surface_shmem_key,
@@ -3846,6 +3847,17 @@ impl UserAgentWorker {
                 child_viewports,
                 child_frame_to_webview,
             } => {
+                println!(
+                    "[graphics] received surface frame for {:?} ({}x{}, {}B)",
+                    webview_id,
+                    width,
+                    height,
+                    incoming
+                        .shmem_regions
+                        .get(&surface_shmem_key)
+                        .map(|region| region.as_slice().len())
+                        .unwrap_or_default()
+                );
                 debug!(
                     "[graphics] received surface frame for {:?} ({}x{}, {}B)",
                     webview_id,
@@ -3923,13 +3935,11 @@ impl UserAgentWorker {
                     .get(&webview_id.0)
                     .and_then(|handle| self.state.event_loops.get(handle))
                     .map(|entry| {
-                        entry.command_sender.send(
-                            EventLoopCommand::FireAndForget {
-                                command: ContentCommand::NotifyVideoEnded {
-                                    video_paint_id: *video_paint_id,
-                                },
+                        entry.command_sender.send(EventLoopCommand::FireAndForget {
+                            command: ContentCommand::NotifyVideoEnded {
+                                video_paint_id: *video_paint_id,
                             },
-                        )
+                        })
                     });
             }
             GraphicsEvent::ShutdownComplete => {

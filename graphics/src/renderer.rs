@@ -16,10 +16,9 @@ use vello::{
     Scene as VelloScene,
 };
 use wgpu::{
-    BufferDescriptor, BufferUsages, CommandEncoderDescriptor, Extent3d, MapMode,
-    Origin3d, TexelCopyBufferInfo, TexelCopyBufferLayout, TexelCopyTextureInfo, Texture,
-    TextureAspect, TextureDescriptor, TextureDimension, TextureFormat, TextureUsages,
-    TextureViewDescriptor,
+    BufferDescriptor, BufferUsages, CommandEncoderDescriptor, Extent3d, MapMode, Origin3d,
+    TexelCopyBufferInfo, TexelCopyBufferLayout, TexelCopyTextureInfo, Texture, TextureAspect,
+    TextureDescriptor, TextureDimension, TextureFormat, TextureUsages, TextureViewDescriptor,
 };
 
 pub struct GpuRenderer {
@@ -174,13 +173,13 @@ impl GpuRenderer {
         let device_handle = &self.device_handle;
         let readback_buffer = &mut self.readback_buffer;
         let render_tex = &self.render_tex;
-        let readback_buf = Self::ensure_readback_buffer_inner(readback_buffer, device_handle, width, height)?;
-        let mut encoder =
-            device_handle
-                .device
-                .create_command_encoder(&CommandEncoderDescriptor {
-                    label: Some("surface-readback"),
-                });
+        let readback_buf =
+            Self::ensure_readback_buffer_inner(readback_buffer, device_handle, width, height)?;
+        let mut encoder = device_handle
+            .device
+            .create_command_encoder(&CommandEncoderDescriptor {
+                label: Some("surface-readback"),
+            });
         let (src_tex, _, _) = render_tex.as_ref()?;
         // bytes_per_row must be a multiple of COPY_BYTES_PER_ROW_ALIGNMENT.
         let alignment = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
@@ -211,9 +210,12 @@ impl GpuRenderer {
         // Wait for GPU work to finish so we can map the buffer.
         let buf_slice = readback_buf.slice(..);
         let (tx, rx) = std::sync::mpsc::channel();
-        buf_slice.map_async(MapMode::Read, move |r: Result<(), wgpu::BufferAsyncError>| {
-            let _ = tx.send(r);
-        });
+        buf_slice.map_async(
+            MapMode::Read,
+            move |r: Result<(), wgpu::BufferAsyncError>| {
+                let _ = tx.send(r);
+            },
+        );
         let _ = device_handle.device.poll(wgpu::PollType::Wait {
             submission_index: None,
             timeout: None,
@@ -238,7 +240,10 @@ impl GpuRenderer {
         self.generation += 1;
         debug!(
             "[gpu-renderer] rendered {}x{} gen={} pixels={}B",
-            width, height, self.generation, pixels.len(),
+            width,
+            height,
+            self.generation,
+            pixels.len(),
         );
         Some((0, self.generation, pixels))
     }
