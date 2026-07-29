@@ -441,32 +441,33 @@ impl WindowedApp {
                 .resume(window_handle, size.width, size.height, || {});
             state.renderer.complete_resume();
         }
-        let Some(webview_id) = state.active_tab else {
-            return;
-        };
-        let Some(image_data) = state.surface_images.remove(&webview_id) else {
-            return;
-        };
         window.pre_present_notify();
 
         state.renderer.render(|scene| {
-            let w = image_data.width;
-            let h = image_data.height;
-            debug!(
-                "[embedder] paint_frame drawing surface webview={:?} {}x{}",
-                webview_id, w, h
-            );
-            let content_transform = Affine::translate((0.0, chrome_height));
-            scene.fill(
-                peniko::Fill::NonZero,
-                content_transform,
-                Paint::Image(peniko::ImageBrushRef {
-                    image: &image_data,
-                    sampler: Default::default(),
-                }),
-                None,
-                &kurbo::Rect::new(0.0, 0.0, f64::from(w), f64::from(h)),
-            );
+            // Paint content surface if one is available.
+            if let Some(webview_id) = state.active_tab {
+                if let Some(image_data) = state.surface_images.get(&webview_id) {
+                    let w = image_data.width;
+                    let h = image_data.height;
+                    debug!(
+                        "[embedder] paint_frame drawing surface webview={:?} {}x{}",
+                        webview_id, w, h
+                    );
+                    let content_transform = Affine::translate((0.0, chrome_height));
+                    scene.fill(
+                        peniko::Fill::NonZero,
+                        content_transform,
+                        Paint::Image(peniko::ImageBrushRef {
+                            image: image_data,
+                            sampler: Default::default(),
+                        }),
+                        None,
+                        &kurbo::Rect::new(0.0, 0.0, f64::from(w), f64::from(h)),
+                    );
+                }
+            }
+            // Always paint chrome, even when no content surface is available
+            // (e.g. chrome-only hover, typing in address bar).
             if let Some(chrome_scene) = chrome_scene.clone() {
                 scene.append_scene(chrome_scene, Affine::IDENTITY);
             }
