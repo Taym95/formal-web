@@ -574,11 +574,13 @@ At the end of each task, run the following steps **in order**:
 
      The WPT runner requires a working Python 3 with a functioning `ssl` module and `venv` support. If the run fails with a Python-related error, check `tests/wpt_runner/README.md` for debugging guidance.
 
-   - **Spec verification** — Validates all TLA+ spec traces (Navigation, RenderingOpportunity, etc.) via formal-web's --verify mode:
+   - **Spec verification** — Validates all TLA+ spec traces (Navigation, RenderingOpportunity, etc.) via the headless verification script (no GUI needed, fully automated):
 
      ```bash
      ./verification/verify-specs.sh
      ```
+
+     The script starts the embedder headless with TLA+ tracing, runs a minimal WebDriver session, collects trace events, and validates them against TLA+ models.  It replaces the older `cargo run -- --verify` command which required manual window interaction.
 
 9. **Suggest a commit message** — Whenever asked for a commit message (whether at end-of-task or any other time), propose a message for the current `git diff HEAD` (the uncommitted changes), not for the entire session's work.  Run `git diff --stat HEAD` to see what changed, and `git diff HEAD` to read the diff before writing the message.
 

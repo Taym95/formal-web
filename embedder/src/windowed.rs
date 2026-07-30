@@ -1153,8 +1153,14 @@ impl ApplicationHandler<FormalWebUserEvent> for WindowedApp {
                 generation: _generation,
             } => {
                 info!(
-                    "[render-pipe] Embedder surface webview={:?} {}x{} pixels={}B",
-                    webview_id, width, height, pixels.len()
+                    "[render-pipe] Embedder surface webview={:?} {}x{} pixels={}B active_tab={:?}",
+                    webview_id,
+                    width,
+                    height,
+                    pixels.len(),
+                    self.windows
+                        .get(&self.active_window_id.unwrap_or(WindowId::new()))
+                        .and_then(|s| s.active_tab)
                 );
                 // Store the rendered pixel data as ImageData for the active tab.
                 if pixels.len() as u32 == width * height * 4 && width > 0 && height > 0 {
@@ -1168,9 +1174,18 @@ impl ApplicationHandler<FormalWebUserEvent> for WindowedApp {
                     if let Some(window_id) = Self::window_for_webview(self, webview_id) {
                         if let Some(state) = self.windows.get_mut(&window_id) {
                             state.surface_images.insert(webview_id, image_data);
+                            let is_active = state.active_tab == Some(webview_id);
                             info!(
-                                "[render-pipe] Embedder stored surface for active_tab={:?} window={:?}",
-                                state.active_tab, window_id
+                                "[render-pipe] Embedder stored surface for webview={:?} active={} tabs={:?} active_tab={:?} window={:?}",
+                                webview_id, is_active, state.tab_order, state.active_tab, window_id
+                            );
+                            // Always request redraw when a surface arrives, regardless
+                            // of whether this is the active tab — the surface might be
+                            // the content of the active tab and we need to redraw.
+                            Self::request_window_redraw(state);
+                            info!(
+                                "[render-pipe] Embedder requested redraw for window={:?}",
+                                window_id
                             );
                         }
                     } else {
@@ -1181,15 +1196,15 @@ impl ApplicationHandler<FormalWebUserEvent> for WindowedApp {
                     }
                 } else {
                     info!(
-                        "[render-pipe] Embedder invalid surface webview={:?} {}x{} pixels={}",
-                        webview_id, width, height, pixels.len()
+                        "[render-pipe] Embedder invalid surface webview={:?} {}x{} pixels={} (expected {}x{}+{}B)",
+                        webview_id,
+                        width,
+                        height,
+                        pixels.len(),
+                        width * 4,
+                        height,
+                        width * height * 4
                     );
-                }
-                // Trigger redraw so paint_frame picks up the new image.
-                if let Some(window) = Self::window_for_webview(self, webview_id)
-                    && let Some(state) = self.windows.get_mut(&window)
-                {
-                    Self::request_window_redraw(state);
                 }
             }
             FormalWebUserEvent::Exit => event_loop.exit(),

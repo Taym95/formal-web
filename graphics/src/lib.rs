@@ -135,7 +135,6 @@ pub fn run_graphics_process<B: MediaBackend + 'static>(
                     &pipeline_webview_map,
                     &mut webviews,
                     &event_sender,
-                    &child_webview_to_parent,
                 );
             }
             recv(sample_tick) -> _ => {
@@ -157,7 +156,6 @@ fn handle_media_event(
     pipeline_webview_map: &HashMap<MediaPipelineId, (WebviewId, VideoPaintId)>,
     webviews: &mut HashMap<WebviewId, WebviewCompositorSlot>,
     composed_scene_sender: &ipc::IpcSender<GraphicsEvent>,
-    child_webview_to_parent: &HashMap<WebviewId, (WebviewId, FrameId)>,
 ) {
     match event {
         MediaBackendEvent::Frame(mut video_frame) => {
@@ -178,29 +176,14 @@ fn handle_media_event(
                 data: pixel_bytes,
             };
             if let Some(slot) = webviews.get_mut(&webview_id) {
-                // First video frame arrival: wake the UA up by composing once so
-                // the SurfaceFrameReady carries animating=true, restarting the
-                // render cycle. Subsequent frames never trigger composition.
-                let was_idle = slot.compositor.update_video_frame(cf);
-                if was_idle
-                    && slot.compositor.committed_root_frame_id().is_some()
-                    && slot.compositor.has_valid_viewport()
-                {
-                    if let Some(mut composed) = slot
-                        .compositor
-                        .compose_scene(&slot.font_receiver, webview_id)
-                    {
-                        let (cv, cftw) = build_child_data(
-                            &mut slot.compositor,
-                            child_webview_to_parent,
-                            &slot.font_receiver,
-                        );
-                        composed.child_viewports = cv;
-                        composed.child_frame_to_webview = cftw;
-                        composed.animating = true;
-                        let _ = send_composed_scene(composed_scene_sender.clone(), slot, composed);
-                    }
-                }
+                // Store the video frame. It will be included in the next normal
+                // composition (triggered by a content PaintFrame via the standard
+                // render cycle). The compositor's compose_frame already checks
+                // self.video_frames when rendering EmbedSite::Video embed sites.
+                // Never compose independently from the video handler — doing so
+                // creates an orphan ComposeScene with no corresponding
+                // UpdateTheRendering, violating the TLA+ pipeline model.
+                slot.compositor.update_video_frame(cf);
             }
         }
         MediaBackendEvent::Eos { pipeline_id } => {
@@ -283,8 +266,11 @@ fn handle_command<B: MediaBackend + 'static>(
                 };
             info!(
                 "[render-pipe] Graphics store frame id={} webview={} root_candidate={} viewport={}x{} children={}",
-                frame_id.0, webview_id.0, is_root_candidate,
-                viewport_width, viewport_height,
+                frame_id.0,
+                webview_id.0,
+                is_root_candidate,
+                viewport_width,
+                viewport_height,
                 composition.embed_sites.len()
             );
             slot.compositor.store_frame(
@@ -477,8 +463,12 @@ fn send_composed_scene(
         return Err(());
     }
     info!(
-        "[render-pipe] Graphics GPU render webview={} {}x{} {} child_frames",
-        webview_id.0, width, height, child_viewports.len()
+        "[render-pipe] Graphics GPU render webview={} {}x{} {} child_frames animating={}",
+        webview_id.0,
+        width,
+        height,
+        child_viewports.len(),
+        animating
     );
     let (_iosurface_id, generation, pixels) =
         match slot.gpu_renderer.render_scene(&scene, width, height) {

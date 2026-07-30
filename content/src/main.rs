@@ -1406,8 +1406,11 @@ impl ContentProcess {
             }
 
             info!(
-                "[render-pipe] Content render start traversable={} document={}",
-                traversable_id, document_id
+                "[render-pipe] Content render traversable={} document={} iframes={} video_registry_entries={}",
+                traversable_id,
+                document_id,
+                document.navigable_container_states.len(),
+                video_paint_registry.borrow().len()
             );
             let paint_frame = {
                 let document_guard = document.document.borrow();
@@ -1452,6 +1455,15 @@ impl ContentProcess {
                         if ended {}
                         *doc_id == document_id && !ended
                     });
+                info!(
+                    "[render-pipe] Content paint_frame ready traversable={} frame={} size=({},{}) has_video={} embed_sites={}",
+                    traversable_id,
+                    document.frame_id.0,
+                    width,
+                    height,
+                    has_video,
+                    composition.embed_sites.len()
+                );
                 let (paint_frame, shmem_data) = PaintFrame::new(
                     WebviewId(traversable_id),
                     document.frame_id,

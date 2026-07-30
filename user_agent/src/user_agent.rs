@@ -1079,7 +1079,9 @@ impl UserAgent {
     /// <https://html.spec.whatwg.org/multipage/#update-the-rendering>
     pub fn note_rendering_opportunity(&self, navigable_id: NavigableId) -> Result<(), String> {
         self.command_sender
-            .send(UserAgentCommand::RenderingOpportunityFor { traversable_id: navigable_id })
+            .send(UserAgentCommand::RenderingOpportunityFor {
+                traversable_id: navigable_id,
+            })
             .map_err(|error| format!("failed to send rendering-opportunity request: {error}"))
     }
 
@@ -3415,11 +3417,15 @@ impl UserAgentWorker {
         }
         self.pending_renders.insert(navigable_id);
         info!(
-            "[render-pipe] UA start render navigable={}",
-            navigable_id
+            "[render-pipe] UA start render navigable={} pending={:?} queued={:?}",
+            navigable_id, self.pending_renders, self.queued_opps
         );
 
         let Some(handle) = self.state.traversable_handles.get(&navigable_id).copied() else {
+            info!(
+                "[render-pipe] UA note_rendering_opportunity: no handle for navigable={}",
+                navigable_id
+            );
             self.pending_renders.remove(&navigable_id);
             return;
         };
@@ -3428,10 +3434,18 @@ impl UserAgentWorker {
             .active_documents_by_traversable
             .get(&navigable_id)
         else {
+            info!(
+                "[render-pipe] UA note_rendering_opportunity: no active document for navigable={}",
+                navigable_id
+            );
             self.pending_renders.remove(&navigable_id);
             return;
         };
         let Some(entry) = self.state.event_loops.get(&handle) else {
+            info!(
+                "[render-pipe] UA note_rendering_opportunity: no event loop entry for handle={}",
+                handle
+            );
             return;
         };
 
@@ -3464,8 +3478,6 @@ impl UserAgentWorker {
             }
         }
     }
-
-
 
     /// Called when a SurfaceFrameReady arrives — the composite frame completed.
     /// Corresponds to the TLA spec's NoteComposedScene action: drains batched

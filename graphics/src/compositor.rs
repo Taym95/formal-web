@@ -12,7 +12,7 @@ use ipc_messages::graphics::FrameHitInfo;
 use crate::ComposedScene;
 use ipc_messages::media::VideoPaintId;
 use kurbo::{Affine, Point, Rect, RoundedRect, Shape};
-use log::trace;
+use log::{info, trace};
 use peniko::{Color, Fill, ImageAlphaType, ImageBrushRef, ImageData, ImageFormat};
 use std::collections::{HashMap, HashSet};
 use std::env;
@@ -170,7 +170,17 @@ impl Compositor {
             return;
         }
 
-        if self.root_frame_id.is_none() && is_root_candidate {
+        // Always update root_frame_id when a root candidate arrives,
+        // even if the frame_id differs from the current root. During
+        // navigation, the content process creates a new document with a
+        // new frame_id, and we need to point the compositor at the latest
+        // root frame regardless of whether NavigationFinalized has
+        // arrived yet.
+        if is_root_candidate && self.root_frame_id != Some(frame_id) {
+            info!(
+                "[render-pipe] Compositor update root from {:?} to {}",
+                self.root_frame_id, frame_id.0
+            );
             self.root_frame_id = Some(frame_id);
         }
 
