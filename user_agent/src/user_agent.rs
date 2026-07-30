@@ -139,7 +139,7 @@ pub trait Embedder: Send + Sync {
     fn new_web_content_surface(
         &self,
         webview_id: WebviewId,
-        pixels: Vec<u8>,
+        surface: ipc::IpcSharedRegion,
         width: u32,
         height: u32,
         generation: u64,
@@ -905,7 +905,7 @@ pub enum UserAgentCommand {
         event: String,
     },
     RenderingOpportunityFor {
-        traversable_id: NavigableId,
+        navigable_id: NavigableId,
     },
     NavigationFetchCompleted {
         fetch_id: NavigationFetchId,
@@ -1080,7 +1080,7 @@ impl UserAgent {
     pub fn note_rendering_opportunity(&self, navigable_id: NavigableId) -> Result<(), String> {
         self.command_sender
             .send(UserAgentCommand::RenderingOpportunityFor {
-                traversable_id: navigable_id,
+                navigable_id,
             })
             .map_err(|error| format!("failed to send rendering-opportunity request: {error}"))
     }
@@ -1281,7 +1281,8 @@ struct UserAgentWorker {
     graphics_event_receiver:
         crossbeam_channel::Receiver<ipc::IpcIncoming<ipc_messages::graphics::GraphicsEvent>>,
     /// Child process handle for the graphics process.
-    #[allow(dead_code)]
+    /// Used during shutdown: sends Shutdown command, waits for
+    /// ShutdownComplete, then joins the child.
     graphics_child: Option<std::process::Child>,
 
     /// Host integration used to surface navigation, paint, clipboard, and viewport state.
@@ -1345,9 +1346,7 @@ impl UserAgentWorker {
                 }
                 Err(error) => {
                     log::error!("failed to start graphics process: {error}");
-                    let (dummy_tx, dummy_rx) = crossbeam_channel::unbounded();
-                    drop(dummy_tx);
-                    (None, dummy_rx, None)
+                    (None, crossbeam_channel::never(), None)
                 }
             }
         };
@@ -1438,8 +1437,8 @@ impl UserAgentWorker {
                     } => {
                         self.handle_dispatch_event_for(traversable_id, event);
                     }
-                    UserAgentCommand::RenderingOpportunityFor { traversable_id } => {
-                        self.note_rendering_opportunity(traversable_id);
+                    UserAgentCommand::RenderingOpportunityFor { navigable_id } => {
+                        self.note_rendering_opportunity(navigable_id);
                     }
                     UserAgentCommand::NavigationFetchCompleted { fetch_id, response } => {
                         self.handle_navigation_fetch_completed(fetch_id, response);
@@ -1490,12 +1489,6 @@ impl UserAgentWorker {
                     recv(self.graphics_event_receiver) -> event => {
                         let Ok(mut incoming) = event else { break; };
                         self.handle_graphics_event(&mut incoming);
-                        // Drain any additional graphics events that arrived during
-                        // processing, preventing bursts when commands flood the
-                        // select! loop and graphics messages pile up.
-                        while let Ok(mut next) = self.graphics_event_receiver.try_recv() {
-                            self.handle_graphics_event(&mut next);
-                        }
                     }
 
                 }
@@ -3849,6 +3842,26 @@ impl UserAgentWorker {
             }
         }
 
+        // Shut down the graphics process: send Shutdown, wait for
+        // ShutdownComplete, then join the child process.
+        if let Some(sender) = &self.graphics_extension_sender {
+            let _ = sender.send(ipc_messages::graphics::GraphicsCommand::Shutdown);
+        }
+        // Drain events until ShutdownComplete arrives.
+        while let Ok(incoming) = self.graphics_event_receiver.recv() {
+            if matches!(
+                incoming.payload,
+                ipc_messages::graphics::GraphicsEvent::ShutdownComplete
+            ) {
+                break;
+            }
+        }
+        if let Some(mut child) = self.graphics_child.take() {
+            if let Err(error) = child.wait() {
+                log::error!("failed to wait for graphics process exit: {error}");
+            }
+        }
+
         self.net_connection.shutdown();
 
         let (timer_reply_sender, timer_reply_receiver) = bounded(1);
@@ -3898,17 +3911,16 @@ impl UserAgentWorker {
                         .map(|region| region.as_slice().len())
                         .unwrap_or_default()
                 );
-                let pixels = incoming
+                let surface = incoming
                     .shmem_regions
-                    .get(&surface_shmem_key)
-                    .map(|region| region.as_slice().to_vec())
-                    .unwrap_or_default();
+                    .remove(surface_shmem_key)
+                    .unwrap_or_else(|| ipc::IpcSharedRegion::from_bytes(&[]));
                 debug!(
                     "[graphics] received surface frame for {:?} ({}x{}, {}B)",
                     webview_id,
                     width,
                     height,
-                    pixels.len()
+                    surface.size()
                 );
 
                 // When the root's composed scene completes, all child frames
@@ -3929,7 +3941,7 @@ impl UserAgentWorker {
                     .insert(*webview_id, child_frame_to_webview.clone());
                 if let Err(e) = self.host.new_web_content_surface(
                     *webview_id,
-                    pixels.clone(),
+                    surface.clone(),
                     *width,
                     *height,
                     *generation,

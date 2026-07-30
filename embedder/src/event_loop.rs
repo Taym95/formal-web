@@ -137,7 +137,7 @@ impl Embedder for EventLoopEmbedder {
     fn new_web_content_surface(
         &self,
         webview_id: WebviewId,
-        pixels: Vec<u8>,
+        surface: ipc::IpcSharedRegion,
         width: u32,
         height: u32,
         generation: u64,
@@ -145,11 +145,12 @@ impl Embedder for EventLoopEmbedder {
         self.dispatcher
             .send(FormalWebUserEvent::NewWebContentSurface {
                 webview_id,
-                pixels,
+                surface,
                 width,
                 height,
                 generation,
             })
+            .map_err(|error| format!("failed to send surface event: {error}"))
     }
 }
 
@@ -163,7 +164,7 @@ pub enum FormalWebUserEvent {
     },
     NewWebContentSurface {
         webview_id: WebviewId,
-        pixels: Vec<u8>,
+        surface: ipc::IpcSharedRegion,
         width: u32,
         height: u32,
         generation: u64,
@@ -313,8 +314,8 @@ fn update_window_viewport_snapshot(snapshot: Option<(u32, u32, f32, ColorScheme)
 }
 
 fn automation_screenshot_png(
-    provider: &mut Option<WebviewProvider>,
-    current_webview_id: Option<WebviewId>,
+    _provider: &mut Option<WebviewProvider>,
+    _current_webview_id: Option<WebviewId>,
 ) -> Result<Vec<u8>, String> {
     let Some((width, height, _, _)) = window_viewport_snapshot() else {
         return Err(String::from("content viewport is not initialized"));
@@ -322,13 +323,6 @@ fn automation_screenshot_png(
     if width == 0 || height == 0 {
         return Err(String::from("content viewport is zero-sized"));
     }
-
-    let Some(provider) = provider.as_mut() else {
-        return Err(String::from("webview provider is not initialized"));
-    };
-    let Some(webview_id) = current_webview_id else {
-        return Err(String::from("no current webview is active"));
-    };
 
     let rgba = render_to_buffer::<VelloCpuImageRenderer, _>(
         |painter| {
@@ -339,7 +333,6 @@ fn automation_screenshot_png(
                 None,
                 &Rect::new(0.0, 0.0, f64::from(width), f64::from(height)),
             );
-            let _ = provider.append_web_content_scene(webview_id, painter, Affine::IDENTITY);
         },
         width,
         height,
@@ -349,26 +342,12 @@ fn automation_screenshot_png(
 }
 
 fn automation_visible_frame_viewports(
-    provider: &mut Option<WebviewProvider>,
-    current_webview_id: Option<WebviewId>,
+    _provider: &mut Option<WebviewProvider>,
+    _current_webview_id: Option<WebviewId>,
 ) -> Result<Vec<AutomationVisibleFrameViewport>, String> {
-    let Some(provider) = provider.as_mut() else {
-        return Err(String::from("webview provider is not initialized"));
-    };
-    let Some(webview_id) = current_webview_id else {
-        return Err(String::from("no current webview is active"));
-    };
-
-    Ok(provider
-        .visible_frame_viewports(webview_id)
-        .into_iter()
-        .map(|viewport| AutomationVisibleFrameViewport {
-            offset_x: viewport.offset_x,
-            offset_y: viewport.offset_y,
-            width: viewport.width,
-            height: viewport.height,
-        })
-        .collect())
+    // Child frame viewports now come from the graphics process via
+    // SurfaceFrameReady. The webview provider no longer maintains them.
+    Ok(Vec::new())
 }
 
 fn encode_png_rgba(rgba: &[u8], width: u32, height: u32) -> Result<Vec<u8>, String> {

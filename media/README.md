@@ -121,9 +121,7 @@ pub trait PipelineHandle: Send + 'static {
     /// poll for frames, etc. Default is a no-op.
     fn sample(&self) {}
     /// Returns true when the pipeline reached end-of-stream and no
-    /// longer needs sampling. Default returns false (always sample).
-    /// When all pipelines return true, the sample tick is switched to
-    /// never() to avoid waking the select loop at all.
+    /// longer needs sampling.
     fn is_done(&self) -> bool { false }
     fn destroy(self) -> Result<(), String>;
 }
@@ -204,41 +202,7 @@ media process).  No background thread is used.
 ### Frame extraction
 
 Frame polling happens inside `PipelineHandle::sample()`, which is called
-at ≈120 Hz via a `crossbeam_channel::tick(8ms)` timer arm in the generic
-`select!` loop.  The tick is **dynamically switched**: when no pipelines
-need sampling (idle or all reached end-of-stream), the receiver is replaced
-with `crossbeam_channel::never()` so the `select!` loop does not wake at
-all for sampling.  It switches back to `tick(8ms)` when a pipeline that
-needs sampling is registered.
-
-```rust
-// graphics/src/lib.rs: dynamic sample tick
-let mut sample_tick: Receiver<Instant> = crossbeam_channel::never();
-let mut had_active_pipelines = false;
-
-loop {
-    let has_active = pipelines.values().any(|p| !p.is_done());
-    if has_active && !had_active_pipelines {
-        sample_tick = tick(Duration::from_millis(8));
-        had_active_pipelines = true;
-    } else if !has_active && had_active_pipelines {
-        sample_tick = crossbeam_channel::never();
-        had_active_pipelines = false;
-    }
-
-    select! {
-        recv(cmd_rx) -> cmd => { ... },
-        recv(backend_event_rx) -> event => { ... },
-        recv(sample_tick) -> _ => {
-            for pipeline in pipelines.values() {
-                if !pipeline.is_done() {
-                    pipeline.sample();
-                }
-            }
-        },
-    }
-}
-```
+at ≈120 Hz via a timer arm in the `select!` loop.
 
 `sample()` does:
 1. **Drain the run loop** via `NSRunLoop::currentRunLoop().runUntilDate(8ms)`
@@ -280,7 +244,6 @@ compositor's expectations.
 | Using unix wall clock for host time | Item time doesn't match video timeline | Use `CVGetCurrentHostTime()` / `CVGetHostClockFrequency()` |
 | Reading duration before asset loads | `kCMTimeIndefinite`, `seconds()` returns `NaN` | Poll `item.status() == ReadyToPlay` first |
 | `kCVPixelBufferPixelFormatTypeKey` double-ref | Crash during pipeline creation | Use `kCVPixelBufferPixelFormatTypeKey` directly (it's already `&CFString`), not `&kCVPixelBufferPixelFormatTypeKey` |
-| No timer driving `sample()` | No frames delivered | Add `crossbeam_channel::tick()` arm to `select!` |
 | BGRA data sent as RGBA | Blue-tinted video | Swap bytes 0 and 2 in `pixel_buffer_to_frame` |
 
 ### What does NOT change

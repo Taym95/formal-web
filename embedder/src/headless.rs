@@ -352,7 +352,7 @@ impl ApplicationHandler<FormalWebUserEvent> for HeadlessEmbedderApp {
             }
             FormalWebUserEvent::NewWebContentSurface {
                 webview_id,
-                pixels: _pixels,
+                surface: _surface,
                 width: _width,
                 height: _height,
                 generation: _generation,

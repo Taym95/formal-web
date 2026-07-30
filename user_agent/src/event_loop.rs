@@ -6,7 +6,7 @@ use ipc_messages::content::{
     ViewportSnapshot,
 };
 use ipc_messages::graphics::GraphicsCommand;
-use log::{debug, error};
+use log::error;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::process::Child;
 use std::sync::Arc;
@@ -173,14 +173,14 @@ struct EventLoopWorker {
 fn requires_command_completed_wakeup(command: &ContentCommand) -> bool {
     // These commands correspond to task-bearing steps whose next dequeue must wait for the
     // content side to emit `CommandCompleted`.
+    // DispatchEvent is intentionally excluded: UI events are sent immediately
+    // without waiting for CommandCompleted so they are not queued behind a
+    // stuck task-bearing command. Content still processes them correctly.
     matches!(
         command,
         ContentCommand::CreateEmptyDocument { .. }
             | ContentCommand::CreateLoadedDocument { .. }
             | ContentCommand::DestroyDocument { .. }
-            // DispatchEvent is sent immediately (no completion wait) so that
-            // UI events are not queued behind a stuck task-bearing command.
-            // The content process will still process the event correctly.
             | ContentCommand::RunBeforeUnload { .. }
             | ContentCommand::UpdateTheRendering { .. }
             | ContentCommand::RunWindowTimer { .. }
@@ -511,19 +511,15 @@ impl EventLoopWorker {
                     log::error!("clipboard write failed: {error}");
                 }
             }
-            ContentEvent::RegisterMediaPipeline(request) => {
+            ContentEvent::RegisterMediaPipeline(_) => {
                 // Content sends CreateMediaPipeline directly to the graphics process.
-                // The UA just acknowledges the registration for bookkeeping.
-                debug!(
-                    "[media] RegisterMediaPipeline url={} (ignored — direct to graphics)",
-                    request.url
-                );
+                // No UA bookkeeping needed.
             }
-            ContentEvent::RenderingOpRequested(traversable_id) => {
+            ContentEvent::RenderingOpRequested(navigable_id) => {
                 // Content requests a rendering opportunity (e.g. after a network fetch
                 // completes). Forward to the UA so it can batch and schedule.
                 self.user_agent_command_sender
-                    .send(UserAgentCommand::RenderingOpportunityFor { traversable_id })
+                    .send(UserAgentCommand::RenderingOpportunityFor { navigable_id })
                     .map_err(|error| format!("failed to forward rendering op request: {error}"))?;
             }
 

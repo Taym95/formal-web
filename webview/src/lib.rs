@@ -2,9 +2,7 @@ pub mod ui_event;
 
 use blitz_traits::events::UiEvent;
 use blitz_traits::shell::ColorScheme;
-use ipc_messages::content::{
-    FrameId, NavigableId, NavigateRequest, UserNavigationInvolvement, WebviewId,
-};
+use ipc_messages::content::{NavigableId, NavigateRequest, UserNavigationInvolvement, WebviewId};
 use log::{debug, error, trace};
 use std::collections::HashMap;
 use std::env;
@@ -16,32 +14,9 @@ use verification::TraceSender;
 
 pub use user_agent::{Embedder, NavigationCompleted, NavigationCompletion};
 
-/// Viewport info for a visible child frame, published to the UA so the
-/// child content process can determine its visible region.
-/// In the new architecture this data comes from the graphics process.
-#[derive(Clone, Debug)]
-pub struct VisibleFrameViewport {
-    pub frame_id: FrameId,
-    pub offset_x: f32,
-    pub offset_y: f32,
-    pub width: u32,
-    pub height: u32,
-}
-
 #[derive(Clone)]
 pub struct WebviewState {
     pub current_navigable_id: Option<NavigableId>,
-    #[allow(dead_code)]
-    focused_frame_id: Option<FrameId>,
-}
-
-impl Default for WebviewState {
-    fn default() -> Self {
-        Self {
-            current_navigable_id: None,
-            focused_frame_id: None,
-        }
-    }
 }
 
 fn startup_destination_url(startup_url: Option<&str>) -> Result<String, String> {
@@ -68,8 +43,6 @@ fn input_debug_enabled() -> bool {
 
 pub struct WebviewProvider {
     webviews: HashMap<WebviewId, WebviewState>,
-    #[allow(dead_code)]
-    viewport_snapshot: Option<(u32, u32, f32, ColorScheme)>,
     embedder: Arc<dyn Embedder>,
     user_agent: UserAgent,
 }
@@ -83,7 +56,6 @@ impl WebviewProvider {
 
         Ok(Self {
             webviews: HashMap::new(),
-            viewport_snapshot: None,
             embedder,
             user_agent,
         })
@@ -129,10 +101,9 @@ impl WebviewProvider {
     }
 
     pub fn set_default_viewport(
-        &mut self,
+        &self,
         snapshot: Option<(u32, u32, f32, ColorScheme)>,
     ) -> Result<(), String> {
-        self.viewport_snapshot = snapshot;
         self.user_agent.set_default_viewport(snapshot)
     }
 
@@ -179,10 +150,6 @@ impl WebviewProvider {
         self.user_agent.click_element(traversable_id.0, selector)
     }
 
-    pub fn on_new_webview(&self, webview_id: WebviewId) {
-        debug!("[webview] new webview {:?}", webview_id);
-    }
-
     pub fn current_navigable_id(&self, webview_id: WebviewId) -> Option<NavigableId> {
         self.webviews
             .get(&webview_id)
@@ -197,19 +164,6 @@ impl WebviewProvider {
             );
         }
         self.embedder.request_redraw(webview_id);
-    }
-
-    pub fn append_web_content_scene(
-        &mut self,
-        _webview_id: WebviewId,
-        _target_scene: &mut impl anyrender::PaintScene,
-        _transform: kurbo::Affine,
-    ) -> bool {
-        false
-    }
-
-    pub fn visible_frame_viewports(&mut self, _webview_id: WebviewId) -> Vec<VisibleFrameViewport> {
-        Vec::new()
     }
 
     pub fn embedder(&self) -> &Arc<dyn Embedder> {

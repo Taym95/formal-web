@@ -1147,25 +1147,26 @@ impl ApplicationHandler<FormalWebUserEvent> for WindowedApp {
             }
             FormalWebUserEvent::NewWebContentSurface {
                 webview_id,
-                pixels,
+                surface,
                 width,
                 height,
                 generation: _generation,
             } => {
+                let pixels = surface.as_slice();
+                let total_pixels = (width * height * 4) as usize;
                 info!(
                     "[render-pipe] Embedder surface webview={:?} {}x{} pixels={}B active_tab={:?}",
                     webview_id,
                     width,
                     height,
-                    pixels.len(),
+                    total_pixels,
                     self.windows
                         .get(&self.active_window_id.unwrap_or(WindowId::new()))
                         .and_then(|s| s.active_tab)
                 );
-                // Store the rendered pixel data as ImageData for the active tab.
-                if pixels.len() as u32 == width * height * 4 && width > 0 && height > 0 {
+                if pixels.len() >= total_pixels && width > 0 && height > 0 {
                     let image_data = peniko::ImageData {
-                        data: pixels.into(),
+                        data: pixels[..total_pixels].to_vec().into(),
                         format: peniko::ImageFormat::Rgba8,
                         alpha_type: peniko::ImageAlphaType::Alpha,
                         width,
@@ -1179,9 +1180,6 @@ impl ApplicationHandler<FormalWebUserEvent> for WindowedApp {
                                 "[render-pipe] Embedder stored surface for webview={:?} active={} tabs={:?} active_tab={:?} window={:?}",
                                 webview_id, is_active, state.tab_order, state.active_tab, window_id
                             );
-                            // Always request redraw when a surface arrives, regardless
-                            // of whether this is the active tab — the surface might be
-                            // the content of the active tab and we need to redraw.
                             Self::request_window_redraw(state);
                             info!(
                                 "[render-pipe] Embedder requested redraw for window={:?}",
@@ -1196,14 +1194,12 @@ impl ApplicationHandler<FormalWebUserEvent> for WindowedApp {
                     }
                 } else {
                     info!(
-                        "[render-pipe] Embedder invalid surface webview={:?} {}x{} pixels={} (expected {}x{}+{}B)",
+                        "[render-pipe] Embedder invalid surface webview={:?} {}x{} shmem={}B (expected {}B)",
                         webview_id,
                         width,
                         height,
                         pixels.len(),
-                        width * 4,
-                        height,
-                        width * height * 4
+                        total_pixels
                     );
                 }
             }

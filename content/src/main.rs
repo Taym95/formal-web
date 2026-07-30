@@ -1361,20 +1361,20 @@ impl ContentProcess {
 
     fn update_the_rendering(
         &mut self,
-        traversable_id: NavigableId,
+        navigable_id: NavigableId,
         document_id: DocumentId,
     ) -> Result<(), String> {
         log_render_state_debug(format!(
-            "process update-the-rendering traversable={} document={}",
-            traversable_id, document_id,
+            "process update-the-rendering navigable={} document={}",
+            navigable_id, document_id,
         ));
-        self.continue_updating_the_rendering(traversable_id, document_id)
+        self.continue_updating_the_rendering(navigable_id, document_id)
     }
 
     /// <https://html.spec.whatwg.org/#update-the-rendering>
     fn continue_updating_the_rendering(
         &mut self,
-        traversable_id: NavigableId,
+        navigable_id: NavigableId,
         document_id: DocumentId,
     ) -> Result<(), String> {
         let video_paint_registry = Rc::clone(&self.video_paint_registry);
@@ -1406,8 +1406,8 @@ impl ContentProcess {
             }
 
             info!(
-                "[render-pipe] Content render traversable={} document={} iframes={} video_registry_entries={}",
-                traversable_id,
+                "[render-pipe] Content render navigable={} document={} iframes={} video_registry_entries={}",
+                navigable_id,
                 document_id,
                 document.navigable_container_states.len(),
                 video_paint_registry.borrow().len()
@@ -1441,8 +1441,8 @@ impl ContentProcess {
                     self.font_sender
                         .prepare_scene(self.font_namespace, scene, &mut next_shmem_key);
                 log_render_state_debug(format!(
-                    "emit paint traversable={} document={} size=({}, {})",
-                    traversable_id, document_id, width, height,
+                    "emit paint navigable={} document={} size=({}, {})",
+                    navigable_id, document_id, width, height,
                 ));
                 // Set animating=true when this document has video elements.
                 // Graphics forwards this to the UA which keeps re-noting
@@ -1456,8 +1456,8 @@ impl ContentProcess {
                         *doc_id == document_id && !ended
                     });
                 info!(
-                    "[render-pipe] Content paint_frame ready traversable={} frame={} size=({},{}) has_video={} embed_sites={}",
-                    traversable_id,
+                    "[render-pipe] Content paint_frame ready navigable={} frame={} size=({},{}) has_video={} embed_sites={}",
+                    navigable_id,
                     document.frame_id.0,
                     width,
                     height,
@@ -1465,7 +1465,7 @@ impl ContentProcess {
                     composition.embed_sites.len()
                 );
                 let (paint_frame, shmem_data) = PaintFrame::new(
-                    WebviewId(traversable_id),
+                    WebviewId(navigable_id),
                     document.frame_id,
                     width,
                     height,
@@ -1483,7 +1483,7 @@ impl ContentProcess {
             self.tla_tracer,
             -> "RenderingOpportunity",
             "UpdateTheRendering",
-            traversable_id
+            navigable_id
         );
 
         let (paint_frame, shmem_map) = paint_frame;
