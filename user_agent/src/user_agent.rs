@@ -1331,6 +1331,14 @@ impl UserAgentWorker {
             {
                 Ok((mut handle, connection)) => {
                     let sender = connection.sender.clone();
+                    // Forward the trace sender to the graphics process.
+                    if let Err(error) =
+                        sender.send(ipc_messages::graphics::GraphicsCommand::SetTraceSender(
+                            trace_sender.clone(),
+                        ))
+                    {
+                        log::error!("failed to send trace sender to graphics: {error}");
+                    }
                     let receiver = connection.receiver;
                     let child = handle.take_child();
                     (Some(sender), ipc::crossbeam_proxy(receiver), child)
@@ -3901,12 +3909,6 @@ impl UserAgentWorker {
                     width,
                     height,
                     pixels.len()
-                );
-                verification::tla_log!(
-                    self.tla_tracer,
-                    -> "RenderingOpportunity",
-                    "ComposeScene",
-                    webview_id.0
                 );
 
                 // When the root's composed scene completes, all child frames

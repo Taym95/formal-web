@@ -70,6 +70,9 @@ pub enum GraphicsCommand {
     /// Notify the compositor that a top-level navigation finalized.
     /// Resets the compositor so the next PaintFrame replaces the old root scene.
     NavigationFinalized { webview_id: WebviewId },
+    /// Forward a TLA+ trace sender (dev only, ipc-channel mode).
+    /// Sent by the UA right after launch, before any other commands.
+    SetTraceSender(Option<verification::TraceSender>),
     /// Shut down the graphics process.
     Shutdown,
 }

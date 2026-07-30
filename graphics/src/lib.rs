@@ -9,6 +9,7 @@ use ipc_messages::content::{FontTransportReceiver, FrameId, WebviewId};
 use ipc_messages::graphics::{FrameHitInfo, GraphicsCommand, GraphicsEvent};
 use ipc_messages::media::{MediaPipelineId, VideoPaintId};
 use log::{debug, error, info};
+use verification::TLATracer;
 
 use media::backend::{MediaBackend, MediaBackendEvent, PipelineHandle};
 
@@ -73,6 +74,27 @@ pub fn run_graphics_process<B: MediaBackend + 'static>(
     let mut webviews: HashMap<WebviewId, WebviewCompositorSlot> = HashMap::new();
     let event_sender = graphics_event_tx;
 
+    // Drain the first message to check for SetTraceSender.
+    let mut tla_tracer = TLATracer::new("Navigation", "formal-web:graphics", None);
+    if let Ok(incoming) = cmd_rx.try_recv() {
+        if let GraphicsCommand::SetTraceSender(sender) = incoming.payload {
+            tla_tracer.set_sender(sender);
+        } else {
+            // Not a trace sender; process it as a normal command.
+            handle_command(
+                incoming.payload,
+                &mut webviews,
+                &event_sender,
+                &incoming.shmem_regions,
+                &mut HashMap::new(),
+                &mut HashMap::new(),
+                None::<&mut B>,
+                &mut HashMap::new(),
+                &mut tla_tracer,
+            );
+        }
+    }
+
     // Media pipeline state.
     let mut pipelines: HashMap<MediaPipelineId, B::Pipeline> = HashMap::new();
     let mut pipeline_webview_map: HashMap<MediaPipelineId, (WebviewId, VideoPaintId)> =
@@ -124,6 +146,7 @@ pub fn run_graphics_process<B: MediaBackend + 'static>(
                     &mut pipeline_webview_map,
                     backend.as_mut(),
                     &mut child_webview_to_parent,
+                    &mut tla_tracer,
                 ) {
                     break;
                 }
@@ -225,6 +248,7 @@ fn handle_command<B: MediaBackend + 'static>(
     pipeline_webview_map: &mut HashMap<MediaPipelineId, (WebviewId, VideoPaintId)>,
     media_backend: Option<&mut B>,
     child_webview_to_parent: &mut HashMap<WebviewId, (WebviewId, FrameId)>,
+    tla_tracer: &mut TLATracer,
 ) -> bool {
     match cmd {
         GraphicsCommand::RegisterWebview { webview_id } => {
@@ -310,6 +334,12 @@ fn handle_command<B: MediaBackend + 'static>(
                     // Content knows what's animating (video, CSS animations)
                     // and sets this. Graphics just passes it through.
                     composed.animating = animating;
+                    verification::tla_log!(
+                        *tla_tracer,
+                        -> "RenderingOpportunity",
+                        "ComposeScene",
+                        webview_id.0
+                    );
                     let _ = send_composed_scene(composed_scene_sender.clone(), slot, composed);
                 }
             }
@@ -400,6 +430,9 @@ fn handle_command<B: MediaBackend + 'static>(
             }
         }
 
+        GraphicsCommand::SetTraceSender(sender) => {
+            tla_tracer.set_sender(sender);
+        }
         GraphicsCommand::Shutdown => return true,
     }
     false
