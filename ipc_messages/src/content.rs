@@ -913,7 +913,6 @@ pub enum Event {
     /// Content requests a rendering opportunity, e.g. after a network fetch completes.
     RenderingOpRequested(NavigableId),
     RegisterMediaPipeline(RegisterMediaPipeline),
-    PaintReady(PaintFrame),
     ShutdownCompleted,
 }
 

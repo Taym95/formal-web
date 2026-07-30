@@ -13,7 +13,7 @@ use ipc_messages::content::{
     FrameId, LoadedDocumentResponse, NavigableId, NavigateRequest, NavigationFetchId, NavigationId,
     NewTraversableInfo, UserNavigationInvolvement, WebviewId, WindowTimerKey, iframe_target_name,
 };
-use log::{debug, error, trace};
+use log::{debug, error, info, trace};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -121,7 +121,6 @@ pub trait Embedder: Send + Sync {
     ) -> Result<(), String>;
     fn navigation_completed(&self, completed: NavigationCompleted) -> Result<(), String>;
     fn new_webview(&self, webview_id: WebviewId, target_name: String) -> Result<(), String>;
-    fn new_frame_rendered(&self) -> Result<(), String>;
     fn request_redraw(&self, webview_id: WebviewId);
     fn viewport_scale_factor(&self) -> f32;
     fn window_viewport_snapshot(&self) -> Option<(u32, u32, f32, ColorScheme)>;
@@ -1078,9 +1077,9 @@ impl UserAgent {
     }
 
     /// <https://html.spec.whatwg.org/multipage/#update-the-rendering>
-    pub fn note_rendering_opportunity(&self, traversable_id: NavigableId) -> Result<(), String> {
+    pub fn note_rendering_opportunity(&self, navigable_id: NavigableId) -> Result<(), String> {
         self.command_sender
-            .send(UserAgentCommand::RenderingOpportunityFor { traversable_id })
+            .send(UserAgentCommand::RenderingOpportunityFor { traversable_id: navigable_id })
             .map_err(|error| format!("failed to send rendering-opportunity request: {error}"))
     }
 
@@ -1132,13 +1131,6 @@ impl UserAgent {
         reply_receiver
             .recv()
             .map_err(|error| format!("selector click reply channel closed: {error}"))?
-    }
-}
-
-/// render-state debug output on the user-agent thread.
-fn log_render_state_debug(message: impl AsRef<str>) {
-    if std::env::var_os("FORMAL_WEB_DEBUG_RENDER_STATE").is_some() {
-        debug!("[render-state][user-agent] {}", message.as_ref());
     }
 }
 
@@ -1294,9 +1286,11 @@ struct UserAgentWorker {
     host: Arc<dyn Embedder>,
     /// Trace logger for the Navigation TLA+ spec.
     tla_tracer: TLATracer,
-    /// Tracks which traversables have a pending render in flight (TLA spec pending field).
+    /// Tracks which navigables have a pending render in flight (TLA spec:
+    /// pending[f] > composed[f]).
     pending_renders: HashSet<NavigableId>,
-    /// Queued opportunities accumulated while a render was pending (TLA spec opp field).
+    /// Batched opportunities noted while a render was pending (TLA spec op_count).
+    /// Set semantics: multiple notes while pending collapse to one re-render.
     queued_opps: HashSet<NavigableId>,
     /// Sender cloned into child workers and sidecars when TLA tracing is enabled.
     trace_sender: Option<TraceSender>,
@@ -3244,17 +3238,38 @@ impl UserAgentWorker {
         // Track which frame is focused based on pointer-down events.
         self.update_focused_frame(webview_id, &event);
 
-        let (target_webview_id, routed_event, _composed_frame_ids) =
+        let (target_webview_id, routed_event, composed_frame_ids) =
             self.route_ui_event(webview_id, event.clone());
 
         if let Ok(routed_message) = crate::ui_event::serialize_ui_event(&routed_event) {
             self.handle_dispatch_event_for(target_webview_id.0, routed_message);
         }
 
-        // Per the TLA spec: every UI event is a NoteRenderingOpportunity.
-        // The gate handles batching — if a task is already queued (pending),
-        // this just increments opp for the next frame_rendered to pick up.
-        self.note_rendering_opportunity(target_webview_id.0);
+        // Note a rendering opportunity for every frame involved in this
+        // composition (from hit-testing), not just the hit-tested target.
+        // This ensures child frames (iframes) get their scene rendered and
+        // composed together with the root.  When no hit-test info exists yet
+        // (first render), fall back to noting for just the target.
+        if composed_frame_ids.is_empty() {
+            self.note_rendering_opportunity(target_webview_id.0);
+        } else {
+            let navigable_ids: Vec<NavigableId> = {
+                let child_frame_map = self.state.child_frame_to_webview.get(&webview_id);
+                composed_frame_ids
+                    .iter()
+                    .map(|frame_id| {
+                        child_frame_map
+                            .and_then(|map| map.get(frame_id))
+                            .copied()
+                            .unwrap_or(webview_id)
+                            .0
+                    })
+                    .collect()
+            };
+            for navigable_id in navigable_ids {
+                self.note_rendering_opportunity(navigable_id);
+            }
+        }
     }
 
     /// Route a UI event to the correct frame using frame hit info from the
@@ -3383,37 +3398,37 @@ impl UserAgentWorker {
     }
 
     /// <https://html.spec.whatwg.org/#rendering-opportunity>
-    fn note_rendering_opportunity(&mut self, traversable_id: NavigableId) {
+    fn note_rendering_opportunity(&mut self, navigable_id: NavigableId) {
         verification::tla_log!(
             self.tla_tracer,
             -> "RenderingOpportunity",
             "NoteRenderingOpportunity",
-            traversable_id
+            navigable_id
         );
-        // TLA spec: NoteRenderingOpportunity(w)
-        //   IF pending[w] = 0 THEN pending[w] = 1 (start render)
-        //   ELSE opp[w] += 1 (queue opportunity)
-        if self.pending_renders.contains(&traversable_id) {
-            // Render already pending — queue the opportunity per spec.
-            self.queued_opps.insert(traversable_id);
-            trace!(
-                "[user-agent] SKIP rendering opportunity traversable={} (pending)",
-                traversable_id
+        if self.pending_renders.contains(&navigable_id) {
+            self.queued_opps.insert(navigable_id);
+            info!(
+                "[render-pipe] UA queue navigable={} (already pending, queued)",
+                navigable_id
             );
             return;
         }
-        self.pending_renders.insert(traversable_id);
+        self.pending_renders.insert(navigable_id);
+        info!(
+            "[render-pipe] UA start render navigable={}",
+            navigable_id
+        );
 
-        let Some(handle) = self.state.traversable_handles.get(&traversable_id).copied() else {
-            self.pending_renders.remove(&traversable_id);
+        let Some(handle) = self.state.traversable_handles.get(&navigable_id).copied() else {
+            self.pending_renders.remove(&navigable_id);
             return;
         };
         let Some(document_id) = self
             .state
             .active_documents_by_traversable
-            .get(&traversable_id)
+            .get(&navigable_id)
         else {
-            self.pending_renders.remove(&traversable_id);
+            self.pending_renders.remove(&navigable_id);
             return;
         };
         let Some(entry) = self.state.event_loops.get(&handle) else {
@@ -3422,129 +3437,64 @@ impl UserAgentWorker {
 
         if input_debug_enabled() {
             trace!(
-                "[input-debug][user-agent] note_rendering_opportunity traversable={} event_loop={} document={}",
-                traversable_id, handle, document_id,
+                "[input-debug][user-agent] note_rendering_opportunity navigable={} event_loop={} document={}",
+                navigable_id, handle, document_id,
             );
         }
 
-        log_render_state_debug(format!(
-            "send rendering opportunity traversable={} document={} event_loop={}",
-            traversable_id, document_id, handle,
-        ));
-
-        trace!(
-            "[user-agent] send rendering opportunity traversable={} document={} event_loop={}",
-            traversable_id, document_id, handle,
-        );
         let command = ContentCommand::UpdateTheRendering {
-            traversable_id,
+            traversable_id: navigable_id,
             document_id: *document_id,
         };
         let _ = entry
             .command_sender
             .send(EventLoopCommand::FireAndForget { command });
 
-        // If this is a child traversable, ensure the root also renders so the
-        // graphics process composes this child's paint frame into the scene.
-        // Only note the root if it's NOT already pending — if it were, the root
-        // would already render and compose this child's paint frame eventually.
-        let is_root = self
-            .state
-            .navigables
-            .get(&traversable_id)
-            .and_then(|n| n.parent_navigable_id)
-            .is_none();
-        if !is_root {
-            if let Some(root_id) = self.state.top_level_traversable_id(traversable_id) {
-                if root_id != traversable_id && !self.pending_renders.contains(&root_id) {
-                    self.note_rendering_opportunity(root_id);
-                }
-            }
-        }
-
-        // Propagate to child navigables so they send their scenes to the
-        // graphics process. The graphics process buffers child frames and
-        // only produces one texture when the root frame arrives.
-        //
-        // Skip children that already have a pending render to avoid queuing
-        // redundant opportunities — the child's own UpdateTheRendering is
-        // already in flight and will produce a paint frame for composition.
-        //
-        // Also skip invisible child frames (zero-area clips) to avoid
-        // unnecessary rendering work for offscreen or display:none iframes.
-        // When no hit-test info exists yet (first render), default to visible.
-        for child_id in descendant_navigable_ids(&self.state, traversable_id) {
-            if self.pending_renders.contains(&child_id) {
-                continue;
-            }
-            if self.is_child_frame_visible(child_id) {
-                self.note_rendering_opportunity(child_id);
+        // When a child navigable gets a rendering opportunity, also note the
+        // root so the graphics process composes the child's frame into the
+        // scene. The compositor only composes when the root frame arrives;
+        // child PaintFrames are stored but never trigger composition.
+        if let Some(root_id) = self.state.top_level_traversable_id(navigable_id) {
+            if root_id != navigable_id && !self.pending_renders.contains(&root_id) {
+                info!(
+                    "[render-pipe] UA propagate child->root child={} root={}",
+                    navigable_id, root_id
+                );
+                self.note_rendering_opportunity(root_id);
             }
         }
     }
 
-    /// Check whether a child navigable's frame is visible, using the most recent
-    /// frame hit info from the graphics process. A frame is invisible when its
-    /// clip rectangle has zero area (hidden/offscreen) or no hit test info exists.
-    fn is_child_frame_visible(&self, child_traversable_id: NavigableId) -> bool {
-        // Find the root traversable for the hit test info lookup.
-        let Some(root_traversable_id) = self.state.top_level_traversable_id(child_traversable_id)
-        else {
-            // No root means no hit test info yet — default to visible to
-            // ensure the first render happens.
-            return true;
-        };
 
-        let Some(child_navigable) = self.state.navigables.get(&child_traversable_id) else {
-            return false;
-        };
-        let Some(child_frame_id) = child_navigable.frame_id else {
-            // No frame id means this is a top-level traversable, not a child.
-            return true;
-        };
-
-        let Some(hit_info_list) = self
-            .state
-            .frame_hit_info
-            .get(&WebviewId(root_traversable_id))
-        else {
-            // No hit test info yet — default to visible.
-            return true;
-        };
-
-        // Find this child frame in the hit info list and check its clip bounds.
-        let Some(hit_info) = hit_info_list
-            .iter()
-            .find(|info| info.frame_id == child_frame_id)
-        else {
-            // Frame not in hit test info — might be newly created, default to visible.
-            return true;
-        };
-
-        let [x0, y0, x1, y1] = hit_info.root_clip_bounds;
-        // A frame is invisible when its clip rectangle has zero area.
-        let width = x1 - x0;
-        let height = y1 - y0;
-        width > 0.0 && height > 0.0
-    }
 
     /// Called when a SurfaceFrameReady arrives — the composite frame completed.
-    /// Corresponds to the TLA spec's FrameRendered action: clears the pending
-    /// gate and re-notes the root if any opportunities were queued while the
-    /// frame was in flight.
+    /// Corresponds to the TLA spec's NoteComposedScene action: drains batched
+    /// opportunities (resets op_count) and re-notes if any were batched or
+    /// the frame has animated content.
     /// <https://html.spec.whatwg.org/#rendering-opportunity>
-    fn frame_rendered(&mut self, root_webview_id: WebviewId, animating: bool) {
+    fn note_composed_scene(&mut self, navigable_id: WebviewId, animating: bool) {
         verification::tla_log!(
             self.tla_tracer,
             -> "RenderingOpportunity",
-            "FrameRendered",
-            root_webview_id.0
+            "NoteComposedScene",
+            navigable_id.0
         );
 
-        self.pending_renders.clear();
-        if !self.queued_opps.is_empty() || animating {
-            self.queued_opps.clear();
-            self.note_rendering_opportunity(root_webview_id.0);
+        self.pending_renders.remove(&navigable_id.0);
+        let had_queued = self.queued_opps.remove(&navigable_id.0);
+        info!(
+            "[render-pipe] UA composed scene navigable={} animating={} had_queued={} pending_remaining={}",
+            navigable_id.0,
+            animating,
+            had_queued,
+            self.pending_renders.len()
+        );
+        if had_queued || animating {
+            info!(
+                "[render-pipe] UA re-note navigable={} (had_queued={} animating={})",
+                navigable_id.0, had_queued, animating
+            );
+            self.note_rendering_opportunity(navigable_id.0);
         }
     }
 
@@ -3800,6 +3750,8 @@ impl UserAgentWorker {
                 removed_document_ids.insert(document_id);
             }
             self.state.remove_traversable(*traversable_id);
+            self.pending_renders.remove(traversable_id);
+            self.queued_opps.remove(traversable_id);
         }
 
         if !removed_document_ids.is_empty() {
@@ -3938,7 +3890,23 @@ impl UserAgentWorker {
                     height,
                     pixels.len()
                 );
-                self.frame_rendered(*webview_id, *animating);
+                verification::tla_log!(
+                    self.tla_tracer,
+                    -> "RenderingOpportunity",
+                    "ComposeScene",
+                    webview_id.0
+                );
+
+                // When the root's composed scene completes, all child frames
+                // included in the composition have also been rendered and
+                // composed.  Clear their pending state so they can receive
+                // new rendering opportunities.
+                for (_child_frame_id, child_wv) in child_frame_to_webview.iter() {
+                    self.pending_renders.remove(&child_wv.0);
+                    self.queued_opps.remove(&child_wv.0);
+                }
+
+                self.note_composed_scene(*webview_id, *animating);
                 self.state
                     .frame_hit_info
                     .insert(*webview_id, frame_hit_info.clone());

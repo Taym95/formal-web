@@ -2,14 +2,21 @@
 EXTENDS Naturals, Sequences, TLC, RenderingOpportunityTraceData
 
 VARIABLES
-    webviews,
+    pending,
+    rendering_updated,
+    composed,
+    op_count,
+    animating,
+    parent,
     trace_index
 
-vars == <<webviews, trace_index>>
+vars == <<pending, rendering_updated, composed, op_count, animating, parent,
+         trace_index>>
 
 Base == INSTANCE RenderingOpportunity WITH
-    WebViews <- TraceWebViews,
-    MaxRenderingOps <- TraceMaxRenderingOps
+    Frame <- TraceFrame,
+    NONE <- TraceNone,
+    MaxCounter <- TraceMaxCounter
 
 TraceLength == Len(Trace)
 
@@ -33,18 +40,36 @@ NoteRenderingOpportunityTrace ==
     /\ trace_index \in 1..TraceLength
     /\ CurrentEvent = "NoteRenderingOpportunity"
     /\ Len(CurrentArgs) = 1
-    /\ LET w == EventArg(1)
+    /\ LET f == EventArg(1)
        IN
-       /\ Base!NoteRenderingOpportunity(w)
+       /\ Base!NoteRenderingOpportunity(f)
        /\ Advance
 
-FrameRenderedTrace ==
+UpdateTheRenderingTrace ==
     /\ trace_index \in 1..TraceLength
-    /\ CurrentEvent = "FrameRendered"
+    /\ CurrentEvent = "UpdateTheRendering"
     /\ Len(CurrentArgs) = 1
-    /\ LET w == EventArg(1)
+    /\ LET f == EventArg(1)
        IN
-       /\ Base!FrameRendered(w)
+       /\ Base!UpdateTheRendering(f)
+       /\ Advance
+
+ComposeSceneTrace ==
+    /\ trace_index \in 1..TraceLength
+    /\ CurrentEvent = "ComposeScene"
+    /\ Len(CurrentArgs) = 1
+    /\ LET f == EventArg(1)
+       IN
+       /\ Base!ComposeScene(f)
+       /\ Advance
+
+NoteComposedSceneTrace ==
+    /\ trace_index \in 1..TraceLength
+    /\ CurrentEvent = "NoteComposedScene"
+    /\ Len(CurrentArgs) = 1
+    /\ LET f == EventArg(1)
+       IN
+       /\ Base!NoteComposedScene(f)
        /\ Advance
 
 Done ==
@@ -53,14 +78,12 @@ Done ==
 
 Next ==
     \/ NoteRenderingOpportunityTrace
-    \/ FrameRenderedTrace
+    \/ UpdateTheRenderingTrace
+    \/ ComposeSceneTrace
+    \/ NoteComposedSceneTrace
     \/ Done
 
 TypeOK == Base!TypeOK
-
-NoMissedOpportunity == Base!NoMissedOpportunity
-
-PendingIsAtMostOne == Base!PendingIsAtMostOne
 
 TraceAccepted == trace_index = TraceLength + 1
 =============================================================================

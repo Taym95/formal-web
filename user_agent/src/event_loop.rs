@@ -64,11 +64,6 @@ fn log_navigation_debug(message: impl AsRef<str>) {
     let _ = message;
 }
 
-/// render-state debug output related to update-the-rendering work.
-fn log_render_state_debug(message: impl AsRef<str>) {
-    let _ = message;
-}
-
 /// timer debug output related to HTML timers and fetch watchdogs.
 fn log_timer_debug(message: impl AsRef<str>) {
     let _ = message;
@@ -515,18 +510,6 @@ impl EventLoopWorker {
                 {
                     log::error!("clipboard write failed: {error}");
                 }
-            }
-            ContentEvent::PaintReady(frame) => {
-                // Content sends PaintFrames directly to the graphics process.
-                // The UA acknowledges the event but does not forward it.
-                log_render_state_debug(format!(
-                    "paint ready event_loop={} traversable={} frame={} size=({}, {})",
-                    self.event_loop_id,
-                    frame.traversable_id.0,
-                    frame.frame_id.0,
-                    frame.viewport_width,
-                    frame.viewport_height,
-                ));
             }
             ContentEvent::RegisterMediaPipeline(request) => {
                 // Content sends CreateMediaPipeline directly to the graphics process.

@@ -1,4 +1,4 @@
-use log::{debug, error};
+use log::{debug, error, info};
 mod chrome;
 
 use self::chrome::{ChromeAction, ChromeTabInfo, ChromeUi, ChromeViewState, WinitShellProvider};
@@ -445,14 +445,10 @@ impl WindowedApp {
 
         state.renderer.render(|scene| {
             // Paint content surface if one is available.
-            if let Some(webview_id) = state.active_tab {
+            let surface_found = state.active_tab.is_some_and(|webview_id| {
                 if let Some(image_data) = state.surface_images.get(&webview_id) {
                     let w = image_data.width;
                     let h = image_data.height;
-                    debug!(
-                        "[embedder] paint_frame drawing surface webview={:?} {}x{}",
-                        webview_id, w, h
-                    );
                     let content_transform = Affine::translate((0.0, chrome_height));
                     scene.fill(
                         peniko::Fill::NonZero,
@@ -464,7 +460,21 @@ impl WindowedApp {
                         None,
                         &kurbo::Rect::new(0.0, 0.0, f64::from(w), f64::from(h)),
                     );
+                    info!(
+                        "[render-pipe] Embedder paint webview={:?} {}x{} at y={}",
+                        webview_id, w, h, chrome_height
+                    );
+                    true
+                } else {
+                    info!(
+                        "[render-pipe] Embedder paint NO SURFACE for active_tab={:?}",
+                        webview_id
+                    );
+                    false
                 }
+            });
+            if !surface_found {
+                info!("[render-pipe] Embedder paint chrome-only");
             }
             // Always paint chrome, even when no content surface is available
             // (e.g. chrome-only hover, typing in address bar).
@@ -986,9 +996,6 @@ impl ApplicationHandler<FormalWebUserEvent> for WindowedApp {
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: FormalWebUserEvent) {
         match event {
-            FormalWebUserEvent::NewFrameRendered => {
-                self.try_run_automation(|automation, app| automation.note_rendering_update(app));
-            }
             FormalWebUserEvent::RequestRedraw(webview_id) => {
                 if let Some(window) = Self::window_for_webview(self, webview_id) {
                     let is_active = self
@@ -1145,13 +1152,11 @@ impl ApplicationHandler<FormalWebUserEvent> for WindowedApp {
                 height,
                 generation: _generation,
             } => {
-                debug!(
-                    "[embedder] NewWebContentSurface webview={:?} size={}x{}",
-                    webview_id, width, height
+                info!(
+                    "[render-pipe] Embedder surface webview={:?} {}x{} pixels={}B",
+                    webview_id, width, height, pixels.len()
                 );
                 // Store the rendered pixel data as ImageData for the active tab.
-                let width = width;
-                let height = height;
                 if pixels.len() as u32 == width * height * 4 && width > 0 && height > 0 {
                     let image_data = peniko::ImageData {
                         data: pixels.into(),
@@ -1163,8 +1168,22 @@ impl ApplicationHandler<FormalWebUserEvent> for WindowedApp {
                     if let Some(window_id) = Self::window_for_webview(self, webview_id) {
                         if let Some(state) = self.windows.get_mut(&window_id) {
                             state.surface_images.insert(webview_id, image_data);
+                            info!(
+                                "[render-pipe] Embedder stored surface for active_tab={:?} window={:?}",
+                                state.active_tab, window_id
+                            );
                         }
+                    } else {
+                        info!(
+                            "[render-pipe] Embedder no window for webview={:?}",
+                            webview_id
+                        );
                     }
+                } else {
+                    info!(
+                        "[render-pipe] Embedder invalid surface webview={:?} {}x{} pixels={}",
+                        webview_id, width, height, pixels.len()
+                    );
                 }
                 // Trigger redraw so paint_frame picks up the new image.
                 if let Some(window) = Self::window_for_webview(self, webview_id)

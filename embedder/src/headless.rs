@@ -309,9 +309,6 @@ impl ApplicationHandler<FormalWebUserEvent> for HeadlessEmbedderApp {
 
     fn user_event(&mut self, el: &ActiveEventLoop, event: FormalWebUserEvent) {
         match event {
-            FormalWebUserEvent::NewFrameRendered => {
-                self.with_automation(|a, app| a.note_rendering_update(app));
-            }
             FormalWebUserEvent::RequestRedraw(_) => {}
             FormalWebUserEvent::NavigationRequested {
                 webview_id,

@@ -91,10 +91,6 @@ impl Embedder for EventLoopEmbedder {
             .send(FormalWebUserEvent::NewWebview(webview_id, target_name))
     }
 
-    fn new_frame_rendered(&self) -> Result<(), String> {
-        self.dispatcher.send(FormalWebUserEvent::NewFrameRendered)
-    }
-
     fn request_redraw(&self, webview_id: WebviewId) {
         if let Err(error) = self
             .dispatcher
@@ -179,7 +175,6 @@ pub enum FormalWebUserEvent {
     NavigationCompleted(NavigationCompleted),
     #[allow(dead_code)]
     NewWebview(WebviewId, String),
-    NewFrameRendered,
     CreateWindow,
     Automation(AutomationCommand),
     ClipboardRead {

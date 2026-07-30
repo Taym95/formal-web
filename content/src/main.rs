@@ -55,7 +55,7 @@ use ipc_messages::content::{
     TraversableViewport, ViewportSnapshot, WebviewId, WindowTimerKey,
 };
 use ipc_messages::media::{VideoEmbedData, VideoPaintId};
-use log::{debug, error, trace, warn};
+use log::{debug, error, info, trace, warn};
 use std::{
     cell::RefCell,
     collections::{HashMap, HashSet},
@@ -1377,7 +1377,6 @@ impl ContentProcess {
         traversable_id: NavigableId,
         document_id: DocumentId,
     ) -> Result<(), String> {
-        let event_sender = self.event_sender.clone();
         let video_paint_registry = Rc::clone(&self.video_paint_registry);
         let paint_frame = {
             let document = self
@@ -1406,6 +1405,10 @@ impl ContentProcess {
                 document_guard.resolve(animation_time);
             }
 
+            info!(
+                "[render-pipe] Content render start traversable={} document={}",
+                traversable_id, document_id
+            );
             let paint_frame = {
                 let document_guard = document.document.borrow();
                 let viewport = document_guard.viewport().clone();
@@ -1464,6 +1467,13 @@ impl ContentProcess {
             paint_frame
         };
 
+        verification::tla_log!(
+            self.tla_tracer,
+            -> "RenderingOpportunity",
+            "UpdateTheRendering",
+            traversable_id
+        );
+
         let (paint_frame, shmem_map) = paint_frame;
 
         // Send the PaintFrame directly to the graphics process for composition.
@@ -1476,10 +1486,7 @@ impl ContentProcess {
             }
         }
 
-        // Also send to the UA event loop for legacy handling.
-        event_sender
-            .send_with_shmem_map(ContentEvent::PaintReady(paint_frame), shmem_map)
-            .map_err(|error| format!("failed to send paint frame: {error}"))
+        Ok(())
     }
 
     fn node_absolute_border_origin(

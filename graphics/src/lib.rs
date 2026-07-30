@@ -8,7 +8,7 @@ use crossbeam_channel::{select, tick};
 use ipc_messages::content::{FontTransportReceiver, FrameId, WebviewId};
 use ipc_messages::graphics::{FrameHitInfo, GraphicsCommand, GraphicsEvent};
 use ipc_messages::media::{MediaPipelineId, VideoPaintId};
-use log::{debug, error};
+use log::{debug, error, info};
 
 use media::backend::{MediaBackend, MediaBackendEvent, PipelineHandle};
 
@@ -281,6 +281,12 @@ fn handle_command<B: MediaBackend + 'static>(
                         return false;
                     }
                 };
+            info!(
+                "[render-pipe] Graphics store frame id={} webview={} root_candidate={} viewport={}x{} children={}",
+                frame_id.0, webview_id.0, is_root_candidate,
+                viewport_width, viewport_height,
+                composition.embed_sites.len()
+            );
             slot.compositor.store_frame(
                 frame_id,
                 viewport_width,
@@ -298,6 +304,10 @@ fn handle_command<B: MediaBackend + 'static>(
             // regardless of how many embedded frames exist.
             let should_compose = is_root_candidate && has_valid_viewport;
             if should_compose {
+                info!(
+                    "[render-pipe] Graphics compose scene webview={} root_frame={}",
+                    webview_id.0, frame_id.0
+                );
                 if let Some(mut composed) = slot
                     .compositor
                     .compose_scene(&slot.font_receiver, webview_id)
@@ -466,6 +476,10 @@ fn send_composed_scene(
     if width == 0 || height == 0 {
         return Err(());
     }
+    info!(
+        "[render-pipe] Graphics GPU render webview={} {}x{} {} child_frames",
+        webview_id.0, width, height, child_viewports.len()
+    );
     let (_iosurface_id, generation, pixels) =
         match slot.gpu_renderer.render_scene(&scene, width, height) {
             Some(r) => r,
