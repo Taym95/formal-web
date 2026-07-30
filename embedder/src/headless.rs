@@ -1,7 +1,7 @@
 use crate::event_loop::winit_integration::event_loop_options;
 use crate::event_loop::{
     FormalWebUserEvent, NavigationCompleted, NavigationCompletion, automation_screenshot_png,
-    automation_visible_frame_viewports, read_clipboard_text, startup_destination_url,
+    read_clipboard_text, startup_destination_url,
     update_window_viewport_snapshot, write_clipboard_text,
 };
 use ::winit::application::ApplicationHandler;
@@ -196,7 +196,7 @@ impl AutomationHost for HeadlessEmbedderApp {
     fn automation_visible_frame_viewports(
         &mut self,
     ) -> Result<Vec<AutomationVisibleFrameViewport>, String> {
-        automation_visible_frame_viewports(&mut self.provider, self.current_webview_id)
+        Ok(Vec::new())
     }
 
     fn automation_screenshot(&mut self) -> Result<Vec<u8>, String> {

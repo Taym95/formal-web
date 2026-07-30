@@ -3845,7 +3845,11 @@ impl UserAgentWorker {
         // Shut down the graphics process: send Shutdown, wait for
         // ShutdownComplete, then join the child process.
         if let Some(sender) = &self.graphics_extension_sender {
-            let _ = sender.send(ipc_messages::graphics::GraphicsCommand::Shutdown);
+            if let Err(error) =
+                sender.send(ipc_messages::graphics::GraphicsCommand::Shutdown)
+            {
+                log::error!("failed to send shutdown to graphics process: {error}");
+            }
         }
         // Drain events until ShutdownComplete arrives.
         while let Ok(incoming) = self.graphics_event_receiver.recv() {

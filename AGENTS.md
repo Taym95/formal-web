@@ -423,6 +423,17 @@ feature never worked, instead of checking whether it did.
   Prefer phrasing like "symptom: X works then crashes; Y was tried and failed;
   Z was not investigated" over "the issue is likely due to X".
 
+# Dead Code and Comments
+
+- **Never use `#[allow(dead_code)]` on fields or functions.** A field stored only for
+  RAII cleanup must be explicitly used during shutdown (send shutdown signal, wait for
+  acknowledgement, join the child process). Remove the dead code instead of annotating
+  around it.
+- **Comments describe what the code DOES, not what it USED TO DO.** Never write
+  comments like "now comes from X instead of Y" or "previously maintained by Z."
+  Those document a migration that is already complete. Delete stale comments and
+  the dead code paths they reference.
+
 # Error Logging
 
 # Logging

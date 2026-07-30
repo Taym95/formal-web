@@ -8,7 +8,7 @@ use super::winit_integration::{
 };
 use super::{
     FormalWebUserEvent, NavigationCompletion, automation_screenshot_png,
-    automation_visible_frame_viewports, normalize_browser_destination, read_clipboard_text,
+    normalize_browser_destination, read_clipboard_text,
     startup_destination_url, write_clipboard_text,
 };
 use anyrender::{Paint, PaintScene, WindowRenderer};
@@ -1338,11 +1338,7 @@ impl AutomationHost for WindowedApp {
     fn automation_visible_frame_viewports(
         &mut self,
     ) -> Result<Vec<AutomationVisibleFrameViewport>, String> {
-        let webview_id = self
-            .active_window_id
-            .and_then(|id| self.windows.get(&id))
-            .and_then(|state| state.active_tab);
-        automation_visible_frame_viewports(&mut self.provider, webview_id)
+        Ok(Vec::new())
     }
 
     fn automation_screenshot(&mut self) -> Result<Vec<u8>, String> {

@@ -13,7 +13,7 @@ pub use self::winit_integration::{
 };
 use anyrender::{PaintScene, render_to_buffer};
 use anyrender_vello_cpu::VelloCpuImageRenderer;
-use automation::{AutomationCommand, AutomationVisibleFrameViewport};
+use automation::AutomationCommand;
 use blitz_traits::shell::ColorScheme;
 use ipc_messages::content::WebviewId;
 use kurbo::{Affine, Rect};
@@ -339,15 +339,6 @@ fn automation_screenshot_png(
     );
 
     encode_png_rgba(&rgba, width, height)
-}
-
-fn automation_visible_frame_viewports(
-    _provider: &mut Option<WebviewProvider>,
-    _current_webview_id: Option<WebviewId>,
-) -> Result<Vec<AutomationVisibleFrameViewport>, String> {
-    // Child frame viewports now come from the graphics process via
-    // SurfaceFrameReady. The webview provider no longer maintains them.
-    Ok(Vec::new())
 }
 
 fn encode_png_rgba(rgba: &[u8], width: u32, height: u32) -> Result<Vec<u8>, String> {
