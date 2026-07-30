@@ -1,4 +1,4 @@
-use crate::media::VideoEmbedData;
+use crate::media::{VideoEmbedData, VideoPaintId};
 use anyrender::{
     Scene,
     recording::{GlyphRunCommand, RenderCommand},
@@ -652,12 +652,12 @@ impl RecordedScene {
     }
 }
 
-fn serialize_scene_to_vec(scene: &RecordedScene) -> Result<Vec<u8>, String> {
+pub fn serialize_scene_to_vec(scene: &RecordedScene) -> Result<Vec<u8>, String> {
     postcard::to_allocvec(scene)
         .map_err(|error| format!("failed to serialize paint scene: {error}"))
 }
 
-fn deserialize_scene_from_slice(scene_bytes: &[u8]) -> Result<RecordedScene, String> {
+pub fn deserialize_scene_from_slice(scene_bytes: &[u8]) -> Result<RecordedScene, String> {
     postcard::from_bytes(scene_bytes)
         .map_err(|error| format!("failed to deserialize paint scene: {error}"))
 }
@@ -675,6 +675,10 @@ pub struct PaintFrame {
     /// reads the bytes from the shmem map using this key and passes them to
     /// `into_recorded_scene()`.
     pub scene_shmem_key: usize,
+    /// True when the rendered scene contains animated content (e.g. video,
+    /// CSS animations). The graphics process forwards this to the UA so it
+    /// can keep re-noting rendering opportunities without user input.
+    pub animating: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -698,6 +702,7 @@ impl PaintFrame {
         composition: FrameCompositionMetadata,
         scene: PreparedScene,
         next_shmem_key: &mut usize,
+        animating: bool,
     ) -> Result<(Self, HashMap<usize, ipc::IpcSharedRegion>), String> {
         let PreparedScene {
             scene,
@@ -722,6 +727,7 @@ impl PaintFrame {
                 composition,
                 font_registrations: registered_fonts,
                 scene_shmem_key,
+                animating,
             },
             shmem_map,
         ))
@@ -873,13 +879,19 @@ pub enum Command {
     /// configuration.
     ContentBootstrap {
         net_sender: ipc::IpcSender<crate::network::Request>,
-        media_sender: Option<ipc::IpcSender<crate::media::MediaCommand>>,
+        /// Direct sender to the graphics process.
+        graphics_sender: Option<ipc::IpcSender<crate::graphics::GraphicsCommand>>,
         /// The content process's own command sender. Net uses this to route
         /// `CompleteDocumentFetch` directly to this content process.
         content_command_sender: ipc::IpcSender<Command>,
         /// TLA trace sender for logging spec-level events from the content process
         /// (e.g. RunBeforeUnload).
         trace_sender: Option<TraceSender>,
+    },
+    /// A video pipeline reached end of stream. Content should unset any
+    /// animating flags associated with this pipeline.
+    NotifyVideoEnded {
+        video_paint_id: VideoPaintId,
     },
     Shutdown,
 }
@@ -898,8 +910,9 @@ pub enum Event {
     /// This is fire-and-forget — no reply is sent.
     ClipboardWriteRequested(ClipboardWriteRequested),
     CommandCompleted,
+    /// Content requests a rendering opportunity, e.g. after a network fetch completes.
+    RenderingOpRequested(NavigableId),
     RegisterMediaPipeline(RegisterMediaPipeline),
-    PaintReady(PaintFrame),
     ShutdownCompleted,
 }
 
@@ -1058,6 +1071,7 @@ mod tests {
             FrameCompositionMetadata::default(),
             prepared,
             &mut next_shmem_key,
+            false,
         )
         .expect("paint frame should serialize into shared memory");
 
@@ -1089,6 +1103,7 @@ mod tests {
             FrameCompositionMetadata::default(),
             first_prepared,
             &mut next_shmem_key,
+            false,
         )
         .expect("first frame should serialize");
         let first_summary = first_frame.transport_summary(&first_shmem_regions);
@@ -1119,6 +1134,7 @@ mod tests {
             FrameCompositionMetadata::default(),
             second_prepared,
             &mut next_shmem_key,
+            false,
         )
         .expect("second frame should serialize");
         let second_summary = second_frame.transport_summary(&second_shmem_regions);

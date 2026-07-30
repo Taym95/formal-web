@@ -117,6 +117,12 @@ pub trait PipelineHandle: Send + 'static {
     fn play(&self) -> Result<(), String>;
     fn pause(&self) -> Result<(), String>;
     fn seek(&self, position_secs: f64) -> Result<(), String>;
+    /// Called at ≈120 Hz by the select loop. Backends pump run loops,
+    /// poll for frames, etc. Default is a no-op.
+    fn sample(&self) {}
+    /// Returns true when the pipeline reached end-of-stream and no
+    /// longer needs sampling.
+    fn is_done(&self) -> bool { false }
     fn destroy(self) -> Result<(), String>;
 }
 ```
@@ -196,25 +202,7 @@ media process).  No background thread is used.
 ### Frame extraction
 
 Frame polling happens inside `PipelineHandle::sample()`, which is called
-at ≈120 Hz via a `crossbeam_channel::tick(8ms)` timer arm in the generic
-`select!` loop:
-
-```rust
-// lib.rs: the select loop drives sampling independently of message traffic
-let sample_tick = crossbeam_channel::tick(Duration::from_millis(8));
-
-loop {
-    crossbeam_channel::select! {
-        recv(cmd_rx) -> cmd => { ... },
-        recv(backend_event_rx) -> event => { ... },
-        recv(sample_tick) -> _ => {
-            for pipeline in pipelines.values() {
-                pipeline.sample();
-            }
-        },
-    }
-}
-```
+at ≈120 Hz via a timer arm in the `select!` loop.
 
 `sample()` does:
 1. **Drain the run loop** via `NSRunLoop::currentRunLoop().runUntilDate(8ms)`
@@ -256,7 +244,6 @@ compositor's expectations.
 | Using unix wall clock for host time | Item time doesn't match video timeline | Use `CVGetCurrentHostTime()` / `CVGetHostClockFrequency()` |
 | Reading duration before asset loads | `kCMTimeIndefinite`, `seconds()` returns `NaN` | Poll `item.status() == ReadyToPlay` first |
 | `kCVPixelBufferPixelFormatTypeKey` double-ref | Crash during pipeline creation | Use `kCVPixelBufferPixelFormatTypeKey` directly (it's already `&CFString`), not `&kCVPixelBufferPixelFormatTypeKey` |
-| No timer driving `sample()` | No frames delivered | Add `crossbeam_channel::tick()` arm to `select!` |
 | BGRA data sent as RGBA | Blue-tinted video | Swap bytes 0 and 2 in `pixel_buffer_to_frame` |
 
 ### What does NOT change

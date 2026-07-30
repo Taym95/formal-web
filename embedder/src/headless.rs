@@ -1,7 +1,7 @@
 use crate::event_loop::winit_integration::event_loop_options;
 use crate::event_loop::{
     FormalWebUserEvent, NavigationCompleted, NavigationCompletion, automation_screenshot_png,
-    automation_visible_frame_viewports, read_clipboard_text, startup_destination_url,
+    read_clipboard_text, startup_destination_url,
     update_window_viewport_snapshot, write_clipboard_text,
 };
 use ::winit::application::ApplicationHandler;
@@ -16,10 +16,11 @@ use blitz_traits::events::{
     MouseEventButtons, PointerCoords, PointerDetails, UiEvent,
 };
 use blitz_traits::shell::ColorScheme;
-use ipc_messages::content::WebviewId;
+use ipc_messages::content::{FontTransportReceiver, RecordedScene, WebviewId};
 use keyboard_types::Modifiers as KeyboardModifiers;
-use log::error;
+use log::{debug, error};
 use serde_json::Value;
+use std::collections::HashMap;
 use std::time::Duration;
 use webview::WebviewProvider;
 
@@ -43,6 +44,8 @@ pub(super) struct HeadlessEmbedderApp {
     pub(super) provider: Option<WebviewProvider>,
     pub(super) current_webview_id: Option<WebviewId>,
     pub(super) buttons: MouseEventButtons,
+    pub(super) composed_scenes: HashMap<WebviewId, RecordedScene>,
+    pub(super) scene_font_receiver: FontTransportReceiver,
 }
 
 impl Default for HeadlessEmbedderApp {
@@ -55,6 +58,8 @@ impl Default for HeadlessEmbedderApp {
             provider: None,
             current_webview_id: None,
             buttons: MouseEventButtons::None,
+            composed_scenes: HashMap::new(),
+            scene_font_receiver: FontTransportReceiver::default(),
         }
     }
 }
@@ -191,7 +196,7 @@ impl AutomationHost for HeadlessEmbedderApp {
     fn automation_visible_frame_viewports(
         &mut self,
     ) -> Result<Vec<AutomationVisibleFrameViewport>, String> {
-        automation_visible_frame_viewports(&mut self.provider, self.current_webview_id)
+        Ok(Vec::new())
     }
 
     fn automation_screenshot(&mut self) -> Result<Vec<u8>, String> {
@@ -253,7 +258,6 @@ impl AutomationHost for HeadlessEmbedderApp {
         match self.provider.as_ref().zip(self.current_webview_id) {
             Some((p, wid)) => {
                 p.click_element(wid, selector)?;
-                p.note_rendering_opportunity(wid, "automation_element_click");
                 Ok(())
             }
             None => Err(String::from("no webview")),
@@ -305,16 +309,6 @@ impl ApplicationHandler<FormalWebUserEvent> for HeadlessEmbedderApp {
 
     fn user_event(&mut self, el: &ActiveEventLoop, event: FormalWebUserEvent) {
         match event {
-            FormalWebUserEvent::WebviewProviderSync => {
-                if let Some(p) = self.provider.as_mut()
-                    && let Err(e) = p.sync_pending_messages()
-                {
-                    error!("provider sync error: {e}");
-                }
-            }
-            FormalWebUserEvent::NewFrameRendered => {
-                self.with_automation(|a, app| a.note_rendering_update(app));
-            }
             FormalWebUserEvent::RequestRedraw(_) => {}
             FormalWebUserEvent::NavigationRequested {
                 webview_id,
@@ -326,9 +320,6 @@ impl ApplicationHandler<FormalWebUserEvent> for HeadlessEmbedderApp {
             FormalWebUserEvent::NewWebview(wid, _) => {
                 self.current_webview_id = Some(wid);
                 self.apply_viewport_snapshot();
-                if let Some(p) = self.provider.as_ref() {
-                    p.note_rendering_opportunity(wid, "request_redraw");
-                }
             }
             FormalWebUserEvent::CreateWindow => {}
             FormalWebUserEvent::Automation(cmd) => {
@@ -339,6 +330,34 @@ impl ApplicationHandler<FormalWebUserEvent> for HeadlessEmbedderApp {
             }
             FormalWebUserEvent::ClipboardWrite { text, reply } => {
                 let _ = reply.send(write_clipboard_text(text));
+            }
+            FormalWebUserEvent::NewWebContentScene {
+                webview_id,
+                scene_bytes,
+                font_registrations,
+                font_data,
+            } => {
+                // Register fonts from the graphics process.
+                self.scene_font_receiver
+                    .register_fonts(font_registrations, &font_data);
+                // Deserialize and store the composed scene.
+                match ipc_messages::content::deserialize_scene_from_slice(&scene_bytes) {
+                    Ok(scene) => {
+                        self.composed_scenes.insert(webview_id, scene);
+                    }
+                    Err(error) => {
+                        error!("[embedder] failed to deserialize composed scene: {error}");
+                    }
+                }
+            }
+            FormalWebUserEvent::NewWebContentSurface {
+                webview_id,
+                surface: _surface,
+                width: _width,
+                height: _height,
+                generation: _generation,
+            } => {
+                debug!("[embedder] headless NewWebContentSurface {:?}", webview_id);
             }
             FormalWebUserEvent::Exit => {
                 self.with_automation(|a, _| {

@@ -427,7 +427,6 @@ fn create_a_new_child_navigable(
             frame_id: content_frame_id,
             document: new_document,
             settings,
-            pending_update_the_rendering: false,
             pending_document_load: None,
             navigable_container_states: HashMap::new(),
             viewport_offset_x: 0.0,

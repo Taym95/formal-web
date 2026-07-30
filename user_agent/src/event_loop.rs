@@ -3,9 +3,10 @@ use crossbeam_channel::{Receiver, Sender, bounded, select, unbounded};
 use ipc_messages::content::{
     ClipboardWriteRequested, ColorScheme as MessageColorScheme, Command as ContentCommand,
     ElementClickResult, Event as ContentEvent, EventLoopId, NavigableId, TraversableViewport,
-    ViewportSnapshot, WebviewProviderMessage,
+    ViewportSnapshot,
 };
-use log::{debug, error};
+use ipc_messages::graphics::GraphicsCommand;
+use log::error;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::process::Child;
 use std::sync::Arc;
@@ -60,11 +61,6 @@ pub struct EventLoopEntry {
 
 /// navigation debug output related to HTML navigation continuations.
 fn log_navigation_debug(message: impl AsRef<str>) {
-    let _ = message;
-}
-
-/// render-state debug output related to update-the-rendering work.
-fn log_render_state_debug(message: impl AsRef<str>) {
     let _ = message;
 }
 
@@ -164,29 +160,27 @@ struct EventLoopWorker {
     command_receiver: Receiver<EventLoopCommand>,
     /// Host integration for paint, clipboard, and initial viewport state.
     host: Arc<dyn Embedder>,
-    /// Sender for queued webview-provider updates drained by embedder sync calls.
-    webview_provider_sender: Sender<WebviewProviderMessage>,
+
     /// Deferred shutdown reply completed after the content process acknowledges shutdown.
     stop_reply: Option<Sender<Result<(), String>>>,
     /// flag that mirrors the single in-flight task step in the HTML event loop
     /// processing model.
     awaiting_task_completion: bool,
     pending_task_commands: VecDeque<PendingTaskCommand>,
-    /// IPC sender to the media extension.
-    #[allow(dead_code)]
-    media_extension_sender: Option<ipc::IpcSender<ipc_messages::media::MediaCommand>>,
 }
 
 /// <https://html.spec.whatwg.org/multipage/#event-loop-processing-model>
 fn requires_command_completed_wakeup(command: &ContentCommand) -> bool {
     // These commands correspond to task-bearing steps whose next dequeue must wait for the
     // content side to emit `CommandCompleted`.
+    // DispatchEvent is intentionally excluded: UI events are sent immediately
+    // without waiting for CommandCompleted so they are not queued behind a
+    // stuck task-bearing command. Content still processes them correctly.
     matches!(
         command,
         ContentCommand::CreateEmptyDocument { .. }
             | ContentCommand::CreateLoadedDocument { .. }
             | ContentCommand::DestroyDocument { .. }
-            | ContentCommand::DispatchEvent { .. }
             | ContentCommand::RunBeforeUnload { .. }
             | ContentCommand::UpdateTheRendering { .. }
             | ContentCommand::RunWindowTimer { .. }
@@ -204,11 +198,10 @@ impl EventLoopWorker {
         user_agent_command_sender: Sender<UserAgentCommand>,
         timer_command_sender: Sender<TimerCommand>,
         host: Arc<dyn Embedder>,
-        webview_provider_sender: Sender<WebviewProviderMessage>,
         command_receiver: Receiver<EventLoopCommand>,
         trace_sender: Option<TraceSender>,
         network_extension_sender: ipc::IpcSender<ipc_messages::network::Request>,
-        media_extension_sender: Option<ipc::IpcSender<ipc_messages::media::MediaCommand>>,
+        graphics_sender_for_bootstrap: Option<ipc::IpcSender<GraphicsCommand>>,
     ) -> Result<Self, String> {
         let manifest = crate::ipc_manifest::ContentExtensionManifest::new(process_label);
         let (mut handle, connection) = ipc::ExtensionHandle::launch::<
@@ -226,7 +219,6 @@ impl EventLoopWorker {
         let content_command_sender = connection.sender.clone();
         // Clone senders for forwarding before they're moved into Self.
         let network_extension_sender_fwd = network_extension_sender.clone();
-        let media_extension_sender_fwd = media_extension_sender.clone();
         let worker = Self {
             event_loop_id,
             command_sender,
@@ -238,16 +230,14 @@ impl EventLoopWorker {
             click_waiters: HashMap::new(),
             command_receiver,
             host,
-            webview_provider_sender,
             stop_reply: None,
             awaiting_task_completion: false,
             pending_task_commands: VecDeque::new(),
-            media_extension_sender,
         };
 
         worker.send_command_inner(&ContentCommand::ContentBootstrap {
             net_sender: network_extension_sender_fwd,
-            media_sender: media_extension_sender_fwd,
+            graphics_sender: graphics_sender_for_bootstrap,
             content_command_sender,
             trace_sender,
         })?;
@@ -393,11 +383,7 @@ impl EventLoopWorker {
     }
 
     /// <https://html.spec.whatwg.org/multipage/#event-loop-processing-model>
-    fn handle_content_event_message(
-        &mut self,
-        event: ContentEvent,
-        incoming_shmem: &HashMap<usize, ipc::IpcSharedRegion>,
-    ) -> Result<bool, String> {
+    fn handle_content_event_message(&mut self, event: ContentEvent) -> Result<bool, String> {
         match event {
             ContentEvent::WindowTimerRequested(request) => {
                 // Content already ran the timer initialization algorithm far enough to assign
@@ -525,44 +511,16 @@ impl EventLoopWorker {
                     log::error!("clipboard write failed: {error}");
                 }
             }
-            ContentEvent::PaintReady(frame) => {
-                log_render_state_debug(format!(
-                    "paint ready event_loop={} traversable={} frame={} size=({}, {})",
-                    self.event_loop_id,
-                    frame.traversable_id.0,
-                    frame.frame_id.0,
-                    frame.viewport_width,
-                    frame.viewport_height,
-                ));
-                if let Err(error) =
-                    self.webview_provider_sender
-                        .send(WebviewProviderMessage::PaintFrame {
-                            frame,
-                            shmem_regions: incoming_shmem.clone(),
-                        })
-                {
-                    error!("failed to enqueue webview-provider paint frame: {error}");
-                } else {
-                    // Silently ignore send failures during shutdown — the event
-                    // loop may have already closed.
-                    let _ = self.host.webview_provider_sync();
-                    let _ = self.host.new_frame_rendered();
-                }
+            ContentEvent::RegisterMediaPipeline(_) => {
+                // Content sends CreateMediaPipeline directly to the graphics process.
+                // No UA bookkeeping needed.
             }
-            ContentEvent::RegisterMediaPipeline(request) => {
-                debug!(
-                    "[media] event loop forwarding RegisterMediaPipeline url={}",
-                    request.url
-                );
+            ContentEvent::RenderingOpRequested(navigable_id) => {
+                // Content requests a rendering opportunity (e.g. after a network fetch
+                // completes). Forward to the UA so it can batch and schedule.
                 self.user_agent_command_sender
-                    .send(UserAgentCommand::MediaLoadRequested {
-                        url: request.url,
-                        document_id: request.document_id,
-                        traversable_id: request.traversable_id,
-                        pipeline_id: request.pipeline_id,
-                        video_paint_id: request.video_paint_id,
-                    })
-                    .map_err(|error| format!("failed to send media load request: {error}"))?;
+                    .send(UserAgentCommand::RenderingOpportunityFor { navigable_id })
+                    .map_err(|error| format!("failed to forward rendering op request: {error}"))?;
             }
 
             ContentEvent::ShutdownCompleted => return Ok(false),
@@ -658,7 +616,7 @@ impl EventLoopWorker {
                     };
 
                     match self
-                        .handle_content_event_message(incoming.payload, &incoming.shmem_regions)
+                        .handle_content_event_message(incoming.payload)
                     {
                         Ok(true) => {}
                         Ok(false) => {
@@ -710,10 +668,9 @@ pub fn spawn_event_loop_entry(
     user_agent_command_sender: Sender<UserAgentCommand>,
     timer_command_sender: Sender<TimerCommand>,
     host: Arc<dyn Embedder>,
-    webview_provider_sender: Sender<WebviewProviderMessage>,
     trace_sender: Option<TraceSender>,
     network_extension_sender: ipc::IpcSender<ipc_messages::network::Request>,
-    media_extension_sender: Option<ipc::IpcSender<ipc_messages::media::MediaCommand>>,
+    graphics_extension_sender: Option<ipc::IpcSender<GraphicsCommand>>,
 ) -> Result<EventLoopEntry, String> {
     let (command_sender, command_receiver) = unbounded();
     let mut worker = EventLoopWorker::new(
@@ -722,11 +679,10 @@ pub fn spawn_event_loop_entry(
         user_agent_command_sender,
         timer_command_sender,
         host,
-        webview_provider_sender,
         command_receiver,
         trace_sender,
         network_extension_sender,
-        media_extension_sender,
+        graphics_extension_sender,
     )?;
     let join_handle = thread::Builder::new()
         .name(format!("formal-web-event-loop-{event_loop_id}"))

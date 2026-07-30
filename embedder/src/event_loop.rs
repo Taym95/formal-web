@@ -13,7 +13,7 @@ pub use self::winit_integration::{
 };
 use anyrender::{PaintScene, render_to_buffer};
 use anyrender_vello_cpu::VelloCpuImageRenderer;
-use automation::{AutomationCommand, AutomationVisibleFrameViewport};
+use automation::AutomationCommand;
 use blitz_traits::shell::ColorScheme;
 use ipc_messages::content::WebviewId;
 use kurbo::{Affine, Rect};
@@ -82,17 +82,13 @@ impl Embedder for EventLoopEmbedder {
     }
 
     fn new_webview(&self, webview_id: WebviewId, target_name: String) -> Result<(), String> {
+        log::debug!(
+            "[embedder] Embedder::new_webview webview={:?} target={}",
+            webview_id,
+            target_name
+        );
         self.dispatcher
             .send(FormalWebUserEvent::NewWebview(webview_id, target_name))
-    }
-
-    fn webview_provider_sync(&self) -> Result<(), String> {
-        self.dispatcher
-            .send(FormalWebUserEvent::WebviewProviderSync)
-    }
-
-    fn new_frame_rendered(&self) -> Result<(), String> {
-        self.dispatcher.send(FormalWebUserEvent::NewFrameRendered)
     }
 
     fn request_redraw(&self, webview_id: WebviewId) {
@@ -121,10 +117,58 @@ impl Embedder for EventLoopEmbedder {
     fn clipboard_set_text(&self, text: String, timeout: Duration) -> Result<(), String> {
         clipboard_set_text(text, timeout)
     }
+
+    fn new_web_content_scene(
+        &self,
+        webview_id: WebviewId,
+        scene_bytes: Vec<u8>,
+        font_registrations: Vec<ipc_messages::content::RegisteredFont>,
+        font_data: std::collections::HashMap<usize, Vec<u8>>,
+    ) -> Result<(), String> {
+        self.dispatcher
+            .send(FormalWebUserEvent::NewWebContentScene {
+                webview_id,
+                scene_bytes,
+                font_registrations,
+                font_data,
+            })
+    }
+
+    fn new_web_content_surface(
+        &self,
+        webview_id: WebviewId,
+        surface: ipc::IpcSharedRegion,
+        width: u32,
+        height: u32,
+        generation: u64,
+    ) -> Result<(), String> {
+        self.dispatcher
+            .send(FormalWebUserEvent::NewWebContentSurface {
+                webview_id,
+                surface,
+                width,
+                height,
+                generation,
+            })
+            .map_err(|error| format!("failed to send surface event: {error}"))
+    }
 }
 
 pub enum FormalWebUserEvent {
     RequestRedraw(WebviewId),
+    NewWebContentScene {
+        webview_id: WebviewId,
+        scene_bytes: Vec<u8>,
+        font_registrations: Vec<ipc_messages::content::RegisteredFont>,
+        font_data: std::collections::HashMap<usize, Vec<u8>>,
+    },
+    NewWebContentSurface {
+        webview_id: WebviewId,
+        surface: ipc::IpcSharedRegion,
+        width: u32,
+        height: u32,
+        generation: u64,
+    },
     NavigationRequested {
         webview_id: WebviewId,
         destination_url: String,
@@ -132,8 +176,6 @@ pub enum FormalWebUserEvent {
     NavigationCompleted(NavigationCompleted),
     #[allow(dead_code)]
     NewWebview(WebviewId, String),
-    WebviewProviderSync,
-    NewFrameRendered,
     CreateWindow,
     Automation(AutomationCommand),
     ClipboardRead {
@@ -272,8 +314,8 @@ fn update_window_viewport_snapshot(snapshot: Option<(u32, u32, f32, ColorScheme)
 }
 
 fn automation_screenshot_png(
-    provider: &mut Option<WebviewProvider>,
-    current_webview_id: Option<WebviewId>,
+    _provider: &mut Option<WebviewProvider>,
+    _current_webview_id: Option<WebviewId>,
 ) -> Result<Vec<u8>, String> {
     let Some((width, height, _, _)) = window_viewport_snapshot() else {
         return Err(String::from("content viewport is not initialized"));
@@ -281,13 +323,6 @@ fn automation_screenshot_png(
     if width == 0 || height == 0 {
         return Err(String::from("content viewport is zero-sized"));
     }
-
-    let Some(provider) = provider.as_mut() else {
-        return Err(String::from("webview provider is not initialized"));
-    };
-    let Some(webview_id) = current_webview_id else {
-        return Err(String::from("no current webview is active"));
-    };
 
     let rgba = render_to_buffer::<VelloCpuImageRenderer, _>(
         |painter| {
@@ -298,36 +333,12 @@ fn automation_screenshot_png(
                 None,
                 &Rect::new(0.0, 0.0, f64::from(width), f64::from(height)),
             );
-            let _ = provider.append_web_content_scene(webview_id, painter, Affine::IDENTITY);
         },
         width,
         height,
     );
 
     encode_png_rgba(&rgba, width, height)
-}
-
-fn automation_visible_frame_viewports(
-    provider: &mut Option<WebviewProvider>,
-    current_webview_id: Option<WebviewId>,
-) -> Result<Vec<AutomationVisibleFrameViewport>, String> {
-    let Some(provider) = provider.as_mut() else {
-        return Err(String::from("webview provider is not initialized"));
-    };
-    let Some(webview_id) = current_webview_id else {
-        return Err(String::from("no current webview is active"));
-    };
-
-    Ok(provider
-        .visible_frame_viewports(webview_id)
-        .into_iter()
-        .map(|viewport| AutomationVisibleFrameViewport {
-            offset_x: viewport.offset_x,
-            offset_y: viewport.offset_y,
-            width: viewport.width,
-            height: viewport.height,
-        })
-        .collect())
 }
 
 fn encode_png_rgba(rgba: &[u8], width: u32, height: u32) -> Result<Vec<u8>, String> {

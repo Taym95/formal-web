@@ -49,11 +49,8 @@ export default function (pi: ExtensionAPI) {
     const chain: ChainEntry[] = [];
     const absTarget = path.resolve(targetPath);
 
-    // Root AGENTS.md always comes first.
-    const agentsPath = path.join(root, "AGENTS.md");
-    if (fs.existsSync(agentsPath)) {
-      chain.push({ dir: root, readme: agentsPath });
-    }
+    // AGENTS.md is excluded — it is always loaded at session start.
+    // Only walk README.md files from the chain.
 
     // Determine the relative directory path from root to target.
     const relPath = path.relative(root, absTarget);
@@ -145,7 +142,7 @@ export default function (pi: ExtensionAPI) {
     label: "Readme Chain",
     description:
       "Walk up the directory tree from a given file or directory path and collect all " +
-      "AGENTS.md and README.md files in the chain. " +
+      "nested README.md files in the chain. " +
       "Use this before editing a file to understand the project conventions for that " +
       "part of the codebase. " +
       "If no path is given, the current working directory is used.",
@@ -158,10 +155,10 @@ export default function (pi: ExtensionAPI) {
       ),
     }),
     promptSnippet:
-      "Collect the documentation chain (AGENTS.md + nested README.md files) for a file path",
+      "Collect the documentation chain (nested README.md files) for a file path",
     promptGuidelines: [
       "Before editing a file in a new directory, use readme_chain to read the " +
-      "documentation chain (AGENTS.md + all README.md files) for that file's path.",
+      "documentation chain (all README.md files) for that file's path.",
     ],
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       const cwd = ctx.cwd;
@@ -186,7 +183,7 @@ export default function (pi: ExtensionAPI) {
     if (isIgnored(filePath, ctx.cwd)) return;
 
     const fileName = path.basename(filePath);
-    if (fileName === "README.md" || fileName === "AGENTS.md") {
+    if (fileName === "README.md") {
       const dir = path.resolve(ctx.cwd, path.dirname(filePath));
       consulted.add(dir);
     }
@@ -196,7 +193,7 @@ export default function (pi: ExtensionAPI) {
 
   pi.registerCommand("readme-chain", {
     description:
-      "Walk up the directory tree from a path and display all AGENTS.md and README.md " +
+      "Walk up the directory tree from a path and display all README.md " +
       "files in the documentation chain. Usage: /readme-chain [path]",
     handler: async (args, ctx) => {
       const targetPath = args?.trim() || ctx.cwd;

@@ -1,11 +1,18 @@
+//! Per-webview compositor — receives PaintFrames and VideoFrames, composes
+//! them into a single final scene, and publishes the result plus hit-testing
+//! info back to the user agent.
+
 use anyrender::{PaintScene, Scene as RenderScene};
 use ipc_messages::content::{
     EmbedBackgroundPolicy, EmbedSite, FontTransportReceiver, FrameCompositionMetadata, FrameId,
     IframeEmbedSite, RecordedScene,
 };
+use ipc_messages::graphics::FrameHitInfo;
+
+use crate::ComposedScene;
 use ipc_messages::media::VideoPaintId;
 use kurbo::{Affine, Point, Rect, RoundedRect, Shape};
-use log::trace;
+use log::{info, trace};
 use peniko::{Color, Fill, ImageAlphaType, ImageBrushRef, ImageData, ImageFormat};
 use std::collections::{HashMap, HashSet};
 use std::env;
@@ -40,15 +47,6 @@ struct NavigableContainerLayout {
     clip_bounds: Rect,
     root_clip_bounds: Rect,
     child_local_from_parent: Affine,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct VisibleFrameViewport {
-    pub frame_id: FrameId,
-    pub offset_x: f32,
-    pub offset_y: f32,
-    pub width: u32,
-    pub height: u32,
 }
 
 #[derive(Clone)]
@@ -88,22 +86,25 @@ pub struct Compositor {
     pending_frames: HashMap<FrameId, CachedFrame>,
     replace_root_on_next_paint: bool,
     resolved_tree_dirty: bool,
-    /// Latest frame per video paint id. Updated by the user agent before compose_scene.
-    /// Never cleared — stale frame stays until superseded or pipeline destroyed.
+    /// Latest frame per video paint id.
     video_frames: HashMap<VideoPaintId, CompositorVideoFrame>,
 }
 
 impl Compositor {
     pub fn note_navigation_finalized(&mut self) {
         self.pending_frames.clear();
+        self.video_frames.clear();
         self.replace_root_on_next_paint = true;
         self.resolved_tree_dirty = true;
     }
 
-    /// Called by the user agent when a new VideoFrame arrives from the media process.
-    /// Non-blocking — just replaces the slot.
-    pub fn update_video_frame(&mut self, frame: CompositorVideoFrame) {
+    /// Insert a decoded video frame. Returns `true` when this is the first
+    /// video frame arriving (transition from idle to animated), which the
+    /// graphics process can use to trigger a one-time wakeup composition.
+    pub fn update_video_frame(&mut self, frame: CompositorVideoFrame) -> bool {
+        let was_idle = self.video_frames.is_empty();
         self.video_frames.insert(frame.video_paint_id, frame);
+        was_idle
     }
 
     pub fn remove_video_frame(&mut self, paint_id: VideoPaintId) {
@@ -169,7 +170,17 @@ impl Compositor {
             return;
         }
 
-        if self.root_frame_id.is_none() && is_root_candidate {
+        // Always update root_frame_id when a root candidate arrives,
+        // even if the frame_id differs from the current root. During
+        // navigation, the content process creates a new document with a
+        // new frame_id, and we need to point the compositor at the latest
+        // root frame regardless of whether NavigationFinalized has
+        // arrived yet.
+        if is_root_candidate && self.root_frame_id != Some(frame_id) {
+            info!(
+                "[render-pipe] Compositor update root from {:?} to {}",
+                self.root_frame_id, frame_id.0
+            );
             self.root_frame_id = Some(frame_id);
         }
 
@@ -181,20 +192,182 @@ impl Compositor {
         self.root_frame_id
     }
 
-    pub fn compose_scene(&mut self, font_receiver: &FontTransportReceiver) -> Option<RenderScene> {
+    /// True when the compositor has active video content that requires
+    /// continuous re-rendering even without user input.
+    /// True when the compositor has active video content that requires
+    /// continuous re-rendering even without user input.
+    pub fn has_animated_content(&self) -> bool {
+        !self.video_frames.is_empty()
+    }
+
+    pub fn has_valid_viewport(&self) -> bool {
+        self.root_frame_id
+            .and_then(|id| self.committed_frames.get(&id))
+            .map(|frame| frame.viewport_width > 0 && frame.viewport_height > 0)
+            .unwrap_or(false)
+    }
+
+    /// True when the root frame is committed and all child frames listed in
+    /// the root's embed sites have also been received. Used by the graphics
+    /// process to delay composition until all embedded content is available.
+    pub fn all_children_received(&self) -> bool {
+        let root_id = match self.root_frame_id {
+            Some(id) => id,
+            None => return false,
+        };
+        let root = match self.committed_frames.get(&root_id) {
+            Some(frame) => frame,
+            None => return false,
+        };
+        for site in &root.composition.embed_sites {
+            if let EmbedSite::Frame(iframe) = site {
+                if !self.committed_frames.contains_key(&iframe.child_frame_id) {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    /// Compose the final scene for this compositor and return it with
+    /// hit-testing info. Caller is responsible for resetting state.
+    pub fn compose_scene(
+        &mut self,
+        font_receiver: &FontTransportReceiver,
+        webview_id: ipc_messages::content::WebviewId,
+    ) -> Option<ComposedScene> {
         let root_frame_id = self.root_frame_id?;
         self.reset_composed_frame_state();
         self.prepare_root_frame(root_frame_id)?;
         let mut stack = HashSet::from([root_frame_id]);
         let scene = self.compose_frame(root_frame_id, font_receiver, &mut stack, Affine::IDENTITY);
         self.resolved_tree_dirty = false;
-        scene
+
+        let scene = scene?;
+        let frame_hit_info = self.build_frame_hit_info(webview_id);
+
+        Some(ComposedScene {
+            webview_id,
+            scene,
+            frame_hit_info,
+            child_viewports: HashMap::new(),
+            child_frame_to_webview: HashMap::new(),
+            animating: false,
+        })
+    }
+
+    fn build_frame_hit_info(
+        &self,
+        webview_id: ipc_messages::content::WebviewId,
+    ) -> Vec<FrameHitInfo> {
+        let mut hit_info = Vec::new();
+        let Some(root_frame_id) = self.root_frame_id else {
+            return hit_info;
+        };
+        // Root frame: clip is its own viewport in root space.
+        if let Some(frame) = self.committed_frames.get(&root_frame_id) {
+            let root_clip = [
+                0.0,
+                0.0,
+                f64::from(frame.viewport_width),
+                f64::from(frame.viewport_height),
+            ];
+            let child_ids: Vec<FrameId> = frame
+                .child_frames
+                .iter()
+                .map(|c| c.child_frame_id)
+                .collect();
+            hit_info.push(FrameHitInfo {
+                frame_id: root_frame_id,
+                webview_id,
+                parent_frame_id: None,
+                viewport_width: frame.viewport_width,
+                viewport_height: frame.viewport_height,
+                root_clip_bounds: root_clip,
+                child_to_parent_transform: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+                child_frame_ids: child_ids,
+            });
+        }
+
+        // Children: each child's clip in root space comes from the parent's
+        // NavigableContainerLayout.root_clip_bounds (the iframe's visible clip
+        // rect in root coordinates), NOT from the child's own viewport dimensions.
+        self.collect_child_hit_info(root_frame_id, webview_id, &mut hit_info);
+        hit_info
+    }
+
+    /// Recursively collect hit-testing info for child frames only.
+    /// Each child's root_clip_bounds is taken directly from the parent's
+    /// NavigableContainerLayout, preserving the iframe's visible clip area
+    /// (which may be smaller than the child's full viewport).
+    fn collect_child_hit_info(
+        &self,
+        parent_frame_id: FrameId,
+        webview_id: ipc_messages::content::WebviewId,
+        hit_info: &mut Vec<FrameHitInfo>,
+    ) {
+        let Some(parent_frame) = self.committed_frames.get(&parent_frame_id) else {
+            return;
+        };
+        for child_layout in &parent_frame.child_frames {
+            let child_frame_id = child_layout.child_frame_id;
+            let Some(child_frame) = self.committed_frames.get(&child_frame_id) else {
+                continue;
+            };
+
+            // Use the parent's layout clip rect for this child — this is the
+            // iframe's visible area in root space, matching hit_test_frame on main.
+            let root_clip = [
+                child_layout.root_clip_bounds.x0,
+                child_layout.root_clip_bounds.y0,
+                child_layout.root_clip_bounds.x1,
+                child_layout.root_clip_bounds.y1,
+            ];
+
+            let child_ids: Vec<FrameId> = child_frame
+                .child_frames
+                .iter()
+                .map(|c| c.child_frame_id)
+                .collect();
+
+            let parent_transform = if let Some(parent_id) = child_frame.parent_frame_id {
+                if let Some(parent) = self.committed_frames.get(&parent_id) {
+                    parent
+                        .child_frames
+                        .iter()
+                        .find(|c| c.child_frame_id == child_frame_id)
+                        .map(|layout| {
+                            let t = layout.child_local_from_parent.as_coeffs();
+                            [t[0], t[1], t[2], t[3], t[4], t[5]]
+                        })
+                        .unwrap_or([1.0, 0.0, 0.0, 1.0, 0.0, 0.0])
+                } else {
+                    [1.0, 0.0, 0.0, 1.0, 0.0, 0.0]
+                }
+            } else {
+                [1.0, 0.0, 0.0, 1.0, 0.0, 0.0]
+            };
+
+            hit_info.push(FrameHitInfo {
+                frame_id: child_frame_id,
+                webview_id,
+                parent_frame_id: child_frame.parent_frame_id,
+                viewport_width: child_frame.viewport_width,
+                viewport_height: child_frame.viewport_height,
+                root_clip_bounds: root_clip,
+                child_to_parent_transform: parent_transform,
+                child_frame_ids: child_ids,
+            });
+
+            // Recurse into nested children.
+            self.collect_child_hit_info(child_frame_id, webview_id, hit_info);
+        }
     }
 
     pub fn visible_frame_viewports(
         &mut self,
         font_receiver: &FontTransportReceiver,
-    ) -> Vec<VisibleFrameViewport> {
+    ) -> Vec<super::VisibleFrameViewport> {
         let refresh_needed = self.resolved_tree_dirty
             || self
                 .root_frame_id
@@ -202,7 +375,19 @@ impl Compositor {
                 .and_then(|frame| frame.resolved_viewport.as_ref())
                 .is_none();
         if refresh_needed {
-            let _ = self.compose_scene(font_receiver);
+            if let Some(root_frame_id) = self.root_frame_id {
+                self.reset_composed_frame_state();
+                if self.prepare_root_frame(root_frame_id).is_some() {
+                    let mut stack = HashSet::from([root_frame_id]);
+                    let _ = self.compose_frame(
+                        root_frame_id,
+                        font_receiver,
+                        &mut stack,
+                        Affine::IDENTITY,
+                    );
+                }
+                self.resolved_tree_dirty = false;
+            }
         }
 
         let Some(root_frame_id) = self.root_frame_id else {
@@ -232,7 +417,12 @@ impl Compositor {
             );
         }
         if refresh_needed {
-            let _ = self.compose_scene(font_receiver);
+            let root_frame_id = self.root_frame_id?;
+            self.reset_composed_frame_state();
+            self.prepare_root_frame(root_frame_id)?;
+            let mut stack = HashSet::from([root_frame_id]);
+            let _ = self.compose_frame(root_frame_id, font_receiver, &mut stack, Affine::IDENTITY);
+            self.resolved_tree_dirty = false;
         }
 
         let root_frame_id = self.root_frame_id?;
@@ -257,18 +447,18 @@ impl Compositor {
         if input_debug_enabled() {
             trace!("[input-debug][compositor] composing frame {}", frame_id.0);
         }
+
         let parent_viewport = self
             .committed_frames
             .get(&frame_id)?
             .resolved_viewport
             .clone()?;
 
-        // Snapshot all per-frame data up front, releasing borrows on self.
         let (embed_sites, decoded_scene) = {
             let frame = self.committed_frames.get(&frame_id)?;
             let embed_sites = frame.composition.embed_sites.clone();
-            // The decoded scene is consumed; clone it before dropping the frame borrow.
             let scene = frame.scene.clone().into_scene(font_receiver);
+
             (embed_sites, scene)
         };
 
@@ -348,7 +538,6 @@ impl Compositor {
                 }
                 EmbedSite::Video(video_data) => {
                     let Some(video_frame) = self.video_frames.get(&video_data.paint_id) else {
-                        // First-frame not yet arrived; nothing to paint.
                         if input_debug_enabled() {
                             trace!(
                                 "[input-debug][compositor] video paint_id={:?} no frame yet",
@@ -358,20 +547,7 @@ impl Compositor {
                         continue;
                     };
                     let transform = Affine::new(video_data.layout.transform);
-                    trace!(
-                        "[compositor] video paint_id={:?} frame={}x{} transform=({:.1},{:.1}) clip_bounds={:?}",
-                        video_data.paint_id,
-                        video_frame.width,
-                        video_frame.height,
-                        transform.as_coeffs()[4],
-                        transform.as_coeffs()[5],
-                        video_data.layout.clip_bounds
-                    );
 
-                    let transform = Affine::new(video_data.layout.transform);
-
-                    // Compute clip bounds in local coordinates (same approach as
-                    // embed_local_clip for iframes).
                     let tx = transform.as_coeffs()[4];
                     let ty = transform.as_coeffs()[5];
                     let clip_rect = Rect::new(
@@ -380,7 +556,6 @@ impl Compositor {
                         video_data.layout.clip_bounds[2] - tx,
                         video_data.layout.clip_bounds[3] - ty,
                     );
-                    // Use rounded clip if the element has border-radius.
                     let rounded_clip: Option<RoundedRect> = if video_data.clip_radius > 0.0 {
                         Some(RoundedRect::from_rect(clip_rect, video_data.clip_radius))
                     } else {
@@ -388,7 +563,6 @@ impl Compositor {
                     };
                     let local_clip = clip_rect;
 
-                    // Build a peniko ImageData from the RGBA8 frame bytes.
                     let pixel_data = video_frame.data.clone();
                     let image_data = ImageData {
                         data: peniko::Blob::from(pixel_data.to_vec()),
@@ -398,11 +572,6 @@ impl Compositor {
                         height: video_frame.height,
                     };
 
-                    // Compute a transform mapping the video's natural size to fill
-                    // the clip rect at the correct screen position.
-                    // The push_clip_layer clips at (local_clip) + (transform translation),
-                    // but does NOT transform subsequent drawing — so draw_image must
-                    // apply both the scale AND position translation.
                     let local_w = local_clip.width();
                     let local_h = local_clip.height();
                     let scale_x = if video_frame.width > 0 {
@@ -415,8 +584,6 @@ impl Compositor {
                     } else {
                         1.0
                     };
-                    // Include the clip layer's translation so the image is drawn at the
-                    // element's screen position (same pattern as iframe child_transform).
                     let video_transform = Affine::new([scale_x, 0.0, 0.0, scale_y, tx, ty]);
 
                     match rounded_clip {
@@ -562,7 +729,7 @@ impl Compositor {
     fn collect_visible_frame_viewports(
         &self,
         frame_id: FrameId,
-        viewports: &mut Vec<VisibleFrameViewport>,
+        viewports: &mut Vec<super::VisibleFrameViewport>,
     ) {
         let Some(frame) = self.committed_frames.get(&frame_id) else {
             return;
@@ -572,10 +739,7 @@ impl Compositor {
             let viewport_width = child.root_clip_bounds.width().ceil().max(1.0) as u32;
             let viewport_height = child.root_clip_bounds.height().ceil().max(1.0) as u32;
 
-            // Publish embed-site-derived child viewport bounds even before the child content
-            // has committed its first frame. Cross-origin iframes need that first viewport to
-            // trigger their initial rendering opportunity.
-            viewports.push(VisibleFrameViewport {
+            viewports.push(super::VisibleFrameViewport {
                 frame_id: child.child_frame_id,
                 offset_x: child.root_clip_bounds.x0 as f32,
                 offset_y: child.root_clip_bounds.y0 as f32,
@@ -646,8 +810,6 @@ impl Compositor {
             frame_id,
             local_x: point.x as f32,
             local_y: point.y as f32,
-            // Child embed sites should remain targetable before the child process commits its
-            // first frame, so an unresolved child frame still reports as a child-frame hit.
             is_child_frame: frame.is_none_or(|frame| frame.parent_frame_id.is_some()),
             has_child_frames: frame.is_some_and(|frame| !frame.child_frames.is_empty()),
         })

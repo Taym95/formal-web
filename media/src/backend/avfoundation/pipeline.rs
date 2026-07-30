@@ -5,7 +5,7 @@ use objc2::MainThreadMarker;
 
 use ipc_messages::media::MediaPipelineId;
 
-use crate::backend::{BackendEvent, PipelineHandle};
+use crate::backend::{MediaBackendEvent, PipelineHandle};
 
 use super::av_sys::{AvPlayer, AvVideoOutput, url_from_string};
 
@@ -13,7 +13,7 @@ use super::av_sys::{AvPlayer, AvVideoOutput, url_from_string};
 // AvfPipeline
 //
 // Runs inside the select loop on the main thread.
-// Frames are sent as BackendEvent::Frame.
+// Frames are sent as MediaBackendEvent::Frame.
 // ---------------------------------------------------------------------------
 
 pub struct AvfPipeline {
@@ -21,16 +21,19 @@ pub struct AvfPipeline {
     player: AvPlayer,
     item: super::av_sys::AvPlayerItem,
     video_output: AvVideoOutput,
-    event_tx: Sender<BackendEvent>,
+    event_tx: Sender<MediaBackendEvent>,
     destroyed: Cell<bool>,
     duration_reported: Cell<bool>,
+    /// True when the player was playing (rate > 0) and then stopped (rate = 0),
+    /// indicating the video reached end of stream.
+    eos_sent: Cell<bool>,
 }
 
 impl AvfPipeline {
     pub fn new(
         id: MediaPipelineId,
         url_string: String,
-        event_tx: Sender<BackendEvent>,
+        event_tx: Sender<MediaBackendEvent>,
     ) -> Result<Self, String> {
         let mtm = MainThreadMarker::new()
             .ok_or_else(|| String::from("AvfPipeline must be created on the main thread"))?;
@@ -57,6 +60,7 @@ impl AvfPipeline {
             event_tx,
             destroyed: Cell::new(false),
             duration_reported: Cell::new(false),
+            eos_sent: Cell::new(false),
         })
     }
 }
@@ -78,6 +82,10 @@ impl PipelineHandle for AvfPipeline {
         log::info!("[avf] p{}: seek to {position_secs}s", self.id.0);
         self.player.seek(position_secs);
         Ok(())
+    }
+
+    fn is_done(&self) -> bool {
+        self.eos_sent.get()
     }
 
     fn sample(&self) {
@@ -102,6 +110,28 @@ impl PipelineHandle for AvfPipeline {
             }
         }
 
+        // Detect end of stream: rate dropped to 0 after playing.
+        if !self.eos_sent.get() && self.duration_reported.get() {
+            let rate = self.player.rate();
+            if rate == 0.0
+                && self.item.status() == objc2_av_foundation::AVPlayerItemStatus::ReadyToPlay
+            {
+                // The player stopped. Check if we're at or past the duration.
+                let current = self.item.current_time_secs();
+                let duration = self.item.duration_secs();
+                if duration > 0.0 && current >= duration - 0.1 {
+                    log::info!(
+                        "[avf] p{}: end of stream (t={current:.2}s / d={duration:.2}s)",
+                        self.id.0
+                    );
+                    self.eos_sent.set(true);
+                    let _ = self.event_tx.send(MediaBackendEvent::Eos {
+                        pipeline_id: self.id,
+                    });
+                }
+            }
+        }
+
         // Poll for frames.
         let host_secs = super::av_sys::time::host_time_seconds();
         let item_time = self.video_output.item_time_for_host_time(host_secs);
@@ -113,7 +143,7 @@ impl PipelineHandle for AvfPipeline {
                     {
                         let _ = self
                             .event_tx
-                            .send(crate::backend::BackendEvent::Frame(frame));
+                            .send(crate::backend::MediaBackendEvent::Frame(frame));
                     }
                 }
             }

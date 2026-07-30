@@ -42,7 +42,8 @@ use js_engine::ExecutionContext;
 use ipc_messages::content::Command::{
     ClickElement, CompleteDocumentFetch, ContentBootstrap, CreateEmptyDocument,
     CreateLoadedDocument, DestroyDocument, DispatchEvent, EvaluateScript, FailDocumentFetch,
-    RunWindowTimer, SetTraversableViewport, SetViewport, Shutdown, UpdateTheRendering,
+    NotifyVideoEnded, RunWindowTimer, SetTraversableViewport, SetViewport, Shutdown,
+    UpdateTheRendering,
 };
 use ipc_messages::content::{
     BeforeUnloadCheckId, ClipboardWriteRequested, ColorScheme as MessageColorScheme, Command,
@@ -54,7 +55,7 @@ use ipc_messages::content::{
     TraversableViewport, ViewportSnapshot, WebviewId, WindowTimerKey,
 };
 use ipc_messages::media::{VideoEmbedData, VideoPaintId};
-use log::{debug, error, trace, warn};
+use log::{debug, error, info, trace, warn};
 use std::{
     cell::RefCell,
     collections::{HashMap, HashSet},
@@ -127,6 +128,9 @@ struct LocalContentState {
 }
 
 pub(crate) type LocalContentStateRef = Arc<Mutex<LocalContentState>>;
+
+/// Tracks the playback state of a video element across paints.
+/// Stored in the paint registry instead of on the element for now.
 
 pub(crate) fn new_document_fetch_id() -> DocumentFetchId {
     DocumentFetchId::new()
@@ -372,8 +376,6 @@ pub(crate) struct ContentDocument {
     frame_id: FrameId,
     document: Rc<RefCell<BaseDocument>>,
     settings: EnvironmentSettingsObject,
-    // Latched while an update-the-rendering attempt is queued or waiting on critical resources.
-    pending_update_the_rendering: bool,
     pending_document_load: Option<PendingDocumentLoad>,
     navigable_container_states: HashMap<usize, NavigableContainerState>,
     viewport_offset_x: f32,
@@ -397,7 +399,7 @@ pub(crate) struct ContentProcess {
     active_documents_by_traversable: HashMap<NavigableId, DocumentId>,
     font_namespace: u64,
     font_sender: FontTransportSender,
-    navigation_tracer: TLATracer,
+    tla_tracer: TLATracer,
     /// Shared clipboard cache. The embedder writes prefetched clipboard text
     /// here before dispatching paste events; `ShellProvider::get_clipboard_text`
     /// reads from this cache instead of doing a blocking IPC round-trip.
@@ -414,10 +416,14 @@ pub(crate) struct ContentProcess {
     wasm: crate::wasm::ContentWasmState,
 
     video_paint_registry: Rc<RefCell<HashMap<(DocumentId, usize), VideoPaintId>>>,
+    /// (DocumentId, node_id) pairs of video elements that have reached
+    /// end-of-stream. Checked alongside the registry to determine whether
+    /// the document has active (non-ended) video.
+    ended_video_nodes: HashSet<(DocumentId, usize)>,
     /// Direct sender to the net extension. Set during DirectChannelsSetup.
     network_extension_sender: ipc::IpcSender<ipc_messages::network::Request>,
-    /// Direct sender to the media extension. Set during ContentBootstrap.
-    media_extension_sender: Option<ipc::IpcSender<ipc_messages::media::MediaCommand>>,
+    /// Direct sender to the graphics process (composition + media). Set during ContentBootstrap.
+    graphics_sender: Option<ipc::IpcSender<ipc_messages::graphics::GraphicsCommand>>,
     /// This content process's own command sender, used by net for direct response routing.
     content_command_sender: ipc::IpcSender<Command>,
     realm_parent: Engine,
@@ -429,7 +435,7 @@ impl ContentProcess {
         _wasm_signal_sender: crossbeam_channel::Sender<()>,
         event_loop_id: EventLoopId,
         network_extension_sender: ipc::IpcSender<ipc_messages::network::Request>,
-        media_extension_sender: Option<ipc::IpcSender<ipc_messages::media::MediaCommand>>,
+        graphics_sender: Option<ipc::IpcSender<ipc_messages::graphics::GraphicsCommand>>,
         content_command_sender: ipc::IpcSender<Command>,
         trace_sender: Option<TraceSender>,
     ) -> Self {
@@ -446,14 +452,15 @@ impl ContentProcess {
             active_documents_by_traversable: HashMap::new(),
             font_namespace: new_font_namespace(),
             font_sender: FontTransportSender::default(),
-            navigation_tracer: TLATracer::new("Navigation", "formal-web:content", trace_sender),
+            tla_tracer: TLATracer::new("Navigation", "formal-web:content", trace_sender),
             clipboard_cache: clipboard_cache.clone(),
             new_document_registry: Rc::new(RefCell::new(HashMap::new())),
             video_paint_registry: Rc::new(RefCell::new(HashMap::new())),
+            ended_video_nodes: HashSet::new(),
             #[cfg(all(boa_backend, feature = "wasm"))]
             wasm: crate::wasm::ContentWasmState::new(_wasm_signal_sender),
             network_extension_sender,
-            media_extension_sender,
+            graphics_sender,
             content_command_sender,
             realm_parent: Engine::new(),
         }
@@ -577,9 +584,10 @@ impl ContentProcess {
         document.viewport_offset_x = viewport_state.offset_x;
         document.viewport_offset_y = viewport_state.offset_y;
 
-        // Repaint immediately so embed-site geometry (including iframe clip/transform)
-        // reflects the new viewport instead of waiting for a later scroll/input tick.
-        self.request_render_update(traversable_id, document_id, "traversable_viewport")
+        // The UA notes a rendering opportunity after sending this command,
+        // so embed-site geometry (including iframe clip/transform) will be
+        // repainted on the next UpdateTheRendering cycle.
+        Ok(())
     }
 
     fn register_pending_handler(
@@ -790,7 +798,6 @@ impl ContentProcess {
                     frame_id,
                     document,
                     settings,
-                    pending_update_the_rendering: false,
                     pending_document_load: None,
                     navigable_container_states: HashMap::new(),
                     viewport_offset_x: 0.0,
@@ -912,8 +919,9 @@ impl ContentProcess {
                 },
             ))
             .map_err(|error| format!("failed to send finalize-navigation event: {error}"))?;
-
-        self.update_the_rendering(traversable_id, document_id)
+        // The UA handles the rendering opportunity upon receiving
+        // FinalizeNavigation, so we don't request one here.
+        Ok(())
     }
 
     /// <https://html.spec.whatwg.org/#creating-a-new-browsing-context>
@@ -943,8 +951,8 @@ impl ContentProcess {
         // resource_selection_algorithm can register paint IDs.
         if let Err(error) = with_global_scope(settings.ec(), |global_scope| {
             global_scope.set_video_paint_registry(Rc::clone(&self.video_paint_registry));
-            if let Some(ref sender) = self.media_extension_sender {
-                global_scope.set_media_extension_sender(sender.clone());
+            if let Some(ref sender) = self.graphics_sender {
+                global_scope.set_graphics_sender(sender.clone());
             }
             Ok(())
         }) {
@@ -979,7 +987,6 @@ impl ContentProcess {
                 frame_id,
                 document,
                 settings,
-                pending_update_the_rendering: false,
                 pending_document_load: None,
                 navigable_container_states: HashMap::new(),
                 viewport_offset_x: viewport_state
@@ -1045,8 +1052,8 @@ impl ContentProcess {
         // resource_selection_algorithm can register paint IDs.
         if let Err(error) = with_global_scope(settings.ec(), |global_scope| {
             global_scope.set_video_paint_registry(Rc::clone(&self.video_paint_registry));
-            if let Some(ref sender) = self.media_extension_sender {
-                global_scope.set_media_extension_sender(sender.clone());
+            if let Some(ref sender) = self.graphics_sender {
+                global_scope.set_graphics_sender(sender.clone());
             }
             Ok(())
         }) {
@@ -1078,7 +1085,6 @@ impl ContentProcess {
                 frame_id,
                 document: Rc::clone(&document),
                 settings,
-                pending_update_the_rendering: false,
                 pending_document_load: Some(PendingDocumentLoad {
                     finalize_url: final_url.clone(),
                     scripts: deferred_scripts,
@@ -1335,7 +1341,7 @@ impl ContentProcess {
         if let Some(navigable_id) = navigable_id {
             let outcome = if canceled { "Aborted" } else { "Approved" };
             verification::tla_log!(
-                self.navigation_tracer,
+                self.tla_tracer,
                 "RunBeforeUnload",
                 navigable_id,
                 navigation_id,
@@ -1355,36 +1361,22 @@ impl ContentProcess {
 
     fn update_the_rendering(
         &mut self,
-        traversable_id: NavigableId,
+        navigable_id: NavigableId,
         document_id: DocumentId,
     ) -> Result<(), String> {
-        self.request_render_update(traversable_id, document_id, "command")
-    }
-
-    fn request_render_update(
-        &mut self,
-        traversable_id: NavigableId,
-        document_id: DocumentId,
-        reason: &str,
-    ) -> Result<(), String> {
-        let Some(document) = self.documents.get_mut(&document_id) else {
-            return Ok(());
-        };
         log_render_state_debug(format!(
-            "queue update-the-rendering traversable={} document={} reason={}",
-            traversable_id, document_id, reason,
+            "process update-the-rendering navigable={} document={}",
+            navigable_id, document_id,
         ));
-        document.pending_update_the_rendering = true;
-        self.continue_updating_the_rendering(traversable_id, document_id)
+        self.continue_updating_the_rendering(navigable_id, document_id)
     }
 
     /// <https://html.spec.whatwg.org/#update-the-rendering>
     fn continue_updating_the_rendering(
         &mut self,
-        traversable_id: NavigableId,
+        navigable_id: NavigableId,
         document_id: DocumentId,
     ) -> Result<(), String> {
-        let event_sender = self.event_sender.clone();
         let video_paint_registry = Rc::clone(&self.video_paint_registry);
         let paint_frame = {
             let document = self
@@ -1392,25 +1384,7 @@ impl ContentProcess {
                 .get_mut(&document_id)
                 .ok_or_else(|| format!("unknown document id: {document_id}"))?;
 
-            if !document.pending_update_the_rendering {
-                log_render_state_debug(format!(
-                    "skip paint no pending render traversable={} document={}",
-                    traversable_id, document_id,
-                ));
-                return Ok(());
-            }
-
             document.document.borrow_mut().handle_messages();
-
-            if document.document.borrow().has_pending_critical_resources() {
-                log_render_state_debug(format!(
-                    "skip paint pending critical resources traversable={} document={}",
-                    traversable_id, document_id,
-                ));
-                return Ok(());
-            }
-
-            document.pending_update_the_rendering = false;
 
             let frame_timestamp_ms = document.settings.current_time_millis();
 
@@ -1431,6 +1405,13 @@ impl ContentProcess {
                 document_guard.resolve(animation_time);
             }
 
+            info!(
+                "[render-pipe] Content render navigable={} document={} iframes={} video_registry_entries={}",
+                navigable_id,
+                document_id,
+                document.navigable_container_states.len(),
+                video_paint_registry.borrow().len()
+            );
             let paint_frame = {
                 let document_guard = document.document.borrow();
                 let viewport = document_guard.viewport().clone();
@@ -1460,27 +1441,64 @@ impl ContentProcess {
                     self.font_sender
                         .prepare_scene(self.font_namespace, scene, &mut next_shmem_key);
                 log_render_state_debug(format!(
-                    "emit paint traversable={} document={} size=({}, {})",
-                    traversable_id, document_id, width, height,
+                    "emit paint navigable={} document={} size=({}, {})",
+                    navigable_id, document_id, width, height,
                 ));
+                // Set animating=true when this document has video elements.
+                // Graphics forwards this to the UA which keeps re-noting
+                // rendering opportunities to drive video animation.
+                let has_video = video_paint_registry
+                    .borrow()
+                    .keys()
+                    .any(|(doc_id, node_id)| {
+                        let ended = self.ended_video_nodes.contains(&(*doc_id, *node_id));
+                        if ended {}
+                        *doc_id == document_id && !ended
+                    });
+                info!(
+                    "[render-pipe] Content paint_frame ready navigable={} frame={} size=({},{}) has_video={} embed_sites={}",
+                    navigable_id,
+                    document.frame_id.0,
+                    width,
+                    height,
+                    has_video,
+                    composition.embed_sites.len()
+                );
                 let (paint_frame, shmem_data) = PaintFrame::new(
-                    WebviewId(traversable_id),
+                    WebviewId(navigable_id),
                     document.frame_id,
                     width,
                     height,
                     composition,
                     scene,
                     &mut next_shmem_key,
+                    has_video,
                 )?;
                 (paint_frame, shmem_data)
             };
             paint_frame
         };
 
+        verification::tla_log!(
+            self.tla_tracer,
+            -> "RenderingOpportunity",
+            "UpdateTheRendering",
+            navigable_id
+        );
+
         let (paint_frame, shmem_map) = paint_frame;
-        event_sender
-            .send_with_shmem_map(ContentEvent::PaintReady(paint_frame), shmem_map)
-            .map_err(|error| format!("failed to send paint frame: {error}"))
+
+        // Send the PaintFrame directly to the graphics process for composition.
+        if let Some(graphics_sender) = &self.graphics_sender {
+            let command = ipc_messages::graphics::GraphicsCommand::PaintFrame {
+                frame: paint_frame.clone(),
+            };
+            if let Err(error) = graphics_sender.send_with_shmem_map(command, shmem_map.clone()) {
+                error!("failed to send paint frame to graphics process: {error}");
+            }
+        }
+
+        Ok(())
     }
 
     fn node_absolute_border_origin(
@@ -1714,7 +1732,11 @@ impl ContentProcess {
                     response_url,
                 ));
                 self.continue_document_load(document_id)?;
-                self.request_render_update(traversable_id, document_id, "resource_fetch_complete")?;
+                self.event_sender
+                    .send(ContentEvent::RenderingOpRequested(traversable_id))
+                    .map_err(|error| {
+                        format!("failed to request rendering op for resource fetch: {error}")
+                    })?;
                 Ok(())
             }
             PendingNetworkHandler::DeferredScript {
@@ -1748,11 +1770,11 @@ impl ContentProcess {
                     response_url,
                 ));
                 self.continue_document_load(document_id)?;
-                self.request_render_update(
-                    traversable_id,
-                    document_id,
-                    "deferred_script_fetch_complete",
-                )?;
+                self.event_sender
+                    .send(ContentEvent::RenderingOpRequested(traversable_id))
+                    .map_err(|error| {
+                        format!("failed to request rendering op for deferred script fetch: {error}")
+                    })?;
                 Ok(())
             }
         }
@@ -1788,7 +1810,13 @@ impl ContentProcess {
                     handler_id, traversable_id, document_id,
                 ));
                 self.continue_document_load(document_id)?;
-                self.request_render_update(traversable_id, document_id, "resource_fetch_failed")?;
+                self.event_sender
+                    .send(ContentEvent::RenderingOpRequested(traversable_id))
+                    .map_err(|error| {
+                        format!(
+                            "failed to request rendering op for resource fetch failure: {error}"
+                        )
+                    })?;
                 Ok(())
             }
             PendingNetworkHandler::DeferredScript {
@@ -1808,11 +1836,9 @@ impl ContentProcess {
                     handler_id, traversable_id, document_id, script_index,
                 ));
                 self.continue_document_load(document_id)?;
-                self.request_render_update(
-                    traversable_id,
-                    document_id,
-                    "deferred_script_fetch_failed",
-                )?;
+                self.event_sender
+                    .send(ContentEvent::RenderingOpRequested(traversable_id))
+                    .map_err(|error| format!("failed to request rendering op for deferred script fetch failure: {error}"))?;
                 Ok(())
             }
         }
@@ -2214,6 +2240,22 @@ impl ContentProcess {
                 debug_assert!(false, "ContentBootstrap should not reach handle_command");
                 Ok(true)
             }
+            NotifyVideoEnded { video_paint_id } => {
+                // Keep the paint ID in the registry so the last video frame is
+                // still rendered as part of the composition. Just mark the node
+                // as ended so the animating flag is set to false.
+                let ended_key: Vec<(DocumentId, usize)> = self
+                    .video_paint_registry
+                    .borrow()
+                    .iter()
+                    .filter(|(_, existing_id)| **existing_id == video_paint_id)
+                    .map(|((doc_id, node_id), _)| (*doc_id, *node_id))
+                    .collect();
+                for key in ended_key {
+                    self.ended_video_nodes.insert(key);
+                }
+                Ok(true)
+            }
             Shutdown => {
                 self.note_shutdown_completed()?;
                 Ok(false)
@@ -2254,17 +2296,18 @@ pub fn run_content_process(token: String) -> Result<(), String> {
 
         let cmd_rx = ipc::crossbeam_proxy(server.connection.receiver);
 
-        let (network_extension_sender, media_sender, content_command_sender, trace_sender) = {
+        let (network_extension_sender, graphics_sender, content_command_sender, trace_sender) = {
             match cmd_rx.recv() {
                 Ok(incoming) => match incoming.payload {
                     ContentBootstrap {
                         net_sender,
-                        media_sender,
+                        graphics_sender,
                         content_command_sender,
                         trace_sender,
+                        ..
                     } => (
                         net_sender,
-                        media_sender,
+                        graphics_sender,
                         content_command_sender,
                         trace_sender,
                     ),
@@ -2286,7 +2329,7 @@ pub fn run_content_process(token: String) -> Result<(), String> {
                 wasm_signal_sender,
                 event_loop_id,
                 network_extension_sender,
-                media_sender,
+                graphics_sender,
                 content_command_sender,
                 trace_sender,
             )

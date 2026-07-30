@@ -157,6 +157,9 @@ impl<T: IpcSerialize + IpcDeserialize> IpcSender<T> {
         }
     }
 
+    /// Convert this sender to an opaque sender that can be used for
+    /// low-level Mach IPC operations (e.g., extracting the underlying
+    /// Mach port for surface transport).
     pub fn send_with_shmem_map(
         &self,
         message: T,

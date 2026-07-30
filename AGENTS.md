@@ -169,7 +169,10 @@ shared dependency resolution and incremental compilation.
 
 - **Root binary** (`formal-web`): runs the embedder directly in-process, creating the window and event loop.
 - **Embedder crate** (`embedder`): a library used by the root binary that owns the winit event loop, window, chrome, and automation plumbing. A standalone `formal-web-embedder` binary is also produced for direct use.
-- **Helper processes** (`formal-web-content`, `formal-web-net`, `formal-web-media`): spawned by the embedder.
+- **Helper processes** (`formal-web-content`, `formal-web-net`, `formal-web-media`, `formal-web-graphics`): spawned by the embedder.
+  - `formal-web-graphics` owns per-webview compositors and video/audio playback (media backend).
+    It receives `PaintFrame` and `VideoFrame` payloads and sends back composed scenes with
+    `FrameHitInfo` for hit-testing.
 - **`js_engine` crate**: a generic JS engine trait and ECMA-262 abstract operations. Two backends: Boa (default, most operational) and JSC (macOS opt-in). WebAssembly is a separate feature (`wasm`). See `js_engine/README.md`.
 - **`js_engine_macros` crate**: proc-macro companion providing `#[gc_struct]` for GC-traced platform objects.
 
@@ -236,7 +239,7 @@ cargo build --release -p net     --bin formal-web-net
 cargo build --release -p embedder --bin formal-web-embedder
 ```
 
-### Media binary
+### Media / Graphics binary
 
 ```bash
 # macOS: AVFoundation (default) — no special flags needed
@@ -248,6 +251,9 @@ cargo build --release -p media --bin formal-web-media \
 
 # Linux: GStreamer (only backend) — no special flags needed
 cargo build --release -p media --bin formal-web-media
+
+# Graphics process (composition + media backend)
+cargo build --release -p graphics --bin formal-web-graphics
 ```
 
 ### External dependencies: blitz and anyrender
@@ -417,6 +423,17 @@ feature never worked, instead of checking whether it did.
   Prefer phrasing like "symptom: X works then crashes; Y was tried and failed;
   Z was not investigated" over "the issue is likely due to X".
 
+# Dead Code and Comments
+
+- **Never use `#[allow(dead_code)]` on fields or functions.** A field stored only for
+  RAII cleanup must be explicitly used during shutdown (send shutdown signal, wait for
+  acknowledgement, join the child process). Remove the dead code instead of annotating
+  around it.
+- **Comments describe what the code DOES, not what it USED TO DO.** Never write
+  comments like "now comes from X instead of Y" or "previously maintained by Z."
+  Those document a migration that is already complete. Delete stale comments and
+  the dead code paths they reference.
+
 # Error Logging
 
 # Logging
@@ -568,11 +585,13 @@ At the end of each task, run the following steps **in order**:
 
      The WPT runner requires a working Python 3 with a functioning `ssl` module and `venv` support. If the run fails with a Python-related error, check `tests/wpt_runner/README.md` for debugging guidance.
 
-   - **Navigation verification** — Validates hyperlink navigation and shutdown-time TLA+ model checking via WebDriver:
+   - **Spec verification** — Validates all TLA+ spec traces (Navigation, RenderingOpportunity, etc.) via the headless verification script (no GUI needed, fully automated):
 
      ```bash
-     ./verification/verify-navigation.sh
+     ./verification/verify-specs.sh
      ```
+
+     The script starts the embedder headless with TLA+ tracing, runs a minimal WebDriver session, collects trace events, and validates them against TLA+ models.  It replaces the older `cargo run -- --verify` command which required manual window interaction.
 
 9. **Suggest a commit message** — Whenever asked for a commit message (whether at end-of-task or any other time), propose a message for the current `git diff HEAD` (the uncommitted changes), not for the entire session's work.  Run `git diff --stat HEAD` to see what changed, and `git diff HEAD` to read the diff before writing the message.
 

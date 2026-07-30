@@ -44,6 +44,11 @@ impl AvPlayer {
         unsafe { self.inner.replaceCurrentItemWithPlayerItem(None) };
     }
 
+    /// Current playback rate (0 = paused/ended, 1 = playing).
+    pub(crate) fn rate(&self) -> f32 {
+        unsafe { self.inner.rate() }
+    }
+
     /// Get the current AVPlayerItem, if any.
     pub(crate) fn current_item(&self) -> Option<AvPlayerItem> {
         let item = unsafe { self.inner.currentItem()? };
