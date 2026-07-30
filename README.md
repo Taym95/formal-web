@@ -55,14 +55,10 @@ A multiprocess approach is chosen by default, because the goal is to match [Appl
 
 The following procesess are used:
 
-- Main: running the `embedder`, `webview`, and `user_agent` crates. The process is started in `src/main.rs`.
-- Content: running the `content` crate, and started in `user_agent/src/event_loop.rs`, because each process is running what is essentially a window event loop. In the future it will also run dedicated worker event loops. Service workers will likely run in their own process, and for shared worker the issue hasn't been decided yet (it seems there is a move towards isolating them per top-level sites). There is one process per [similar origin window agent](https://html.spec.whatwg.org/#similar-origin-window-agent); this is the only type of process of which there can be more than one.
-- Net: running the `net` crate. That process is owned by the fetch worker in `user_agent/src/fetch.rs`, and the code in the process will essentially be the part of the fetch standard that starts at https://fetch.spec.whatwg.org/#http-network-or-cache-fetch.
-- Media: running the `media` crate, started and owned by the media worker in `user_agent/src/media.rs`. The media binary uses one of two backends, selected at compile time. Backend selection is platform-dependent:
-  - **macOS/iOS**: AVFoundation (AVPlayer + AVPlayerItemVideoOutput) by default.
-    GStreamer available opt-in via the `backend-gstreamer` feature.
-  - **Linux**: GStreamer (uridecodebin → videoconvert → appsink).
-  See [`media/README.md`](./media/README.md) for backend-specific details.
+- **Main** (`src/main.rs`): runs the `embedder`, `webview`, and `user_agent` crates. Owns windows, chrome, and the redraw loop.
+- **Content** (`user_agent/src/event_loop.rs`): runs the `content` crate. One per [similar origin window agent](https://html.spec.whatwg.org/#similar-origin-window-agent). Each is a dedicated event loop that handles parsing, JS execution, and `paint_scene` for its documents.
+- **Graphics** (`graphics/src/bin/graphics_process.rs`): runs the `graphics` and `media` crates. Receives `PaintFrame` payloads directly from content processes via IPC shared memory, composes them (including iframe and video embed sites), renders the final scene via Vello GPU rasterisation, and ships the RGBA result back to the embedder. The media backend (AVFoundation or GStreamer) runs on the graphics process's main thread, driven by a timer arm in the select loop — no separate media process.
+- **Net** (`user_agent/src/fetch.rs`): runs the `net` crate. Handles HTTP and file fetch requests.
 
 ## Project structure
 
@@ -71,7 +67,8 @@ The following procesess are used:
 | [`embedder/`](./embedder/README.md) | Application lifecycle, window management, browser chrome, redraw loop |
 | [`user_agent/`](./user_agent/README.md) | Navigables, session history, event loops, timers, fetch workers |
 | [`content/`](./content/README.md) | DOM, HTML algorithms, Boa JS integration, Web IDL bridges |
-| [`media/`](./media/README.md) | Media pipeline: GStreamer or AVFoundation backend, frame extraction, IPC |
+| [`graphics/`](./graphics/README.md) | Scene composition, Vello GPU rasterisation, hit-testing |
+| [`media/`](./media/README.md) | Media pipeline: GStreamer or AVFoundation backend, frame extraction |
 | [`net/`](./net/README.md) | HTTP and file fetch |
 | [`webview/`](./webview/README.md) | Embedder-facing compositor and redraw API |
 | [`automation/`](./automation/README.md) | WebDriver and CDP wire-protocol servers |
