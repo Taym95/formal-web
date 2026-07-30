@@ -376,8 +376,6 @@ pub(crate) struct ContentDocument {
     frame_id: FrameId,
     document: Rc<RefCell<BaseDocument>>,
     settings: EnvironmentSettingsObject,
-    // Latched while an update-the-rendering attempt is queued or waiting on critical resources.
-    pending_update_the_rendering: bool,
     pending_document_load: Option<PendingDocumentLoad>,
     navigable_container_states: HashMap<usize, NavigableContainerState>,
     viewport_offset_x: f32,
@@ -800,7 +798,6 @@ impl ContentProcess {
                     frame_id,
                     document,
                     settings,
-                    pending_update_the_rendering: false,
                     pending_document_load: None,
                     navigable_container_states: HashMap::new(),
                     viewport_offset_x: 0.0,
@@ -990,7 +987,6 @@ impl ContentProcess {
                 frame_id,
                 document,
                 settings,
-                pending_update_the_rendering: false,
                 pending_document_load: None,
                 navigable_container_states: HashMap::new(),
                 viewport_offset_x: viewport_state
@@ -1089,7 +1085,6 @@ impl ContentProcess {
                 frame_id,
                 document: Rc::clone(&document),
                 settings,
-                pending_update_the_rendering: false,
                 pending_document_load: Some(PendingDocumentLoad {
                     finalize_url: final_url.clone(),
                     scripts: deferred_scripts,
@@ -1369,14 +1364,10 @@ impl ContentProcess {
         traversable_id: NavigableId,
         document_id: DocumentId,
     ) -> Result<(), String> {
-        let Some(document) = self.documents.get_mut(&document_id) else {
-            return Ok(());
-        };
         log_render_state_debug(format!(
             "process update-the-rendering traversable={} document={}",
             traversable_id, document_id,
         ));
-        document.pending_update_the_rendering = true;
         self.continue_updating_the_rendering(traversable_id, document_id)
     }
 
@@ -1394,25 +1385,7 @@ impl ContentProcess {
                 .get_mut(&document_id)
                 .ok_or_else(|| format!("unknown document id: {document_id}"))?;
 
-            if !document.pending_update_the_rendering {
-                log_render_state_debug(format!(
-                    "skip paint no pending render traversable={} document={}",
-                    traversable_id, document_id,
-                ));
-                return Ok(());
-            }
-
             document.document.borrow_mut().handle_messages();
-
-            if document.document.borrow().has_pending_critical_resources() {
-                log_render_state_debug(format!(
-                    "skip paint pending critical resources traversable={} document={}",
-                    traversable_id, document_id,
-                ));
-                return Ok(());
-            }
-
-            document.pending_update_the_rendering = false;
 
             let frame_timestamp_ms = document.settings.current_time_millis();
 
