@@ -38,6 +38,67 @@ struct WebviewCompositorSlot {
     gpu_renderer: crate::renderer::GpuRenderer,
     font_receiver: FontTransportReceiver,
     child_frame_to_parent: HashMap<FrameId, WebviewId>,
+    /// Persistent shared-memory pixel buffers for the rendered surface,
+    /// a three-slot ring. A buffer is only written when the embedder has
+    /// acked the previous frame that used it (TextureConsumed); otherwise
+    /// the composed scene is deferred here until a buffer frees up.
+    surface_shmem: Option<SurfaceShmemBuffers>,
+    /// The most recent composed scene that could not be rendered because
+    /// every surface buffer was still awaiting the embedder's ack.
+    deferred_scene: Option<ComposedScene>,
+}
+
+/// Three shared-memory pixel buffers per webview used as a ring. Each
+/// frame's pixels are written into a free buffer and that buffer's handle
+/// is shipped alongside the frame metadata; the embedder uploads them to its
+/// persistent GPU texture and acknowledges consumption (TextureConsumed).
+/// A buffer stays PENDING until that ack arrives — the graphics process
+/// never rewrites a buffer whose previous frame may still be in use.
+struct SurfaceShmemBuffers {
+    regions: [ipc::IpcSharedRegion; 3],
+    /// Generation of the frame written into each buffer awaiting the
+    /// embedder's ack; None when the buffer is free to be written.
+    pending_generation: [Option<u64>; 3],
+    /// Ring index where the next free buffer search starts.
+    write_index: usize,
+    width: u32,
+    height: u32,
+}
+
+impl SurfaceShmemBuffers {
+    fn allocate(width: u32, height: u32) -> Result<Self, ipc::IpcError> {
+        let byte_count = (width as usize) * (height as usize) * 4;
+        let region_zero = ipc::IpcSharedRegion::allocate(byte_count)?;
+        let region_one = ipc::IpcSharedRegion::allocate(byte_count)?;
+        let region_two = ipc::IpcSharedRegion::allocate(byte_count)?;
+        Ok(Self {
+            regions: [region_zero, region_one, region_two],
+            pending_generation: [None, None, None],
+            write_index: 0,
+            width,
+            height,
+        })
+    }
+
+    /// Index of the next free buffer to write, scanning the ring from
+    /// `write_index`; None when every buffer is awaiting an ack.
+    fn next_free(&self) -> Option<usize> {
+        (0..3)
+            .map(|offset| (self.write_index + offset) % 3)
+            .find(|index| self.pending_generation[*index].is_none())
+    }
+
+    /// Free the buffer holding `generation` (the embedder's ack). Returns
+    /// true when a pending buffer was found and freed.
+    fn ack(&mut self, generation: u64) -> bool {
+        for index in 0..3 {
+            if self.pending_generation[index] == Some(generation) {
+                self.pending_generation[index] = None;
+                return true;
+            }
+        }
+        false
+    }
 }
 
 impl WebviewCompositorSlot {
@@ -50,6 +111,8 @@ impl WebviewCompositorSlot {
             },
             font_receiver: FontTransportReceiver::default(),
             child_frame_to_parent: HashMap::new(),
+            surface_shmem: None,
+            deferred_scene: None,
         }
     }
 }
@@ -340,7 +403,12 @@ fn handle_command<B: MediaBackend + 'static>(
                         "ComposeScene",
                         webview_id.0
                     );
-                    let _ = send_composed_scene(composed_scene_sender.clone(), slot, composed);
+                    let _ = send_composed_scene(
+                        composed_scene_sender.clone(),
+                        slot,
+                        composed,
+                        tla_tracer,
+                    );
                 }
             }
         }
@@ -350,6 +418,47 @@ fn handle_command<B: MediaBackend + 'static>(
         } => {
             if let Some(slot) = webviews.get_mut(&webview_id) {
                 slot.compositor.remove_video_frame(paint_id);
+            }
+        }
+        GraphicsCommand::TextureConsumed {
+            webview_id,
+            generation,
+        } => {
+            let Some(slot) = webviews.get_mut(&webview_id) else {
+                debug!(
+                    "[graphics] texture consumed for unknown webview {:?}",
+                    webview_id
+                );
+                return false;
+            };
+            if !slot
+                .surface_shmem
+                .as_mut()
+                .is_some_and(|b| b.ack(generation))
+            {
+                debug!(
+                    "[graphics] texture consumed for unknown generation {} (webview={:?})",
+                    generation, webview_id
+                );
+            } else {
+                debug!(
+                    "[graphics] texture consumed webview={:?} gen={}",
+                    webview_id.0, generation
+                );
+                verification::tla_log!(
+                    *tla_tracer,
+                    -> "GPURendering",
+                    "TextureConsumed",
+                    webview_id.0,
+                    generation
+                );
+            }
+            // A composed scene deferred for lack of a free buffer can now be
+            // rendered and sent.
+            if slot.deferred_scene.is_some() {
+                let composed = slot.deferred_scene.take().expect("checked above");
+                let _ =
+                    send_composed_scene(composed_scene_sender.clone(), slot, composed, tla_tracer);
             }
         }
         GraphicsCommand::RegisterChildNavigableHost {
@@ -474,6 +583,7 @@ fn send_composed_scene(
     sender: ipc::IpcSender<GraphicsEvent>,
     slot: &mut WebviewCompositorSlot,
     composed: ComposedScene,
+    tla_tracer: &mut verification::TLATracer,
 ) -> Result<(), ()> {
     let ComposedScene {
         webview_id,
@@ -503,14 +613,67 @@ fn send_composed_scene(
         child_viewports.len(),
         animating
     );
-    let (_iosurface_id, generation, pixels) =
-        match slot.gpu_renderer.render_scene(&scene, width, height) {
-            Some(r) => r,
-            None => {
-                error!("[graphics] render failed for {:?}", webview_id);
+
+    // Reuse the per-webview shared-memory buffers across frames, reallocating
+    // only when the viewport size changes. The pixels are written in place
+    // into a free buffer; the embedder maps the same pages via the handle
+    // shipped with the message and acks consumption before the buffer is
+    // ever rewritten.
+    let needs_new = slot
+        .surface_shmem
+        .as_ref()
+        .is_none_or(|buffers| buffers.width != width || buffers.height != height);
+    if needs_new {
+        match SurfaceShmemBuffers::allocate(width, height) {
+            Ok(buffers) => slot.surface_shmem = Some(buffers),
+            Err(error) => {
+                error!(
+                    "[graphics] allocate surface shmem {}x{}: {error}",
+                    width, height
+                );
                 return Err(());
             }
-        };
+        }
+    }
+    let buffers = slot.surface_shmem.as_mut().expect("allocated above");
+    let Some(buffer_index) = buffers.next_free() else {
+        // Every buffer still awaits the embedder's ack: hold the composed
+        // scene and send it once a TextureConsumed frees a buffer. This
+        // keeps the rendering-opportunity cycle alive instead of dropping
+        // the frame.
+        info!(
+            "[render-pipe] Graphics defer scene webview={} (all {} buffers pending acks)",
+            webview_id.0, 3
+        );
+        slot.deferred_scene = Some(ComposedScene {
+            webview_id,
+            scene,
+            frame_hit_info,
+            child_viewports,
+            child_frame_to_webview,
+            animating,
+        });
+        return Ok(());
+    };
+    let region = &mut buffers.regions[buffer_index];
+    // SAFETY: this buffer is free (the embedder acked the frame that last
+    // used it), so no other party is reading or writing these pages.
+    let pixel_slice = unsafe { region.as_mut_slice() };
+    let generation = match slot
+        .gpu_renderer
+        .render_scene(&scene, width, height, pixel_slice)
+    {
+        Some(generation) => generation,
+        None => {
+            error!("[graphics] render failed for {:?}", webview_id);
+            return Err(());
+        }
+    };
+    // Ship a clone of the buffer; the slot keeps its own handle to write the
+    // frame after the embedder acks this one.
+    let surface_region = region.clone();
+    buffers.pending_generation[buffer_index] = Some(generation);
+    buffers.write_index = (buffer_index + 1) % 3;
 
     let child_ports: Vec<ipc_messages::graphics::ChildViewport> = child_viewports
         .into_iter()
@@ -520,16 +683,15 @@ fn send_composed_scene(
         })
         .collect();
 
-    // Place pixel data in shared memory to avoid copying across IPC.
-    let surface_shmem_key = generation as usize;
+    let shmem_key = generation as usize;
     let mut shmem_map = std::collections::HashMap::new();
-    shmem_map.insert(surface_shmem_key, ipc::IpcSharedRegion::from_bytes(&pixels));
+    shmem_map.insert(shmem_key, surface_region);
 
     if sender
         .send_with_shmem_map(
-            GraphicsEvent::SurfaceFrameReady {
+            GraphicsEvent::PixelFrameReady {
                 webview_id,
-                surface_shmem_key,
+                shmem_key,
                 animating,
                 width,
                 height,
@@ -544,6 +706,16 @@ fn send_composed_scene(
     {
         return Err(());
     }
+
+    verification::tla_log!(
+        *tla_tracer,
+        -> "GPURendering",
+        "SurfaceFrameSent",
+        webview_id.0,
+        generation,
+        format!("{}x{}", width, height),
+        buffer_index
+    );
 
     Ok(())
 }

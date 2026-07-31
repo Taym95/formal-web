@@ -1,8 +1,8 @@
 use crate::event_loop::winit_integration::event_loop_options;
 use crate::event_loop::{
     FormalWebUserEvent, NavigationCompleted, NavigationCompletion, automation_screenshot_png,
-    read_clipboard_text, startup_destination_url,
-    update_window_viewport_snapshot, write_clipboard_text,
+    read_clipboard_text, startup_destination_url, update_window_viewport_snapshot,
+    write_clipboard_text,
 };
 use ::winit::application::ApplicationHandler;
 use ::winit::event::WindowEvent;
@@ -46,6 +46,7 @@ pub(super) struct HeadlessEmbedderApp {
     pub(super) buttons: MouseEventButtons,
     pub(super) composed_scenes: HashMap<WebviewId, RecordedScene>,
     pub(super) scene_font_receiver: FontTransportReceiver,
+    pub(super) tla_tracer: verification::TLATracer,
 }
 
 impl Default for HeadlessEmbedderApp {
@@ -60,6 +61,7 @@ impl Default for HeadlessEmbedderApp {
             buttons: MouseEventButtons::None,
             composed_scenes: HashMap::new(),
             scene_font_receiver: FontTransportReceiver::default(),
+            tla_tracer: verification::TLATracer::new("GPURendering", "embedder", None),
         }
     }
 }
@@ -353,11 +355,25 @@ impl ApplicationHandler<FormalWebUserEvent> for HeadlessEmbedderApp {
             FormalWebUserEvent::NewWebContentSurface {
                 webview_id,
                 surface: _surface,
-                width: _width,
-                height: _height,
-                generation: _generation,
+                width,
+                height,
+                generation,
             } => {
                 debug!("[embedder] headless NewWebContentSurface {:?}", webview_id);
+                verification::tla_log!(
+                    self.tla_tracer,
+                    -> "GPURendering",
+                    "SurfaceFrameReceived",
+                    webview_id.0,
+                    generation,
+                    format!("{}x{}", width, height)
+                );
+                // Ack the frame so the graphics process can reuse its buffer.
+                if let Some(provider) = self.provider.as_ref() {
+                    if let Err(error) = provider.texture_consumed(webview_id, generation) {
+                        error!("[embedder] texture consumed: {error}");
+                    }
+                }
             }
             FormalWebUserEvent::Exit => {
                 self.with_automation(|a, _| {

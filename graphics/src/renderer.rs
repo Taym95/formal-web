@@ -129,14 +129,16 @@ impl GpuRenderer {
         readback_buffer.as_ref().map(|(b, _, _)| b)
     }
 
-    /// Render a scene and read back RGBA pixels to a CPU buffer.
-    /// Returns (iosurface_id, generation, pixels).
+    /// Render a scene and write the RGBA pixels directly into `pixels`
+    /// (tightly packed, `width * height * 4` bytes). Returns the frame
+    /// generation on success.
     pub fn render_scene(
         &mut self,
         scene: &anyrender::Scene,
         width: u32,
         height: u32,
-    ) -> Option<(u32, u64, Vec<u8>)> {
+        pixels: &mut [u8],
+    ) -> Option<u64> {
         let (width, height) = (width.max(1), height.max(1));
         self.ensure_render_tex(width, height);
 
@@ -224,27 +226,40 @@ impl GpuRenderer {
             return None;
         }
         let data = buf_slice.get_mapped_range();
-        // Strip alignment padding — return only the actual pixel data.
+        // Strip alignment padding — write only the actual pixel data into
+        // the destination slice, which is tightly packed (width * 4 bytes
+        // per row).
         let pixel_count = (width * height * 4) as usize;
-        let padded_bytes_per_row = ((width * 4 + 255) / 256) * 256;
-        let pixels: Vec<u8> = if padded_bytes_per_row == width * 4 {
-            data[..pixel_count].to_vec()
+        if pixels.len() < pixel_count {
+            error!(
+                "[gpu-renderer] destination too small: {}B for {}x{} (need {}B)",
+                pixels.len(),
+                width,
+                height,
+                pixel_count
+            );
+            drop(data);
+            readback_buf.unmap();
+            return None;
+        }
+        let padded_bytes_per_row = ((width * 4) as usize).div_ceil(256) * 256;
+        let row_bytes = (width * 4) as usize;
+        if padded_bytes_per_row == row_bytes {
+            pixels[..pixel_count].copy_from_slice(&data[..pixel_count]);
         } else {
-            data.chunks(padded_bytes_per_row as usize)
-                .flat_map(|row| row[..(width * 4) as usize].iter().copied())
-                .collect()
-        };
+            for (row_index, row) in data.chunks(padded_bytes_per_row).enumerate() {
+                let start = row_index * row_bytes;
+                pixels[start..start + row_bytes].copy_from_slice(&row[..row_bytes]);
+            }
+        }
         drop(data);
         readback_buf.unmap();
 
         self.generation += 1;
         debug!(
             "[gpu-renderer] rendered {}x{} gen={} pixels={}B",
-            width,
-            height,
-            self.generation,
-            pixels.len(),
+            width, height, self.generation, pixel_count,
         );
-        Some((0, self.generation, pixels))
+        Some(self.generation)
     }
 }

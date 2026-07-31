@@ -900,6 +900,12 @@ pub enum UserAgentCommand {
         offset_x: f32,
         offset_y: f32,
     },
+    /// The embedder has consumed a rendered surface frame; forward the ack
+    /// to the graphics process so it can reuse the buffer.
+    TextureConsumed {
+        webview_id: WebviewId,
+        generation: u64,
+    },
     DispatchEventFor {
         traversable_id: NavigableId,
         event: String,
@@ -1079,9 +1085,7 @@ impl UserAgent {
     /// <https://html.spec.whatwg.org/multipage/#update-the-rendering>
     pub fn note_rendering_opportunity(&self, navigable_id: NavigableId) -> Result<(), String> {
         self.command_sender
-            .send(UserAgentCommand::RenderingOpportunityFor {
-                navigable_id,
-            })
+            .send(UserAgentCommand::RenderingOpportunityFor { navigable_id })
             .map_err(|error| format!("failed to send rendering-opportunity request: {error}"))
     }
 
@@ -1096,6 +1100,16 @@ impl UserAgent {
         self.command_sender
             .send(UserAgentCommand::BroadcastViewport { snapshot })
             .map_err(|error| format!("failed to broadcast viewport: {error}"))
+    }
+
+    /// forwarding an embedder surface-consumption ack to the graphics process.
+    pub fn texture_consumed(&self, webview_id: WebviewId, generation: u64) -> Result<(), String> {
+        self.command_sender
+            .send(UserAgentCommand::TextureConsumed {
+                webview_id,
+                generation,
+            })
+            .map_err(|error| format!("failed to forward texture consumed: {error}"))
     }
 
     /// updating the viewport of one traversable's content implementation.
@@ -1424,6 +1438,12 @@ impl UserAgentWorker {
                             offset_x,
                             offset_y,
                         );
+                    }
+                    UserAgentCommand::TextureConsumed {
+                        webview_id,
+                        generation,
+                    } => {
+                        self.handle_texture_consumed(webview_id, generation);
                     }
                     UserAgentCommand::SendUiEvent {
                         webview_id,
@@ -3189,6 +3209,25 @@ impl UserAgentWorker {
         self.note_rendering_opportunity(traversable_id);
     }
 
+    /// forwarding an embedder surface-consumption ack to the graphics process.
+    /// The ack frees the shared-memory buffer that carried the frame, so the
+    /// graphics process can reuse it for a later frame.
+    fn handle_texture_consumed(&mut self, webview_id: WebviewId, generation: u64) {
+        if let Some(sender) = &self.graphics_extension_sender {
+            if let Err(error) =
+                sender.send(ipc_messages::graphics::GraphicsCommand::TextureConsumed {
+                    webview_id,
+                    generation,
+                })
+            {
+                error!(
+                    "failed to forward texture consumed to graphics process (webview={:?} gen={}): {error}",
+                    webview_id, generation
+                );
+            }
+        }
+    }
+
     /// Track which frame was last focused via pointer-down, for routing
     /// non-positional events (keyboard, IME).
     fn update_focused_frame(
@@ -3480,7 +3519,7 @@ impl UserAgentWorker {
         }
     }
 
-    /// Called when a SurfaceFrameReady arrives — the composite frame completed.
+    /// Called when a PixelFrameReady arrives — the composite frame completed.
     /// Corresponds to the TLA spec's NoteComposedScene action: drains batched
     /// opportunities (resets op_count) and re-notes if any were batched or
     /// the frame has animated content.
@@ -3845,9 +3884,7 @@ impl UserAgentWorker {
         // Shut down the graphics process: send Shutdown, wait for
         // ShutdownComplete, then join the child process.
         if let Some(sender) = &self.graphics_extension_sender {
-            if let Err(error) =
-                sender.send(ipc_messages::graphics::GraphicsCommand::Shutdown)
-            {
+            if let Err(error) = sender.send(ipc_messages::graphics::GraphicsCommand::Shutdown) {
                 log::error!("failed to send shutdown to graphics process: {error}");
             }
         }
@@ -3893,9 +3930,9 @@ impl UserAgentWorker {
     ) {
         use ipc_messages::graphics::GraphicsEvent;
         match &incoming.payload {
-            GraphicsEvent::SurfaceFrameReady {
+            GraphicsEvent::PixelFrameReady {
                 webview_id,
-                surface_shmem_key,
+                shmem_key,
                 animating,
                 width,
                 height,
@@ -3911,13 +3948,13 @@ impl UserAgentWorker {
                     height,
                     incoming
                         .shmem_regions
-                        .get(&surface_shmem_key)
+                        .get(&shmem_key)
                         .map(|region| region.as_slice().len())
                         .unwrap_or_default()
                 );
                 let surface = incoming
                     .shmem_regions
-                    .remove(surface_shmem_key)
+                    .remove(shmem_key)
                     .unwrap_or_else(|| ipc::IpcSharedRegion::from_bytes(&[]));
                 debug!(
                     "[graphics] received surface frame for {:?} ({}x{}, {}B)",

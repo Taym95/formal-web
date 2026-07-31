@@ -508,6 +508,18 @@ impl IpcSharedRegion {
         self.0.deref()
     }
 
+    /// Returns a mutable view of the region's bytes.
+    ///
+    /// # Safety
+    ///
+    /// Only safe when no other party is concurrently reading or writing the
+    /// same underlying shared pages.
+    pub unsafe fn as_mut_slice(&mut self) -> &mut [u8] {
+        // SAFETY: mirrors the `ipc_channel` contract — the caller guarantees
+        // there is only one reader/writer on the data.
+        unsafe { self.0.deref_mut() }
+    }
+
     pub fn size(&self) -> usize {
         self.0.len()
     }

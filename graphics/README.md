@@ -1,14 +1,16 @@
-# Graphics Process — IOSurface Zero-Copy Pipeline
+# Graphics Process — Surface Delivery Pipeline
 
-## Status: Cross-process IOSurface sharing is not working
+## Status
 
-The graphics process renders composed scenes to an IOSurface-backed wgpu::Texture
-via Vello (intermediate texture → GPU blit → export texture).  The GPU-side
-pipeline works correctly.  Sharing the IOSurface with the embedder for zero-copy
-compositing does not work on macOS Sequoia 15.x — all approaches tried so far
-have failed.
+Composed scenes are delivered to the embedder via **CPU readback + shared
+memory**: the graphics process renders each frame with Vello, reads the pixels
+back to CPU, and writes them into a persistent per-webview shared-memory buffer.
+The embedder uploads those bytes in place into a persistent per-webview wgpu
+texture registered once with its own Vello renderer, and draws the stable
+resource each frame. Cross-process IOSurface sharing was attempted first and
+failed on macOS Sequoia 15.x — see below.
 
-## Failed approaches
+## Failed approaches (IOSurface zero-copy)
 
 | Approach | Problem |
 |---|---|
@@ -16,26 +18,65 @@ have failed.
 | Mach port via ipc-channel serde — extract port from `OpaqueIpcSender` UB read + hand-rolled `mach_msg` | UB + sender port arrives as 0; custom Mach structs had layout bugs |
 | Bootstrap register/lookup — `bootstrap_register` receive port, graphics sends IOSurface Mach port via `mach_msg` | `mach_msg` fails with `MACH_SEND_INVALID_DEST`; `bootstrap_register` is unreliable on Sequoia |
 
-## Remaining options (unexplored)
-
-- **Unix socket + SCM_RIGHTS:** Both processes are children of the same parent.
-  Embedder creates a socket pair, sends one fd via existing IPC (`sendmsg` with
-  `SCM_RIGHTS`).  Graphics sends the IOSurface Mach port through the socket.
-- **Inline the renderer:** Run compositor + Vello renderer in the embedder
-  process, eliminating cross-process GPU sharing entirely.
-- **XPC IOSurface objects:** `xpc_dictionary_set_iosurface` /
-  `xpc_dictionary_copy_iosurface` handle Mach port transfer transparently.
-  Requires XPC IPC backend or a standalone XPC channel.
-- **CPU readback + shared memory:** GPU → CPU readback, ship pixels via
-  `IpcSharedRegion`, embedder creates Vello `ImageData`.  CPU round-trip but
-  will work immediately.  Partially implemented in an earlier iteration.
-
 ## Current implementation
 
+- **Graphics process** (`graphics/src/renderer.rs`, `graphics/src/lib.rs`):
+  `GpuRenderer::render_scene` renders the composed scene (Vello compute →
+  intermediate texture → staging-buffer readback) and writes the tightly packed
+  RGBA8 pixels directly into a caller-provided shared-memory slice — no
+  intermediate `Vec<u8>`.  `send_composed_scene` keeps **three** persistent
+  `IpcSharedRegion` buffers per webview used as a ring (reallocated only on
+  resize).  Each frame is written into the next free buffer; the buffer is
+  marked PENDING and shipped with the frame metadata in
+  `GraphicsEvent::PixelFrameReady`.  A buffer is only rewritten after the
+  embedder acks the frame that used it (`GraphicsCommand::TextureConsumed`
+  carrying the generation), so the embedder is guaranteed to have consumed the
+  previous frame's pixels before the buffer is reused.  When every buffer is
+  still awaiting an ack, the composed scene is deferred (`deferred_scene`) and
+  rendered as soon as an ack frees a buffer — keeping the rendering-opportunity
+  cycle alive.
+- **Embedder** (`embedder/src/windowed.rs`): one persistent `wgpu::Texture` per
+  webview (`Rgba8Unorm`, `COPY_DST | COPY_SRC | TEXTURE_BINDING`), registered
+  once with Vello via `try_register_custom_resource`.  Each
+  `NewWebContentSurface` uploads the shared-memory bytes with
+  `queue.write_texture` (in place, no allocation, no re-registration) and
+  `paint_frame` draws `PaintRef::Resource` with the stable `ResourceId`.  Vello
+  re-copies the override texture into its image atlas every frame
+  (`mark_override_image_dirty`), so the updated pixels are picked up without a
+  CPU-side image import.  Textures are recreated and re-registered only on
+  viewport resize.  After the upload the embedder sends the `TextureConsumed`
+  ack (via `WebviewProvider::texture_consumed` → UA → graphics process), which
+  frees the shared-memory buffer for reuse.
+
 The `ipc::mach_transport` module (gated on `#[cfg(target_os = "macos")]`)
-contains working `mach2`-based primitives for sending/receiving IOSurface port
-rights via raw Mach messages.  The `bootstrap_register` / `bootstrap_look_up`
-pair is wired through existing IPC as
-`GraphicsCommand::SetSurfaceTransport { bootstrap_name: String }`.
-These primitives could be reused with a different channel-establishment mechanism
-(e.g. Unix socket SCM_RIGHTS).
+still contains the working `mach2`-based primitives for sending/receiving
+IOSurface port rights via raw Mach messages, plus the
+`bootstrap_register`/`bootstrap_look_up` wiring.  They are unused by the
+shipped path but could be reused if a zero-copy transport is ever revisited.
+
+## Session investigation log
+
+### 2026-08-01 — TextureConsumed ack protocol (3-buffer ring)
+
+**Files changed:** `graphics/src/lib.rs` (`SurfaceShmemBuffers` ring with
+per-buffer pending generations, `deferred_scene`, `TextureConsumed` handler),
+`ipc_messages/src/graphics.rs` (`GraphicsCommand::TextureConsumed`),
+`user_agent`/`webview`/`embedder` (ack forwarding from the embedder to the
+graphics process), `verification/tla_specs/GPURendering*` (model updated to
+the 3-slot ring with ack gating).
+
+**What was confirmed:** The recorded trace shows the full ack cycle per frame
+(`SurfaceFrameSent gen=N region=r` → `SurfaceFrameReceived` →
+`TextureConsumed gen=N`), with the ring advancing 0→1→2 and each buffer
+acked before reuse.  The GPURendering model checks clean (model checking +
+trace validation) — the ack-gating invariant "a buffer is never rewritten
+while PENDING" holds on the recorded trace.
+
+**What was ruled out:** the previous 2-buffer design had no hard guarantee
+that the embedder had consumed a frame before its buffer was rewritten (only
+2 frames of headroom); the ack protocol closes that gap.
+
+**Not investigated:** the original "totally random output on resize" symptom
+was never reproduced headlessly; the ack protocol removes the buffer-reuse
+race class, but a separate render/transport cause would need a windowed
+reproduction to confirm.

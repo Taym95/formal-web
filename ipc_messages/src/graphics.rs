@@ -33,6 +33,14 @@ pub enum GraphicsCommand {
     /// A paint frame (scene + composition metadata) from a content process.
     /// The full PaintFrame with its shmem regions is reconstructed before sending.
     PaintFrame { frame: PaintFrame },
+    /// The embedder has finished consuming the pixels of a rendered surface
+    /// frame (generation) for a webview; its shared-memory buffer is now
+    /// free to be reused. The graphics process must not rewrite a buffer
+    /// until this ack arrives for the frame that used it.
+    TextureConsumed {
+        webview_id: WebviewId,
+        generation: u64,
+    },
     /// Remove a video frame slot (pipeline destroyed).
     RemoveVideoFrame {
         webview_id: WebviewId,
@@ -110,11 +118,13 @@ pub struct FrameHitInfo {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum GraphicsEvent {
-    /// A rendered surface frame is ready for one webview.
-    SurfaceFrameReady {
+    /// A rendered surface frame is ready for one webview. Pixels live in the
+    /// IPC shared memory region carried alongside the message; the embedder
+    /// uploads them in place into its persistent per-webview texture.
+    PixelFrameReady {
         webview_id: WebviewId,
         /// Key into the IPC shared memory map for the rendered RGBA pixel buffer.
-        surface_shmem_key: usize,
+        shmem_key: usize,
         /// True when the composed scene contains animated content (video)
         /// that requires the UA to re-note a rendering opportunity even
         /// without user input.
