@@ -6,7 +6,7 @@ formal-web is a Rust web-engine prototype with a modular architecture and suppor
 
 The project has only been run on macOS; all build commands assume macOS.
 
-The default: (Boa as the js engine and AVFoundation as the media backend):
+The default: **Boa** as the js engine and **AVFoundation** as the media backend:
 ```bash
 cargo build --release
 cargo run --release
