@@ -22,19 +22,22 @@ failed on macOS Sequoia 15.x — see below.
 
 - **Graphics process** (`graphics/src/renderer.rs`, `graphics/src/lib.rs`):
   `GpuRenderer::render_scene` renders the composed scene (Vello compute →
-  intermediate texture → staging-buffer readback) and writes the tightly packed
-  RGBA8 pixels directly into a caller-provided shared-memory slice — no
-  intermediate `Vec<u8>`.  `send_composed_scene` keeps **three** persistent
-  `IpcSharedRegion` buffers per webview used as a ring (reallocated only on
-  resize).  Each frame is written into the next free buffer; the buffer is
-  marked PENDING and shipped with the frame metadata in
-  `GraphicsEvent::PixelFrameReady`.  A buffer is only rewritten after the
-  embedder acks the frame that used it (`GraphicsCommand::TextureConsumed`
-  carrying the generation), so the embedder is guaranteed to have consumed the
-  previous frame's pixels before the buffer is reused.  When every buffer is
-  still awaiting an ack, the composed scene is deferred (`deferred_scene`) and
-  rendered as soon as an ack frees a buffer — keeping the rendering-opportunity
-  cycle alive.
+  intermediate texture) and **submits** the GPU → CPU readback without
+  blocking: the staging buffer is mapped via `map_buffer_on_submit`, and a
+  `PollRequest` is sent to a dedicated **poll thread** (spawned at graphics
+  startup) that blocks on `device.poll(PollType::Wait)` until the submission
+  completes.  The map callback fires on the poll thread and delivers a
+  `ReadbackReady` message (carrying the frame metadata and the pre-selected
+  shared-memory buffer index) to the main `select!` loop — no interval
+  polling or busy loop.  `submit_composed_scene` picks the next free buffer of
+  the **three-slot ring** at submit time (`SurfaceFrameSubmitted`), and
+  `handle_readback_ready` writes the completed pixels into that buffer, marks
+  it pending, and sends `GraphicsEvent::PixelFrameReady`
+  (`SurfaceFrameSent`).  A buffer is only rewritten after the embedder acks
+  the frame that used it (`GraphicsCommand::TextureConsumed` carrying the
+  generation); when every buffer is reserved or pending, the composed scene
+  is deferred (`deferred_scene`) and submitted as soon as an ack frees a
+  buffer.
 - **Embedder** (`embedder/src/windowed.rs`): one persistent `wgpu::Texture` per
   webview (`Rgba8Unorm`, `COPY_DST | COPY_SRC | TEXTURE_BINDING`), registered
   once with Vello via `try_register_custom_resource`.  Each
@@ -53,30 +56,3 @@ still contains the working `mach2`-based primitives for sending/receiving
 IOSurface port rights via raw Mach messages, plus the
 `bootstrap_register`/`bootstrap_look_up` wiring.  They are unused by the
 shipped path but could be reused if a zero-copy transport is ever revisited.
-
-## Session investigation log
-
-### 2026-08-01 — TextureConsumed ack protocol (3-buffer ring)
-
-**Files changed:** `graphics/src/lib.rs` (`SurfaceShmemBuffers` ring with
-per-buffer pending generations, `deferred_scene`, `TextureConsumed` handler),
-`ipc_messages/src/graphics.rs` (`GraphicsCommand::TextureConsumed`),
-`user_agent`/`webview`/`embedder` (ack forwarding from the embedder to the
-graphics process), `verification/tla_specs/GPURendering*` (model updated to
-the 3-slot ring with ack gating).
-
-**What was confirmed:** The recorded trace shows the full ack cycle per frame
-(`SurfaceFrameSent gen=N region=r` → `SurfaceFrameReceived` →
-`TextureConsumed gen=N`), with the ring advancing 0→1→2 and each buffer
-acked before reuse.  The GPURendering model checks clean (model checking +
-trace validation) — the ack-gating invariant "a buffer is never rewritten
-while PENDING" holds on the recorded trace.
-
-**What was ruled out:** the previous 2-buffer design had no hard guarantee
-that the embedder had consumed a frame before its buffer was rewritten (only
-2 frames of headroom); the ack protocol closes that gap.
-
-**Not investigated:** the original "totally random output on resize" symptom
-was never reproduced headlessly; the ack protocol removes the buffer-reuse
-race class, but a separate render/transport cause would need a windowed
-reproduction to confirm.

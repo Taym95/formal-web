@@ -4,21 +4,22 @@ EXTENDS Naturals, Sequences, TLC, GPURenderingTraceData
 VARIABLES
     generation,
     buffer_size,
-    buffer_state,
-    sent_size,
+    reserved,
+    pending,
+    submitted_size,
+    sent,
     received,
     texture_size,
     trace_index
 
-vars == <<generation, buffer_size, buffer_state, sent_size, received,
-          texture_size, trace_index>>
+vars == <<generation, buffer_size, reserved, pending, submitted_size,
+          sent, received, texture_size, trace_index>>
 
 Base == INSTANCE GPURendering WITH
     Webview <- TraceWebview,
     Generation <- TraceGeneration,
     Size <- TraceSize,
     Region <- TraceRegion,
-    FREE <- TraceFree,
     NONE <- TraceNone
 
 TraceLength == Len(Trace)
@@ -39,7 +40,21 @@ Init ==
     /\ Base!Init
     /\ trace_index = 1
 
-\* Graphics sends frame g at size s into region r.
+\* Graphics submits frame g at size s into region r (buffer picked at submit).
+SurfaceFrameSubmittedTrace ==
+    /\ trace_index \in 1..TraceLength
+    /\ CurrentEvent = "SurfaceFrameSubmitted"
+    /\ Len(CurrentArgs) = 4
+    /\ LET w == EventArg(1)
+           g == EventArg(2)
+           s == EventArg(3)
+           r == EventArg(4)
+       IN
+       /\ Base!SurfaceFrameSubmitted(w, g, s, r)
+       /\ Advance
+
+\* The GPU readback for g completed; the pixels were delivered and the frame
+\* was sent from region r.
 SurfaceFrameSentTrace ==
     /\ trace_index \in 1..TraceLength
     /\ CurrentEvent = "SurfaceFrameSent"
@@ -80,6 +95,7 @@ Done ==
     /\ UNCHANGED vars
 
 Next ==
+    \/ SurfaceFrameSubmittedTrace
     \/ SurfaceFrameSentTrace
     \/ TextureConsumedTrace
     \/ SurfaceFrameReceivedTrace

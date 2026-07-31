@@ -745,7 +745,7 @@ fn collect_rendering_opportunity_trace_ids(
         match event.event.as_str() {
             "NoteRenderingOpportunity"
             | "UpdateTheRendering"
-            | "ComposeScene"
+            | "GraphicsComputed"
             | "NoteComposedScene" => {
                 if let Some(frame_id) = event.event_args.first() {
                     frame_ids.insert(frame_id.clone());
@@ -877,7 +877,7 @@ fn render_trace_event(event: &TraceEvent) -> String {
 /// model can do arithmetic on them (e.g. the strict +1 generation check).
 fn render_gpu_rendering_trace_event(event: &TraceEvent) -> String {
     let rendered_args = match event.event.as_str() {
-        "SurfaceFrameSent" => vec![
+        "SurfaceFrameSubmitted" | "SurfaceFrameSent" => vec![
             render_tla_string(
                 event
                     .event_args
@@ -962,7 +962,7 @@ fn render_gpu_rendering_trace_module(
         }
         let generation = parse_trace_u64(event.event_args.get(1));
         match event.event.as_str() {
-            "SurfaceFrameSent" => {
+            "SurfaceFrameSubmitted" | "SurfaceFrameSent" => {
                 if let Some(size) = event.event_args.get(2) {
                     sizes.insert(size.clone());
                 }
@@ -1014,7 +1014,6 @@ fn render_gpu_rendering_trace_module(
          \nTraceSize == {rendered_sizes}\n\
          \nTraceGeneration == {{{rendered_generations}}}\n\
          \nTraceRegion == {{0, 1, 2}}\n\
-         \nTraceFree == 0\n\
          \nTraceNone == \"NONEVAL\"\n\
          \n=============================================================================\n"
     )
@@ -1319,10 +1318,11 @@ relevant counter has reached MaxCounter. "
 rendered the frame, advancing rendering_updated to match pending. This step \
 requires rendering_updated < pending (content is behind the request). "
         }
-        "ComposeScene" => {
-            "The model tried to apply a ComposeScene action. Graphics composed \
-the frame, advancing composed to match rendering_updated. This step requires \
-rendering_updated > composed (content rendered something not yet composed). "
+        "GraphicsComputed" => {
+            "The model tried to apply a GraphicsComputed action. Graphics finished \
+the frame's output, advancing composed to match rendering_updated. This step \
+requires rendering_updated > composed (content rendered something not yet \
+output). "
         }
         "NoteComposedScene" => {
             "The model tried to apply a NoteComposedScene action. The UA processed \

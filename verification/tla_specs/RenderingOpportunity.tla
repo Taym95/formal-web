@@ -7,7 +7,7 @@ EXTENDS Naturals, FiniteSets, TLC
   Each frame tracks:
     pending[f]           — render requests that started a render cycle
     rendering_updated[f] — renders completed by content
-    composed[f]          — renders composed by graphics
+    composed[f]          — renders whose graphical output was computed and sent by graphics
     op_count[f]          — batched opportunities noted while a render was in flight
 
   NoteRenderingOpportunity is always enabled.  When no render is in flight
@@ -90,9 +90,10 @@ UpdateTheRendering(f) ==
   /\ rendering_updated' = [rendering_updated EXCEPT ![f] = pending[f]]
   /\ UNCHANGED <<pending, composed, op_count, animating, parent>>
 
-\* Graphics composes frame f.  Enabled when content has rendered something
-\* not yet composed (rendering_updated > composed).
-ComposeScene(f) ==
+\* Graphics finishes a frame's output: the composed scene was rendered and the
+\* pixels were sent (PixelFrameReady).  Enabled when content has rendered
+\* something not yet output (rendering_updated > composed).
+GraphicsComputed(f) ==
   /\ rendering_updated[f] > composed[f]
   /\ composed' = [composed EXCEPT ![f] = rendering_updated[f]]
   /\ UNCHANGED <<pending, rendering_updated, op_count, animating, parent>>
@@ -113,14 +114,14 @@ NoteComposedScene(f) ==
 Next ==
   \/ \E f \in Frame: NoteRenderingOpportunity(f)
   \/ \E f \in Frame: UpdateTheRendering(f)
-  \/ \E f \in Frame: ComposeScene(f)
+  \/ \E f \in Frame: GraphicsComputed(f)
   \/ \E f \in Frame: NoteComposedScene(f)
 
 \* ---- Fairness ----
 
 Fairness ==
   /\ \A f \in Frame: WF_vars(UpdateTheRendering(f))
-  /\ \A f \in Frame: WF_vars(ComposeScene(f))
+  /\ \A f \in Frame: WF_vars(GraphicsComputed(f))
   /\ \A f \in Frame: WF_vars(NoteComposedScene(f))
 
 Spec == Init /\ [][Next]_vars /\ Fairness
