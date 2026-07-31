@@ -54,13 +54,13 @@ UpdateTheRenderingTrace ==
        /\ Base!UpdateTheRendering(f)
        /\ Advance
 
-ComposeSceneTrace ==
+GraphicsComputedTrace ==
     /\ trace_index \in 1..TraceLength
-    /\ CurrentEvent = "ComposeScene"
+    /\ CurrentEvent = "GraphicsComputed"
     /\ Len(CurrentArgs) = 1
     /\ LET f == EventArg(1)
        IN
-       /\ Base!ComposeScene(f)
+       /\ Base!GraphicsComputed(f)
        /\ Advance
 
 NoteComposedSceneTrace ==
@@ -79,7 +79,7 @@ Done ==
 Next ==
     \/ NoteRenderingOpportunityTrace
     \/ UpdateTheRenderingTrace
-    \/ ComposeSceneTrace
+    \/ GraphicsComputedTrace
     \/ NoteComposedSceneTrace
     \/ Done
 

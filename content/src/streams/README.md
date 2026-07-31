@@ -17,3 +17,17 @@
 - Keep long-lived pipe state, abort handling, and finalization on typed Rust state instead of routing them through JavaScript callbacks.
 - Model shared mixins and abstract operations with Rust traits or receiver-owned methods when the spec describes reusable behavior.
 - Use the `web_standards` extension (`spec_lookup`) with `https://streams.spec.whatwg.org/` to read the Streams spec, and `vendor/wpt/streams` as the test reference.
+
+## Session investigation log
+
+### 2026-07-31 — BYOB tests fail with zero-filled buffers
+
+**Files changed:** none.
+**What was confirmed:** `streams/readable-byte-streams/patched-global.any.js` and
+`streams/readable-byte-streams/respond-after-enqueue.any.js` fail in the default
+WPT run with `assert_array_equals` errors showing buffers of zeros where written
+values (e.g. `[1, 2, 3]`, `[66, …]`) are expected.  Both failures reproduce
+identically on the unmodified tree (verified via `git stash` + rebuild), so they
+are pre-existing branch bugs, not regressions.
+**What was ruled out:** unrelated to the graphics surface-delivery pipeline.
+**Not investigated:** root cause inside the BYOB read/respond implementation.

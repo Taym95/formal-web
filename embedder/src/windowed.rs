@@ -8,10 +8,10 @@ use super::winit_integration::{
 };
 use super::{
     FormalWebUserEvent, NavigationCompletion, automation_screenshot_png,
-    normalize_browser_destination, read_clipboard_text,
-    startup_destination_url, write_clipboard_text,
+    normalize_browser_destination, read_clipboard_text, startup_destination_url,
+    write_clipboard_text,
 };
-use anyrender::{Paint, PaintScene, WindowRenderer};
+use anyrender::{PaintRef, PaintScene, RenderContext, ResourceId, WindowRenderer};
 use anyrender_vello::VelloWindowRenderer;
 use automation::{
     AutomationController, AutomationHost, AutomationSnapshot, AutomationVisibleFrameViewport,
@@ -153,12 +153,29 @@ fn apple_standard_keybinding_for_key_down(event: &BlitzKeyEvent) -> Option<&'sta
     }
 }
 
+/// Persistent GPU texture holding the latest composited surface pixels for
+/// one webview, registered once with the Vello renderer. Each frame's pixel
+/// data is uploaded in place via `queue.write_texture`, so Vello reuses the
+/// same GPU resource instead of re-importing fresh image bytes every frame.
+pub(super) struct WebviewSurfaceTexture {
+    texture: wgpu::Texture,
+    /// Vello registration id; valid while `registered` is true.
+    resource_id: ResourceId,
+    width: u32,
+    height: u32,
+    /// False until the texture has been registered with the renderer.
+    /// Registration is dropped if the renderer is suspended; `paint_frame`
+    /// re-registers unregistered textures before drawing.
+    registered: bool,
+}
+
 /// Per-window state: owns a winit window, a renderer, chrome, and tabs
 pub(super) struct WindowState {
     pub(super) window: Option<Arc<Window>>,
     pub(super) renderer: VelloWindowRenderer,
-    /// Cached rendered image data from the graphics process, keyed by webview.
-    pub(super) surface_images: HashMap<WebviewId, peniko::ImageData>,
+    /// Persistent GPU surface textures from the graphics process, keyed by
+    /// webview.
+    pub(super) surface_textures: HashMap<WebviewId, WebviewSurfaceTexture>,
     pub(super) chrome: Option<ChromeUi>,
     pub(super) tabs: HashMap<WebviewId, TabState>,
     pub(super) tab_order: Vec<WebviewId>,
@@ -176,7 +193,7 @@ impl WindowState {
         Self {
             window: None,
             renderer: VelloWindowRenderer::new(),
-            surface_images: HashMap::new(),
+            surface_textures: HashMap::new(),
             chrome: None,
             tabs: HashMap::new(),
             tab_order: Vec::new(),
@@ -195,6 +212,7 @@ pub(super) struct WindowedApp {
     pub(super) windows: HashMap<WindowId, WindowState>,
     pub(super) provider: Option<WebviewProvider>,
     pub(super) active_window_id: Option<WindowId>,
+    pub(super) tla_tracer: verification::TLATracer,
 }
 
 impl Default for WindowedApp {
@@ -203,6 +221,7 @@ impl Default for WindowedApp {
             windows: HashMap::new(),
             provider: None,
             active_window_id: None,
+            tla_tracer: verification::TLATracer::new("GPURendering", "embedder", None),
         }
     }
 }
@@ -365,10 +384,19 @@ impl WindowedApp {
         );
         update_window_viewport_snapshot(Some(viewport));
         if let Some(provider) = provider.as_mut() {
-            // set_default_viewport broadcasts the viewport to all existing
-            // traversables and stores it for future ones. The UA notes a
-            // rendering opportunity after setting the viewport.
-            let _ = provider.set_default_viewport(Some(viewport));
+            // Apply the window's viewport to each top-level traversable in
+            // THIS window. Broadcasting a single global default would resize
+            // the content of every window: the UA applies the default to
+            // whichever traversable is active, which may belong to a
+            // different window. Per-traversable viewports keep each window's
+            // content sized to its own window.
+            for tab_webview_id in &window_state.tab_order {
+                if let Err(error) =
+                    provider.set_traversable_viewport(*tab_webview_id, viewport, 0.0, 0.0)
+                {
+                    error!("[embedder] set traversable viewport: {error}");
+                }
+            }
         }
     }
 
@@ -443,26 +471,46 @@ impl WindowedApp {
         }
         window.pre_present_notify();
 
+        // Re-register any surface textures whose Vello registration was
+        // dropped (e.g. after a renderer suspend).
+        for surface in state.surface_textures.values_mut() {
+            if !surface.registered {
+                Self::register_surface_texture(&mut state.renderer, surface);
+            }
+        }
+
         state.renderer.render(|scene| {
             // Paint content surface if one is available.
             let surface_found = state.active_tab.is_some_and(|webview_id| {
-                if let Some(image_data) = state.surface_images.get(&webview_id) {
-                    let w = image_data.width;
-                    let h = image_data.height;
+                if let Some(surface) = state.surface_textures.get(&webview_id)
+                    && surface.registered
+                {
+                    // Draw the texture at its natural size. While a resize
+                    // is in flight the texture still holds the previous
+                    // frame's dimensions, so the newly exposed area shows
+                    // the surface base color until the next frame arrives;
+                    // stretching it would look like the old content is being
+                    // pulled out of shape.
+                    let content_rect = kurbo::Rect::new(
+                        0.0,
+                        0.0,
+                        f64::from(surface.width),
+                        f64::from(surface.height),
+                    );
                     let content_transform = Affine::translate((0.0, chrome_height));
                     scene.fill(
                         peniko::Fill::NonZero,
                         content_transform,
-                        Paint::Image(peniko::ImageBrushRef {
-                            image: image_data,
+                        PaintRef::Resource(peniko::ImageBrush {
+                            image: surface.resource_id,
                             sampler: Default::default(),
                         }),
                         None,
-                        &kurbo::Rect::new(0.0, 0.0, f64::from(w), f64::from(h)),
+                        &content_rect,
                     );
                     info!(
                         "[render-pipe] Embedder paint webview={:?} {}x{} at y={}",
-                        webview_id, w, h, chrome_height
+                        webview_id, surface.width, surface.height, chrome_height
                     );
                     true
                 } else {
@@ -515,6 +563,47 @@ impl WindowedApp {
             .create_window(Window::default_attributes().with_title(title))
             .map(Arc::new)
             .map_err(|error| format!("failed to create winit window: {error}"))
+    }
+
+    /// Create the persistent GPU texture that receives composited surface
+    /// pixels for one webview. `COPY_SRC` is required by Vello's
+    /// `register_texture`, which copies the texture into its image atlas.
+    fn create_surface_texture(device: &wgpu::Device, width: u32, height: u32) -> wgpu::Texture {
+        device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("webview-surface"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_DST
+                | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        })
+    }
+
+    /// Register a surface texture with the Vello renderer, keeping the
+    /// `ResourceId` stable across frames. No-op while the renderer is not
+    /// active; `paint_frame` retries for unregistered textures.
+    fn register_surface_texture(
+        renderer: &mut VelloWindowRenderer,
+        surface: &mut WebviewSurfaceTexture,
+    ) {
+        if !renderer.is_active() {
+            return;
+        }
+        match renderer.try_register_custom_resource(Box::new(surface.texture.clone())) {
+            Ok(resource_id) => {
+                surface.resource_id = resource_id;
+                surface.registered = true;
+            }
+            Err(error) => error!("[embedder] register surface texture: {error:?}"),
+        }
     }
 
     fn resume_renderer(state: &mut WindowState, window: &Arc<Window>) {
@@ -1150,10 +1239,10 @@ impl ApplicationHandler<FormalWebUserEvent> for WindowedApp {
                 surface,
                 width,
                 height,
-                generation: _generation,
+                generation,
             } => {
-                let pixels = surface.as_slice();
                 let total_pixels = (width * height * 4) as usize;
+                let pixels = surface.as_slice();
                 info!(
                     "[render-pipe] Embedder surface webview={:?} {}x{} pixels={}B active_tab={:?}",
                     webview_id,
@@ -1164,35 +1253,7 @@ impl ApplicationHandler<FormalWebUserEvent> for WindowedApp {
                         .get(&self.active_window_id.unwrap_or(WindowId::new()))
                         .and_then(|s| s.active_tab)
                 );
-                if pixels.len() >= total_pixels && width > 0 && height > 0 {
-                    let image_data = peniko::ImageData {
-                        data: pixels[..total_pixels].to_vec().into(),
-                        format: peniko::ImageFormat::Rgba8,
-                        alpha_type: peniko::ImageAlphaType::Alpha,
-                        width,
-                        height,
-                    };
-                    if let Some(window_id) = Self::window_for_webview(self, webview_id) {
-                        if let Some(state) = self.windows.get_mut(&window_id) {
-                            state.surface_images.insert(webview_id, image_data);
-                            let is_active = state.active_tab == Some(webview_id);
-                            info!(
-                                "[render-pipe] Embedder stored surface for webview={:?} active={} tabs={:?} active_tab={:?} window={:?}",
-                                webview_id, is_active, state.tab_order, state.active_tab, window_id
-                            );
-                            Self::request_window_redraw(state);
-                            info!(
-                                "[render-pipe] Embedder requested redraw for window={:?}",
-                                window_id
-                            );
-                        }
-                    } else {
-                        info!(
-                            "[render-pipe] Embedder no window for webview={:?}",
-                            webview_id
-                        );
-                    }
-                } else {
+                if pixels.len() < total_pixels || width == 0 || height == 0 {
                     info!(
                         "[render-pipe] Embedder invalid surface webview={:?} {}x{} shmem={}B (expected {}B)",
                         webview_id,
@@ -1201,7 +1262,111 @@ impl ApplicationHandler<FormalWebUserEvent> for WindowedApp {
                         pixels.len(),
                         total_pixels
                     );
+                    return;
                 }
+                let Some(window_id) = Self::window_for_webview(self, webview_id) else {
+                    info!(
+                        "[render-pipe] Embedder no window for webview={:?}",
+                        webview_id
+                    );
+                    return;
+                };
+                let Some(state) = self.windows.get_mut(&window_id) else {
+                    return;
+                };
+                // The renderer must be active (window resumed) to create and
+                // register GPU textures. If not, drop the frame — the next
+                // one arrives once the window is rendering again.
+                let Some(device_handle) = state.renderer.current_device_handle().cloned() else {
+                    info!(
+                        "[render-pipe] Embedder renderer inactive, dropping surface webview={:?}",
+                        webview_id
+                    );
+                    return;
+                };
+
+                // Recreate the texture only when the viewport size changed;
+                // otherwise keep the existing GPU resource and just update
+                // its contents in place.
+                let needs_new = match state.surface_textures.get(&webview_id) {
+                    Some(surface_tex) => surface_tex.width != width || surface_tex.height != height,
+                    None => true,
+                };
+                if needs_new {
+                    if let Some(old) = state.surface_textures.remove(&webview_id)
+                        && old.registered
+                    {
+                        state.renderer.unregister_resource(old.resource_id);
+                    }
+                    let texture =
+                        Self::create_surface_texture(&device_handle.device, width, height);
+                    let mut surface_tex = WebviewSurfaceTexture {
+                        texture,
+                        resource_id: ResourceId::new(),
+                        width,
+                        height,
+                        registered: false,
+                    };
+                    Self::register_surface_texture(&mut state.renderer, &mut surface_tex);
+                    state.surface_textures.insert(webview_id, surface_tex);
+                }
+
+                // Upload the new pixels in place into the persistent texture.
+                // `write_texture` copies the shared-memory bytes into a
+                // staging buffer synchronously; no allocation or Vello
+                // re-registration is involved.
+                if let Some(surface_tex) = state.surface_textures.get_mut(&webview_id) {
+                    device_handle.queue.write_texture(
+                        wgpu::TexelCopyTextureInfo {
+                            texture: &surface_tex.texture,
+                            mip_level: 0,
+                            origin: wgpu::Origin3d::ZERO,
+                            aspect: wgpu::TextureAspect::All,
+                        },
+                        &pixels[..total_pixels],
+                        wgpu::TexelCopyBufferLayout {
+                            offset: 0,
+                            bytes_per_row: Some(width * 4),
+                            rows_per_image: Some(height),
+                        },
+                        wgpu::Extent3d {
+                            width,
+                            height,
+                            depth_or_array_layers: 1,
+                        },
+                    );
+                } else {
+                    error!(
+                        "[embedder] missing surface texture for webview={:?} after insert",
+                        webview_id
+                    );
+                }
+                let is_active = state.active_tab == Some(webview_id);
+                info!(
+                    "[render-pipe] Embedder updated surface webview={:?} active={} tabs={:?} active_tab={:?} window={:?}",
+                    webview_id, is_active, state.tab_order, state.active_tab, window_id
+                );
+                verification::tla_log!(
+                    self.tla_tracer,
+                    -> "GPURendering",
+                    "SurfaceFrameReceived",
+                    webview_id.0,
+                    generation,
+                    format!("{}x{}", width, height)
+                );
+                // The pixels are now copied out of the shared-memory region
+                // (write_texture staged them synchronously); ack the frame so
+                // the graphics process can reuse the buffer.
+                if let Some(provider) = self.provider.as_ref() {
+                    if let Err(error) = provider.texture_consumed(webview_id, generation) {
+                        error!("[embedder] texture consumed: {error}");
+                    }
+                }
+                Self::request_window_redraw(state);
+                info!(
+                    "[render-pipe] Embedder requested redraw for window={:?}",
+                    window_id
+                );
             }
             FormalWebUserEvent::Exit => event_loop.exit(),
         }

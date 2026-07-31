@@ -248,7 +248,7 @@ fn run_embedder_event_loop<A, MakeApp>(
 ) -> Result<(), String>
 where
     A: ApplicationHandler<FormalWebUserEvent>,
-    MakeApp: FnOnce(WebviewProvider) -> A,
+    MakeApp: FnOnce(WebviewProvider, Option<TraceSender>) -> A,
 {
     let event_loop = EventLoop::<FormalWebUserEvent>::with_user_event()
         .build()
@@ -263,7 +263,7 @@ where
 
     let event_loop_embedder = Arc::new(EventLoopEmbedder::new(dispatcher));
     let embedder: Arc<dyn Embedder> = event_loop_embedder.clone();
-    let provider = match WebviewProvider::new(embedder, trace_sender) {
+    let provider = match WebviewProvider::new(embedder, trace_sender.clone()) {
         Ok(provider) => provider,
         Err(error) => {
             let mut guard = EVENT_LOOP_PROXY
@@ -275,7 +275,7 @@ where
         }
     };
 
-    let mut app = make_app(provider);
+    let mut app = make_app(provider, trace_sender);
     let run_result = event_loop
         .run_app(&mut app)
         .map_err(|error| format!("winit event loop failed: {error}"));
@@ -292,15 +292,17 @@ where
 }
 
 pub fn run_headed_event_loop(trace_sender: Option<TraceSender>) -> Result<(), String> {
-    run_embedder_event_loop(trace_sender, |provider| WindowedApp {
+    run_embedder_event_loop(trace_sender.clone(), |provider, trace_sender| WindowedApp {
         provider: Some(provider),
+        tla_tracer: verification::TLATracer::new("GPURendering", "embedder", trace_sender),
         ..WindowedApp::default()
     })
 }
 
 pub fn run_headless_event_loop(trace_sender: Option<TraceSender>) -> Result<(), String> {
-    run_embedder_event_loop(trace_sender, |provider| HeadlessEmbedderApp {
+    run_embedder_event_loop(trace_sender, |provider, trace_sender| HeadlessEmbedderApp {
         provider: Some(provider),
+        tla_tracer: verification::TLATracer::new("GPURendering", "embedder", trace_sender),
         ..HeadlessEmbedderApp::default()
     })
 }
