@@ -168,8 +168,6 @@ impl GpuRenderer {
         )
     }
 
-    /// True when any readback submission is still waiting for the GPU to
-    /// finish. The main loop uses this to decide whether to keep polling.
     /// Drop the in-flight marker for a readback slot (map failure path).
     pub fn release_readback(&mut self, readback_index: usize) {
         if let Some(generation) = self.inflight_readbacks[readback_index].take() {

@@ -171,7 +171,7 @@ pub fn run_graphics_process<B: MediaBackend + 'static>(
         poll_tx,
         readback_ready_tx,
     };
-    let _poll_thread = std::thread::Builder::new()
+    let poll_thread = std::thread::Builder::new()
         .name(String::from("formal-web:gpu-poll"))
         .spawn(move || {
             while let Ok(request) = poll_rx.recv() {
@@ -234,8 +234,8 @@ pub fn run_graphics_process<B: MediaBackend + 'static>(
     };
 
     // Completed GPU readbacks arrive here from the poll thread's map
-    // callbacks; there is no interval tick — the poll thread blocks on the
-    // device until a submission completes.
+    // callbacks; the poll thread blocks on the device until a submission
+    // completes.
 
     loop {
         // Dynamically switch the sample tick: when at least one pipeline
@@ -291,6 +291,17 @@ pub fn run_graphics_process<B: MediaBackend + 'static>(
                 handle_readback_ready(&mut webviews, &event_sender, &mut tla_tracer, ready);
             }
         }
+    }
+
+    // Shutdown: drop every poll sender (the renderers' ReadbackChannels clones
+    // and the main channels) so the poll thread's channel closes, then join it.
+    // The poll thread may still be blocked in device.poll(Wait) for the current
+    // submission; that completes, the next recv() sees the closed channel, and
+    // the thread exits.
+    drop(webviews);
+    drop(channels);
+    if let Err(error) = poll_thread.join() {
+        error!("[graphics] gpu poll thread panicked: {error:?}");
     }
 }
 
