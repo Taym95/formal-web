@@ -460,11 +460,6 @@ impl WindowedApp {
             return;
         }
         let size = window.inner_size();
-        // Content area height below the chrome; the surface texture is
-        // stretched to fill it while a resize is in flight.
-        let content_height = size
-            .height
-            .saturating_sub(Self::chrome_height_physical(state));
         if state.renderer.is_active() {
             state.renderer.set_size(size.width, size.height);
         } else {
@@ -490,16 +485,17 @@ impl WindowedApp {
                 if let Some(surface) = state.surface_textures.get(&webview_id)
                     && surface.registered
                 {
-                    // Draw the texture over the window's content area. When
-                    // the texture size matches the current viewport this is
-                    // a 1:1 blit; while a resize is in flight (texture still
-                    // the previous size) it stretches to fill instead of
-                    // leaving white edges.
+                    // Draw the texture at its natural size. While a resize
+                    // is in flight the texture still holds the previous
+                    // frame's dimensions, so the newly exposed area shows
+                    // the surface base color until the next frame arrives;
+                    // stretching it would look like the old content is being
+                    // pulled out of shape.
                     let content_rect = kurbo::Rect::new(
                         0.0,
                         0.0,
-                        f64::from(size.width),
-                        f64::from(content_height),
+                        f64::from(surface.width),
+                        f64::from(surface.height),
                     );
                     let content_transform = Affine::translate((0.0, chrome_height));
                     scene.fill(

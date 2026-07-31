@@ -425,14 +425,16 @@ fn handle_command<B: MediaBackend + 'static>(
                 recorded_scene,
                 is_root_candidate,
             );
-            // Skip composition for zero-sized viewports (e.g. during resize).
-            let has_valid_viewport = viewport_width > 0 && viewport_height > 0;
+            // Compose whenever the root frame arrives, even at a zero-sized
+            // viewport: the frame is rendered at a minimum size so the UA's
+            // rendering cycle always completes (a skipped frame would leave
+            // the cycle open and stall all future renders).
             // Only compose and produce a texture when the top-level (root)
             // frame arrives. Child PaintFrames and video frames are buffered
             // locally — their LATEST data is included when the root triggers
             // composition. This ensures exactly one texture per render cycle
             // regardless of how many embedded frames exist.
-            let should_compose = is_root_candidate && has_valid_viewport;
+            let should_compose = is_root_candidate;
             if should_compose {
                 info!(
                     "[render-pipe] Graphics compose scene webview={} root_frame={}",
@@ -638,17 +640,22 @@ fn submit_composed_scene(
         animating,
     } = composed;
 
+    // Render at a minimum size even when the viewport is zero-sized (e.g.
+    // the window shrank below the chrome): a PixelFrameReady must always be
+    // produced for a root frame, otherwise the UA's rendering cycle never
+    // completes and all subsequent renders stall. The clamped size is used
+    // for both the render and the message, so the embedder always receives
+    // a valid frame to upload and ack.
     let width = frame_hit_info
         .first()
         .map(|h| h.viewport_width)
-        .unwrap_or(0);
+        .unwrap_or(0)
+        .max(1);
     let height = frame_hit_info
         .first()
         .map(|h| h.viewport_height)
-        .unwrap_or(0);
-    if width == 0 || height == 0 {
-        return Err(());
-    }
+        .unwrap_or(0)
+        .max(1);
     info!(
         "[render-pipe] Graphics GPU render webview={} {}x{} {} child_frames animating={}",
         webview_id.0,
