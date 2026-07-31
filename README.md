@@ -1,6 +1,6 @@
 # formal-web
 
-formal-web is a Rust web-engine prototype in alpha status.
+formal-web is a Rust web-engine prototype with a modular architecture and support for formal verfication.
 
 ## Getting Started
 
@@ -45,10 +45,14 @@ Besides this, a modular approach is followed by making the following components 
 
 The following procesess are used:
 
-- **Main** (`src/main.rs`): runs the `embedder`, `webview`, and `user_agent` crates. Owns windows, chrome, and the redraw loop.
+- **Main** (`src/main.rs`): runs the `embedder`, `webview`, and `user_agent` crates.
 - **Content** (`user_agent/src/event_loop.rs`): runs the `content` crate. Multiple processes: one per [similar origin window agent](https://html.spec.whatwg.org/#similar-origin-window-agent).
 - **Graphics** (`graphics/src/bin/graphics_process.rs`): runs the `graphics` and `media` crates.
 - **Net** (`user_agent/src/fetch.rs`): runs the `net` crate.
+
+## Formal verification
+
+A set of core algorithms will be formalized using TLA+, and their Rust implementation model-checked against those formal specification using the tracing approach described in [Validating Traces of Distributed Programs Against TLA+ Specifications](https://arxiv.org/abs/2404.16075). For further details, see [the verification folder](verification/README.md).
 
 ## Pi coding agent extensions
 
