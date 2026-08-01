@@ -17,6 +17,12 @@ cpu_readback = []
 # Force the zero-copy IOSurface backend. It is already the default on macOS;
 # on other platforms it is a compile error (IOSurface sharing is macOS-only).
 zero_copy = []
+# Media backend selection, forwarded to the media crate so this crate's
+# AVFoundation-specific code matches the backend that will actually deliver
+# video frames. Off macOS the CPU readback surface backend is the only one
+# (the GStreamer media backend delivers CPU video bytes).
+backend-avfoundation = ["media/backend-avfoundation"]
+backend-gstreamer = ["media/backend-gstreamer"]
 
 [lib]
 path = "src/lib.rs"

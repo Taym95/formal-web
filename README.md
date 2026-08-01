@@ -31,23 +31,22 @@ cargo run --release --no-default-features --features v8,media
 cargo build --release --no-default-features --features backend-gstreamer,boa,media
 ```
 
-**Surface backend** — chosen by feature in the graphics crate: rendered
-frames ship as CPU readback + IPC shared memory on non-macOS; on macOS the
-graphics process renders directly into a shared IOSurface (zero-copy) and
-the embedder blits it — no CPU readback, no IPC pixel bytes. The zero-copy
-IOSurface backend is the default on macOS; building the graphics process
-with `--features cpu_readback` selects the CPU readback backend there
-instead. Off macOS the CPU readback backend is the only one. The zero-copy
-path requires the forked `ipc-channel` (see below):
-```bash
-cargo build --release
-cargo run --release
+The graphics process has two independent backends — scene delivery
+(zero-copy IOSurface, macOS only, or CPU readback, all platforms) and
+video frames (AVFoundation keeps decoded frames on the GPU, GStreamer
+delivers CPU bytes):
 
-# macOS: CPU readback surface backend instead of the zero-copy default
-cargo build --release -p graphics --features cpu_readback
-```
-Resize updates in one step once the resize settles (no live-resize animation);
-see `graphics/README.md` for details.
+| Build | Scene delivery | Video | Result |
+|---|---|---|---|
+| macOS default | zero-copy (IOSurface) | AVFoundation (GPU) | fully zero-copy |
+| macOS + `--no-default-features --features backend-gstreamer,boa,media` | zero-copy (IOSurface) | GStreamer (CPU bytes) | video via CPU, scene zero-copy |
+| macOS + `-p graphics --features cpu_readback` | CPU readback | either | scene via shared memory |
+| Linux | CPU readback | GStreamer (CPU bytes) | no zero-copy |
+
+Trade-offs: zero-copy avoids a GPU→CPU readback, IPC pixel bytes, and a
+CPU→GPU upload per frame but needs macOS (IOSurface); CPU readback works
+everywhere. AVFoundation keeps video on the GPU (macOS only); GStreamer
+runs everywhere but copies each decoded video frame through the CPU.
 
 
 ## Project architecture

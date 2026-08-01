@@ -299,10 +299,10 @@ pub fn run_graphics_process<B: MediaBackend + 'static>(
                 }
                 // Zero-copy path: no map callback exists; deliver the done
                 // notice directly.
-                if let Some(done) = request.done {
-                    if let Err(send_error) = render_done_tx.send(done) {
-                        error!("[graphics] failed to deliver render done: {send_error}");
-                    }
+                if let Some(done) = request.done
+                    && let Err(send_error) = render_done_tx.send(done)
+                {
+                    error!("[graphics] failed to deliver render done: {send_error}");
                 }
             }
         })
@@ -462,7 +462,15 @@ fn handle_media_event(
                 slot.compositor.update_video_frame(cf);
             }
         }
-        #[cfg(target_os = "macos")]
+        // AVFoundation video frames arrive as GPU pixel buffers and are
+        // composited as textures; GStreamer delivers CPU bytes (Frame
+        // above). The variant exists only when AVFoundation is the active
+        // media backend (explicit feature, or the default on macOS when no
+        // backend feature is selected).
+        #[cfg(all(
+            target_os = "macos",
+            any(feature = "backend-avfoundation", not(feature = "backend-gstreamer"))
+        ))]
         MediaBackendEvent::PixelBufferFrame(frame) => {
             let pipeline_id = frame.pipeline_id;
             let Some(&(webview_id, paint_id)) = pipeline_webview_map.get(&pipeline_id) else {
