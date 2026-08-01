@@ -1,3 +1,4 @@
+#![cfg(target_os = "macos")]
 //! macOS zero-copy surface: a shared IOSurface the graphics process renders
 //! into and the embedder imports and blits, with no CPU readback and no IPC
 //! pixel bytes. The surface's Mach port travels in the `PixelFrameReady`
@@ -28,14 +29,13 @@ pub fn padded_width(width: u32) -> u32 {
 }
 
 /// One shared IOSurface texture in the ring: the Metal texture (kept alive
-/// by the imported wgpu texture), the IOSurface it is backed by, and a Mach
-/// port (send right) that can be shipped to the embedder on every frame.
+/// by the imported wgpu texture; the Metal texture retains the IOSurface)
+/// and a Mach port (send right) that can be shipped to the embedder on
+/// every frame.
 pub struct IosurfaceTexture {
     pub texture: Texture,
     pub texture_id: u64,
     port: OsMachPort,
-    #[allow(dead_code)]
-    surface: Retained<IOSurfaceRef>,
 }
 
 impl IosurfaceTexture {
@@ -155,7 +155,6 @@ pub fn create_shared_texture(
         texture,
         texture_id,
         port,
-        surface: surface.into(),
     })
 }
 

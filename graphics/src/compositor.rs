@@ -12,7 +12,7 @@ use ipc_messages::graphics::FrameHitInfo;
 use crate::ComposedScene;
 use ipc_messages::media::VideoPaintId;
 use kurbo::{Affine, Point, Rect, RoundedRect, Shape};
-use log::{info, trace};
+use log::{error, info, trace};
 use peniko::{Color, Fill, ImageAlphaType, ImageBrushRef, ImageData, ImageFormat};
 use std::collections::{HashMap, HashSet};
 use std::env;
@@ -390,8 +390,15 @@ impl Compositor {
             self.reset_composed_frame_state();
             if self.prepare_root_frame(root_frame_id).is_some() {
                 let mut stack = HashSet::from([root_frame_id]);
-                let _ =
-                    self.compose_frame(root_frame_id, font_receiver, &mut stack, Affine::IDENTITY);
+                if self
+                    .compose_frame(root_frame_id, font_receiver, &mut stack, Affine::IDENTITY)
+                    .is_none()
+                {
+                    error!(
+                        "[compositor] refresh compose failed for root frame {}",
+                        root_frame_id.0
+                    );
+                }
             }
             self.resolved_tree_dirty = false;
         }
@@ -427,7 +434,15 @@ impl Compositor {
             self.reset_composed_frame_state();
             self.prepare_root_frame(root_frame_id)?;
             let mut stack = HashSet::from([root_frame_id]);
-            let _ = self.compose_frame(root_frame_id, font_receiver, &mut stack, Affine::IDENTITY);
+            if self
+                .compose_frame(root_frame_id, font_receiver, &mut stack, Affine::IDENTITY)
+                .is_none()
+            {
+                error!(
+                    "[compositor] hit-test refresh compose failed for root frame {}",
+                    root_frame_id.0
+                );
+            }
             self.resolved_tree_dirty = false;
         }
 

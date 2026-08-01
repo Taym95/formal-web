@@ -5,11 +5,9 @@ use graphics::renderer::{GpuRenderer, ReadbackChannels};
 #[test]
 fn iosurface_dimension_constraints() {
     let (poll_tx, _poll_rx) = crossbeam_channel::unbounded();
-    let (readback_ready_tx, _readback_ready_rx) = crossbeam_channel::unbounded();
     let (render_done_tx, _render_done_rx) = crossbeam_channel::unbounded();
     let channels = ReadbackChannels {
         poll_tx,
-        readback_ready_tx,
         render_done_tx,
     };
     let renderer = GpuRenderer::new(channels).expect("renderer");

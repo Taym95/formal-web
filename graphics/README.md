@@ -8,14 +8,16 @@ back to CPU, and ships them through IPC shared memory; the embedder uploads
 those bytes into a persistent per-webview GPU texture and blits it. This path
 works on every platform.
 
-On macOS a **zero-copy** backend is also implemented: the graphics process
-renders directly into a shared IOSurface texture and the embedder imports the
-same surface and blits it — no CPU readback, no IPC pixel bytes. The
-cross-process transport problem (shipping the surface's Mach port) is solved
-by the forked `ipc-channel` (a git dependency on
-<https://github.com/gterzian/ipc-channel>), which adds an `OsMachPort`
-serde-transportable type. The backend is selected with
-`FORMAL_WEB_SURFACE_BACKEND=iosurface|cpu` (default `cpu`).
+On macOS the **zero-copy** backend is the default (matching the default
+AVFoundation media backend): the graphics process renders directly into a
+shared IOSurface texture and the embedder imports the same surface and
+blits it — no CPU readback, no IPC pixel bytes. The cross-process transport
+problem (shipping the surface's Mach port) is solved by the forked
+`ipc-channel` (a git dependency on <https://github.com/gterzian/ipc-channel>),
+which adds an `OsMachPort` serde-transportable type. The backend is chosen
+at compile time: `iosurface` on macOS (the only surface backend there; the
+CPU path is compiled out), `cpu` elsewhere (where the GStreamer media
+backend delivers CPU video bytes).
 
 ## Current pipeline (CPU readback + shared memory)
 
@@ -142,9 +144,18 @@ Rejected alternatives, for the record:
 
 The ring, the ack protocol, the deferral, the messages, and the embedder's draw
 path are all transport-agnostic. A per-webview `SurfaceBuffers` enum holds the
-frame buffers for one of two implementations: the cross-platform CPU path and
-the macOS-only zero-copy path. The ring lifecycle (`SurfaceRingState`: pick /
-reserve / mark-pending / ack) is shared verbatim.
+frame buffers for one of two implementations; the variant is chosen at compile
+time by platform (CPU readback off macOS, zero-copy IOSurface on macOS). The
+ring lifecycle (`SurfaceRingState`: pick / reserve / mark-pending / ack) is
+shared verbatim.
+
+The renderers are two implementations of the `SurfaceRenderer` trait
+(`renderer/cpu.rs` and `renderer/iosurface.rs`): each defines its own
+`RenderData` associated type — the per-frame payload produced at submit time
+and consumed by its `handle_render_done`, which marks the ring buffer pending
+and sends `PixelFrameReady`. Completed frames arrive on a single channel whose
+message type is the backend's `RenderData` (chosen at compile time), delivered
+by the readback map callbacks (CPU) or the poll thread (zero-copy).
 
 ### Producer side (graphics)
 
@@ -189,9 +200,12 @@ hal-import machinery), registered once, then blit. The draw path
 
 ### Backend selection
 
-Chosen at startup (e.g. `FORMAL_WEB_SURFACE_BACKEND=iosurface|cpu`, defaulting
-to `cpu`); both processes agree because the payload enum identifies the backend
-in use.
+Chosen at compile time by platform: the zero-copy IOSurface backend on macOS
+(matching the default AVFoundation media backend), the CPU readback backend
+elsewhere (GStreamer media backend). The two are separate implementations of
+the `SurfaceRenderer` trait (`renderer/cpu.rs` and `renderer/iosurface.rs`),
+so only one is compiled per platform; the payload enum identifies the backend
+in use on the wire.
 
 ### What stays identical
 

@@ -31,14 +31,15 @@ cargo run --release --no-default-features --features v8,media
 cargo build --release --no-default-features --features backend-gstreamer,boa,media
 ```
 
-**Zero-copy surface backend** (macOS, optional): by default rendered frames are
-shipped as CPU readback + IPC shared memory. With
-`FORMAL_WEB_SURFACE_BACKEND=iosurface` the graphics process renders directly
-into a shared IOSurface and the embedder blits it — no CPU readback, no IPC
-pixel bytes. This requires the forked `ipc-channel` (see below):
+**Zero-copy surface backend** (macOS, default): rendered frames ship as CPU
+readback + IPC shared memory on non-macOS; on macOS the graphics process
+renders directly into a shared IOSurface and the embedder blits it — no CPU
+readback, no IPC pixel bytes. The backend is chosen at compile time by
+platform (iosurface on macOS, cpu elsewhere) and requires the forked
+`ipc-channel` (see below):
 ```bash
 cargo build --release
-FORMAL_WEB_SURFACE_BACKEND=iosurface cargo run --release
+cargo run --release
 ```
 Resize updates in one step once the resize settles (no live-resize animation);
 see `graphics/README.md` for details.

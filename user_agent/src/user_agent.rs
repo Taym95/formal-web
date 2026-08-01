@@ -135,15 +135,13 @@ pub trait Embedder: Send + Sync {
         font_registrations: Vec<ipc_messages::content::RegisteredFont>,
         font_data: std::collections::HashMap<usize, Vec<u8>>,
     ) -> Result<(), String>;
-    /// Forward a rendered surface frame from the graphics process. The
-    /// payload identifies how the pixels are delivered (CPU shared memory
-    /// vs. a shared IOSurface on macOS); `surface` carries the pixel bytes
-    /// for the CPU path.
+    /// Forward a rendered surface frame from the graphics process. `frame`
+    /// identifies how the pixels are delivered (CPU shared memory vs. a
+    /// shared IOSurface on macOS) and carries the delivery payload.
     fn new_web_content_surface(
         &self,
         webview_id: WebviewId,
-        payload: ipc_messages::graphics::SurfacePayload,
-        surface: Option<ipc::IpcSharedRegion>,
+        frame: ipc_messages::graphics::SurfaceFrame,
         width: u32,
         height: u32,
         generation: u64,
@@ -3955,22 +3953,34 @@ impl UserAgentWorker {
                 // The CPU path carries the pixel bytes in the shared-memory
                 // map; the zero-copy path (macOS) carries the shared surface's
                 // Mach port in the payload itself.
-                let surface = match payload {
+                let frame = match payload {
+                    #[cfg(not(target_os = "macos"))]
                     ipc_messages::graphics::SurfacePayload::CpuShmem { shmem_key } => {
-                        incoming.shmem_regions.remove(shmem_key)
+                        let region = incoming
+                            .shmem_regions
+                            .remove(shmem_key)
+                            .unwrap_or_else(|| ipc::IpcSharedRegion::from_bytes(&[]));
+                        ipc_messages::graphics::SurfaceFrame::CpuShmem(region)
                     }
                     #[cfg(target_os = "macos")]
-                    ipc_messages::graphics::SurfacePayload::SharedTexture { .. } => None,
+                    ipc_messages::graphics::SurfacePayload::SharedTexture { texture_id, port } => {
+                        ipc_messages::graphics::SurfaceFrame::SharedTexture {
+                            texture_id: *texture_id,
+                            port: port.clone(),
+                        }
+                    }
                 };
                 debug!(
                     "[graphics] received surface frame for {:?} ({}x{}, {}B)",
                     webview_id,
                     width,
                     height,
-                    surface
-                        .as_ref()
-                        .map(|region| region.size())
-                        .unwrap_or_default()
+                    match &frame {
+                        #[cfg(not(target_os = "macos"))]
+                        ipc_messages::graphics::SurfaceFrame::CpuShmem(region) => region.size(),
+                        #[cfg(target_os = "macos")]
+                        ipc_messages::graphics::SurfaceFrame::SharedTexture { .. } => 0,
+                    }
                 );
 
                 // When the root's composed scene completes, all child frames
@@ -3991,8 +4001,7 @@ impl UserAgentWorker {
                     .insert(*webview_id, child_frame_to_webview.clone());
                 if let Err(e) = self.host.new_web_content_surface(
                     *webview_id,
-                    payload.clone(),
-                    surface,
+                    frame,
                     *width,
                     *height,
                     *generation,

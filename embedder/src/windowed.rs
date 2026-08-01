@@ -154,27 +154,136 @@ fn apple_standard_keybinding_for_key_down(event: &BlitzKeyEvent) -> Option<&'sta
 }
 
 /// Persistent GPU texture holding the latest composited surface pixels for
-/// one webview, registered once with the Vello renderer. Each frame's pixel
-/// data is uploaded in place via `queue.write_texture`, so Vello reuses the
-/// same GPU resource instead of re-importing fresh image bytes every frame.
-pub(super) struct WebviewSurfaceTexture {
-    texture: wgpu::Texture,
-    /// Vello registration id; valid while `registered` is true.
-    resource_id: ResourceId,
-    /// Logical (viewport) width/height of the surface content.
-    width: u32,
-    height: u32,
-    /// Physical width of the texture: the shared IOSurface is padded up to
-    /// a 64-multiple width (Metal constraint); the draw clips to `width`.
-    texture_width: u32,
-    /// False until the texture has been registered with the renderer.
-    /// Registration is dropped if the renderer is suspended; `paint_frame`
-    /// re-registers unregistered textures before drawing.
-    registered: bool,
-    /// Identity of the shared IOSurface this texture wraps (macOS zero-copy
-    /// path); None for the CPU upload path. Changes on resize.
+/// one webview, registered once with the Vello renderer. One variant per
+/// delivery path: the CPU upload path fills the texture from shared-memory
+/// bytes each frame; the macOS zero-copy path wraps a shared IOSurface.
+pub(super) enum WebviewSurfaceTexture {
+    /// CPU upload path: the texture is exactly the viewport size and its
+    /// contents are replaced in place via `queue.write_texture`.
+    #[cfg(not(target_os = "macos"))]
+    CpuUpload {
+        texture: wgpu::Texture,
+        /// Vello registration id; valid while `registered` is true.
+        resource_id: ResourceId,
+        width: u32,
+        height: u32,
+        /// False until the texture has been registered with the renderer.
+        /// Registration is dropped if the renderer is suspended; `paint_frame`
+        /// re-registers unregistered textures before drawing.
+        registered: bool,
+    },
+    /// macOS zero-copy path: the texture wraps a shared IOSurface imported
+    /// from the graphics process's Mach port.
     #[cfg(target_os = "macos")]
-    shared_surface_id: Option<u64>,
+    SharedSurface {
+        texture: wgpu::Texture,
+        /// Vello registration id; valid while `registered` is true.
+        resource_id: ResourceId,
+        /// Logical (viewport) width/height of the surface content.
+        width: u32,
+        height: u32,
+        /// Physical width of the texture: the shared IOSurface is padded up
+        /// to a 64-multiple width (Metal constraint); the draw clips to
+        /// `width`.
+        texture_width: u32,
+        /// False until the texture has been registered with the renderer.
+        /// Registration is dropped if the renderer is suspended; `paint_frame`
+        /// re-registers unregistered textures before drawing.
+        registered: bool,
+        /// Identity of the shared IOSurface; changes on resize.
+        texture_id: u64,
+    },
+}
+
+impl WebviewSurfaceTexture {
+    fn width(&self) -> u32 {
+        match self {
+            #[cfg(not(target_os = "macos"))]
+            WebviewSurfaceTexture::CpuUpload { width, .. } => *width,
+            #[cfg(target_os = "macos")]
+            WebviewSurfaceTexture::SharedSurface { width, .. } => *width,
+        }
+    }
+
+    fn height(&self) -> u32 {
+        match self {
+            #[cfg(not(target_os = "macos"))]
+            WebviewSurfaceTexture::CpuUpload { height, .. } => *height,
+            #[cfg(target_os = "macos")]
+            WebviewSurfaceTexture::SharedSurface { height, .. } => *height,
+        }
+    }
+
+    /// Physical texture width; padded for the shared surface variant.
+    fn texture_width(&self) -> u32 {
+        match self {
+            #[cfg(not(target_os = "macos"))]
+            WebviewSurfaceTexture::CpuUpload { width, .. } => *width,
+            #[cfg(target_os = "macos")]
+            WebviewSurfaceTexture::SharedSurface { texture_width, .. } => *texture_width,
+        }
+    }
+
+    fn texture(&self) -> &wgpu::Texture {
+        match self {
+            #[cfg(not(target_os = "macos"))]
+            WebviewSurfaceTexture::CpuUpload { texture, .. } => texture,
+            #[cfg(target_os = "macos")]
+            WebviewSurfaceTexture::SharedSurface { texture, .. } => texture,
+        }
+    }
+
+    fn resource_id(&self) -> ResourceId {
+        match self {
+            #[cfg(not(target_os = "macos"))]
+            WebviewSurfaceTexture::CpuUpload { resource_id, .. } => *resource_id,
+            #[cfg(target_os = "macos")]
+            WebviewSurfaceTexture::SharedSurface { resource_id, .. } => *resource_id,
+        }
+    }
+
+    fn is_registered(&self) -> bool {
+        match self {
+            #[cfg(not(target_os = "macos"))]
+            WebviewSurfaceTexture::CpuUpload { registered, .. } => *registered,
+            #[cfg(target_os = "macos")]
+            WebviewSurfaceTexture::SharedSurface { registered, .. } => *registered,
+        }
+    }
+
+    fn set_registration(&mut self, resource_id: ResourceId, registered: bool) {
+        match self {
+            #[cfg(not(target_os = "macos"))]
+            WebviewSurfaceTexture::CpuUpload {
+                resource_id: id,
+                registered: reg,
+                ..
+            } => {
+                *id = resource_id;
+                *reg = registered;
+            }
+            #[cfg(target_os = "macos")]
+            WebviewSurfaceTexture::SharedSurface {
+                resource_id: id,
+                registered: reg,
+                ..
+            } => {
+                *id = resource_id;
+                *reg = registered;
+            }
+        }
+    }
+
+    /// Identity of the shared IOSurface this texture wraps; None on the CPU
+    /// path. Changes on resize.
+    #[cfg(target_os = "macos")]
+    fn texture_id(&self) -> Option<u64> {
+        match self {
+            #[cfg(not(target_os = "macos"))]
+            WebviewSurfaceTexture::CpuUpload { .. } => None,
+            WebviewSurfaceTexture::SharedSurface { texture_id, .. } => Some(*texture_id),
+        }
+    }
 }
 
 /// Per-window state: owns a winit window, a renderer, chrome, and tabs
@@ -482,7 +591,7 @@ impl WindowedApp {
         // Re-register any surface textures whose Vello registration was
         // dropped (e.g. after a renderer suspend).
         for surface in state.surface_textures.values_mut() {
-            if !surface.registered {
+            if !surface.is_registered() {
                 Self::register_surface_texture(&mut state.renderer, surface);
             }
         }
@@ -491,7 +600,7 @@ impl WindowedApp {
             // Paint content surface if one is available.
             let surface_found = state.active_tab.is_some_and(|webview_id| {
                 if let Some(surface) = state.surface_textures.get(&webview_id)
-                    && surface.registered
+                    && surface.is_registered()
                 {
                     // Draw the texture at its natural (padded) size. While
                     // a resize is in flight the texture still holds the
@@ -504,14 +613,14 @@ impl WindowedApp {
                     let content_rect = kurbo::Rect::new(
                         0.0,
                         0.0,
-                        f64::from(surface.width),
-                        f64::from(surface.height),
+                        f64::from(surface.width()),
+                        f64::from(surface.height()),
                     );
                     let texture_rect = kurbo::Rect::new(
                         0.0,
                         0.0,
-                        f64::from(surface.texture_width),
-                        f64::from(surface.height),
+                        f64::from(surface.texture_width()),
+                        f64::from(surface.height()),
                     );
                     let content_transform = Affine::translate((0.0, chrome_height));
                     scene.push_clip_layer(content_transform, &content_rect);
@@ -519,7 +628,7 @@ impl WindowedApp {
                         peniko::Fill::NonZero,
                         content_transform,
                         PaintRef::Resource(peniko::ImageBrush {
-                            image: surface.resource_id,
+                            image: surface.resource_id(),
                             sampler: Default::default(),
                         }),
                         None,
@@ -528,7 +637,10 @@ impl WindowedApp {
                     scene.pop_layer();
                     info!(
                         "[render-pipe] Embedder paint webview={:?} {}x{} at y={}",
-                        webview_id, surface.width, surface.height, chrome_height
+                        webview_id,
+                        surface.width(),
+                        surface.height(),
+                        chrome_height
                     );
                     true
                 } else {
@@ -586,6 +698,7 @@ impl WindowedApp {
     /// Create the persistent GPU texture that receives composited surface
     /// pixels for one webview. `COPY_SRC` is required by Vello's
     /// `register_texture`, which copies the texture into its image atlas.
+    #[cfg(not(target_os = "macos"))]
     fn create_surface_texture(device: &wgpu::Device, width: u32, height: u32) -> wgpu::Texture {
         device.create_texture(&wgpu::TextureDescriptor {
             label: Some("webview-surface"),
@@ -615,10 +728,9 @@ impl WindowedApp {
         if !renderer.is_active() {
             return;
         }
-        match renderer.try_register_custom_resource(Box::new(surface.texture.clone())) {
+        match renderer.try_register_custom_resource(Box::new(surface.texture().clone())) {
             Ok(resource_id) => {
-                surface.resource_id = resource_id;
-                surface.registered = true;
+                surface.set_registration(resource_id, true);
             }
             Err(error) => error!("[embedder] register surface texture: {error:?}"),
         }
@@ -1333,8 +1445,7 @@ impl ApplicationHandler<FormalWebUserEvent> for WindowedApp {
             }
             FormalWebUserEvent::NewWebContentSurface {
                 webview_id,
-                payload,
-                surface,
+                frame,
                 width,
                 height,
                 generation,
@@ -1360,15 +1471,9 @@ impl ApplicationHandler<FormalWebUserEvent> for WindowedApp {
                     return;
                 };
 
-                match payload {
-                    ipc_messages::graphics::SurfacePayload::CpuShmem { .. } => {
-                        let Some(surface) = surface else {
-                            error!(
-                                "[embedder] missing shmem region for CPU surface webview={:?}",
-                                webview_id
-                            );
-                            return;
-                        };
+                match frame {
+                    #[cfg(not(target_os = "macos"))]
+                    ipc_messages::graphics::SurfaceFrame::CpuShmem(surface) => {
                         let total_pixels = (width * height * 4) as usize;
                         let pixels = surface.as_slice();
                         info!(
@@ -1392,27 +1497,24 @@ impl ApplicationHandler<FormalWebUserEvent> for WindowedApp {
                         // and just update its contents in place.
                         let needs_new = match state.surface_textures.get(&webview_id) {
                             Some(surface_tex) => {
-                                surface_tex.width != width || surface_tex.height != height
+                                surface_tex.width() != width || surface_tex.height() != height
                             }
                             None => true,
                         };
                         if needs_new {
                             if let Some(old) = state.surface_textures.remove(&webview_id)
-                                && old.registered
+                                && old.is_registered()
                             {
-                                state.renderer.unregister_resource(old.resource_id);
+                                state.renderer.unregister_resource(old.resource_id());
                             }
                             let texture =
                                 Self::create_surface_texture(&device_handle.device, width, height);
-                            let mut surface_tex = WebviewSurfaceTexture {
+                            let mut surface_tex = WebviewSurfaceTexture::CpuUpload {
                                 texture,
                                 resource_id: ResourceId::new(),
                                 width,
                                 height,
-                                texture_width: width,
                                 registered: false,
-                                #[cfg(target_os = "macos")]
-                                shared_surface_id: None,
                             };
                             Self::register_surface_texture(&mut state.renderer, &mut surface_tex);
                             state.surface_textures.insert(webview_id, surface_tex);
@@ -1425,7 +1527,7 @@ impl ApplicationHandler<FormalWebUserEvent> for WindowedApp {
                         if let Some(surface_tex) = state.surface_textures.get_mut(&webview_id) {
                             device_handle.queue.write_texture(
                                 wgpu::TexelCopyTextureInfo {
-                                    texture: &surface_tex.texture,
+                                    texture: surface_tex.texture(),
                                     mip_level: 0,
                                     origin: wgpu::Origin3d::ZERO,
                                     aspect: wgpu::TextureAspect::All,
@@ -1450,8 +1552,7 @@ impl ApplicationHandler<FormalWebUserEvent> for WindowedApp {
                         }
                     }
                     #[cfg(target_os = "macos")]
-                    ipc_messages::graphics::SurfacePayload::SharedTexture { texture_id, port } => {
-                        let _ = surface;
+                    ipc_messages::graphics::SurfaceFrame::SharedTexture { texture_id, port } => {
                         // Zero-copy path: the frame was rendered directly
                         // into a shared IOSurface by the graphics process.
                         // Import the surface (once per texture id) as the
@@ -1462,17 +1563,17 @@ impl ApplicationHandler<FormalWebUserEvent> for WindowedApp {
                         );
                         let is_new_surface = match state.surface_textures.get(&webview_id) {
                             Some(surface_tex) => {
-                                surface_tex.width != width
-                                    || surface_tex.height != height
-                                    || surface_tex.shared_surface_id != Some(texture_id)
+                                surface_tex.width() != width
+                                    || surface_tex.height() != height
+                                    || surface_tex.texture_id() != Some(texture_id)
                             }
                             None => true,
                         };
                         if is_new_surface {
                             if let Some(old) = state.surface_textures.remove(&webview_id)
-                                && old.registered
+                                && old.is_registered()
                             {
-                                state.renderer.unregister_resource(old.resource_id);
+                                state.renderer.unregister_resource(old.resource_id());
                             }
                             // SAFETY: the port is a send right to the shared
                             // surface; lookup consumes it.
@@ -1499,14 +1600,14 @@ impl ApplicationHandler<FormalWebUserEvent> for WindowedApp {
                                 );
                                 return;
                             };
-                            let mut surface_tex = WebviewSurfaceTexture {
+                            let mut surface_tex = WebviewSurfaceTexture::SharedSurface {
                                 texture,
                                 resource_id: ResourceId::new(),
                                 width,
                                 height,
                                 texture_width: padded_width,
                                 registered: false,
-                                shared_surface_id: Some(texture_id),
+                                texture_id,
                             };
                             Self::register_surface_texture(&mut state.renderer, &mut surface_tex);
                             state.surface_textures.insert(webview_id, surface_tex);

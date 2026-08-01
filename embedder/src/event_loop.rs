@@ -137,8 +137,7 @@ impl Embedder for EventLoopEmbedder {
     fn new_web_content_surface(
         &self,
         webview_id: WebviewId,
-        payload: ipc_messages::graphics::SurfacePayload,
-        surface: Option<ipc::IpcSharedRegion>,
+        frame: ipc_messages::graphics::SurfaceFrame,
         width: u32,
         height: u32,
         generation: u64,
@@ -146,8 +145,7 @@ impl Embedder for EventLoopEmbedder {
         self.dispatcher
             .send(FormalWebUserEvent::NewWebContentSurface {
                 webview_id,
-                payload,
-                surface,
+                frame,
                 width,
                 height,
                 generation,
@@ -166,13 +164,9 @@ pub enum FormalWebUserEvent {
     },
     NewWebContentSurface {
         webview_id: WebviewId,
-        /// How the rendered pixels are delivered (CPU shared memory vs.
-        /// shared IOSurface on macOS).
-        payload: ipc_messages::graphics::SurfacePayload,
-        /// The shared-memory region for the CPU path (None for the
-        /// zero-copy path, which carries the surface's Mach port in
-        /// `payload`).
-        surface: Option<ipc::IpcSharedRegion>,
+        /// The rendered surface frame: how the pixels are delivered (CPU
+        /// shared memory vs. shared IOSurface on macOS) and the payload.
+        frame: ipc_messages::graphics::SurfaceFrame,
         width: u32,
         height: u32,
         generation: u64,

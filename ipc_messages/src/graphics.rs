@@ -159,7 +159,9 @@ pub enum GraphicsEvent {
 /// How a rendered frame's pixels are delivered to the embedder.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum SurfacePayload {
-    /// CPU readback pixels in the IPC shared-memory map (cross-platform).
+    /// CPU readback pixels in the IPC shared-memory map (non-macOS, where
+    /// the GStreamer media backend delivers CPU video bytes).
+    #[cfg(not(target_os = "macos"))]
     CpuShmem {
         /// Key into the IPC shared memory map for the rendered RGBA pixel buffer.
         shmem_key: usize,
@@ -167,6 +169,25 @@ pub enum SurfacePayload {
     /// macOS zero-copy: the frame was rendered directly into a shared
     /// IOSurface, whose Mach port travels in this variant. The embedder
     /// looks the surface up from the port and blits it.
+    #[cfg(target_os = "macos")]
+    SharedTexture {
+        /// Stable identity of the shared IOSurface; changes on resize.
+        texture_id: u64,
+        /// Mach port (send right) to the IOSurface.
+        port: OsMachPort,
+    },
+}
+
+/// A rendered surface frame delivered to the embedder: the pixel delivery
+/// backend plus its payload. This is the boundary type (user agent →
+/// embedder event) — unlike the wire [`SurfacePayload`], the CPU path's
+/// shared-memory region is already extracted and carried here.
+#[derive(Debug)]
+pub enum SurfaceFrame {
+    /// CPU readback pixels in a shared-memory region.
+    #[cfg(not(target_os = "macos"))]
+    CpuShmem(ipc::IpcSharedRegion),
+    /// macOS zero-copy: a shared IOSurface to import and blit.
     #[cfg(target_os = "macos")]
     SharedTexture {
         /// Stable identity of the shared IOSurface; changes on resize.

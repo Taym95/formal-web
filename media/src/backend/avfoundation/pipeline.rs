@@ -125,9 +125,11 @@ impl PipelineHandle for AvfPipeline {
                         self.id.0
                     );
                     self.eos_sent.set(true);
-                    let _ = self.event_tx.send(MediaBackendEvent::Eos {
+                    if let Err(send_error) = self.event_tx.send(MediaBackendEvent::Eos {
                         pipeline_id: self.id,
-                    });
+                    }) {
+                        log::error!("[avf] p{}: eos send failed: {send_error}", self.id.0);
+                    }
                 }
             }
         }
@@ -143,14 +145,19 @@ impl PipelineHandle for AvfPipeline {
             // of the CPU byte conversion.
             let width = super::av_sys::pixel_buffer::pixel_buffer_width(&pixel_buf);
             let height = super::av_sys::pixel_buffer::pixel_buffer_height(&pixel_buf);
-            let _ = self.event_tx.send(MediaBackendEvent::PixelBufferFrame(
+            if let Err(send_error) = self.event_tx.send(MediaBackendEvent::PixelBufferFrame(
                 crate::backend::PixelBufferVideoFrame {
                     pipeline_id: self.id,
                     width,
                     height,
                     pixel_buffer: pixel_buf,
                 },
-            ));
+            )) {
+                log::error!(
+                    "[avf] p{}: pixel buffer frame send failed: {send_error}",
+                    self.id.0
+                );
+            }
         }
     }
 
