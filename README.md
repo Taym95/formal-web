@@ -31,6 +31,18 @@ cargo run --release --no-default-features --features v8,media
 cargo build --release --no-default-features --features backend-gstreamer,boa,media
 ```
 
+**Zero-copy surface backend** (macOS, optional): by default rendered frames are
+shipped as CPU readback + IPC shared memory. With
+`FORMAL_WEB_SURFACE_BACKEND=iosurface` the graphics process renders directly
+into a shared IOSurface and the embedder blits it — no CPU readback, no IPC
+pixel bytes. This requires the forked `ipc-channel` (see below):
+```bash
+cargo build --release
+FORMAL_WEB_SURFACE_BACKEND=iosurface cargo run --release
+```
+Resize updates in one step once the resize settles (no live-resize animation);
+see `graphics/README.md` for details.
+
 
 ## Project architecture
 
@@ -49,6 +61,16 @@ The following procesess are used:
 - **Content** (`user_agent/src/event_loop.rs`): runs the `content` crate. Multiple processes: one per [similar origin window agent](https://html.spec.whatwg.org/#similar-origin-window-agent).
 - **Graphics** (`graphics/src/bin/graphics_process.rs`): runs the `graphics` and `media` crates.
 - **Net** (`user_agent/src/fetch.rs`): runs the `net` crate.
+
+### External dependency: forked ipc-channel
+
+The zero-copy IOSurface surface path needs to transport arbitrary Mach ports
+(an IOSurface's) inside IPC messages, which upstream ipc-channel cannot do. The
+workspace depends on a fork at
+<https://github.com/gterzian/ipc-channel> that adds an `OsMachPort`
+serde-transportable type (each crate declares it as a git dependency; the
+`Cargo.lock` pins the fork revision). The CPU-only surface path also builds
+from the fork.
 
 ## Formal verification
 

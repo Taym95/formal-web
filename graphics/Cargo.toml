@@ -23,6 +23,7 @@ anyrender_vello = "0.10.1"
 ipc = { path = "../ipc" }
 ipc_messages = { path = "../ipc_messages" }
 media = { path = "../media" }
+ipc-channel = { git = "https://github.com/gterzian/ipc-channel" }
 kurbo = "0.13"
 peniko = "0.6"
 serde = { version = "1", features = ["derive"] }
@@ -36,6 +37,7 @@ pollster = "0.4"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
-objc2-metal = "0.3"
+objc2-metal = { version = "0.3", features = ["objc2-io-surface"] }
 objc2-core-foundation = "0.3"
 objc2-io-surface = "0.3"
+objc2-core-video = "0.3"

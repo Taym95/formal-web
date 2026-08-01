@@ -8,14 +8,14 @@ back to CPU, and ships them through IPC shared memory; the embedder uploads
 those bytes into a persistent per-webview GPU texture and blits it. This path
 works on every platform.
 
-The long-term goal is **zero-copy GPU texture rendering**: the graphics process
-renders directly into a GPU texture and the embedder blits that same texture,
-with no CPU readback and no IPC byte copies. On macOS the only mechanism for
-sharing GPU memory across processes is **IOSurface**, and every attempt to
-share an IOSurface cross-process has failed so far (see below). The design in
-this document covers the current pipeline, the zero-copy target, the generic
-backend abstraction that lets both coexist, and the transport problem that
-currently blocks the zero-copy path.
+On macOS a **zero-copy** backend is also implemented: the graphics process
+renders directly into a shared IOSurface texture and the embedder imports the
+same surface and blits it — no CPU readback, no IPC pixel bytes. The
+cross-process transport problem (shipping the surface's Mach port) is solved
+by the forked `ipc-channel` (a git dependency on
+<https://github.com/gterzian/ipc-channel>), which adds an `OsMachPort`
+serde-transportable type. The backend is selected with
+`FORMAL_WEB_SURFACE_BACKEND=iosurface|cpu` (default `cpu`).
 
 ## Current pipeline (CPU readback + shared memory)
 
@@ -94,33 +94,43 @@ blits it. No readback, no IPC pixel bytes, no upload.
 - **Usage**: producer needs `STORAGE_BINDING | TEXTURE_BINDING | COPY_SRC`
   (Vello renders via compute into the target); consumer needs
   `TEXTURE_BINDING | COPY_SRC` (the `register_texture` requirement).
-- **GPU sync**: the embedder's blit must not start before the producer's GPU
-  render into the shared texture completes. The coarse sync is the ack (the
-  embedder acks after its blit is submitted — refine to ack after
-  `on_submitted_work_done` if needed); a true fence uses a shared
-  `MTLSharedEvent`.
+- **Width padding**: Metal rejects an IOSurface-backed texture whose **width is
+  not a multiple of 64** (verified empirically: 1516 fails, 1600 works; height
+  is unconstrained). Both sides create/import the surface at
+  `round_up_64(width)` and the producer renders only the logical width's
+  top-left region; the consumer clips the draw to the logical rect. See
+  `graphics/tests/iosurface_sizes.rs`.
+- **GPU sync**: the producer waits for its render submission to complete (the
+  dedicated poll thread, `PollRequest.done`) before sending `PixelFrameReady`,
+  so the embedder's blit never starts before the producer's render. A true
+  fence would use a shared `MTLSharedEvent`.
 - **Lifecycle**: resize recreates the IOSurface + re-shares + re-registers; the
   texture handle's lifetime must outlive in-flight blits.
 
-### The transport blocker (Mach port over ipc-channel)
+### The transport blocker (Mach port over ipc-channel) — solved
 
 The `mach_msg` machinery in ipc-channel 0.22 already sends Mach ports in every
 message — but only its own channel endpoints (`OsIpcChannel` ports collected by
-the serializer from `OpaqueIpcSender`/`OpaqueIpcReceiver` values). There is no
+the serializer from `OpaqueIpcSender`/`OpaqueIpcReceiver` values). There was no
 public API to attach an **arbitrary** Mach port (such as an IOSurface's) to a
-message: no `OsMachPort` type exists in ipc-channel 0.22 (it is a Servo-fork
-addition), and port names are per-task so the right must physically travel in
-the message. This is why the earlier attempts resorted to UB port extraction
-and hand-rolled messages (both failed).
+message: port names are per-task so the right must physically travel in the
+message.
 
-Options:
+**Solution (implemented in the `ipc-channel` fork, a git dependency on
+<https://github.com/gterzian/ipc-channel>):** a serializable
+`OsMachPort` type that pushes the port into a serialization thread-local
+(mirroring `OS_IPC_CHANNELS_FOR_SERIALIZATION`) and pops it on deserialize. The
+ports travel as a single `MACH_MSG_OOL_PORTS_DESCRIPTOR` (out-of-line ports,
+`MOVE_SEND`) appended after the shared-memory descriptors; the receive path
+collects them into a third descriptor phase. `IpcSender::send` gathers them
+alongside channel ports. The fork adds `OsIpcSender::send_with_mach_ports`;
+non-macOS platforms are untouched.
 
-1. **Patch ipc-channel** (what Servo does): add a serializable `OsMachPort`
-   that pushes a raw `mach_port_t` into a serialization thread-local (mirroring
-   `OS_IPC_CHANNELS_FOR_SERIALIZATION`) and pops it on deserialize; extend the
-   receive path to collect arbitrary ports alongside channel ports. The
-   transport's `send(.., ports, ..)` already accepts a ports vec, so the change
-   is bounded — but requires a Cargo `[patch]` to a fork or vendoring.
+Rejected alternatives, for the record:
+
+1. Plain per-port descriptors (`MACH_MSG_PORT_DESCRIPTOR`) for the arbitrary
+   ports — indistinguishable from channel ports on the receive side (the
+   receiver cannot tell how many leading descriptors are channels).
 2. **Implement the raw `mach_msg` in-tree** (in the `ipc` crate), using
    ipc-channel's own macOS `Message` layout as the reference — the previous
    failure was a buggy hand-rolled struct, not an impossible one.
@@ -130,50 +140,33 @@ Options:
 
 ## Generic surface backend abstraction
 
-The current code is already shaped for multiple delivery backends: the ring,
-the ack protocol, the deferral, the messages, and the embedder's draw path are
-all transport-agnostic. The abstraction introduces a per-webview "frame buffer"
-concept with two implementations: the current cross-platform CPU path, and a
-macOS-only zero-copy path.
+The ring, the ack protocol, the deferral, the messages, and the embedder's draw
+path are all transport-agnostic. A per-webview `SurfaceBuffers` enum holds the
+frame buffers for one of two implementations: the cross-platform CPU path and
+the macOS-only zero-copy path. The ring lifecycle (`SurfaceRingState`: pick /
+reserve / mark-pending / ack) is shared verbatim.
 
 ### Producer side (graphics)
 
 ```rust
-/// A per-webview shared frame buffer: the thing a rendered frame is delivered into.
-trait SurfaceBuffer {
-    /// CPU path: copy rendered pixels into the shared-memory region.
-    fn deliver_pixels(&mut self, pixels: &[u8], width: u32, height: u32);
-    /// Zero-copy path: the wgpu texture Vello renders *into* directly.
+enum SurfaceBuffers {
+    Cpu(SurfaceShmemBuffers),                    // current
     #[cfg(target_os = "macos")]
-    fn render_target(&mut self) -> Option<&wgpu::Texture>;
-    /// The wire payload that travels in PixelFrameReady.
-    fn wire_payload(&self) -> SurfacePayload;
+    Iosurface(IosurfaceBuffers),                 // zero-copy
 }
 
-/// The ring lifecycle is backend-agnostic.
-struct SurfaceRing<T: SurfaceBuffer> {
-    buffers: [T; 3],
+struct SurfaceRingState {
     state: [BufferState; 3], // Free / Reserved(g) / Pending(g)
     write_index: usize,
     width: u32,
     height: u32,
 }
-
-type CpuSurfaceRing = SurfaceRing<CpuShmemBuffer>;        // current
-#[cfg(target_os = "macos")]
-type IosurfaceRing = SurfaceRing<IosurfaceTextureBuffer>; // zero-copy
 ```
 
-The renderer's target becomes an enum, so the readback machinery (staging pool,
-poll thread, `ReadbackReady`) is confined to the CPU variant:
-
-```rust
-enum RenderTarget<'a> {
-    Readback,                          // render to intermediate, read back
-    #[cfg(target_os = "macos")]
-    SharedTexture(&'a wgpu::Texture),  // render Vello directly into the shared texture
-}
-```
+The renderer's target differs per backend: the CPU path renders to an
+intermediate texture and submits a readback; the zero-copy path renders Vello
+directly into the shared texture (`render_scene_shared`) and the poll thread
+delivers `RenderDone` once the submission completes.
 
 ### Wire payload
 
@@ -182,7 +175,7 @@ enum RenderTarget<'a> {
 enum SurfacePayload {
     CpuShmem { shmem_key: usize },                    // current
     #[cfg(target_os = "macos")]
-    SharedTexture { texture_id: u64 },                // handle to the shared texture
+    SharedTexture { texture_id: u64, port: OsMachPort }, // zero-copy
 }
 ```
 
@@ -209,39 +202,37 @@ in use.
 
 ## AVFoundation → shared texture
 
-Video frames are currently decoded to CPU bytes (`AVPlayerItemVideoOutput::copy_pixel_buffer` → `pixel_buffer_to_frame`) and embedded into the composed scene as image bytes. The zero-copy path composes video as a GPU texture instead:
+Video frames are composited as GPU textures (macOS): the AVFoundation pipeline
+delivers the decoded `CVPixelBuffer` itself (`MediaBackendEvent::PixelBufferFrame`)
+instead of CPU bytes; the graphics process wraps it as a Metal texture via
+`CVMetalTextureCacheCreateTextureFromImage` (zero-copy when the pixel buffer is
+GPU-backed), does a one-pass BGRA→RGBA compute blit into a per-pipeline RGBA
+texture, and registers that texture with its Vello renderer via
+`Renderer::override_image` (a fake `ImageData` with an empty blob; the scene
+draws it as a plain image brush, so no anyrender changes are needed). The video
+composites into the composed scene — including the shared IOSurface on the
+zero-copy surface backend — without a CPU round-trip. GStreamer keeps the CPU
+byte path (`MediaBackendEvent::Frame`).
 
-1. `copy_pixel_buffer` already yields a `CVPixelBuffer`; wrap it as a Metal
-   texture via `CVMetalTextureCacheCreateTextureFromImage` (zero-copy when the
-   pixel buffer is GPU-backed).
-2. Import into the graphics device via the same `texture_from_raw` +
-   `create_texture_from_hal` machinery, on the **same device** the `GpuRenderer`
-   composites with (the media backend currently has no wgpu device — it needs
-   the graphics device's Metal handle from `raw_device()`).
-3. Register with the graphics Vello renderer and draw the video embed site as
-   `Paint::Resource(video_resource_id)` in the composed scene (the `anyrender`
-   recording already supports the `Resource` paint variant).
-4. The graphics Vello render samples the video texture directly while rendering
-   into the shared IOSurface texture; the embedder's blit includes video with
-   zero extra copies.
-
-Caveats: `AVPlayerItemVideoOutput` yields BGRA, so either request an RGBA
-pixel-buffer format or do a one-pass BGRA→RGBA GPU blit per frame; the
-`CVPixelBuffer` must be retained while the texture referencing it is in use (a
-small pool cycling with the ring). This work is orthogonal to the transport
-problem — the blit happens entirely inside the graphics process — and is a
-prerequisite for the zero-copy route (video must composite into the shared
-texture without a CPU round-trip).
+Caveats: the `CVPixelBuffer` must stay alive while the texture referencing it
+is in use (kept until the next frame replaces it); a BGRA→RGBA blit is needed
+because Vello's `register_texture` requires `Rgba8Unorm`.
 
 ## Open risks and questions
 
-- **Transport**: the IOSurface Mach-port delivery is unsolved (the blocker
-  above); every option touches either a vendored crate or the XPC backend.
-- **GPU sync across processes**: the ack is a coarse fence; a true zero-copy
-  path may need a shared `MTLSharedEvent` to bound the consumer's blit against
-  the producer's render.
+- **Resize**: on resize the whole 3-slot IOSurface ring is recreated and the
+  embedder re-imports + re-registers the new surfaces. The update happens in
+  one large step once the resize settles — there is no incremental (live)
+  resize animation. Known and accepted for now; a smoother resize would
+  re-render at intermediate sizes during the drag and/or reuse ring slots
+  whose size is unchanged.
+- **GPU sync across processes**: the producer waits for its render submission
+  before signaling (coarse fence); a true zero-copy path may need a shared
+  `MTLSharedEvent` to bound the consumer's blit against the producer's render
+  without the CPU-side wait.
 - **Device topology**: the zero-copy path works best with one shared wgpu
   device across webviews (and with the media backend); today the graphics
-  process creates a device per webview.
+  process creates a device per webview. Video textures live on the webview's
+  device, so a pipeline plays only on the webview it was created for.
 - **Format/lifecycle**: RGBA-only for Vello, pixel-buffer/texture lifetime
-  management, resize re-sharing.
+  management, the 64-multiple width padding (see above).

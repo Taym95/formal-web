@@ -1,12 +1,14 @@
 pub mod compositor;
-pub(crate) mod renderer;
+#[cfg(target_os = "macos")]
+pub mod iosurface;
+pub mod renderer;
 
 use std::collections::HashMap;
 
 use compositor::{Compositor, CompositorVideoFrame};
 use crossbeam_channel::{select, tick};
 use ipc_messages::content::{FontTransportReceiver, FrameId, WebviewId};
-use ipc_messages::graphics::{FrameHitInfo, GraphicsCommand, GraphicsEvent};
+use ipc_messages::graphics::{FrameHitInfo, GraphicsCommand, GraphicsEvent, SurfacePayload};
 use ipc_messages::media::{MediaPipelineId, VideoPaintId};
 use log::{debug, error, info};
 use verification::TLATracer;
@@ -33,41 +35,70 @@ pub struct ComposedScene {
     pub animating: bool,
 }
 
+/// Which surface delivery backend a webview's frames use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SurfaceBackendKind {
+    /// CPU readback + shared memory (cross-platform).
+    Cpu,
+    /// macOS zero-copy: render directly into a shared IOSurface.
+    #[cfg(target_os = "macos")]
+    Iosurface,
+}
+
+impl SurfaceBackendKind {
+    fn selected() -> Self {
+        #[cfg(target_os = "macos")]
+        {
+            match std::env::var("FORMAL_WEB_SURFACE_BACKEND").as_deref() {
+                Ok("iosurface") => SurfaceBackendKind::Iosurface,
+                _ => SurfaceBackendKind::Cpu,
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            SurfaceBackendKind::Cpu
+        }
+    }
+}
+
 struct WebviewCompositorSlot {
     compositor: Compositor,
     gpu_renderer: crate::renderer::GpuRenderer,
     font_receiver: FontTransportReceiver,
     child_frame_to_parent: HashMap<FrameId, WebviewId>,
-    /// Persistent shared-memory pixel buffers for the rendered surface,
-    /// a three-slot ring. A buffer is only written when the embedder has
-    /// acked the previous frame that used it (TextureConsumed); otherwise
-    /// the composed scene is deferred here until a buffer frees up.
-    surface_shmem: Option<SurfaceShmemBuffers>,
+    backend: SurfaceBackendKind,
+    /// Persistent per-webview frame buffers, a three-slot ring. A buffer is
+    /// only written when the embedder has acked the previous frame that used
+    /// it (TextureConsumed); otherwise the composed scene is deferred here
+    /// until a buffer frees up.
+    surface_buffers: Option<SurfaceBuffers>,
+    /// Monotonic identity for shared IOSurface textures; changes on resize.
+    #[cfg(target_os = "macos")]
+    iosurface_texture_id_counter: u64,
     /// The most recent composed scene that could not be rendered because
     /// every surface buffer was still awaiting the embedder's ack.
     deferred_scene: Option<ComposedScene>,
 }
 
-/// State of one shared-memory surface buffer in the ring.
+/// State of one surface buffer in the ring.
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum BufferState {
     /// Free to be picked for a new frame's submission.
     Free,
-    /// Picked at submit time; the GPU readback is in flight and the pixels
-    /// have not been delivered yet.
+    /// Picked at submit time; the render is in flight and the pixels have
+    /// not been delivered yet.
     Reserved(u64),
     /// Delivered (PixelFrameReady sent); awaiting the embedder's ack.
     Pending(u64),
 }
 
-/// Three shared-memory pixel buffers per webview used as a ring. A buffer is
-/// picked at submit time (Reserved), becomes Pending when the pixels are
-/// delivered, and is freed by the embedder's TextureConsumed ack. The
-/// graphics process never writes a buffer that is Reserved or Pending, so
-/// the embedder is guaranteed to have consumed the previous frame's pixels
-/// before the buffer is reused.
-struct SurfaceShmemBuffers {
-    regions: [ipc::IpcSharedRegion; 3],
+/// The ring lifecycle shared by both backends: a buffer is picked at submit
+/// time (Reserved), becomes Pending when the pixels are delivered, and is
+/// freed by the embedder's TextureConsumed ack. The graphics process never
+/// writes a buffer that is Reserved or Pending, so the embedder is
+/// guaranteed to have consumed the previous frame's pixels before the buffer
+/// is reused.
+struct SurfaceRingState {
     state: [BufferState; 3],
     /// Ring index where the next free buffer search starts.
     write_index: usize,
@@ -75,19 +106,14 @@ struct SurfaceShmemBuffers {
     height: u32,
 }
 
-impl SurfaceShmemBuffers {
-    fn allocate(width: u32, height: u32) -> Result<Self, ipc::IpcError> {
-        let byte_count = (width as usize) * (height as usize) * 4;
-        let region_zero = ipc::IpcSharedRegion::allocate(byte_count)?;
-        let region_one = ipc::IpcSharedRegion::allocate(byte_count)?;
-        let region_two = ipc::IpcSharedRegion::allocate(byte_count)?;
-        Ok(Self {
-            regions: [region_zero, region_one, region_two],
+impl SurfaceRingState {
+    fn new(width: u32, height: u32) -> Self {
+        Self {
             state: [BufferState::Free, BufferState::Free, BufferState::Free],
             write_index: 0,
             width,
             height,
-        })
+        }
     }
 
     /// Index of the next free buffer to pick, scanning the ring from
@@ -124,6 +150,96 @@ impl SurfaceShmemBuffers {
     }
 }
 
+/// Three shared-memory pixel buffers per webview used as a ring (CPU path).
+struct SurfaceShmemBuffers {
+    regions: [ipc::IpcSharedRegion; 3],
+    ring: SurfaceRingState,
+}
+
+impl SurfaceShmemBuffers {
+    fn allocate(width: u32, height: u32) -> Result<Self, ipc::IpcError> {
+        let byte_count = (width as usize) * (height as usize) * 4;
+        let region_zero = ipc::IpcSharedRegion::allocate(byte_count)?;
+        let region_one = ipc::IpcSharedRegion::allocate(byte_count)?;
+        let region_two = ipc::IpcSharedRegion::allocate(byte_count)?;
+        Ok(Self {
+            regions: [region_zero, region_one, region_two],
+            ring: SurfaceRingState::new(width, height),
+        })
+    }
+}
+
+/// Three shared IOSurface textures per webview used as a ring (macOS
+/// zero-copy path).
+#[cfg(target_os = "macos")]
+struct IosurfaceBuffers {
+    textures: [iosurface::IosurfaceTexture; 3],
+    ring: SurfaceRingState,
+}
+
+#[cfg(target_os = "macos")]
+impl IosurfaceBuffers {
+    fn allocate(
+        renderer: &crate::renderer::GpuRenderer,
+        width: u32,
+        height: u32,
+        texture_id_counter: &mut u64,
+    ) -> Option<Self> {
+        let texture_zero =
+            iosurface::create_shared_texture(renderer, width, height, *texture_id_counter)?;
+        *texture_id_counter += 1;
+        let texture_one =
+            iosurface::create_shared_texture(renderer, width, height, *texture_id_counter)?;
+        *texture_id_counter += 1;
+        let texture_two =
+            iosurface::create_shared_texture(renderer, width, height, *texture_id_counter)?;
+        *texture_id_counter += 1;
+        Some(Self {
+            textures: [texture_zero, texture_one, texture_two],
+            ring: SurfaceRingState::new(width, height),
+        })
+    }
+}
+
+/// The per-webview frame buffers, one implementation per backend. The
+/// zero-copy variant is boxed to keep the enum small (each texture holds a
+/// wgpu texture plus the IOSurface and its Mach port).
+enum SurfaceBuffers {
+    Cpu(SurfaceShmemBuffers),
+    #[cfg(target_os = "macos")]
+    Iosurface(Box<IosurfaceBuffers>),
+}
+
+impl SurfaceBuffers {
+    fn ring(&self) -> &SurfaceRingState {
+        match self {
+            SurfaceBuffers::Cpu(buffers) => &buffers.ring,
+            #[cfg(target_os = "macos")]
+            SurfaceBuffers::Iosurface(buffers) => &buffers.ring,
+        }
+    }
+
+    fn ring_mut(&mut self) -> &mut SurfaceRingState {
+        match self {
+            SurfaceBuffers::Cpu(buffers) => &mut buffers.ring,
+            #[cfg(target_os = "macos")]
+            SurfaceBuffers::Iosurface(buffers) => &mut buffers.ring,
+        }
+    }
+
+    fn next_free(&self) -> Option<usize> {
+        self.ring().next_free()
+    }
+
+    fn reserve(&mut self, index: usize, generation: u64) {
+        self.ring_mut().reserve(index, generation);
+    }
+
+    fn ack(&mut self, generation: u64) -> bool {
+        self.ring_mut().ack(generation)
+    }
+}
+
 impl WebviewCompositorSlot {
     fn new(channels: crate::renderer::ReadbackChannels) -> Self {
         Self {
@@ -134,7 +250,10 @@ impl WebviewCompositorSlot {
             },
             font_receiver: FontTransportReceiver::default(),
             child_frame_to_parent: HashMap::new(),
-            surface_shmem: None,
+            backend: SurfaceBackendKind::selected(),
+            surface_buffers: None,
+            #[cfg(target_os = "macos")]
+            iosurface_texture_id_counter: 1,
             deferred_scene: None,
         }
     }
@@ -167,21 +286,31 @@ pub fn run_graphics_process<B: MediaBackend + 'static>(
     let (poll_tx, poll_rx) = crossbeam_channel::unbounded::<crate::renderer::PollRequest>();
     let (readback_ready_tx, readback_ready_rx) =
         crossbeam_channel::unbounded::<crate::renderer::ReadbackReady>();
+    let (render_done_tx, render_done_rx) =
+        crossbeam_channel::unbounded::<crate::renderer::RenderDone>();
     let channels = crate::renderer::ReadbackChannels {
         poll_tx,
         readback_ready_tx,
+        render_done_tx,
     };
+    let render_done_tx = channels.render_done_tx.clone();
     let poll_thread = std::thread::Builder::new()
         .name(String::from("formal-web:gpu-poll"))
         .spawn(move || {
+            let render_done_tx = render_done_tx;
             while let Ok(request) = poll_rx.recv() {
-                // Block until this submission completes; the map callbacks
-                // registered with map_buffer_on_submit fire here, sending
-                // ReadbackReady to the main loop.
+                // Block until the requested submission(s) complete; the map
+                // callbacks registered with map_buffer_on_submit fire here,
+                // sending ReadbackReady to the main loop.
                 let _ = request.device.device.poll(wgpu::PollType::Wait {
-                    submission_index: Some(request.submission_index),
+                    submission_index: request.submission_index,
                     timeout: None,
                 });
+                // Zero-copy path: no map callback exists; deliver the done
+                // notice directly.
+                if let Some(done) = request.done {
+                    let _ = render_done_tx.send(done);
+                }
             }
         })
         .expect("failed to spawn gpu poll thread");
@@ -290,6 +419,10 @@ pub fn run_graphics_process<B: MediaBackend + 'static>(
                 let Ok(ready) = ready else { break };
                 handle_readback_ready(&mut webviews, &event_sender, &mut tla_tracer, ready);
             }
+            recv(render_done_rx) -> done => {
+                let Ok(done) = done else { break };
+                handle_render_done(&mut webviews, &event_sender, &mut tla_tracer, done);
+            }
         }
     }
 
@@ -327,7 +460,7 @@ fn handle_media_event(
                 video_paint_id: paint_id,
                 width: video_frame.width,
                 height: video_frame.height,
-                data: pixel_bytes,
+                content: compositor::VideoFrameContent::Bytes(pixel_bytes),
             };
             if let Some(slot) = webviews.get_mut(&webview_id) {
                 // Store the video frame. It will be included in the next normal
@@ -339,6 +472,39 @@ fn handle_media_event(
                 // UpdateTheRendering, violating the TLA+ pipeline model.
                 slot.compositor.update_video_frame(cf);
             }
+        }
+        #[cfg(target_os = "macos")]
+        MediaBackendEvent::PixelBufferFrame(frame) => {
+            let pipeline_id = frame.pipeline_id;
+            let Some(&(webview_id, paint_id)) = pipeline_webview_map.get(&pipeline_id) else {
+                debug!(
+                    "[graphics] pixel buffer frame for unknown pipeline {:?}",
+                    pipeline_id
+                );
+                return;
+            };
+            let Some(slot) = webviews.get_mut(&webview_id) else {
+                return;
+            };
+            let Some(resource_id) = slot.gpu_renderer.import_video_frame(
+                paint_id,
+                &frame.pixel_buffer,
+                frame.width,
+                frame.height,
+            ) else {
+                error!(
+                    "[graphics] failed to import video texture pipeline={:?}",
+                    pipeline_id
+                );
+                return;
+            };
+            let cf = CompositorVideoFrame {
+                video_paint_id: paint_id,
+                width: frame.width,
+                height: frame.height,
+                content: compositor::VideoFrameContent::Texture(resource_id),
+            };
+            slot.compositor.update_video_frame(cf);
         }
         MediaBackendEvent::Eos { pipeline_id } => {
             if let Some(&(webview_id, paint_id)) = pipeline_webview_map.get(&pipeline_id) {
@@ -491,9 +657,9 @@ fn handle_command<B: MediaBackend + 'static>(
                 return false;
             };
             if !slot
-                .surface_shmem
+                .surface_buffers
                 .as_mut()
-                .is_some_and(|b| b.ack(generation))
+                .is_some_and(|buffers| buffers.ack(generation))
             {
                 debug!(
                     "[graphics] texture consumed for unknown generation {} (webview={:?})",
@@ -566,34 +732,34 @@ fn handle_command<B: MediaBackend + 'static>(
             }
         }
         GraphicsCommand::MediaPlay { pipeline_id } => {
-            if let Some(p) = pipelines.get(&pipeline_id) {
-                if let Err(e) = p.play() {
-                    error!("[graphics:media] play: {e}");
-                }
+            if let Some(p) = pipelines.get(&pipeline_id)
+                && let Err(e) = p.play()
+            {
+                error!("[graphics:media] play: {e}");
             }
         }
         GraphicsCommand::MediaPause { pipeline_id } => {
-            if let Some(p) = pipelines.get(&pipeline_id) {
-                if let Err(e) = p.pause() {
-                    error!("[graphics:media] pause: {e}");
-                }
+            if let Some(p) = pipelines.get(&pipeline_id)
+                && let Err(e) = p.pause()
+            {
+                error!("[graphics:media] pause: {e}");
             }
         }
         GraphicsCommand::MediaSeek {
             pipeline_id,
             position_secs,
         } => {
-            if let Some(p) = pipelines.get(&pipeline_id) {
-                if let Err(e) = p.seek(position_secs) {
-                    error!("[graphics:media] seek: {e}");
-                }
+            if let Some(p) = pipelines.get(&pipeline_id)
+                && let Err(e) = p.seek(position_secs)
+            {
+                error!("[graphics:media] seek: {e}");
             }
         }
         GraphicsCommand::MediaDestroy { pipeline_id } => {
-            if let Some(p) = pipelines.remove(&pipeline_id) {
-                if let Err(e) = p.destroy() {
-                    error!("[graphics:media] destroy: {e}");
-                }
+            if let Some(p) = pipelines.remove(&pipeline_id)
+                && let Err(e) = p.destroy()
+            {
+                error!("[graphics:media] destroy: {e}");
             }
         }
 
@@ -668,35 +834,58 @@ fn submit_composed_scene(
         .unwrap_or(0)
         .max(1);
     info!(
-        "[render-pipe] Graphics GPU render webview={} {}x{} {} child_frames animating={}",
+        "[render-pipe] Graphics GPU render webview={} {}x{} {} child_frames animating={} backend={:?}",
         webview_id.0,
         width,
         height,
         child_viewports.len(),
-        animating
+        animating,
+        slot.backend
     );
 
-    // Reuse the per-webview shared-memory buffers across frames, reallocating
-    // only when the viewport size changes. The buffer is picked here (at
-    // submit time) and reserved; the pixels are written into it later, when
-    // the GPU completes the readback.
+    // Reuse the per-webview frame buffers across frames, reallocating only
+    // when the viewport size changes. The buffer is picked here (at submit
+    // time) and reserved; the pixels are delivered later, when the GPU
+    // completes the render.
     let needs_new = slot
-        .surface_shmem
+        .surface_buffers
         .as_ref()
-        .is_none_or(|buffers| buffers.width != width || buffers.height != height);
+        .is_none_or(|buffers| buffers.ring().width != width || buffers.ring().height != height);
     if needs_new {
-        match SurfaceShmemBuffers::allocate(width, height) {
-            Ok(buffers) => slot.surface_shmem = Some(buffers),
-            Err(error) => {
-                error!(
-                    "[graphics] allocate surface shmem {}x{}: {error}",
-                    width, height
-                );
-                return Err(());
+        match slot.backend {
+            SurfaceBackendKind::Cpu => match SurfaceShmemBuffers::allocate(width, height) {
+                Ok(buffers) => slot.surface_buffers = Some(SurfaceBuffers::Cpu(buffers)),
+                Err(error) => {
+                    error!(
+                        "[graphics] allocate surface shmem {}x{}: {error}",
+                        width, height
+                    );
+                    return Err(());
+                }
+            },
+            #[cfg(target_os = "macos")]
+            SurfaceBackendKind::Iosurface => {
+                match IosurfaceBuffers::allocate(
+                    &slot.gpu_renderer,
+                    width,
+                    height,
+                    &mut slot.iosurface_texture_id_counter,
+                ) {
+                    Some(buffers) => {
+                        slot.surface_buffers = Some(SurfaceBuffers::Iosurface(Box::new(buffers)));
+                    }
+                    None => {
+                        error!(
+                            "[graphics] allocate shared textures {}x{}: failed",
+                            width, height
+                        );
+                        return Err(());
+                    }
+                }
             }
         }
     }
-    let buffers = slot.surface_shmem.as_mut().expect("allocated above");
+    let buffers = slot.surface_buffers.as_mut().expect("allocated above");
     let Some(buffer_index) = buffers.next_free() else {
         // Every buffer is reserved or awaiting the embedder's ack: hold the
         // composed scene and submit it once a buffer frees. This keeps the
@@ -716,8 +905,8 @@ fn submit_composed_scene(
         return Ok(());
     };
 
-    // Render and submit the GPU → CPU readback. The shared-memory buffer was
-    // pre-selected above; the pixels land there once the readback completes.
+    // Render and submit. The frame buffer was pre-selected above; its pixels
+    // are delivered once the GPU completes the render.
     let child_ports: Vec<ipc_messages::graphics::ChildViewport> = child_viewports
         .into_iter()
         .map(|(cwv, b)| ipc_messages::graphics::ChildViewport {
@@ -733,10 +922,25 @@ fn submit_composed_scene(
         child_frame_to_webview,
         animating,
     };
-    let Some(submit) = slot
-        .gpu_renderer
-        .render_scene(&scene, width, height, completion)
-    else {
+    let submit = match slot.backend {
+        SurfaceBackendKind::Cpu => slot
+            .gpu_renderer
+            .render_scene(&scene, width, height, completion),
+        #[cfg(target_os = "macos")]
+        SurfaceBackendKind::Iosurface => {
+            let SurfaceBuffers::Iosurface(buffers) = buffers else {
+                unreachable!("backend mismatch");
+            };
+            slot.gpu_renderer.render_scene_shared(
+                &scene,
+                width,
+                height,
+                &buffers.textures[buffer_index].texture,
+                completion,
+            )
+        }
+    };
+    let Some(submit) = submit else {
         error!("[graphics] render failed for {:?}", webview_id);
         return Err(());
     };
@@ -755,7 +959,7 @@ fn submit_composed_scene(
     Ok(())
 }
 
-/// Deliver a completed readback: copy the pixels from the staging buffer
+/// Deliver a completed CPU readback: copy the pixels from the staging buffer
 /// into the shared-memory buffer that was pre-selected at submit time, mark
 /// it pending (awaiting the embedder's ack), and send PixelFrameReady.
 fn handle_readback_ready(
@@ -792,9 +996,17 @@ fn handle_readback_ready(
         slot.gpu_renderer.release_readback(readback_index);
         return;
     }
-    let Some(buffers) = slot.surface_shmem.as_mut() else {
+    let Some(buffers) = slot.surface_buffers.as_mut() else {
         error!(
             "[graphics] no surface buffers for readback {:?} gen={}",
+            webview_id, generation
+        );
+        slot.gpu_renderer.release_readback(readback_index);
+        return;
+    };
+    let SurfaceBuffers::Cpu(buffers) = buffers else {
+        error!(
+            "[graphics] readback ready on non-CPU backend {:?} gen={}",
             webview_id, generation
         );
         slot.gpu_renderer.release_readback(readback_index);
@@ -822,7 +1034,7 @@ fn handle_readback_ready(
         );
         return;
     }
-    buffers.mark_pending(shmem_index, generation);
+    buffers.ring.mark_pending(shmem_index, generation);
 
     verification::tla_log!(
         *tla_tracer,
@@ -834,8 +1046,6 @@ fn handle_readback_ready(
         shmem_index
     );
 
-    let child_ports = child_viewports;
-
     let shmem_key = generation as usize;
     let mut shmem_map = std::collections::HashMap::new();
     shmem_map.insert(shmem_key, buffers.regions[shmem_index].clone());
@@ -844,13 +1054,13 @@ fn handle_readback_ready(
         .send_with_shmem_map(
             GraphicsEvent::PixelFrameReady {
                 webview_id,
-                shmem_key,
+                payload: SurfacePayload::CpuShmem { shmem_key },
                 animating,
                 width,
                 height,
                 generation,
                 frame_hit_info,
-                child_viewports: child_ports,
+                child_viewports,
                 child_frame_to_webview,
             },
             shmem_map,
@@ -873,4 +1083,102 @@ fn handle_readback_ready(
         "GraphicsComputed",
         webview_id.0
     );
+}
+
+/// Deliver a completed zero-copy render into a shared IOSurface: mark the
+/// ring buffer pending and send PixelFrameReady carrying the surface's Mach
+/// port. The embedder's blit of the shared surface is GPU-safe because the
+/// poll thread waited for the render submission to complete.
+fn handle_render_done(
+    webviews: &mut HashMap<WebviewId, WebviewCompositorSlot>,
+    sender: &ipc::IpcSender<GraphicsEvent>,
+    tla_tracer: &mut verification::TLATracer,
+    done: crate::renderer::RenderDone,
+) {
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (webviews, sender, tla_tracer, done);
+        debug!("[graphics] render done on non-macos (unexpected)");
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let crate::renderer::RenderDone {
+            webview_id,
+            generation,
+            width,
+            height,
+            buffer_index,
+            completion,
+        } = done;
+        let Some(slot) = webviews.get_mut(&webview_id) else {
+            debug!(
+                "[graphics] render done for unknown webview {:?}",
+                webview_id
+            );
+            return;
+        };
+        let Some(buffers) = slot.surface_buffers.as_mut() else {
+            error!(
+                "[graphics] no surface buffers for render done {:?} gen={}",
+                webview_id, generation
+            );
+            return;
+        };
+        let SurfaceBuffers::Iosurface(buffers) = buffers else {
+            error!(
+                "[graphics] render done on non-Iosurface backend {:?} gen={}",
+                webview_id, generation
+            );
+            return;
+        };
+        let Some(texture) = buffers.textures.get(buffer_index) else {
+            error!(
+                "[graphics] bad buffer index {} for render done {:?} gen={}",
+                buffer_index, webview_id, generation
+            );
+            return;
+        };
+        buffers.ring.mark_pending(buffer_index, generation);
+
+        verification::tla_log!(
+            *tla_tracer,
+            -> "GPURendering",
+            "SurfaceFrameSent",
+            webview_id.0,
+            generation,
+            format!("{}x{}", width, height),
+            buffer_index
+        );
+
+        let child_ports = completion.child_viewports;
+
+        let frame_event = GraphicsEvent::PixelFrameReady {
+            webview_id,
+            payload: SurfacePayload::SharedTexture {
+                texture_id: texture.texture_id,
+                port: texture.port_for_frame(),
+            },
+            animating: completion.animating,
+            width,
+            height,
+            generation,
+            frame_hit_info: completion.frame_hit_info,
+            child_viewports: child_ports,
+            child_frame_to_webview: completion.child_frame_to_webview,
+        };
+        if sender.send(frame_event).is_err() {
+            error!(
+                "[graphics] failed to send PixelFrameReady for {:?} gen={}",
+                webview_id, generation
+            );
+            return;
+        }
+
+        verification::tla_log!(
+            *tla_tracer,
+            -> "RenderingOpportunity",
+            "GraphicsComputed",
+            webview_id.0
+        );
+    }
 }

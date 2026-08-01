@@ -69,14 +69,26 @@ pub struct HitTestResult {
     pub has_child_frames: bool,
 }
 
+/// The content of a decoded video frame: CPU bytes (cross-platform) or a
+/// GPU texture on the graphics device (macOS zero-copy).
+#[derive(Clone)]
+pub enum VideoFrameContent {
+    /// RGBA8 pixel data, width * height * 4 bytes.
+    Bytes(std::sync::Arc<[u8]>),
+    /// Fake image data referencing a GPU texture on the graphics device
+    /// (registered with the renderer's Vello via `override_image`); drawn
+    /// as a plain image brush.
+    #[cfg(target_os = "macos")]
+    Texture(peniko::ImageData),
+}
+
 /// Carries the latest decoded video frame for a given pipeline, ready to paint.
 #[derive(Clone)]
 pub struct CompositorVideoFrame {
     pub video_paint_id: VideoPaintId,
     pub width: u32,
     pub height: u32,
-    /// RGBA8 pixel data, width * height * 4 bytes.
-    pub data: std::sync::Arc<[u8]>,
+    pub content: VideoFrameContent,
 }
 
 #[derive(Clone, Default)]
@@ -220,10 +232,10 @@ impl Compositor {
             None => return false,
         };
         for site in &root.composition.embed_sites {
-            if let EmbedSite::Frame(iframe) = site {
-                if !self.committed_frames.contains_key(&iframe.child_frame_id) {
-                    return false;
-                }
+            if let EmbedSite::Frame(iframe) = site
+                && !self.committed_frames.contains_key(&iframe.child_frame_id)
+            {
+                return false;
             }
         }
         true
@@ -374,20 +386,14 @@ impl Compositor {
                 .and_then(|frame_id| self.committed_frames.get(&frame_id))
                 .and_then(|frame| frame.resolved_viewport.as_ref())
                 .is_none();
-        if refresh_needed {
-            if let Some(root_frame_id) = self.root_frame_id {
-                self.reset_composed_frame_state();
-                if self.prepare_root_frame(root_frame_id).is_some() {
-                    let mut stack = HashSet::from([root_frame_id]);
-                    let _ = self.compose_frame(
-                        root_frame_id,
-                        font_receiver,
-                        &mut stack,
-                        Affine::IDENTITY,
-                    );
-                }
-                self.resolved_tree_dirty = false;
+        if refresh_needed && let Some(root_frame_id) = self.root_frame_id {
+            self.reset_composed_frame_state();
+            if self.prepare_root_frame(root_frame_id).is_some() {
+                let mut stack = HashSet::from([root_frame_id]);
+                let _ =
+                    self.compose_frame(root_frame_id, font_receiver, &mut stack, Affine::IDENTITY);
             }
+            self.resolved_tree_dirty = false;
         }
 
         let Some(root_frame_id) = self.root_frame_id else {
@@ -563,15 +569,6 @@ impl Compositor {
                     };
                     let local_clip = clip_rect;
 
-                    let pixel_data = video_frame.data.clone();
-                    let image_data = ImageData {
-                        data: peniko::Blob::from(pixel_data.to_vec()),
-                        format: ImageFormat::Rgba8,
-                        alpha_type: ImageAlphaType::Alpha,
-                        width: video_frame.width,
-                        height: video_frame.height,
-                    };
-
                     let local_w = local_clip.width();
                     let local_h = local_clip.height();
                     let scale_x = if video_frame.width > 0 {
@@ -590,7 +587,27 @@ impl Compositor {
                         Some(ref rc) => composed_scene.push_clip_layer(transform, rc),
                         None => composed_scene.push_clip_layer(transform, &local_clip),
                     };
-                    composed_scene.draw_image(ImageBrushRef::from(&image_data), video_transform);
+                    match &video_frame.content {
+                        VideoFrameContent::Bytes(pixel_bytes) => {
+                            let image_data = ImageData {
+                                data: peniko::Blob::from(pixel_bytes.to_vec()),
+                                format: ImageFormat::Rgba8,
+                                alpha_type: ImageAlphaType::Alpha,
+                                width: video_frame.width,
+                                height: video_frame.height,
+                            };
+                            composed_scene
+                                .draw_image(ImageBrushRef::from(&image_data), video_transform);
+                        }
+                        #[cfg(target_os = "macos")]
+                        VideoFrameContent::Texture(image_data) => {
+                            // The texture is sampled by the graphics Vello
+                            // renderer via its override_image registration;
+                            // the scene just references the fake image data.
+                            composed_scene
+                                .draw_image(ImageBrushRef::from(image_data), video_transform);
+                        }
+                    }
                     composed_scene.pop_layer();
                 }
             }

@@ -15,10 +15,60 @@ use ipc_messages::media::MediaPipelineId;
 
 use ipc_messages::media::VideoFrame;
 
+/// A decoded video frame delivered as a GPU-backed pixel buffer (macOS
+/// AVFoundation). The graphics process wraps it as a Metal texture and
+/// composites it, avoiding the CPU readback + BGRA→RGBA byte conversion.
+#[cfg(all(
+    any(feature = "backend-avfoundation", avf_default),
+    target_os = "macos"
+))]
+#[derive(Clone)]
+pub struct PixelBufferVideoFrame {
+    pub pipeline_id: MediaPipelineId,
+    pub width: u32,
+    pub height: u32,
+    /// The decoded BGRA pixel buffer; must stay alive while the Metal
+    /// texture wrapping it is in use.
+    pub pixel_buffer: objc2::rc::Retained<objc2_core_video::CVPixelBuffer>,
+}
+
+// SAFETY: the pixel buffer is produced by the AVFoundation pipeline and
+// consumed by the graphics event loop on the same thread (the media backend
+// runs inside the graphics process's select loop); it is only ever touched
+// on that thread. The crossbeam channel between them only needs the Send
+// marker.
+#[cfg(all(
+    any(feature = "backend-avfoundation", avf_default),
+    target_os = "macos"
+))]
+unsafe impl Send for PixelBufferVideoFrame {}
+
+#[cfg(all(
+    any(feature = "backend-avfoundation", avf_default),
+    target_os = "macos"
+))]
+impl std::fmt::Debug for PixelBufferVideoFrame {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PixelBufferVideoFrame")
+            .field("pipeline_id", &self.pipeline_id)
+            .field("width", &self.width)
+            .field("height", &self.height)
+            .field("pixel_buffer", &(&**self.pixel_buffer as *const _))
+            .finish()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum MediaBackendEvent {
-    /// A decoded video frame is ready.
+    /// A decoded video frame is ready (CPU bytes).
     Frame(VideoFrame),
+    /// A decoded video frame is ready as a GPU-backed pixel buffer (macOS).
+    #[cfg(all(
+        any(feature = "backend-avfoundation", avf_default),
+        target_os = "macos"
+    ))]
+    PixelBufferFrame(PixelBufferVideoFrame),
     /// The pipeline reached end of stream.
     Eos { pipeline_id: MediaPipelineId },
     /// An unrecoverable error occurred in the backend.
