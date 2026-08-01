@@ -1,7 +1,14 @@
 pub mod compositor;
-#[cfg(target_os = "macos")]
+// The zero-copy IOSurface surface backend: the default on macOS; disabled
+// by the `cpu_readback` feature. IOSurface sharing is macOS-only.
+#[cfg(all(target_os = "macos", not(feature = "cpu_readback")))]
 pub mod iosurface;
 pub mod renderer;
+
+#[cfg(all(not(target_os = "macos"), feature = "zero_copy"))]
+compile_error!(
+    "the `zero_copy` feature requires macOS: IOSurface texture sharing is not available on this platform (use `cpu_readback` or no features)"
+);
 
 use std::collections::HashMap;
 
@@ -47,7 +54,7 @@ struct WebviewCompositorSlot {
     /// until a buffer frees up.
     surface_buffers: Option<SurfaceBuffers>,
     /// Monotonic identity for shared IOSurface textures; changes on resize.
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", not(feature = "cpu_readback")))]
     iosurface_texture_id_counter: u64,
     /// The most recent composed scene that could not be rendered because
     /// every surface buffer was still awaiting the embedder's ack.
@@ -124,15 +131,16 @@ impl SurfaceRingState {
     }
 }
 
-/// Three shared-memory pixel buffers per webview used as a ring (CPU path,
-/// non-macOS).
-#[cfg(not(target_os = "macos"))]
+/// Three shared-memory pixel buffers per webview used as a ring (CPU
+/// readback path: the default off macOS, opt-in on macOS via the
+/// `cpu_readback` feature).
+#[cfg(any(not(target_os = "macos"), feature = "cpu_readback"))]
 struct SurfaceShmemBuffers {
     regions: [ipc::IpcSharedRegion; 3],
     ring: SurfaceRingState,
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(any(not(target_os = "macos"), feature = "cpu_readback"))]
 impl SurfaceShmemBuffers {
     fn allocate(width: u32, height: u32) -> Result<Self, ipc::IpcError> {
         let byte_count = (width as usize) * (height as usize) * 4;
@@ -146,15 +154,15 @@ impl SurfaceShmemBuffers {
     }
 }
 
-/// Three shared IOSurface textures per webview used as a ring (macOS
-/// zero-copy path).
-#[cfg(target_os = "macos")]
+/// Three shared IOSurface textures per webview used as a ring (zero-copy
+/// path, the default on macOS).
+#[cfg(all(target_os = "macos", not(feature = "cpu_readback")))]
 struct IosurfaceBuffers {
     textures: [iosurface::IosurfaceTexture; 3],
     ring: SurfaceRingState,
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", not(feature = "cpu_readback")))]
 impl IosurfaceBuffers {
     fn allocate(
         renderer: &crate::renderer::GpuRenderer,
@@ -179,32 +187,33 @@ impl IosurfaceBuffers {
 }
 
 /// The per-webview frame buffers, one implementation per backend. The
-/// variant — and with it the whole delivery path — is chosen at compile time:
-/// the CPU readback path off macOS, the zero-copy IOSurface path on macOS.
-/// The zero-copy variant is boxed to keep the enum small (each texture holds
-/// a wgpu texture plus the IOSurface and its Mach port).
+/// variant — and with it the whole delivery path — is chosen at compile
+/// time by features: the CPU readback backend off macOS (and on macOS with
+/// the `cpu_readback` feature), the zero-copy IOSurface backend on macOS by
+/// default. The zero-copy variant is boxed to keep the enum small (each
+/// texture holds a wgpu texture plus the IOSurface and its Mach port).
 enum SurfaceBuffers {
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(any(not(target_os = "macos"), feature = "cpu_readback"))]
     Cpu(SurfaceShmemBuffers),
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", not(feature = "cpu_readback")))]
     Iosurface(Box<IosurfaceBuffers>),
 }
 
 impl SurfaceBuffers {
     fn ring(&self) -> &SurfaceRingState {
         match self {
-            #[cfg(not(target_os = "macos"))]
+            #[cfg(any(not(target_os = "macos"), feature = "cpu_readback"))]
             SurfaceBuffers::Cpu(buffers) => &buffers.ring,
-            #[cfg(target_os = "macos")]
+            #[cfg(all(target_os = "macos", not(feature = "cpu_readback")))]
             SurfaceBuffers::Iosurface(buffers) => &buffers.ring,
         }
     }
 
     fn ring_mut(&mut self) -> &mut SurfaceRingState {
         match self {
-            #[cfg(not(target_os = "macos"))]
+            #[cfg(any(not(target_os = "macos"), feature = "cpu_readback"))]
             SurfaceBuffers::Cpu(buffers) => &mut buffers.ring,
-            #[cfg(target_os = "macos")]
+            #[cfg(all(target_os = "macos", not(feature = "cpu_readback")))]
             SurfaceBuffers::Iosurface(buffers) => &mut buffers.ring,
         }
     }
@@ -233,7 +242,7 @@ impl WebviewCompositorSlot {
             font_receiver: FontTransportReceiver::default(),
             child_frame_to_parent: HashMap::new(),
             surface_buffers: None,
-            #[cfg(target_os = "macos")]
+            #[cfg(all(target_os = "macos", not(feature = "cpu_readback")))]
             iosurface_texture_id_counter: 1,
             deferred_scene: None,
         }
@@ -844,7 +853,7 @@ fn submit_composed_scene(
         .as_ref()
         .is_none_or(|buffers| buffers.ring().width != width || buffers.ring().height != height);
     if needs_new {
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(any(not(target_os = "macos"), feature = "cpu_readback"))]
         match SurfaceShmemBuffers::allocate(width, height) {
             Ok(buffers) => slot.surface_buffers = Some(SurfaceBuffers::Cpu(buffers)),
             Err(error) => {
@@ -855,7 +864,7 @@ fn submit_composed_scene(
                 return Err(());
             }
         }
-        #[cfg(target_os = "macos")]
+        #[cfg(all(target_os = "macos", not(feature = "cpu_readback")))]
         match IosurfaceBuffers::allocate(
             &slot.gpu_renderer,
             width,

@@ -156,11 +156,10 @@ fn apple_standard_keybinding_for_key_down(event: &BlitzKeyEvent) -> Option<&'sta
 /// Persistent GPU texture holding the latest composited surface pixels for
 /// one webview, registered once with the Vello renderer. One variant per
 /// delivery path: the CPU upload path fills the texture from shared-memory
-/// bytes each frame; the macOS zero-copy path wraps a shared IOSurface.
+/// bytes each frame; the zero-copy path (macOS) wraps a shared IOSurface.
 pub(super) enum WebviewSurfaceTexture {
     /// CPU upload path: the texture is exactly the viewport size and its
     /// contents are replaced in place via `queue.write_texture`.
-    #[cfg(not(target_os = "macos"))]
     CpuUpload {
         texture: wgpu::Texture,
         /// Vello registration id; valid while `registered` is true.
@@ -198,7 +197,6 @@ pub(super) enum WebviewSurfaceTexture {
 impl WebviewSurfaceTexture {
     fn width(&self) -> u32 {
         match self {
-            #[cfg(not(target_os = "macos"))]
             WebviewSurfaceTexture::CpuUpload { width, .. } => *width,
             #[cfg(target_os = "macos")]
             WebviewSurfaceTexture::SharedSurface { width, .. } => *width,
@@ -207,7 +205,6 @@ impl WebviewSurfaceTexture {
 
     fn height(&self) -> u32 {
         match self {
-            #[cfg(not(target_os = "macos"))]
             WebviewSurfaceTexture::CpuUpload { height, .. } => *height,
             #[cfg(target_os = "macos")]
             WebviewSurfaceTexture::SharedSurface { height, .. } => *height,
@@ -217,7 +214,6 @@ impl WebviewSurfaceTexture {
     /// Physical texture width; padded for the shared surface variant.
     fn texture_width(&self) -> u32 {
         match self {
-            #[cfg(not(target_os = "macos"))]
             WebviewSurfaceTexture::CpuUpload { width, .. } => *width,
             #[cfg(target_os = "macos")]
             WebviewSurfaceTexture::SharedSurface { texture_width, .. } => *texture_width,
@@ -226,7 +222,6 @@ impl WebviewSurfaceTexture {
 
     fn texture(&self) -> &wgpu::Texture {
         match self {
-            #[cfg(not(target_os = "macos"))]
             WebviewSurfaceTexture::CpuUpload { texture, .. } => texture,
             #[cfg(target_os = "macos")]
             WebviewSurfaceTexture::SharedSurface { texture, .. } => texture,
@@ -235,7 +230,6 @@ impl WebviewSurfaceTexture {
 
     fn resource_id(&self) -> ResourceId {
         match self {
-            #[cfg(not(target_os = "macos"))]
             WebviewSurfaceTexture::CpuUpload { resource_id, .. } => *resource_id,
             #[cfg(target_os = "macos")]
             WebviewSurfaceTexture::SharedSurface { resource_id, .. } => *resource_id,
@@ -244,7 +238,6 @@ impl WebviewSurfaceTexture {
 
     fn is_registered(&self) -> bool {
         match self {
-            #[cfg(not(target_os = "macos"))]
             WebviewSurfaceTexture::CpuUpload { registered, .. } => *registered,
             #[cfg(target_os = "macos")]
             WebviewSurfaceTexture::SharedSurface { registered, .. } => *registered,
@@ -253,7 +246,6 @@ impl WebviewSurfaceTexture {
 
     fn set_registration(&mut self, resource_id: ResourceId, registered: bool) {
         match self {
-            #[cfg(not(target_os = "macos"))]
             WebviewSurfaceTexture::CpuUpload {
                 resource_id: id,
                 registered: reg,
@@ -279,7 +271,6 @@ impl WebviewSurfaceTexture {
     #[cfg(target_os = "macos")]
     fn texture_id(&self) -> Option<u64> {
         match self {
-            #[cfg(not(target_os = "macos"))]
             WebviewSurfaceTexture::CpuUpload { .. } => None,
             WebviewSurfaceTexture::SharedSurface { texture_id, .. } => Some(*texture_id),
         }
@@ -698,7 +689,6 @@ impl WindowedApp {
     /// Create the persistent GPU texture that receives composited surface
     /// pixels for one webview. `COPY_SRC` is required by Vello's
     /// `register_texture`, which copies the texture into its image atlas.
-    #[cfg(not(target_os = "macos"))]
     fn create_surface_texture(device: &wgpu::Device, width: u32, height: u32) -> wgpu::Texture {
         device.create_texture(&wgpu::TextureDescriptor {
             label: Some("webview-surface"),
@@ -1472,7 +1462,6 @@ impl ApplicationHandler<FormalWebUserEvent> for WindowedApp {
                 };
 
                 match frame {
-                    #[cfg(not(target_os = "macos"))]
                     ipc_messages::graphics::SurfaceFrame::CpuShmem(surface) => {
                         let total_pixels = (width * height * 4) as usize;
                         let pixels = surface.as_slice();

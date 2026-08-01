@@ -1,7 +1,8 @@
-//! CPU readback surface backend (non-macOS): renders Vello into an
-//! intermediate texture, submits a GPU → CPU readback, and copies the pixels
-//! into the webview's shared-memory ring once the readback completes. The
-//! GStreamer media backend delivers CPU video bytes on this platform.
+//! CPU readback surface backend: renders Vello into an intermediate texture,
+//! submits a GPU → CPU readback, and copies the pixels into the webview's
+//! shared-memory ring once the readback completes. This is the backend off
+//! macOS (GStreamer media backend) and on macOS when built with the
+//! `cpu_readback` feature.
 
 use super::{FrameMetadata, GpuRenderer, PollRequest, RenderSubmit, SurfaceRenderer};
 use anyrender::PaintScene;
@@ -12,7 +13,7 @@ use log::{debug, error};
 use vello::{AaConfig, RenderParams};
 use wgpu::{
     BufferDescriptor, BufferUsages, CommandEncoderDescriptor, Extent3d, Origin3d,
-    TexelCopyBufferInfo, TexelCopyBufferLayout, TexelCopyTextureInfo, Texture, TextureAspect,
+    TexelCopyBufferInfo, TexelCopyBufferLayout, TexelCopyTextureInfo, TextureAspect,
     TextureDescriptor, TextureDimension, TextureFormat, TextureUsages, TextureViewDescriptor,
 };
 

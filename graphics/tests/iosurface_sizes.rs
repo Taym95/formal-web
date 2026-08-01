@@ -1,4 +1,5 @@
 //! Verify the 64-multiple width padding produces usable Metal textures.
+#![cfg(all(target_os = "macos", not(feature = "cpu_readback")))]
 use graphics::iosurface::padded_width;
 use graphics::renderer::{GpuRenderer, ReadbackChannels};
 

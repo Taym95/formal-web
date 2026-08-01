@@ -1,6 +1,7 @@
-//! Zero-copy IOSurface surface backend (macOS): renders Vello directly into
-//! a shared IOSurface texture from the webview's ring; the embedder imports
-//! the same surface and blits it, with no readback and no IPC pixel bytes.
+//! Zero-copy IOSurface surface backend (the default on macOS): renders Vello
+//! directly into a shared IOSurface texture from the webview's ring; the
+//! embedder imports the same surface and blits it, with no readback and no
+//! IPC pixel bytes.
 
 use super::{FrameMetadata, GpuRenderer, PollRequest, RenderSubmit, SurfaceRenderer};
 use anyrender::PaintScene;

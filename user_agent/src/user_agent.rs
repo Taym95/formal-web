@@ -3954,7 +3954,6 @@ impl UserAgentWorker {
                 // map; the zero-copy path (macOS) carries the shared surface's
                 // Mach port in the payload itself.
                 let frame = match payload {
-                    #[cfg(not(target_os = "macos"))]
                     ipc_messages::graphics::SurfacePayload::CpuShmem { shmem_key } => {
                         let region = incoming
                             .shmem_regions
@@ -3976,7 +3975,6 @@ impl UserAgentWorker {
                     width,
                     height,
                     match &frame {
-                        #[cfg(not(target_os = "macos"))]
                         ipc_messages::graphics::SurfaceFrame::CpuShmem(region) => region.size(),
                         #[cfg(target_os = "macos")]
                         ipc_messages::graphics::SurfaceFrame::SharedTexture { .. } => 0,

@@ -1,4 +1,4 @@
-#![cfg(target_os = "macos")]
+#![cfg(all(target_os = "macos", not(feature = "cpu_readback")))]
 //! macOS zero-copy surface: a shared IOSurface the graphics process renders
 //! into and the embedder imports and blits, with no CPU readback and no IPC
 //! pixel bytes. The surface's Mach port travels in the `PixelFrameReady`

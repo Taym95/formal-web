@@ -6,12 +6,13 @@
 //!
 //! The CPU path (readback + shared memory) renders to an intermediate
 //! texture and submits a GPU → CPU readback; the pixels are copied into the
-//! webview's shared-memory ring once the readback completes. It is compiled
-//! on non-macOS (where the GStreamer media backend delivers CPU bytes).
+//! webview's shared-memory ring once the readback completes. It is the
+//! backend off macOS (GStreamer media backend) and on macOS when built with
+//! the `cpu_readback` feature.
 //!
-//! The zero-copy path (macOS) renders Vello directly into a shared
-//! IOSurface texture; the embedder imports the same surface and blits it,
-//! with no readback and no IPC pixel bytes. See graphics/README.md.
+//! The zero-copy path renders Vello directly into a shared IOSurface
+//! texture (macOS, the default); the embedder imports the same surface and
+//! blits it, with no readback and no IPC pixel bytes. See graphics/README.md.
 
 use ipc_messages::content::{FrameId, WebviewId};
 use ipc_messages::graphics::{ChildViewport, FrameHitInfo, GraphicsEvent};
@@ -348,8 +349,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 /// The per-webview GPU renderer: Vello rendering plus the surface backend's
 /// delivery machinery. The `SurfaceRenderer` impl is chosen at compile time
-/// by the platform: readback + shared memory off macOS, zero-copy IOSurface
-/// on macOS.
+/// by features: readback + shared memory off macOS (and on macOS with
+/// `cpu_readback`), zero-copy IOSurface on macOS by default.
 pub struct GpuRenderer {
     device_handle: wgpu_context::DeviceHandle,
     vello_renderer: VelloRenderer,
@@ -363,13 +364,13 @@ pub struct GpuRenderer {
     video_import: Option<video_texture::VideoImport>,
     /// Intermediate texture for Vello compute (has STORAGE_BINDING +
     /// COPY_SRC); the CPU readback source.
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(any(not(target_os = "macos"), feature = "cpu_readback"))]
     render_tex: Option<(Texture, u32, u32)>,
     /// Staging buffers for GPU → CPU readback, one per in-flight frame.
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(any(not(target_os = "macos"), feature = "cpu_readback"))]
     readback_buffers: [Option<(wgpu::Buffer, u32, u32)>; cpu::READBACK_SLOTS],
     /// Generation of the frame whose readback is in flight per slot.
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(any(not(target_os = "macos"), feature = "cpu_readback"))]
     inflight_readbacks: [Option<u64>; cpu::READBACK_SLOTS],
 }
 
@@ -401,11 +402,11 @@ impl GpuRenderer {
             video_textures: HashMap::new(),
             #[cfg(target_os = "macos")]
             video_import: None,
-            #[cfg(not(target_os = "macos"))]
+            #[cfg(any(not(target_os = "macos"), feature = "cpu_readback"))]
             render_tex: None,
-            #[cfg(not(target_os = "macos"))]
+            #[cfg(any(not(target_os = "macos"), feature = "cpu_readback"))]
             readback_buffers: [None, None, None],
-            #[cfg(not(target_os = "macos"))]
+            #[cfg(any(not(target_os = "macos"), feature = "cpu_readback"))]
             inflight_readbacks: [None, None, None],
         })
     }
@@ -545,28 +546,29 @@ impl GpuRenderer {
 
 // ── Backend implementations ───────────────────────────────────────────────
 
-/// The CPU readback backend (non-macOS): renders into an intermediate
-/// texture and ships pixels through the webview's shared-memory ring.
-#[cfg(not(target_os = "macos"))]
+/// The CPU readback backend: renders into an intermediate texture and ships
+/// pixels through the webview's shared-memory ring. The backend off macOS
+/// (GStreamer media backend) and on macOS when built with `cpu_readback`.
+#[cfg(any(not(target_os = "macos"), feature = "cpu_readback"))]
 pub(crate) mod cpu;
-/// The zero-copy IOSurface backend (macOS): renders directly into a shared
-/// IOSurface texture.
-#[cfg(target_os = "macos")]
+/// The zero-copy IOSurface backend (macOS default): renders directly into a
+/// shared IOSurface texture.
+#[cfg(all(target_os = "macos", not(feature = "cpu_readback")))]
 mod iosurface;
 
 /// Per-frame data for the CPU readback path: delivered by the readback map
 /// callback when the GPU completes the copy.
-#[cfg(not(target_os = "macos"))]
+#[cfg(any(not(target_os = "macos"), feature = "cpu_readback"))]
 pub use cpu::CpuRenderData;
 /// Per-frame data for the zero-copy path: delivered by the poll thread once
 /// the render into the shared texture completes (the embedder's blit of the
 /// shared surface is then GPU-safe).
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", not(feature = "cpu_readback")))]
 pub use iosurface::SharedRenderData;
 
 /// A completed frame, delivered on the renderer's single done channel. The
 /// message type is chosen at compile time by the surface backend.
-#[cfg(not(target_os = "macos"))]
+#[cfg(any(not(target_os = "macos"), feature = "cpu_readback"))]
 pub type RenderDone = CpuRenderData;
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", not(feature = "cpu_readback")))]
 pub type RenderDone = SharedRenderData;

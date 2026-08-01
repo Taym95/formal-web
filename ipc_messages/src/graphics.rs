@@ -159,9 +159,9 @@ pub enum GraphicsEvent {
 /// How a rendered frame's pixels are delivered to the embedder.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum SurfacePayload {
-    /// CPU readback pixels in the IPC shared-memory map (non-macOS, where
-    /// the GStreamer media backend delivers CPU video bytes).
-    #[cfg(not(target_os = "macos"))]
+    /// CPU readback pixels in the IPC shared-memory map (the default off
+    /// macOS, where the GStreamer media backend delivers CPU video bytes;
+    /// opt-in on macOS via the graphics crate's `cpu_readback` build).
     CpuShmem {
         /// Key into the IPC shared memory map for the rendered RGBA pixel buffer.
         shmem_key: usize,
@@ -185,7 +185,6 @@ pub enum SurfacePayload {
 #[derive(Debug)]
 pub enum SurfaceFrame {
     /// CPU readback pixels in a shared-memory region.
-    #[cfg(not(target_os = "macos"))]
     CpuShmem(ipc::IpcSharedRegion),
     /// macOS zero-copy: a shared IOSurface to import and blit.
     #[cfg(target_os = "macos")]

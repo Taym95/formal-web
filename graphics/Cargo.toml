@@ -8,6 +8,15 @@ autobins = false
 [features]
 default = []
 ipc-channel-backend = ["ipc/ipc-channel-backend"]
+# Surface backend selection. The zero-copy IOSurface backend is the default
+# on macOS (matching the default AVFoundation media backend); enabling
+# `cpu_readback` selects the CPU readback + shared-memory backend there
+# instead. Off macOS the CPU readback backend is the only one (the GStreamer
+# media backend delivers CPU video bytes).
+cpu_readback = []
+# Force the zero-copy IOSurface backend. It is already the default on macOS;
+# on other platforms it is a compile error (IOSurface sharing is macOS-only).
+zero_copy = []
 
 [lib]
 path = "src/lib.rs"

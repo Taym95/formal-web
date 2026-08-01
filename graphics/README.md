@@ -15,9 +15,11 @@ blits it — no CPU readback, no IPC pixel bytes. The cross-process transport
 problem (shipping the surface's Mach port) is solved by the forked
 `ipc-channel` (a git dependency on <https://github.com/gterzian/ipc-channel>),
 which adds an `OsMachPort` serde-transportable type. The backend is chosen
-at compile time: `iosurface` on macOS (the only surface backend there; the
-CPU path is compiled out), `cpu` elsewhere (where the GStreamer media
-backend delivers CPU video bytes).
+at compile time by feature: the zero-copy IOSurface backend is the macOS
+default, the `cpu_readback` feature replaces it with the CPU readback path
+on macOS, and elsewhere (GStreamer media backend) the CPU readback path is
+the only one. The embedder and user agent handle both wire payloads
+regardless of which backend the graphics process was built with.
 
 ## Current pipeline (CPU readback + shared memory)
 
@@ -145,9 +147,9 @@ Rejected alternatives, for the record:
 The ring, the ack protocol, the deferral, the messages, and the embedder's draw
 path are all transport-agnostic. A per-webview `SurfaceBuffers` enum holds the
 frame buffers for one of two implementations; the variant is chosen at compile
-time by platform (CPU readback off macOS, zero-copy IOSurface on macOS). The
-ring lifecycle (`SurfaceRingState`: pick / reserve / mark-pending / ack) is
-shared verbatim.
+time by feature (CPU readback off macOS and with `cpu_readback`, zero-copy
+IOSurface on macOS by default). The ring lifecycle (`SurfaceRingState`: pick /
+reserve / mark-pending / ack) is shared verbatim.
 
 The renderers are two implementations of the `SurfaceRenderer` trait
 (`renderer/cpu.rs` and `renderer/iosurface.rs`): each defines its own
@@ -157,55 +159,30 @@ and sends `PixelFrameReady`. Completed frames arrive on a single channel whose
 message type is the backend's `RenderData` (chosen at compile time), delivered
 by the readback map callbacks (CPU) or the poll thread (zero-copy).
 
-### Producer side (graphics)
-
-```rust
-enum SurfaceBuffers {
-    Cpu(SurfaceShmemBuffers),                    // current
-    #[cfg(target_os = "macos")]
-    Iosurface(IosurfaceBuffers),                 // zero-copy
-}
-
-struct SurfaceRingState {
-    state: [BufferState; 3], // Free / Reserved(g) / Pending(g)
-    write_index: usize,
-    width: u32,
-    height: u32,
-}
-```
-
 The renderer's target differs per backend: the CPU path renders to an
 intermediate texture and submits a readback; the zero-copy path renders Vello
 directly into the shared texture (`render_scene_shared`) and the poll thread
 delivers `RenderDone` once the submission completes.
 
-### Wire payload
-
-```rust
-/// What PixelFrameReady carries beyond width/height/generation.
-enum SurfacePayload {
-    CpuShmem { shmem_key: usize },                    // current
-    #[cfg(target_os = "macos")]
-    SharedTexture { texture_id: u64, port: OsMachPort }, // zero-copy
-}
-```
-
 ### Consumer side (embedder)
 
 `NewWebContentSurface` matches on the payload: `CpuShmem` → `write_texture`
-from the bytes into the persistent texture (current); `SharedTexture` → the
+from the bytes into the persistent texture; `SharedTexture` → the
 `WebviewSurfaceTexture` is created from the imported shared texture (via the
 hal-import machinery), registered once, then blit. The draw path
 (`PaintRef::Resource`) is identical for both.
 
 ### Backend selection
 
-Chosen at compile time by platform: the zero-copy IOSurface backend on macOS
-(matching the default AVFoundation media backend), the CPU readback backend
-elsewhere (GStreamer media backend). The two are separate implementations of
-the `SurfaceRenderer` trait (`renderer/cpu.rs` and `renderer/iosurface.rs`),
-so only one is compiled per platform; the payload enum identifies the backend
-in use on the wire.
+Chosen at compile time by the graphics crate's features: the zero-copy
+IOSurface backend is the default on macOS (matching the default AVFoundation
+media backend); building with `--features cpu_readback` selects the CPU
+readback backend on macOS instead. Off macOS the CPU readback backend is the
+only one (`zero_copy` is a compile error there — IOSurface sharing is
+macOS-only; the GStreamer media backend delivers CPU bytes). The two are
+separate implementations of the `SurfaceRenderer` trait (`renderer/cpu.rs`
+and `renderer/iosurface.rs`), so only one is compiled per configuration; the
+payload enum identifies the backend in use on the wire.
 
 ### What stays identical
 
