@@ -119,7 +119,7 @@ impl WebviewProvider {
     }
 
     /// Notify the UA that the embedder is about to paint a frame for
-    /// `webview_id`, paced by vsync; the UA gates render cycles on this.
+    /// `webview_id`; the UA gates render cycles on this.
     pub fn frame_needed(&self, webview_id: WebviewId) -> Result<(), String> {
         self.user_agent.frame_needed(webview_id)
     }

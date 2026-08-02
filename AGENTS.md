@@ -432,6 +432,12 @@ feature never worked, instead of checking whether it did.
   RAII cleanup must be explicitly used during shutdown (send shutdown signal, wait for
   acknowledgement, join the child process). Remove the dead code instead of annotating
   around it.
+- **Remove unused bindings; never silence them with `_`-prefixed names or `let _ =`.**
+  If a pattern field, parameter, or local variable is not used, delete it: elide
+  unneeded struct/enum fields with `..` in the pattern, drop the binding or parameter,
+  and remove any code that existed only to consume it. An unused binding kept alive as
+  `_foo`, `_bar` or `let _ = ...` is dead code that silently accumulates — the warning
+  is a request to delete the binding, not to rename it.
 - **Comments describe what the code DOES, not what it USED TO DO.** Never write
   comments like "now comes from X instead of Y" or "previously maintained by Z."
   Those document a migration that is already complete. Delete stale comments and

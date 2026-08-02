@@ -236,12 +236,9 @@ impl GpuContext {
 }
 
 /// The alternating double-buffer lifecycle shared by both backends: each
-/// render cycle renders into the buffer that was NOT used by the last
-/// render. The embedder is blitting the last-rendered buffer while the next
-/// one is rendered, and because the embedder's FrameNeeded pacing allows
-/// only one render per cycle, the chosen buffer is the one from two cycles
-/// ago — long since consumed by the embedder. No ack is needed: the
-/// alternation guarantees the chosen buffer is free.
+/// render cycle renders into the buffer the last render did not use. The
+/// chosen buffer therefore holds the frame from two cycles ago, which the
+/// embedder has long since consumed.
 pub(crate) struct SurfaceRingState {
     /// Index of the buffer the most recent render used; the next render
     /// uses the other one (buffer 0 on the first frame after allocation).

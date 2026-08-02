@@ -310,9 +310,8 @@ impl ApplicationHandler<FormalWebUserEvent> for HeadlessEmbedderApp {
     fn user_event(&mut self, el: &ActiveEventLoop, event: FormalWebUserEvent) {
         match event {
             FormalWebUserEvent::RequestRedraw(webview_id) => {
-                // Headless has no window to paint, but the FrameNeeded
-                // message is what paces the render cycle: forward it so the
-                // UA starts a render for the requested frame.
+                // Headless has no window to paint; notify the UA that a
+                // frame is needed for the requested webview.
                 if let Some(provider) = self.provider.as_ref()
                     && let Err(error) = provider.frame_needed(webview_id)
                 {
@@ -359,19 +358,10 @@ impl ApplicationHandler<FormalWebUserEvent> for HeadlessEmbedderApp {
                     }
                 }
             }
-            FormalWebUserEvent::NewWebContentSurface {
-                webview_id,
-                frame: _frame,
-                width: _width,
-                height: _height,
-                generation: _generation,
-            } => {
+            FormalWebUserEvent::NewWebContentSurface { webview_id, .. } => {
                 debug!("[embedder] headless NewWebContentSurface {:?}", webview_id);
-                // No ack is sent: the graphics process alternates its two
-                // buffers per render cycle. Headless has no display pacing,
-                // so the next frame is requested immediately after this one
-                // is received (the UA starts the next render only if there
-                // is something to render).
+                // Headless has no display pacing; request the next frame
+                // immediately.
                 if let Some(provider) = self.provider.as_ref()
                     && let Err(error) = provider.frame_needed(webview_id)
                 {

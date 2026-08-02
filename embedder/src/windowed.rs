@@ -585,10 +585,8 @@ impl WindowedApp {
             }
         }
 
-        // The embedder needs a frame: tell the UA right before rendering,
-        // so the next content render cycle can start in parallel with this
-        // paint. Paced by vsync because the paint blocks on the CAMetalLayer
-        // drawable acquisition.
+        // Notify the UA that a frame is needed before rendering, so the
+        // next content render can start in parallel with this paint.
         if let Some(webview_id) = state.active_tab
             && let Some(provider) = provider.as_ref()
             && let Err(error) = provider.frame_needed(webview_id)
@@ -847,11 +845,6 @@ impl WindowedApp {
                 error!("content event error: {error}");
             }
         });
-        // No redraw here: a content UI event does not change the embedder's
-        // scene. If the event changes the content, the content renders and a
-        // new surface frame arrives (NewWebContentSurface), which requests
-        // the redraw. Painting on every input event would re-render and
-        // present identical pixels at input rate.
     }
 
     fn try_run_automation<R>(
@@ -959,9 +952,8 @@ impl ApplicationHandler<FormalWebUserEvent> for WindowedApp {
                 if let Some(state) = self.windows.get_mut(&window_id) {
                     state.window_occluded = occluded;
                 }
-                // The render cycle pauses while occluded (no paints, no
-                // FrameNeeded); resume it when the window becomes visible
-                // again.
+                // The window became visible again; request a redraw so
+                // painting resumes.
                 if !occluded && let Some(state) = self.windows.get(&window_id) {
                     Self::request_window_redraw(state);
                 }
@@ -1057,11 +1049,6 @@ impl ApplicationHandler<FormalWebUserEvent> for WindowedApp {
                 }
             }
             WindowEvent::CursorMoved { position, .. } => {
-                let _chrome_height_physical = self
-                    .windows
-                    .get(&window_id)
-                    .map(Self::chrome_height_physical)
-                    .unwrap_or(0);
                 if Self::pointer_in_chrome_st(&self.windows, window_id, position) {
                     if let Some(state) = self.windows.get_mut(&window_id) {
                         state.pointer_pos = position;
@@ -1289,9 +1276,6 @@ impl ApplicationHandler<FormalWebUserEvent> for WindowedApp {
                             }
                         });
                     }
-                    // No redraw here: the scroll event does not change the
-                    // embedder's scene; the content's re-render arrives as a
-                    // new surface frame and requests the redraw.
                 }
             }
             _ => {}
@@ -1430,12 +1414,7 @@ impl ApplicationHandler<FormalWebUserEvent> for WindowedApp {
             FormalWebUserEvent::ClipboardWrite { text, reply } => {
                 let _ = reply.send(write_clipboard_text(text));
             }
-            FormalWebUserEvent::NewWebContentScene {
-                webview_id,
-                scene_bytes,
-                font_registrations,
-                font_data,
-            } => {
+            FormalWebUserEvent::NewWebContentScene { webview_id, .. } => {
                 // Removed: the IOSurface surface path replaces the old scene bytes path.
                 // Trigger a redraw so the surface-based path can render.
                 debug!(
@@ -1447,16 +1426,13 @@ impl ApplicationHandler<FormalWebUserEvent> for WindowedApp {
                 {
                     Self::request_window_redraw(state);
                 }
-                let _ = scene_bytes.len();
-                let _ = font_registrations;
-                let _ = font_data;
             }
             FormalWebUserEvent::NewWebContentSurface {
                 webview_id,
                 frame,
                 width,
                 height,
-                generation: _generation,
+                ..
             } => {
                 let Some(window_id) = Self::window_for_webview(self, webview_id) else {
                     info!(
@@ -1626,12 +1602,8 @@ impl ApplicationHandler<FormalWebUserEvent> for WindowedApp {
                     "[render-pipe] Embedder updated surface webview={:?} active={} tabs={:?} active_tab={:?} window={:?}",
                     webview_id, is_active, state.tab_order, state.active_tab, window_id
                 );
-                // The frame is stored: the CPU path staged the pixels into
-                // the persistent texture synchronously; the zero-copy path
-                // blits the shared surface on the next paint. No ack is sent:
-                // the graphics process alternates its two buffers per render
-                // cycle (driven by FrameNeeded), so the embedder's pacing
-                // guarantees the reused buffer is already consumed.
+                // A new surface frame is available; request a redraw so
+                // the next paint blits it.
                 Self::request_window_redraw(state);
                 info!(
                     "[render-pipe] Embedder requested redraw for window={:?}",

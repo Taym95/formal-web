@@ -267,9 +267,8 @@ impl SurfaceRenderer for CpuRenderer {
             ));
         }
         let buffers = self.buffers.as_mut().ok_or(RenderError::Failed)?;
-        // Double buffering: each cycle renders into the buffer the last
-        // render did not use. The embedder's FrameNeeded pacing guarantees
-        // that buffer is free (it holds the frame from two cycles ago).
+        // Double buffering: render into the buffer the last render did
+        // not use.
         let buffer_index = buffers.next_buffer();
 
         let metadata = frame_metadata(
