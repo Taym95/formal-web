@@ -5,7 +5,7 @@
 
 use super::{
     FrameDelivery, FrameMetadata, GpuContext, PollRequest, ReadbackChannels, RenderError,
-    RenderSubmit, SurfaceBuffers, SurfaceRenderer, SurfaceRingState, frame_metadata, render_size,
+    SurfaceBuffers, SurfaceRenderer, SurfaceRingState, frame_metadata, render_size,
 };
 use crate::iosurface::{IosurfaceTexture, create_shared_texture};
 use ipc_messages::content::WebviewId;
@@ -83,7 +83,7 @@ impl SurfaceRenderer for IosurfaceRenderer {
         })
     }
 
-    fn submit_scene(&mut self, composed: ComposedScene) -> Result<RenderSubmit, RenderError> {
+    fn submit_scene(&mut self, composed: ComposedScene) -> Result<(), RenderError> {
         let ComposedScene {
             webview_id,
             scene,
@@ -171,12 +171,7 @@ impl SurfaceRenderer for IosurfaceRenderer {
             width, height, generation, buffer_index
         );
 
-        Ok(RenderSubmit {
-            generation,
-            width,
-            height,
-            buffer_index,
-        })
+        Ok(())
     }
 
     fn handle_render_done(
@@ -193,11 +188,6 @@ impl SurfaceRenderer for IosurfaceRenderer {
             metadata,
         } = data;
         let mut delivery = FrameDelivery {
-            generation,
-            width,
-            height,
-            buffer_index,
-            surface_frame_sent: false,
             graphics_computed: false,
         };
         let Some(buffers) = self.buffers.as_mut() else {
@@ -216,7 +206,6 @@ impl SurfaceRenderer for IosurfaceRenderer {
         };
         let texture_id = texture.texture_id;
         let port = texture.port_for_frame();
-        delivery.surface_frame_sent = true;
 
         let frame_event = GraphicsEvent::PixelFrameReady {
             webview_id,

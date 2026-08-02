@@ -12,7 +12,7 @@ compile_error!(
 
 use std::collections::HashMap;
 
-use crate::renderer::{ReadbackChannels, RenderError, SurfaceRenderer};
+use crate::renderer::{ReadbackChannels, SurfaceRenderer};
 use compositor::{Compositor, CompositorVideoFrame};
 use crossbeam_channel::{select, tick};
 use ipc_messages::content::{FrameId, WebviewId};
@@ -426,24 +426,11 @@ fn handle_command<B: MediaBackend + 'static, R: SurfaceRenderer>(
                     // Content knows what's animating (video, CSS animations)
                     // and sets this. Graphics just passes it through.
                     composed.animating = animating;
-                    match slot.renderer.submit_scene(composed) {
-                        Ok(submit) => {
-                            verification::tla_log!(
-                                *tla_tracer,
-                                -> "GPURendering",
-                                "SurfaceFrameSubmitted",
-                                webview_id.0,
-                                submit.generation,
-                                format!("{}x{}", submit.width, submit.height),
-                                submit.buffer_index
-                            );
-                        }
-                        Err(RenderError::Failed) => {
-                            error!(
-                                "[graphics] submit composed scene failed for {:?}",
-                                webview_id
-                            );
-                        }
+                    if let Err(error) = slot.renderer.submit_scene(composed) {
+                        error!(
+                            "[graphics] submit composed scene failed for {:?}: {error:?}",
+                            webview_id
+                        );
                     }
                 }
             }
@@ -588,17 +575,6 @@ fn handle_render_done<R: SurfaceRenderer>(
         return;
     };
     let delivery = slot.renderer.handle_render_done(done, sender);
-    if delivery.surface_frame_sent {
-        verification::tla_log!(
-            *tla_tracer,
-            -> "GPURendering",
-            "SurfaceFrameSent",
-            webview_id.0,
-            delivery.generation,
-            format!("{}x{}", delivery.width, delivery.height),
-            delivery.buffer_index
-        );
-    }
     // The graphical output for the webview is done: the pixels were sent.
     // Traced with the webview's navigable id so it matches the per-frame
     // RenderingOpportunity model (the webview id is the root navigable).

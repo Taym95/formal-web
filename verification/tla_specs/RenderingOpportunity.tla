@@ -2,13 +2,16 @@
 EXTENDS Naturals, FiniteSets, TLC
 
 (*
-  Generation-counter model of the FrameNeeded-gated render cycle.
+  Generation-counter model of the FrameNeeded-gated render cycle with
+  double-buffered surface delivery.
 
-  Each frame tracks:
-    pending[f]           — render cycles started but not yet produced by graphics
-    rendering_updated[f] — renders completed by content
-    composed[f]          — renders whose graphical output was computed and sent by graphics
-    op_count[f]          — batched rendering opportunities not yet applied
+  All pipeline counters are relative to the last consumption (the
+  embedder's paint): the pipeline depth is bounded by BufferCount, which is
+  the only bound the model needs. Each frame tracks:
+    pending[f]           — renders started but not yet consumed (painted)
+    rendering_updated[f] — renders completed by content, not yet consumed
+    composed[f]          — renders whose pixels were computed by graphics, not yet consumed
+    op_count[f]          — a batched rendering opportunity not yet applied (set semantics, 0 or 1)
     frame_needed[f]      — the embedder needs a frame (sent at each paint, paced by vsync)
     animating[f]         — the last composed frame had animated content
     parent[f]            — parent navigable, for the frame hierarchy
@@ -22,23 +25,29 @@ EXTENDS Naturals, FiniteSets, TLC
   UpdateTheRendering renders the document; GraphicsComputed completes the
   cycle and, if content is animating or opportunities were batched, keeps
   the next cycle ready.
+
+  Double buffering: the embedder consumes (paints) the composed frames at
+  each FrameNeeded — the pipeline counters drop by composed — and the next
+  render can start while the previous frame is still being displayed (the
+  graphics process renders into the other buffer). The pipeline is bounded:
+  pending never exceeds BufferCount (DoubleBufferBound).
 *)
 
 CONSTANTS
   Frame,
   NONE,
-  MaxCounter
+  BufferCount
 
 ASSUME
   /\ Frame # {}
   /\ NONE \notin Frame
-  /\ MaxCounter > 0
+  /\ BufferCount > 0
 
 VARIABLES
-  pending,           \* [Frame -> 0..MaxCounter]
-  rendering_updated, \* [Frame -> 0..MaxCounter]
-  composed,          \* [Frame -> 0..MaxCounter]
-  op_count,          \* [Frame -> 0..MaxCounter]
+  pending,           \* [Frame -> 0..BufferCount]
+  rendering_updated, \* [Frame -> 0..BufferCount]
+  composed,          \* [Frame -> 0..BufferCount]
+  op_count,          \* [Frame -> 0..1]
   animating,         \* [Frame -> BOOLEAN]
   frame_needed,      \* [Frame -> BOOLEAN]
   parent             \* [Frame -> Frame \cup {NONE}]
@@ -58,10 +67,10 @@ HierarchyFrames(root) == {f \in Frame: HierarchyRoot(f) = root}
 \* ---- Type correctness ----
 
 TypeOK ==
-  /\ pending \in [Frame -> 0..MaxCounter]
-  /\ rendering_updated \in [Frame -> 0..MaxCounter]
-  /\ composed \in [Frame -> 0..MaxCounter]
-  /\ op_count \in [Frame -> 0..MaxCounter]
+  /\ pending \in [Frame -> 0..BufferCount]
+  /\ rendering_updated \in [Frame -> 0..BufferCount]
+  /\ composed \in [Frame -> 0..BufferCount]
+  /\ op_count \in [Frame -> 0..1]
   /\ animating \in [Frame -> BOOLEAN]
   /\ frame_needed \in [Frame -> BOOLEAN]
   /\ parent \in [Frame -> (Frame \cup {NONE})]
@@ -86,43 +95,43 @@ Init ==
 \* completed by graphics.
 InFlight(f) == pending[f] > composed[f]
 
-\* Always enabled.  When a render is in flight, batches the opportunity
-\* (op_count).  Otherwise, when the embedder needs a frame, starts a render
-\* and drains the batch; when no frame is needed, batches the opportunity.
+\* Always enabled.  When a render is in flight, or the embedder does not
+\* need a frame, batches the opportunity (set semantics: repeated notes
+\* while already batched stay one batched opportunity).  Otherwise, when
+\* the embedder needs a frame, starts a render and drains the batch.
 NoteRenderingOpportunity(f) ==
-  IF InFlight(f)
-  THEN /\ op_count[f] < MaxCounter
-       /\ op_count' = [op_count EXCEPT ![f] = op_count[f] + 1]
+  IF InFlight(f) \/ ~frame_needed[f]
+  THEN /\ op_count' = [op_count EXCEPT ![f] = 1]
        /\ UNCHANGED <<pending, rendering_updated, composed, animating,
                       frame_needed, parent>>
-  ELSE IF frame_needed[f]
-  THEN /\ pending[f] < MaxCounter
+  ELSE /\ pending[f] < BufferCount
        /\ pending' = [pending EXCEPT ![f] = pending[f] + 1]
        /\ frame_needed' = [frame_needed EXCEPT ![f] = FALSE]
        /\ op_count' = [op_count EXCEPT ![f] = 0]
        /\ UNCHANGED <<rendering_updated, composed, animating, parent>>
-  ELSE /\ op_count[f] < MaxCounter
-       /\ op_count' = [op_count EXCEPT ![f] = op_count[f] + 1]
-       /\ UNCHANGED <<pending, rendering_updated, composed, animating,
-                      frame_needed, parent>>
 
-\* The embedder needs a frame: sets the flag.  When no render is in flight
-\* and there is something to render (a batched opportunity or animating
-\* content), starts a render and drains the batch; otherwise the flag stays
-\* set until a future opportunity.
+\* The embedder needs a frame: the paint consumes the composed frames (the
+\* embedder blits the most recent texture), so the pipeline counters drop by
+\* composed and a render can start while the previous frame is still being
+\* displayed — the double buffering.  When the pipeline is drained and there
+\* is something to render (a batched opportunity or animating content),
+\* starts a render and drains the batch; otherwise the flag stays set until
+\* a future opportunity.
 FrameNeeded(f) ==
-  IF InFlight(f)
-  THEN /\ frame_needed' = [frame_needed EXCEPT ![f] = TRUE]
-       /\ UNCHANGED <<pending, rendering_updated, composed, op_count,
-                      animating, parent>>
-  ELSE IF (op_count[f] > 0 \/ animating[f]) /\ pending[f] < MaxCounter
-  THEN /\ frame_needed' = [frame_needed EXCEPT ![f] = FALSE]
-       /\ pending' = [pending EXCEPT ![f] = pending[f] + 1]
-       /\ op_count' = [op_count EXCEPT ![f] = 0]
-       /\ UNCHANGED <<rendering_updated, composed, animating, parent>>
-  ELSE /\ frame_needed' = [frame_needed EXCEPT ![f] = TRUE]
-       /\ UNCHANGED <<pending, rendering_updated, composed, op_count,
-                      animating, parent>>
+  LET in_flight == pending[f] - composed[f]
+      consume_rendering_updated == rendering_updated[f] - composed[f]
+      can_start == in_flight = 0 /\ (op_count[f] > 0 \/ animating[f])
+  IN
+  /\ composed' = [composed EXCEPT ![f] = 0]
+  /\ rendering_updated' = [rendering_updated EXCEPT ![f] = consume_rendering_updated]
+  /\ IF can_start
+     THEN /\ pending' = [pending EXCEPT ![f] = 1]
+          /\ frame_needed' = [frame_needed EXCEPT ![f] = FALSE]
+          /\ op_count' = [op_count EXCEPT ![f] = 0]
+     ELSE /\ pending' = [pending EXCEPT ![f] = in_flight]
+          /\ frame_needed' = [frame_needed EXCEPT ![f] = TRUE]
+          /\ op_count' = op_count
+  /\ UNCHANGED <<animating, parent>>
 
 \* Content renders frame f.  Enabled when content is behind (rendering_updated <
 \* pending).  Advances rendering_updated to match pending.
@@ -141,12 +150,12 @@ GraphicsComputed(f) ==
   /\ rendering_updated[f] > composed[f]
   /\ composed' = [composed EXCEPT ![f] = rendering_updated[f]]
   /\ IF frame_needed[f] /\ (op_count[f] > 0 \/ animating[f])
-        /\ pending[f] < MaxCounter
+        /\ pending[f] < BufferCount
      THEN /\ pending' = [pending EXCEPT ![f] = pending[f] + 1]
           /\ frame_needed' = [frame_needed EXCEPT ![f] = FALSE]
           /\ op_count' = [op_count EXCEPT ![f] = 0]
      ELSE /\ IF animating[f]
-           THEN op_count' = [op_count EXCEPT ![f] = op_count[f] + 1]
+           THEN op_count' = [op_count EXCEPT ![f] = 1]
            ELSE op_count' = op_count
           /\ pending' = pending
           /\ frame_needed' = frame_needed
@@ -177,16 +186,22 @@ PendingLeadsRendering ==
 RenderingLeadsComposed ==
   \A f \in Frame: rendering_updated[f] >= composed[f]
 
+\* Double buffering: the pipeline never holds more than BufferCount renders
+\* started but not yet consumed by the embedder's paint (one being displayed,
+\* the rest being rendered into the other buffers).
+DoubleBufferBound ==
+  \A f \in Frame: pending[f] <= BufferCount
+
 \* ---- Liveness ----
 
 \* Batched opportunities are serviced when the embedder needs a frame: once
-\* a frame is needed and a render can start (within the counter bounds), the
-\* batch drains to zero.
+\* a frame is needed and a render can start, the batch drains to zero.
 OpportunitiesServiced ==
   \A f \in Frame:
-    ((op_count[f] > 0 /\ frame_needed[f] /\ pending[f] < MaxCounter)
+    ((op_count[f] > 0 /\ frame_needed[f] /\ pending[f] < BufferCount)
        ~> (op_count[f] = 0))
 
 THEOREM
-    Spec => (TypeOK /\ PendingLeadsRendering /\ RenderingLeadsComposed)
+    Spec => (TypeOK /\ PendingLeadsRendering /\ RenderingLeadsComposed
+             /\ DoubleBufferBound)
 =============================================================================

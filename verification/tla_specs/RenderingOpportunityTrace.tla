@@ -17,7 +17,7 @@ vars == <<pending, rendering_updated, composed, op_count, animating,
 Base == INSTANCE RenderingOpportunity WITH
     Frame <- TraceFrame,
     NONE <- TraceNone,
-    MaxCounter <- TraceMaxCounter
+    BufferCount <- TraceBufferCount
 
 TraceLength == Len(Trace)
 

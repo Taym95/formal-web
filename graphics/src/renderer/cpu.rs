@@ -6,7 +6,7 @@
 
 use super::{
     FrameDelivery, FrameMetadata, GpuContext, PollRequest, ReadbackChannels, RenderError,
-    RenderSubmit, SurfaceBuffers, SurfaceRenderer, SurfaceRingState, frame_metadata, render_size,
+    SurfaceBuffers, SurfaceRenderer, SurfaceRingState, frame_metadata, render_size,
 };
 use ipc_messages::content::WebviewId;
 use ipc_messages::graphics::{GraphicsEvent, SurfacePayload};
@@ -224,7 +224,7 @@ impl SurfaceRenderer for CpuRenderer {
         })
     }
 
-    fn submit_scene(&mut self, composed: ComposedScene) -> Result<RenderSubmit, RenderError> {
+    fn submit_scene(&mut self, composed: ComposedScene) -> Result<(), RenderError> {
         let ComposedScene {
             webview_id,
             scene,
@@ -393,12 +393,7 @@ impl SurfaceRenderer for CpuRenderer {
             width, height, generation, readback_index
         );
 
-        Ok(RenderSubmit {
-            generation,
-            width,
-            height,
-            buffer_index,
-        })
+        Ok(())
     }
 
     fn handle_render_done(
@@ -417,11 +412,6 @@ impl SurfaceRenderer for CpuRenderer {
             metadata,
         } = data;
         let mut delivery = FrameDelivery {
-            generation,
-            width,
-            height,
-            buffer_index: shmem_index,
-            surface_frame_sent: false,
             graphics_computed: false,
         };
         if let Err(error) = result {
@@ -465,7 +455,6 @@ impl SurfaceRenderer for CpuRenderer {
             );
             return delivery;
         }
-        delivery.surface_frame_sent = true;
         let shmem_key = generation as usize;
         let mut shmem_map = HashMap::new();
         shmem_map.insert(shmem_key, buffers.payload()[shmem_index].clone());

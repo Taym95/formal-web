@@ -47,28 +47,11 @@ pub struct FrameMetadata {
     pub animating: bool,
 }
 
-/// The result of submitting a frame: the generation now in flight, the size
-/// it was submitted at, and the ring buffer it occupies. Reported to the run
-/// loop, which emits the `SurfaceFrameSubmitted` trace event.
-pub struct RenderSubmit {
-    pub generation: u64,
-    pub width: u32,
-    pub height: u32,
-    pub buffer_index: usize,
-}
-
 /// The outcome of delivering a completed frame, reported to the run loop so
-/// the TLA tracing stays there. The two flags mirror the trace events:
-/// `surface_frame_sent` gates `SurfaceFrameSent` (the pixels were copied and
-/// the ring buffer marked pending), `graphics_computed` gates
-/// `GraphicsComputed` (PixelFrameReady was actually sent).
+/// the TLA tracing stays there. `graphics_computed` gates the
+/// `GraphicsComputed` RenderingOpportunity trace event (PixelFrameReady was
+/// actually sent).
 pub struct FrameDelivery {
-    pub generation: u64,
-    pub width: u32,
-    pub height: u32,
-    pub buffer_index: usize,
-    /// The pixels were marked pending and the frame sent to the embedder.
-    pub surface_frame_sent: bool,
     /// PixelFrameReady was delivered to the UA (the frame is fully computed).
     pub graphics_computed: bool,
 }
@@ -382,17 +365,14 @@ pub trait SurfaceRenderer {
         Self: Sized;
 
     /// Submit `composed` for rendering. The renderer derives the render
-    /// size, (re)allocates its surface buffers on resize, picks a free ring
-    /// buffer — or retains the scene when every buffer is busy — and submits
-    /// the render. The GPU completion is delivered on
-    /// `ReadbackChannels::render_done_tx` as `Self::RenderData`. The run
-    /// loop emits the `SurfaceFrameSubmitted` trace event from the returned
-    /// [`RenderSubmit`].
-    fn submit_scene(&mut self, composed: ComposedScene) -> Result<RenderSubmit, RenderError>;
+    /// size, (re)allocates its surface buffers on resize, picks the
+    /// alternating buffer, and submits the render. The GPU completion is
+    /// delivered on `ReadbackChannels::render_done_tx` as `Self::RenderData`.
+    fn submit_scene(&mut self, composed: ComposedScene) -> Result<(), RenderError>;
 
-    /// The GPU completed a frame: mark the ring buffer pending and deliver
-    /// the frame to the embedder. The run loop emits the `SurfaceFrameSent`
-    /// and `GraphicsComputed` trace events from the returned
+    /// The GPU completed a frame: deliver
+    /// the frame to the embedder. The run loop emits the `GraphicsComputed`
+    /// RenderingOpportunity trace event from the returned
     /// [`FrameDelivery`].
     fn handle_render_done(
         &mut self,

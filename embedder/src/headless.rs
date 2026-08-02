@@ -46,7 +46,6 @@ pub(super) struct HeadlessEmbedderApp {
     pub(super) buttons: MouseEventButtons,
     pub(super) composed_scenes: HashMap<WebviewId, RecordedScene>,
     pub(super) scene_font_receiver: FontTransportReceiver,
-    pub(super) tla_tracer: verification::TLATracer,
 }
 
 impl Default for HeadlessEmbedderApp {
@@ -61,7 +60,6 @@ impl Default for HeadlessEmbedderApp {
             buttons: MouseEventButtons::None,
             composed_scenes: HashMap::new(),
             scene_font_receiver: FontTransportReceiver::default(),
-            tla_tracer: verification::TLATracer::new("GPURendering", "embedder", None),
         }
     }
 }
@@ -364,19 +362,11 @@ impl ApplicationHandler<FormalWebUserEvent> for HeadlessEmbedderApp {
             FormalWebUserEvent::NewWebContentSurface {
                 webview_id,
                 frame: _frame,
-                width,
-                height,
-                generation,
+                width: _width,
+                height: _height,
+                generation: _generation,
             } => {
                 debug!("[embedder] headless NewWebContentSurface {:?}", webview_id);
-                verification::tla_log!(
-                    self.tla_tracer,
-                    -> "GPURendering",
-                    "SurfaceFrameReceived",
-                    webview_id.0,
-                    generation,
-                    format!("{}x{}", width, height)
-                );
                 // No ack is sent: the graphics process alternates its two
                 // buffers per render cycle. Headless has no display pacing,
                 // so the next frame is requested immediately after this one

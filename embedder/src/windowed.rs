@@ -320,7 +320,6 @@ pub(super) struct WindowedApp {
     pub(super) windows: HashMap<WindowId, WindowState>,
     pub(super) provider: Option<WebviewProvider>,
     pub(super) active_window_id: Option<WindowId>,
-    pub(super) tla_tracer: verification::TLATracer,
 }
 
 impl Default for WindowedApp {
@@ -329,7 +328,6 @@ impl Default for WindowedApp {
             windows: HashMap::new(),
             provider: None,
             active_window_id: None,
-            tla_tracer: verification::TLATracer::new("GPURendering", "embedder", None),
         }
     }
 }
@@ -1458,7 +1456,7 @@ impl ApplicationHandler<FormalWebUserEvent> for WindowedApp {
                 frame,
                 width,
                 height,
-                generation,
+                generation: _generation,
             } => {
                 let Some(window_id) = Self::window_for_webview(self, webview_id) else {
                     info!(
@@ -1627,14 +1625,6 @@ impl ApplicationHandler<FormalWebUserEvent> for WindowedApp {
                 info!(
                     "[render-pipe] Embedder updated surface webview={:?} active={} tabs={:?} active_tab={:?} window={:?}",
                     webview_id, is_active, state.tab_order, state.active_tab, window_id
-                );
-                verification::tla_log!(
-                    self.tla_tracer,
-                    -> "GPURendering",
-                    "SurfaceFrameReceived",
-                    webview_id.0,
-                    generation,
-                    format!("{}x{}", width, height)
                 );
                 // The frame is stored: the CPU path staged the pixels into
                 // the persistent texture synchronously; the zero-copy path

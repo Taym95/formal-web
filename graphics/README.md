@@ -202,8 +202,6 @@ payload enum identifies the backend in use on the wire.
 ### What stays identical
 
 - The embedder's registration + draw path.
-- The GPURendering TLA model — it validates the alternating-buffer semantics
-  (two regions, no ack) and would check both backends' traces unchanged.
 
 ## AVFoundation → shared texture
 
@@ -246,7 +244,7 @@ because Vello's `register_texture` requires `Rgba8Unorm`.
     is the natural place to gate on "a proper video frame".
   - Constraint: compositions must stay tied to render cycles (the
     "never compose independently from the video handler" rule, to keep the
-    GPURendering/RenderingOpportunity TLA pipeline models valid). A
+    RenderingOpportunity TLA pipeline model valid). A
     video-frame arrival should therefore re-note a rendering opportunity
     through the UA (e.g. a `VideoFrameReady` trace event), and the
     composition itself still happens on the root `PaintFrame` within the

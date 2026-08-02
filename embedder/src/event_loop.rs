@@ -294,18 +294,20 @@ where
 }
 
 pub fn run_headed_event_loop(trace_sender: Option<TraceSender>) -> Result<(), String> {
-    run_embedder_event_loop(trace_sender.clone(), |provider, trace_sender| WindowedApp {
-        provider: Some(provider),
-        tla_tracer: verification::TLATracer::new("GPURendering", "embedder", trace_sender),
-        ..WindowedApp::default()
+    run_embedder_event_loop(trace_sender.clone(), |provider, _trace_sender| {
+        WindowedApp {
+            provider: Some(provider),
+            ..WindowedApp::default()
+        }
     })
 }
 
 pub fn run_headless_event_loop(trace_sender: Option<TraceSender>) -> Result<(), String> {
-    run_embedder_event_loop(trace_sender, |provider, trace_sender| HeadlessEmbedderApp {
-        provider: Some(provider),
-        tla_tracer: verification::TLATracer::new("GPURendering", "embedder", trace_sender),
-        ..HeadlessEmbedderApp::default()
+    run_embedder_event_loop(trace_sender, |provider, _trace_sender| {
+        HeadlessEmbedderApp {
+            provider: Some(provider),
+            ..HeadlessEmbedderApp::default()
+        }
     })
 }
 

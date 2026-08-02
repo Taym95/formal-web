@@ -13,8 +13,7 @@ The verification crate owns trace recording, TLA+ validation, and the shutdown w
 | Spec | Events traced (producer) | Validates |
 |---|---|---|
 | `Navigation` | UA navigation lifecycle | navigable/navigation state machine |
-| `RenderingOpportunity` | UA `NoteRenderingOpportunity`/`FrameNeeded`, content `UpdateTheRendering`, graphics `GraphicsComputed` (traced when the pixels are actually sent) | FrameNeeded-gated render cycle: a render starts only when the embedder needs a frame (paced by vsync) AND a rendering opportunity was noted; batched-opportunity counters |
-| `GPURendering` | graphics `SurfaceFrameSubmitted`/`SurfaceFrameSent`, embedder `SurfaceFrameReceived` | per-webview alternating double buffer: strict +1 submit generations, sent frames are a subset of submitted frames delivered from the region they were submitted into, consecutive renders alternate the two buffers (no ack needed), consumed frames match sent frames |
+| `RenderingOpportunity` | UA `NoteRenderingOpportunity`/`FrameNeeded`, content `UpdateTheRendering`, graphics `GraphicsComputed` (traced when the pixels are actually sent) | FrameNeeded-gated render cycle with double buffering: a render starts only when the embedder needs a frame (paced by vsync) AND a rendering opportunity was noted; the paint consumes the composed frames, and the pipeline never holds more than `BufferCount` (2) renders in flight (one displayed, one being rendered) |
 | `MessagePort*` | (not written yet) | — |
 
 ### Adding a spec
