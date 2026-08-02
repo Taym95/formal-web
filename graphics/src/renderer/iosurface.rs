@@ -7,8 +7,10 @@ use super::{
     FrameMetadata, GpuContext, PollRequest, ReadbackChannels, RenderError, SurfaceBuffers,
     SurfaceRenderer, SurfaceRingState, frame_metadata, render_size,
 };
+use crate::iosurface::{IosurfaceTexture, create_shared_texture};
 use ipc_messages::content::WebviewId;
 use ipc_messages::graphics::{GraphicsEvent, SurfacePayload};
+use ipc_messages::media::VideoPaintId;
 use log::{debug, error, info};
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
@@ -37,7 +39,7 @@ pub struct IosurfaceRenderer {
     channels: ReadbackChannels<SharedRenderData>,
     /// The webview's shared IOSurface ring (three textures), reallocated on
     /// resize.
-    buffers: Option<SurfaceBuffers<[crate::iosurface::IosurfaceTexture; 3]>>,
+    buffers: Option<SurfaceBuffers<[IosurfaceTexture; 3]>>,
     /// Monotonic identity for shared IOSurface textures; changes on resize.
     texture_id_counter: u64,
     /// The most recent composed scene that could not be submitted because
@@ -46,6 +48,21 @@ pub struct IosurfaceRenderer {
 }
 
 impl IosurfaceRenderer {
+    /// Allocate the three shared IOSurface textures for the ring, using
+    /// `first_texture_id` as the id of the first texture.
+    fn allocate_textures(
+        renderer: &IosurfaceRenderer,
+        width: u32,
+        height: u32,
+        first_texture_id: u64,
+    ) -> Option<[IosurfaceTexture; 3]> {
+        Some([
+            create_shared_texture(renderer, width, height, first_texture_id)?,
+            create_shared_texture(renderer, width, height, first_texture_id + 1)?,
+            create_shared_texture(renderer, width, height, first_texture_id + 2)?,
+        ])
+    }
+
     /// The wgpu device this renderer composites with (also used to create
     /// the shared IOSurface textures).
     pub(crate) fn device(&self) -> &wgpu::Device {
@@ -102,14 +119,8 @@ impl SurfaceRenderer for IosurfaceRenderer {
             .as_ref()
             .is_none_or(|buffers| buffers.ring().width != width || buffers.ring().height != height);
         if needs_new {
-            let mut textures: [Option<crate::iosurface::IosurfaceTexture>; 3] = [None, None, None];
-            for slot in textures.iter_mut() {
-                let texture = crate::iosurface::create_shared_texture(
-                    self,
-                    width,
-                    height,
-                    self.texture_id_counter,
-                )
+            let first_texture_id = self.texture_id_counter;
+            let payload = Self::allocate_textures(self, width, height, first_texture_id)
                 .ok_or_else(|| {
                     error!(
                         "[graphics] allocate shared textures {}x{}: failed",
@@ -117,10 +128,7 @@ impl SurfaceRenderer for IosurfaceRenderer {
                     );
                     RenderError::Failed
                 })?;
-                self.texture_id_counter += 1;
-                *slot = Some(texture);
-            }
-            let payload = textures.map(|texture| texture.expect("filled above"));
+            self.texture_id_counter += 3;
             self.buffers = Some(SurfaceBuffers::new(
                 SurfaceRingState::new(width, height),
                 payload,
@@ -301,7 +309,7 @@ impl SurfaceRenderer for IosurfaceRenderer {
 
     fn import_video_frame(
         &mut self,
-        paint_id: ipc_messages::media::VideoPaintId,
+        paint_id: VideoPaintId,
         pixel_buffer: &Retained<CVPixelBuffer>,
         width: u32,
         height: u32,

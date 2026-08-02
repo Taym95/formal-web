@@ -11,6 +11,7 @@ use super::{
 use ipc_messages::content::WebviewId;
 use ipc_messages::graphics::{GraphicsEvent, SurfacePayload};
 use log::{debug, error, info};
+use std::collections::HashMap;
 use verification::TLATracer;
 use wgpu::{
     BufferDescriptor, BufferUsages, CommandEncoderDescriptor, Extent3d, Origin3d,
@@ -18,6 +19,8 @@ use wgpu::{
     TextureDescriptor, TextureDimension, TextureFormat, TextureUsages,
 };
 
+#[cfg(target_os = "macos")]
+use ipc_messages::media::VideoPaintId;
 #[cfg(target_os = "macos")]
 use objc2::rc::Retained;
 #[cfg(target_os = "macos")]
@@ -68,7 +71,9 @@ impl CpuRenderer {
         if self
             .render_tex
             .as_ref()
-            .map(|(_, w, h)| *w == width && *h == height)
+            .map(|(_, render_width, render_height)| {
+                *render_width == width && *render_height == height
+            })
             .unwrap_or(false)
         {
             return;
@@ -191,7 +196,9 @@ impl CpuRenderer {
         let bytes_per_row = (width * 4).div_ceil(alignment) * alignment;
         let size = (bytes_per_row * height) as u64;
         let needs_new = match readback_buffer {
-            Some((_, w, h)) => *w != width || *h != height,
+            Some((_, buffer_width, buffer_height)) => {
+                *buffer_width != width || *buffer_height != height
+            }
             None => true,
         };
         if !needs_new {
@@ -494,7 +501,7 @@ impl SurfaceRenderer for CpuRenderer {
         );
 
         let shmem_key = generation as usize;
-        let mut shmem_map = std::collections::HashMap::new();
+        let mut shmem_map = HashMap::new();
         shmem_map.insert(shmem_key, buffers.payload()[shmem_index].clone());
 
         if sender
@@ -564,7 +571,7 @@ impl SurfaceRenderer for CpuRenderer {
     #[cfg(target_os = "macos")]
     fn import_video_frame(
         &mut self,
-        paint_id: ipc_messages::media::VideoPaintId,
+        paint_id: VideoPaintId,
         pixel_buffer: &Retained<CVPixelBuffer>,
         width: u32,
         height: u32,
