@@ -4,18 +4,26 @@
 //! macOS (GStreamer media backend) and on macOS when built with the
 //! `cpu_readback` feature.
 
-use super::{FrameMetadata, GpuRenderer, PollRequest, RenderSubmit, SurfaceRenderer};
-use anyrender::PaintScene;
+use super::{
+    FrameMetadata, GpuContext, PollRequest, ReadbackChannels, RenderError, SurfaceBuffers,
+    SurfaceRenderer, SurfaceRingState, frame_metadata, render_size,
+};
 use ipc_messages::content::WebviewId;
 use ipc_messages::graphics::{GraphicsEvent, SurfacePayload};
-use kurbo::Affine;
-use log::{debug, error};
-use vello::{AaConfig, RenderParams};
+use log::{debug, error, info};
+use verification::TLATracer;
 use wgpu::{
     BufferDescriptor, BufferUsages, CommandEncoderDescriptor, Extent3d, Origin3d,
     TexelCopyBufferInfo, TexelCopyBufferLayout, TexelCopyTextureInfo, TextureAspect,
-    TextureDescriptor, TextureDimension, TextureFormat, TextureUsages, TextureViewDescriptor,
+    TextureDescriptor, TextureDimension, TextureFormat, TextureUsages,
 };
+
+#[cfg(target_os = "macos")]
+use objc2::rc::Retained;
+#[cfg(target_os = "macos")]
+use objc2_core_video::CVPixelBuffer;
+
+use crate::ComposedScene;
 
 /// The number of readback buffers kept per renderer; must be >= the number
 /// of shared-memory surface buffers so each in-flight frame has its own
@@ -35,7 +43,27 @@ pub struct CpuRenderData {
     pub metadata: FrameMetadata,
 }
 
-impl GpuRenderer {
+/// The CPU readback renderer: a [`GpuContext`] plus the intermediate
+/// texture, the readback staging pool, and the webview's shared-memory ring.
+pub struct CpuRenderer {
+    gpu: GpuContext,
+    channels: ReadbackChannels<CpuRenderData>,
+    /// Intermediate texture for Vello compute (has STORAGE_BINDING +
+    /// COPY_SRC); the CPU readback source.
+    render_tex: Option<(wgpu::Texture, u32, u32)>,
+    /// Staging buffers for GPU → CPU readback, one per in-flight frame.
+    readback_buffers: [Option<(wgpu::Buffer, u32, u32)>; READBACK_SLOTS],
+    /// Generation of the frame whose readback is in flight per slot.
+    inflight_readbacks: [Option<u64>; READBACK_SLOTS],
+    /// The webview's shared-memory ring (three regions), reallocated on
+    /// resize.
+    buffers: Option<SurfaceBuffers<[ipc::IpcSharedRegion; 3]>>,
+    /// The most recent composed scene that could not be submitted because
+    /// every ring buffer was still awaiting the embedder's ack.
+    deferred_scene: Option<ComposedScene>,
+}
+
+impl CpuRenderer {
     fn ensure_render_tex(&mut self, width: u32, height: u32) {
         if self
             .render_tex
@@ -46,6 +74,7 @@ impl GpuRenderer {
             return;
         }
         let tex = self
+            .gpu
             .device_handle
             .device
             .create_texture(&TextureDescriptor {
@@ -67,9 +96,22 @@ impl GpuRenderer {
         self.render_tex = Some((tex, width, height));
     }
 
+    /// Three shared-memory pixel buffers for the ring, sized for `width`×
+    /// `height` RGBA8.
+    fn allocate_shmem(width: u32, height: u32) -> Result<[ipc::IpcSharedRegion; 3], ipc::IpcError> {
+        let byte_count = (width as usize) * (height as usize) * 4;
+        let region_zero = ipc::IpcSharedRegion::allocate(byte_count)?;
+        let region_one = ipc::IpcSharedRegion::allocate(byte_count)?;
+        let region_two = ipc::IpcSharedRegion::allocate(byte_count)?;
+        Ok([region_zero, region_one, region_two])
+    }
+
     /// Drop the in-flight marker for a readback slot (map failure path).
-    fn release_readback(&mut self, readback_index: usize) {
-        if let Some(generation) = self.inflight_readbacks[readback_index].take() {
+    fn release_readback(
+        inflight_readbacks: &mut [Option<u64>; READBACK_SLOTS],
+        readback_index: usize,
+    ) {
+        if let Some(generation) = inflight_readbacks[readback_index].take() {
             debug!(
                 "[gpu-renderer] released readback slot {} gen={}",
                 readback_index, generation
@@ -81,20 +123,21 @@ impl GpuRenderer {
     /// `width * height * 4` bytes) and release the readback slot.
     /// Returns false when the slot is not in flight.
     fn copy_readback(
-        &mut self,
+        inflight_readbacks: &mut [Option<u64>; READBACK_SLOTS],
+        readback_buffers: &mut [Option<(wgpu::Buffer, u32, u32)>; READBACK_SLOTS],
         readback_index: usize,
         pixels: &mut [u8],
         width: u32,
         height: u32,
     ) -> bool {
-        let Some(generation) = self.inflight_readbacks[readback_index].take() else {
+        let Some(generation) = inflight_readbacks[readback_index].take() else {
             error!(
                 "[gpu-renderer] readback slot {} not in flight",
                 readback_index
             );
             return false;
         };
-        let Some((buf, _, _)) = &self.readback_buffers[readback_index] else {
+        let Some((buf, _, _)) = &readback_buffers[readback_index] else {
             error!(
                 "[gpu-renderer] readback slot {} has no buffer",
                 readback_index
@@ -137,7 +180,7 @@ impl GpuRenderer {
         true
     }
 
-    fn ensure_readback_buffer_inner<'a>(
+    fn ensure_readback_buffer<'a>(
         readback_buffer: &'a mut Option<(wgpu::Buffer, u32, u32)>,
         device_handle: &wgpu_context::DeviceHandle,
         width: u32,
@@ -165,48 +208,102 @@ impl GpuRenderer {
     }
 }
 
-impl SurfaceRenderer for GpuRenderer {
+impl SurfaceRenderer for CpuRenderer {
     type RenderData = CpuRenderData;
 
-    fn render(
+    fn new(channels: ReadbackChannels<CpuRenderData>) -> Result<Self, String> {
+        Ok(Self {
+            gpu: GpuContext::new()?,
+            channels,
+            render_tex: None,
+            readback_buffers: [None, None, None],
+            inflight_readbacks: [None, None, None],
+            buffers: None,
+            deferred_scene: None,
+        })
+    }
+
+    fn submit_scene(
         &mut self,
-        scene: &anyrender::Scene,
-        width: u32,
-        height: u32,
-        _buffers: &mut crate::SurfaceBuffers,
-        buffer_index: usize,
-        metadata: FrameMetadata,
-    ) -> Option<RenderSubmit> {
-        let (width, height) = (width.max(1), height.max(1));
+        composed: ComposedScene,
+        tla_tracer: &mut TLATracer,
+    ) -> Result<(), RenderError> {
+        let ComposedScene {
+            webview_id,
+            scene,
+            frame_hit_info,
+            child_viewports,
+            child_frame_to_webview,
+            animating,
+        } = composed;
+        let (width, height) = render_size(&frame_hit_info);
+        info!(
+            "[render-pipe] Graphics GPU render webview={} {}x{} {} child_frames animating={}",
+            webview_id.0,
+            width,
+            height,
+            child_viewports.len(),
+            animating,
+        );
+
+        // The intermediate render target must match the current size before
+        // the buffers borrow below.
         self.ensure_render_tex(width, height);
-        self.mark_video_textures_dirty();
 
-        // Step 1: Vello compute render into intermediate texture.
-        self.vello_scene.reset();
-        {
-            let mut painter = anyrender_vello::VelloScenePainter::new(&mut self.vello_scene);
-            painter.append_scene(scene.clone(), Affine::IDENTITY);
-        }
-
-        let view = self
-            .render_tex
+        // Reuse the per-webview frame buffers across frames, reallocating
+        // only when the viewport size changes.
+        let needs_new = self
+            .buffers
             .as_ref()
-            .map(|(tex, _, _)| tex.create_view(&TextureViewDescriptor::default()))?;
+            .is_none_or(|buffers| buffers.ring().width != width || buffers.ring().height != height);
+        if needs_new {
+            let payload = Self::allocate_shmem(width, height).map_err(|error| {
+                error!(
+                    "[graphics] allocate surface shmem {}x{}: {error}",
+                    width, height
+                );
+                RenderError::Failed
+            })?;
+            self.buffers = Some(SurfaceBuffers::new(
+                SurfaceRingState::new(width, height),
+                payload,
+            ));
+        }
+        let buffers = self.buffers.as_mut().ok_or(RenderError::Failed)?;
+        let Some(buffer_index) = buffers.next_free() else {
+            // Every buffer is reserved or awaiting the embedder's ack: hold
+            // the composed scene and submit it once a buffer frees. This
+            // keeps the rendering-opportunity cycle alive instead of
+            // dropping the frame.
+            info!(
+                "[render-pipe] Graphics defer scene webview={} (all {} buffers busy)",
+                webview_id.0, 3
+            );
+            self.deferred_scene = Some(ComposedScene {
+                webview_id,
+                scene,
+                frame_hit_info,
+                child_viewports,
+                child_frame_to_webview,
+                animating,
+            });
+            return Err(RenderError::Deferred);
+        };
 
-        if let Err(e) = self.vello_renderer.render_to_texture(
-            &self.device_handle.device,
-            &self.device_handle.queue,
-            &self.vello_scene,
-            &view,
-            &RenderParams {
-                base_color: vello::peniko::Color::TRANSPARENT,
-                width,
-                height,
-                antialiasing_method: AaConfig::Area,
-            },
-        ) {
-            error!("[gpu-renderer] Vello render failed: {:?}", e);
-            return None;
+        let metadata = frame_metadata(
+            webview_id,
+            frame_hit_info,
+            child_viewports,
+            child_frame_to_webview,
+            animating,
+        );
+
+        // Step 1: Vello compute render into the intermediate texture.
+        let (src_tex, _, _) = self.render_tex.as_ref().ok_or(RenderError::Failed)?;
+        self.gpu.mark_video_textures_dirty();
+        if let Err(error) = self.gpu.render_into(&scene, src_tex, width, height) {
+            error!("[gpu-renderer] {error}");
+            return Err(RenderError::Failed);
         }
 
         // Step 2: pick the next free readback slot and ensure its staging
@@ -218,16 +315,16 @@ impl SurfaceRenderer for GpuRenderer {
                 "[gpu-renderer] no free readback slot for {}x{}",
                 width, height
             );
-            return None;
+            return Err(RenderError::Failed);
         };
-        let device_handle = &self.device_handle;
-        let readback_buffers = &mut self.readback_buffers;
-        let readback_buf = Self::ensure_readback_buffer_inner(
-            &mut readback_buffers[readback_index],
+        let device_handle = &self.gpu.device_handle;
+        let readback_buf = Self::ensure_readback_buffer(
+            &mut self.readback_buffers[readback_index],
             device_handle,
             width,
             height,
-        )?;
+        )
+        .ok_or(RenderError::Failed)?;
         // bytes_per_row must be a multiple of COPY_BYTES_PER_ROW_ALIGNMENT.
         let alignment = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
         let aligned_bytes_per_row = (width * 4).div_ceil(alignment) * alignment;
@@ -238,7 +335,7 @@ impl SurfaceRenderer for GpuRenderer {
             .create_command_encoder(&CommandEncoderDescriptor {
                 label: Some("surface-readback"),
             });
-        let (src_tex, _, _) = self.render_tex.as_ref()?;
+        let (src_tex, _, _) = self.render_tex.as_ref().ok_or(RenderError::Failed)?;
         encoder.copy_texture_to_buffer(
             TexelCopyTextureInfo {
                 texture: src_tex,
@@ -261,8 +358,8 @@ impl SurfaceRenderer for GpuRenderer {
             },
         );
 
-        self.generation += 1;
-        let generation = self.generation;
+        self.gpu.generation += 1;
+        let generation = self.gpu.generation;
         let webview_id = metadata.webview_id;
         let shmem_index = buffer_index;
         let frame_hit_info = metadata.frame_hit_info;
@@ -298,32 +395,41 @@ impl SurfaceRenderer for GpuRenderer {
                 }
             },
         );
-        let submission_index = device_handle.queue.submit([encoder.finish()]);
+        let submission_index = self.gpu.device_handle.queue.submit([encoder.finish()]);
         // Ask the poll thread to block until this submission completes; it
         // fires the map callback above when the GPU is done.
         if let Err(send_error) = self.channels.poll_tx.send(PollRequest {
-            device: self.device_handle.clone(),
+            device: self.gpu.device_handle.clone(),
             submission_index: Some(submission_index),
             done: None,
         }) {
             error!("[gpu-renderer] failed to queue poll request: {send_error}");
         }
         self.inflight_readbacks[readback_index] = Some(generation);
+        buffers.reserve(buffer_index, generation);
         debug!(
             "[gpu-renderer] submitted {}x{} gen={} readback={}",
             width, height, generation, readback_index
         );
-        Some(RenderSubmit { generation })
+
+        verification::tla_log!(
+            *tla_tracer,
+            -> "GPURendering",
+            "SurfaceFrameSubmitted",
+            webview_id.0,
+            generation,
+            format!("{}x{}", width, height),
+            buffer_index
+        );
+        Ok(())
     }
 
     fn handle_render_done(
         &mut self,
         data: CpuRenderData,
-        buffers: &mut crate::SurfaceBuffers,
         sender: &ipc::IpcSender<GraphicsEvent>,
-        tla_tracer: &mut verification::TLATracer,
+        tla_tracer: &mut TLATracer,
     ) {
-        let crate::SurfaceBuffers::Cpu(buffers) = buffers;
         let CpuRenderData {
             webview_id,
             generation,
@@ -339,29 +445,43 @@ impl SurfaceRenderer for GpuRenderer {
                 "[graphics] readback map failed for {:?} gen={}: {error:?}",
                 webview_id, generation
             );
-            self.release_readback(readback_index);
+            Self::release_readback(&mut self.inflight_readbacks, readback_index);
             return;
         }
-        let Some(region) = buffers.regions.get_mut(shmem_index) else {
+        let Some(buffers) = self.buffers.as_mut() else {
+            error!(
+                "[graphics] no surface buffers for render done {:?}",
+                webview_id
+            );
+            return;
+        };
+        let Some(region) = buffers.payload_mut().get_mut(shmem_index) else {
             error!(
                 "[graphics] bad shmem index {} for readback {:?} gen={}",
                 shmem_index, webview_id, generation
             );
-            self.release_readback(readback_index);
+            Self::release_readback(&mut self.inflight_readbacks, readback_index);
             return;
         };
         // SAFETY: this buffer was reserved at submit time and its pixels are
         // delivered exactly once here, before it is marked pending; no other
         // party reads or writes these pages in between.
         let pixel_slice = unsafe { region.as_mut_slice() };
-        if !self.copy_readback(readback_index, pixel_slice, width, height) {
+        if !Self::copy_readback(
+            &mut self.inflight_readbacks,
+            &mut self.readback_buffers,
+            readback_index,
+            pixel_slice,
+            width,
+            height,
+        ) {
             error!(
                 "[graphics] readback copy failed for {:?} gen={}",
                 webview_id, generation
             );
             return;
         }
-        buffers.ring.mark_pending(shmem_index, generation);
+        buffers.ring_mut().mark_pending(shmem_index, generation);
 
         verification::tla_log!(
             *tla_tracer,
@@ -375,7 +495,7 @@ impl SurfaceRenderer for GpuRenderer {
 
         let shmem_key = generation as usize;
         let mut shmem_map = std::collections::HashMap::new();
-        shmem_map.insert(shmem_key, buffers.regions[shmem_index].clone());
+        shmem_map.insert(shmem_key, buffers.payload()[shmem_index].clone());
 
         if sender
             .send_with_shmem_map(
@@ -414,5 +534,42 @@ impl SurfaceRenderer for GpuRenderer {
 
     fn render_done_webview_id(data: &CpuRenderData) -> WebviewId {
         data.webview_id
+    }
+
+    fn ack(&mut self, generation: u64) -> bool {
+        self.buffers
+            .as_mut()
+            .is_some_and(|buffers| buffers.ack(generation))
+    }
+
+    fn submit_deferred(&mut self, tla_tracer: &mut TLATracer) -> bool {
+        let Some(composed) = self.deferred_scene.take() else {
+            return false;
+        };
+        let webview_id = composed.webview_id;
+        if let Err(error) = self.submit_scene(composed, tla_tracer) {
+            match error {
+                RenderError::Deferred => {}
+                RenderError::Failed => {
+                    error!(
+                        "[graphics] submit deferred scene failed for {:?}",
+                        webview_id
+                    );
+                }
+            }
+        }
+        true
+    }
+
+    #[cfg(target_os = "macos")]
+    fn import_video_frame(
+        &mut self,
+        paint_id: ipc_messages::media::VideoPaintId,
+        pixel_buffer: &Retained<CVPixelBuffer>,
+        width: u32,
+        height: u32,
+    ) -> Option<peniko::ImageData> {
+        self.gpu
+            .import_video_frame(paint_id, pixel_buffer, width, height)
     }
 }

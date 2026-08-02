@@ -60,7 +60,17 @@ fn main() {
                 }
             };
 
-        graphics::run_graphics_process(receiver, event_tx, backend);
+        // The surface renderer backend is chosen at compile time by feature:
+        // the zero-copy IOSurface renderer on macOS by default, the CPU
+        // readback renderer off macOS and with `cpu_readback`.
+        #[cfg(all(target_os = "macos", not(feature = "cpu_readback")))]
+        graphics::run_graphics_process::<_, graphics::renderer::IosurfaceRenderer>(
+            receiver, event_tx, backend,
+        );
+        #[cfg(any(not(target_os = "macos"), feature = "cpu_readback"))]
+        graphics::run_graphics_process::<_, graphics::renderer::CpuRenderer>(
+            receiver, event_tx, backend,
+        );
         Ok(())
     });
     if let Err(error) = result {

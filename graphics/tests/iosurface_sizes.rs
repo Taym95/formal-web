@@ -1,17 +1,12 @@
 //! Verify the 64-multiple width padding produces usable Metal textures.
 #![cfg(all(target_os = "macos", not(feature = "cpu_readback")))]
 use graphics::iosurface::padded_width;
-use graphics::renderer::{GpuRenderer, ReadbackChannels};
+use graphics::renderer::{IosurfaceRenderer, ReadbackChannels, SharedRenderData, SurfaceRenderer};
 
 #[test]
 fn iosurface_dimension_constraints() {
-    let (poll_tx, _poll_rx) = crossbeam_channel::unbounded();
-    let (render_done_tx, _render_done_rx) = crossbeam_channel::unbounded();
-    let channels = ReadbackChannels {
-        poll_tx,
-        render_done_tx,
-    };
-    let renderer = GpuRenderer::new(channels).expect("renderer");
+    let (channels, _poll_rx, _render_done_rx) = ReadbackChannels::<SharedRenderData>::new();
+    let renderer = IosurfaceRenderer::new(channels).expect("renderer");
     let mut texture_id = 0u64;
     let sizes = [
         (1600u32, 1030u32),

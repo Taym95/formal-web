@@ -5,7 +5,7 @@
 //! payload via ipc-channel's `OsMachPort` transport (see the ipc-channel
 //! fork in ../ipc-channel).
 
-use crate::renderer::GpuRenderer;
+use crate::renderer::IosurfaceRenderer;
 use ipc_channel::platform::OsMachPort;
 use log::{debug, error};
 use objc2::rc::Retained;
@@ -52,7 +52,7 @@ impl IosurfaceTexture {
 /// Vello needs to render into it via compute; the Metal texture descriptor
 /// must match the IOSurface's 'RGBA' format exactly.
 pub fn create_shared_texture(
-    renderer: &GpuRenderer,
+    renderer: &IosurfaceRenderer,
     width: u32,
     height: u32,
     texture_id: u64,

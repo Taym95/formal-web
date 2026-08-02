@@ -28,7 +28,7 @@ Each frame travels through the processes as follows:
 | Step | Where | What happens |
 |---|---|---|
 | Compose | graphics | `submit_composed_scene` picks the next free buffer of a per-webview **3-slot ring** and reserves it |
-| Render + submit | graphics | `GpuRenderer::render_scene` renders the composed scene with Vello into an intermediate texture, then **submits** a GPU → CPU readback (`map_buffer_on_submit`) without blocking; a `PollRequest` goes to a dedicated **poll thread** |
+| Render + submit | graphics | the renderer renders the composed scene with Vello (CPU path: into an intermediate texture, then **submits** a GPU → CPU readback (`map_buffer_on_submit`) without blocking); a `PollRequest` goes to a dedicated **poll thread** |
 | Wait | poll thread | blocks on `device.poll(PollType::Wait)` until the submission completes; the map callback fires there and delivers `ReadbackReady` to the main loop |
 | Deliver | graphics | `handle_readback_ready` copies the completed pixels into the pre-selected shared-memory buffer, marks it pending, and sends `GraphicsEvent::PixelFrameReady` |
 | Upload | embedder | `NewWebContentSurface` uploads the shared-memory bytes with `queue.write_texture` into the webview's persistent texture |
@@ -45,7 +45,7 @@ Key properties:
 - The transport ships pixel bytes as Mach **out-of-line descriptors with
   `MACH_MSG_VIRTUAL_COPY`** — the receiver gets a kernel (copy-on-write)
   snapshot, not shared pages.
-- The `GpuRenderer` keeps a per-slot staging-buffer pool (one per in-flight
+- The renderer keeps a per-slot staging-buffer pool (one per in-flight
   frame) and a per-webview device; the renderer always produces a frame (sizes
   are clamped to ≥ 1) so the UA's rendering-opportunity cycle never stalls.
 
@@ -145,11 +145,20 @@ Rejected alternatives, for the record:
 ## Generic surface backend abstraction
 
 The ring, the ack protocol, the deferral, the messages, and the embedder's draw
-path are all transport-agnostic. A per-webview `SurfaceBuffers` enum holds the
-frame buffers for one of two implementations; the variant is chosen at compile
-time by feature (CPU readback off macOS and with `cpu_readback`, zero-copy
-IOSurface on macOS by default). The ring lifecycle (`SurfaceRingState`: pick /
-reserve / mark-pending / ack) is shared verbatim.
+path are all transport-agnostic. The per-webview state is a `(Compositor, R)`
+tuple: the compositor (scene assembly, fonts, video frames) and the renderer
+(Vello + surface delivery). The ring is hidden entirely inside the renderer —
+the graphics event loop only sees the `SurfaceRenderer` trait (`submit_scene`,
+`handle_render_done`, `ack`, `submit_deferred`). Each renderer owns its
+`SurfaceBuffers` (the generic ring lifecycle `SurfaceRingState` plus its
+backend's payloads: shared-memory regions or IOSurface textures), its deferred
+scene, and its texture id counter.
+
+`run_graphics_process` is generic over the renderer exactly like the media
+backend: `run_graphics_process<B: MediaBackend, R: SurfaceRenderer>`. The
+graphics process binary selects the concrete renderer at compile time by
+feature (CPU readback off macOS and with `cpu_readback`, zero-copy IOSurface
+on macOS by default) and the loop operates on it only through the trait.
 
 The renderers are two implementations of the `SurfaceRenderer` trait
 (`renderer/cpu.rs` and `renderer/iosurface.rs`): each defines its own
@@ -157,12 +166,18 @@ The renderers are two implementations of the `SurfaceRenderer` trait
 and consumed by its `handle_render_done`, which marks the ring buffer pending
 and sends `PixelFrameReady`. Completed frames arrive on a single channel whose
 message type is the backend's `RenderData` (chosen at compile time), delivered
-by the readback map callbacks (CPU) or the poll thread (zero-copy).
+by the readback map callbacks (CPU) or the poll thread (zero-copy). The shared
+`GpuContext` holds what every backend needs (the wgpu device, the Vello
+renderer, the video texture machinery, the generation counter).
 
 The renderer's target differs per backend: the CPU path renders to an
 intermediate texture and submits a readback; the zero-copy path renders Vello
-directly into the shared texture (`render_scene_shared`) and the poll thread
-delivers `RenderDone` once the submission completes.
+directly into the shared texture and the poll thread delivers the done notice
+once the submission completes.
+
+The video texture import (macOS AVFoundation `PixelBufferFrame` → Metal
+texture → Vello `override_image`) lives in its own module, `renderer/video.rs`,
+behind the renderer trait's macOS-only `import_video_frame`.
 
 ### Consumer side (embedder)
 
