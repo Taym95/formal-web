@@ -22,3 +22,10 @@ The verification crate owns trace recording, TLA+ validation, and the shutdown w
 2. Emit events from code with `verification::tla_log!(tracer, -> "{Name}", "Event", args...)`. Producers holding a `TraceSender`/`TLATracer` are the UA, the graphics process, and the embedder apps.
 3. For specs whose event args need TLA+ numeric types (e.g. generation counters), extend `collect_trace_ids_for_spec` / `render_trace_data_module_for_spec` in `verification/src/validate.rs` with a custom event renderer (see `render_gpu_rendering_trace_event`, which renders generation/region args as integer literals).
 4. `./verification/verify-specs.sh` picks the new spec up automatically; a `CHECK {Name} ... OK` line means the recorded trace is consistent with the model.
+
+### Spec file style
+
+- The `.tla` model files carry **no prose**: at most a one-line comment stating the
+  reason the spec exists. The model's definitions, action names, and invariants
+  are the documentation — explanatory paragraphs about the modeled system live in
+  this README and the owning feature's README, not in the spec.

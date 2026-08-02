@@ -1,37 +1,7 @@
 ---------------------------- MODULE RenderingOpportunity ----------------------------
 EXTENDS Naturals, FiniteSets, TLC
 
-(*
-  Generation-counter model of the FrameNeeded-gated render cycle with
-  double-buffered surface delivery.
-
-  All pipeline counters are relative to the last consumption (the
-  embedder's paint): the pipeline depth is bounded by BufferCount, which is
-  the only bound the model needs. Each frame tracks:
-    pending[f]           — renders started but not yet consumed (painted)
-    rendering_updated[f] — renders completed by content, not yet consumed
-    composed[f]          — renders whose pixels were computed by graphics, not yet consumed
-    op_count[f]          — a batched rendering opportunity not yet applied (set semantics, 0 or 1)
-    frame_needed[f]      — the embedder needs a frame (sent at each paint, paced by vsync)
-    animating[f]         — the last composed frame had animated content
-    parent[f]            — parent navigable, for the frame hierarchy
-
-  A render cycle starts only when the embedder needs a frame (frame_needed)
-  AND there is something to render (a batched opportunity or animating
-  content). NoteRenderingOpportunity and FrameNeeded each start a cycle when
-  the other condition is already met; otherwise they batch (op_count) or set
-  the flag. A render in flight (pending > composed) batches new opportunities
-  and holds a frame_needed flag until the in-flight render completes.
-  UpdateTheRendering renders the document; GraphicsComputed completes the
-  cycle and, if content is animating or opportunities were batched, keeps
-  the next cycle ready.
-
-  Double buffering: the embedder consumes (paints) the composed frames at
-  each FrameNeeded — the pipeline counters drop by composed — and the next
-  render can start while the previous frame is still being displayed (the
-  graphics process renders into the other buffer). The pipeline is bounded:
-  pending never exceeds BufferCount (DoubleBufferBound).
-*)
+(* Validates the FrameNeeded-gated render cycle and its double-buffer bound. *)
 
 CONSTANTS
   Frame,
@@ -44,13 +14,13 @@ ASSUME
   /\ BufferCount > 0
 
 VARIABLES
-  pending,           \* [Frame -> 0..BufferCount]
-  rendering_updated, \* [Frame -> 0..BufferCount]
-  composed,          \* [Frame -> 0..BufferCount]
-  op_count,          \* [Frame -> 0..1]
-  animating,         \* [Frame -> BOOLEAN]
-  frame_needed,      \* [Frame -> BOOLEAN]
-  parent             \* [Frame -> Frame \cup {NONE}]
+  pending,           \* queued update the rendering for f (UA pending_update_the_rendering)
+  rendering_updated, \* content completed the update (UpdateTheRendering)
+  composed,          \* graphics sent the pixels (PixelFrameReady)
+  op_count,          \* a batched rendering opportunity (UA queued_rendering_opportunities, 0 or 1)
+  animating,         \* the last composed frame had animated content
+  frame_needed,      \* the embedder needs a frame (FrameNeeded, sent at each paint)
+  parent             \* navigable hierarchy: parent navigable of f (NONE at the top-level traversable)
 
 vars == <<pending, rendering_updated, composed, op_count, animating,
           frame_needed, parent>>
@@ -66,6 +36,8 @@ HierarchyFrames(root) == {f \in Frame: HierarchyRoot(f) = root}
 
 \* ---- Type correctness ----
 
+\* Counters are relative to the last paint; the pipeline depth is bounded
+\* by BufferCount.
 TypeOK ==
   /\ pending \in [Frame -> 0..BufferCount]
   /\ rendering_updated \in [Frame -> 0..BufferCount]
@@ -91,14 +63,14 @@ Init ==
 
 \* ---- Actions ----
 
-\* A render is in flight for f when a started cycle has not yet been
-\* completed by graphics.
+\* An update is in flight for f when graphics has not yet computed it.
 InFlight(f) == pending[f] > composed[f]
 
-\* Always enabled.  When a render is in flight, or the embedder does not
-\* need a frame, batches the opportunity (set semantics: repeated notes
-\* while already batched stay one batched opportunity).  Otherwise, when
-\* the embedder needs a frame, starts a render and drains the batch.
+\* The UA noted a rendering opportunity for f (input, navigation, viewport
+\* change, or content request). When an update is in flight or the embedder
+\* does not need a frame, the opportunity is batched (set semantics:
+\* repeated notes stay one batched opportunity); otherwise update the
+\* rendering is queued and the batch drains.
 NoteRenderingOpportunity(f) ==
   IF InFlight(f) \/ ~frame_needed[f]
   THEN /\ op_count' = [op_count EXCEPT ![f] = 1]
@@ -110,13 +82,10 @@ NoteRenderingOpportunity(f) ==
        /\ op_count' = [op_count EXCEPT ![f] = 0]
        /\ UNCHANGED <<rendering_updated, composed, animating, parent>>
 
-\* The embedder needs a frame: the paint consumes the composed frames (the
-\* embedder blits the most recent texture), so the pipeline counters drop by
-\* composed and a render can start while the previous frame is still being
-\* displayed — the double buffering.  When the pipeline is drained and there
-\* is something to render (a batched opportunity or animating content),
-\* starts a render and drains the batch; otherwise the flag stays set until
-\* a future opportunity.
+\* The embedder's paint (FrameNeeded): the paint consumes the composed
+\* frames — the counters drop by composed — and if the pipeline is drained
+\* and something is to render, queues the next update (the double buffering:
+\* the next frame renders while the previous one is still being displayed).
 FrameNeeded(f) ==
   LET in_flight == pending[f] - composed[f]
       consume_rendering_updated == rendering_updated[f] - composed[f]
@@ -133,18 +102,15 @@ FrameNeeded(f) ==
           /\ op_count' = op_count
   /\ UNCHANGED <<animating, parent>>
 
-\* Content renders frame f.  Enabled when content is behind (rendering_updated <
-\* pending).  Advances rendering_updated to match pending.
+\* Content runs the queued update: rendering_updated catches up to pending.
 UpdateTheRendering(f) ==
   /\ rendering_updated[f] < pending[f]
   /\ rendering_updated' = [rendering_updated EXCEPT ![f] = pending[f]]
   /\ UNCHANGED <<pending, composed, op_count, animating, frame_needed, parent>>
 
-\* Graphics finishes a frame's output: the composed scene was rendered and the
-\* pixels were sent (PixelFrameReady).  Enabled when content has rendered
-\* something not yet output (rendering_updated > composed).  Completes the
-\* cycle; animated content queues the next frame's opportunity, and a held
-\* frame_needed flag with something to render starts the next cycle
+\* Graphics sent the frame (PixelFrameReady): composed catches up to
+\* rendering_updated. Animated content batches the next opportunity, and a
+\* held frame_needed flag with something to render queues the next update
 \* immediately.
 GraphicsComputed(f) ==
   /\ rendering_updated[f] > composed[f]
@@ -180,15 +146,15 @@ Spec == Init /\ [][Next]_vars /\ Fairness
 
 \* ---- Invariants ----
 
+\* A queued update is completed by content before graphics computes it.
 PendingLeadsRendering ==
   \A f \in Frame: pending[f] >= rendering_updated[f]
 
 RenderingLeadsComposed ==
   \A f \in Frame: rendering_updated[f] >= composed[f]
 
-\* Double buffering: the pipeline never holds more than BufferCount renders
-\* started but not yet consumed by the embedder's paint (one being displayed,
-\* the rest being rendered into the other buffers).
+\* The pipeline never holds more than BufferCount updates queued but not yet
+\* consumed by the embedder's paint (the double buffer).
 DoubleBufferBound ==
   \A f \in Frame: pending[f] <= BufferCount
 

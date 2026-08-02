@@ -3506,10 +3506,10 @@ impl UserAgentWorker {
     }
 
     /// Queue update the rendering for `navigable_id`: mark it in flight,
-    /// drain its batched opportunities, clear the root's frame-needed flag,
-    /// and command the content process. A child also queues the
-    /// top-level traversable's update, since the graphics process composes
-    /// only when the top-level frame arrives.
+    /// drain its batched opportunities, clear the top-level traversable's
+    /// frame-needed flag, and command the content process. A child also
+    /// queues the top-level traversable's update, since the graphics
+    /// process composes only when the top-level frame arrives.
     fn queue_update_the_rendering(&mut self, navigable_id: NavigableId) {
         if self.pending_update_the_rendering.contains(&navigable_id) {
             return;
@@ -4007,17 +4007,18 @@ impl UserAgentWorker {
                     }
                 );
 
-                // When the root's composed scene completes, all child frames
-                // included in the composition have also been rendered and
-                // composed.  Clear their pending state so they can receive
-                // new rendering opportunities.
+                // When the top-level traversable's composed scene completes,
+                // all child frames included in the composition have also been
+                // rendered and composed.  Clear their pending state so they
+                // can receive new rendering opportunities.
                 for (_child_frame_id, child_wv) in child_frame_to_webview.iter() {
                     self.pending_update_the_rendering.remove(&child_wv.0);
                     self.queued_rendering_opportunities.remove(&child_wv.0);
                 }
 
-                // The frame was produced; the render cycle for the root is
-                // complete. The texture is forwarded to the embedder below.
+                // The frame was produced; the update for the top-level
+                // traversable is complete. The texture is forwarded to the
+                // embedder below.
                 self.pending_update_the_rendering.remove(&webview_id.0);
                 info!(
                     "[render-pipe] UA composed scene navigable={} animating={} pending_remaining={}",
