@@ -902,11 +902,10 @@ pub enum UserAgentCommand {
         offset_x: f32,
         offset_y: f32,
     },
-    /// The embedder has consumed a rendered surface frame; forward the ack
-    /// to the graphics process so it can reuse the buffer.
-    TextureConsumed {
+    /// The embedder is about to paint a frame (paced by vsync); the UA
+    /// starts a render cycle if a rendering opportunity was noted.
+    FrameNeeded {
         webview_id: WebviewId,
-        generation: u64,
     },
     DispatchEventFor {
         traversable_id: NavigableId,
@@ -1104,14 +1103,12 @@ impl UserAgent {
             .map_err(|error| format!("failed to broadcast viewport: {error}"))
     }
 
-    /// forwarding an embedder surface-consumption ack to the graphics process.
-    pub fn texture_consumed(&self, webview_id: WebviewId, generation: u64) -> Result<(), String> {
+    /// The embedder is about to paint a frame (paced by vsync); the UA
+    /// starts a render cycle if a rendering opportunity was noted.
+    pub fn frame_needed(&self, webview_id: WebviewId) -> Result<(), String> {
         self.command_sender
-            .send(UserAgentCommand::TextureConsumed {
-                webview_id,
-                generation,
-            })
-            .map_err(|error| format!("failed to forward texture consumed: {error}"))
+            .send(UserAgentCommand::FrameNeeded { webview_id })
+            .map_err(|error| format!("failed to forward frame needed: {error}"))
     }
 
     /// updating the viewport of one traversable's content implementation.
@@ -1308,9 +1305,15 @@ struct UserAgentWorker {
     /// Tracks which navigables have a pending render in flight (TLA spec:
     /// pending[f] > composed[f]).
     pending_renders: HashSet<NavigableId>,
-    /// Batched opportunities noted while a render was pending (TLA spec op_count).
-    /// Set semantics: multiple notes while pending collapse to one re-render.
+    /// Batched opportunities noted while a render was pending or no frame
+    /// was needed yet (TLA spec op_count). Set semantics: multiple notes
+    /// while pending collapse to one re-render.
     queued_opps: HashSet<NavigableId>,
+    /// Top-level traversables for which the embedder needs a frame
+    /// (FrameNeeded, sent at each paint and paced by vsync). A render cycle
+    /// starts only when a frame is needed AND a rendering opportunity was
+    /// noted.
+    frame_needed: HashSet<NavigableId>,
     /// Sender cloned into child workers and sidecars when TLA tracing is enabled.
     trace_sender: Option<TraceSender>,
     /// request ids for automation round-trips across the user-agent and
@@ -1382,6 +1385,7 @@ impl UserAgentWorker {
             tla_tracer: TLATracer::new("Navigation", "formal-web:user-agent", trace_sender.clone()),
             pending_renders: HashSet::new(),
             queued_opps: HashSet::new(),
+            frame_needed: HashSet::new(),
             trace_sender,
             next_automation_request_id: 1,
         }
@@ -1441,11 +1445,8 @@ impl UserAgentWorker {
                             offset_y,
                         );
                     }
-                    UserAgentCommand::TextureConsumed {
-                        webview_id,
-                        generation,
-                    } => {
-                        self.handle_texture_consumed(webview_id, generation);
+                    UserAgentCommand::FrameNeeded { webview_id } => {
+                        self.handle_frame_needed(webview_id);
                     }
                     UserAgentCommand::SendUiEvent {
                         webview_id,
@@ -3211,21 +3212,44 @@ impl UserAgentWorker {
         self.note_rendering_opportunity(traversable_id);
     }
 
-    /// forwarding an embedder surface-consumption ack to the graphics process.
-    /// The ack frees the shared-memory buffer that carried the frame, so the
-    /// graphics process can reuse it for a later frame.
-    fn handle_texture_consumed(&mut self, webview_id: WebviewId, generation: u64) {
-        if let Some(sender) = &self.graphics_extension_sender {
-            if let Err(error) =
-                sender.send(ipc_messages::graphics::GraphicsCommand::TextureConsumed {
-                    webview_id,
-                    generation,
-                })
-            {
-                error!(
-                    "failed to forward texture consumed to graphics process (webview={:?} gen={}): {error}",
-                    webview_id, generation
-                );
+    /// The embedder is about to paint a frame for the top-level traversable
+    /// `webview_id`, paced by vsync (the paint blocks on the CAMetalLayer
+    /// drawable). A render cycle starts when a frame is needed AND a
+    /// rendering opportunity was noted; the flag stays set until then.
+    fn handle_frame_needed(&mut self, webview_id: WebviewId) {
+        let navigable_id = webview_id.0;
+        verification::tla_log!(
+            self.tla_tracer,
+            -> "RenderingOpportunity",
+            "FrameNeeded",
+            navigable_id
+        );
+        self.frame_needed.insert(navigable_id);
+        info!(
+            "[render-pipe] UA frame needed navigable={} pending={:?} queued={:?}",
+            navigable_id, self.pending_renders, self.queued_opps
+        );
+        self.start_queued_under(navigable_id);
+    }
+
+    /// True when the embedder needs a frame for the top-level traversable
+    /// containing `navigable_id` (children render only when the root is
+    /// painted, since their frames are composed into the root's texture).
+    fn root_frame_needed(&self, navigable_id: NavigableId) -> bool {
+        self.state
+            .top_level_traversable_id(navigable_id)
+            .is_some_and(|root_id| self.frame_needed.contains(&root_id))
+    }
+
+    /// Start a render for every navigable in the tree rooted at `root_id`
+    /// that has a batched rendering opportunity.
+    fn start_queued_under(&mut self, root_id: NavigableId) {
+        if self.pending_renders.contains(&root_id) {
+            return;
+        }
+        for candidate in self.queued_opps.iter().copied().collect::<Vec<_>>() {
+            if self.state.top_level_traversable_id(candidate) == Some(root_id) {
+                self.start_render(candidate);
             }
         }
     }
@@ -3442,6 +3466,10 @@ impl UserAgentWorker {
     }
 
     /// <https://html.spec.whatwg.org/#rendering-opportunity>
+    /// A render cycle starts only when the embedder needs a frame
+    /// (FrameNeeded, paced by vsync) AND there is something to render.
+    /// Otherwise the opportunity is batched and an embedder redraw is
+    /// requested, so the next paint sends FrameNeeded and starts the cycle.
     fn note_rendering_opportunity(&mut self, navigable_id: NavigableId) {
         verification::tla_log!(
             self.tla_tracer,
@@ -3457,7 +3485,37 @@ impl UserAgentWorker {
             );
             return;
         }
+        if !self.root_frame_needed(navigable_id) {
+            self.queued_opps.insert(navigable_id);
+            info!(
+                "[render-pipe] UA queue navigable={} (no frame needed, queued)",
+                navigable_id
+            );
+            // Ask the embedder to paint; the paint sends FrameNeeded (paced
+            // by vsync), which starts the render cycle for the batched
+            // opportunity.
+            if let Some(root_id) = self.state.top_level_traversable_id(navigable_id) {
+                self.host.request_redraw(WebviewId(root_id));
+            }
+            return;
+        }
+        self.start_render(navigable_id);
+    }
+
+    /// Start a render cycle for `navigable_id`: mark it in flight, drain
+    /// its batched opportunities, clear the root's frame-needed flag, and
+    /// command the content process to update the rendering. A child render
+    /// also starts the root's render, since the graphics process composes
+    /// only when the root frame arrives.
+    fn start_render(&mut self, navigable_id: NavigableId) {
+        if self.pending_renders.contains(&navigable_id) {
+            return;
+        }
         self.pending_renders.insert(navigable_id);
+        self.queued_opps.remove(&navigable_id);
+        if let Some(root_id) = self.state.top_level_traversable_id(navigable_id) {
+            self.frame_needed.remove(&root_id);
+        }
         info!(
             "[render-pipe] UA start render navigable={} pending={:?} queued={:?}",
             navigable_id, self.pending_renders, self.queued_opps
@@ -3506,53 +3564,20 @@ impl UserAgentWorker {
             .command_sender
             .send(EventLoopCommand::FireAndForget { command });
 
-        // When a child navigable gets a rendering opportunity, also note the
-        // root so the graphics process composes the child's frame into the
-        // scene. The compositor only composes when the root frame arrives;
-        // child PaintFrames are stored but never trigger composition.
-        if let Some(root_id) = self.state.top_level_traversable_id(navigable_id) {
-            if root_id != navigable_id && !self.pending_renders.contains(&root_id) {
-                info!(
-                    "[render-pipe] UA propagate child->root child={} root={}",
-                    navigable_id, root_id
-                );
-                self.note_rendering_opportunity(root_id);
-            }
+        // When a child navigable starts a render, also start the root so the
+        // graphics process composes the child's frame into the scene. The
+        // compositor only composes when the root frame arrives; child
+        // PaintFrames are stored but never trigger composition.
+        if let Some(root_id) = self.state.top_level_traversable_id(navigable_id)
+            && root_id != navigable_id
+        {
+            self.start_render(root_id);
         }
     }
 
-    /// Called when a PixelFrameReady arrives — the composite frame completed.
-    /// Corresponds to the TLA spec's NoteComposedScene action: drains batched
-    /// opportunities (resets op_count) and re-notes if any were batched or
-    /// the frame has animated content.
-    /// <https://html.spec.whatwg.org/#rendering-opportunity>
-    fn note_composed_scene(&mut self, navigable_id: WebviewId, animating: bool) {
-        verification::tla_log!(
-            self.tla_tracer,
-            -> "RenderingOpportunity",
-            "NoteComposedScene",
-            navigable_id.0
-        );
-
-        self.pending_renders.remove(&navigable_id.0);
-        let had_queued = self.queued_opps.remove(&navigable_id.0);
-        info!(
-            "[render-pipe] UA composed scene navigable={} animating={} had_queued={} pending_remaining={}",
-            navigable_id.0,
-            animating,
-            had_queued,
-            self.pending_renders.len()
-        );
-        if had_queued || animating {
-            info!(
-                "[render-pipe] UA re-note navigable={} (had_queued={} animating={})",
-                navigable_id.0, had_queued, animating
-            );
-            self.note_rendering_opportunity(navigable_id.0);
-        }
-    }
-
-    /// resuming an event-loop-local document fetch after the fetch worker succeeds.
+    /// The embedder no longer gates on composed scenes: PixelFrameReady
+    /// only forwards the texture (see the graphics event handler). The
+    /// next render cycle is gated on FrameNeeded instead.
     /// <https://html.spec.whatwg.org/multipage/#attempt-to-populate-the-history-entry's-document>
     fn handle_navigation_fetch_completed(
         &mut self,
@@ -3990,7 +4015,28 @@ impl UserAgentWorker {
                     self.queued_opps.remove(&child_wv.0);
                 }
 
-                self.note_composed_scene(*webview_id, *animating);
+                // The frame was produced; the render cycle for the root is
+                // complete. The texture is forwarded to the embedder below —
+                // the graphics pipeline no longer gates the next render.
+                self.pending_renders.remove(&webview_id.0);
+                info!(
+                    "[render-pipe] UA composed scene navigable={} animating={} pending_remaining={}",
+                    webview_id.0,
+                    animating,
+                    self.pending_renders.len()
+                );
+                // Animated content wants the next frame: queue an
+                // opportunity so the next FrameNeeded (the next paint)
+                // starts the next frame.
+                if *animating {
+                    self.queued_opps.insert(webview_id.0);
+                }
+                // If the embedder already needs the next frame (a
+                // FrameNeeded arrived while this render was in flight, e.g.
+                // content was slower than vsync), start it now.
+                if self.frame_needed.contains(&webview_id.0) {
+                    self.start_queued_under(webview_id.0);
+                }
                 self.state
                     .frame_hit_info
                     .insert(*webview_id, frame_hit_info.clone());

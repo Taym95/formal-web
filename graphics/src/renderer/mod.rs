@@ -76,9 +76,6 @@ pub struct FrameDelivery {
 /// The outcome of submitting a composed scene.
 #[derive(Debug)]
 pub enum RenderError {
-    /// Every surface buffer was reserved or pending; the scene was retained
-    /// for submission once an ack frees a buffer.
-    Deferred,
     /// Buffer allocation or GPU failure; the scene was dropped.
     Failed,
 }
@@ -255,28 +252,17 @@ impl GpuContext {
     }
 }
 
-/// State of one surface buffer in the ring.
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum BufferState {
-    /// Free to be picked for a new frame's submission.
-    Free,
-    /// Picked at submit time; the render is in flight and the pixels have
-    /// not been delivered yet.
-    Reserved(u64),
-    /// Delivered (PixelFrameReady sent); awaiting the embedder's ack.
-    Pending(u64),
-}
-
-/// The ring lifecycle shared by both backends: a buffer is picked at submit
-/// time (Reserved), becomes Pending when the pixels are delivered, and is
-/// freed by the embedder's TextureConsumed ack. The graphics process never
-/// writes a buffer that is Reserved or Pending, so the embedder is
-/// guaranteed to have consumed the previous frame's pixels before the buffer
-/// is reused.
+/// The alternating double-buffer lifecycle shared by both backends: each
+/// render cycle renders into the buffer that was NOT used by the last
+/// render. The embedder is blitting the last-rendered buffer while the next
+/// one is rendered, and because the embedder's FrameNeeded pacing allows
+/// only one render per cycle, the chosen buffer is the one from two cycles
+/// ago — long since consumed by the embedder. No ack is needed: the
+/// alternation guarantees the chosen buffer is free.
 pub(crate) struct SurfaceRingState {
-    state: [BufferState; 3],
-    /// Ring index where the next free buffer search starts.
-    write_index: usize,
+    /// Index of the buffer the most recent render used; the next render
+    /// uses the other one (buffer 0 on the first frame after allocation).
+    last_used: Option<usize>,
     width: u32,
     height: u32,
 }
@@ -284,44 +270,21 @@ pub(crate) struct SurfaceRingState {
 impl SurfaceRingState {
     pub(crate) fn new(width: u32, height: u32) -> Self {
         Self {
-            state: [BufferState::Free, BufferState::Free, BufferState::Free],
-            write_index: 0,
+            last_used: None,
             width,
             height,
         }
     }
 
-    /// Index of the next free buffer to pick, scanning the ring from
-    /// `write_index`; None when every buffer is reserved or pending.
-    pub(crate) fn next_free(&self) -> Option<usize> {
-        (0..3)
-            .map(|offset| (self.write_index + offset) % 3)
-            .find(|index| self.state[*index] == BufferState::Free)
-    }
-
-    /// Mark the buffer picked for a submitted frame.
-    pub(crate) fn reserve(&mut self, index: usize, generation: u64) {
-        debug_assert!(self.state[index] == BufferState::Free);
-        self.state[index] = BufferState::Reserved(generation);
-        self.write_index = (index + 1) % 3;
-    }
-
-    /// Move the buffer from Reserved to Pending once its pixels are delivered.
-    pub(crate) fn mark_pending(&mut self, index: usize, generation: u64) {
-        debug_assert!(self.state[index] == BufferState::Reserved(generation));
-        self.state[index] = BufferState::Pending(generation);
-    }
-
-    /// Free the buffer holding `generation` (the embedder's ack). Returns
-    /// true when a pending buffer was found and freed.
-    pub(crate) fn ack(&mut self, generation: u64) -> bool {
-        for index in 0..3 {
-            if self.state[index] == BufferState::Pending(generation) {
-                self.state[index] = BufferState::Free;
-                return true;
-            }
-        }
-        false
+    /// The buffer to render into this cycle: the one not used by the last
+    /// render.
+    pub(crate) fn next_buffer(&mut self) -> usize {
+        let next = match self.last_used {
+            None => 0,
+            Some(last_used) => 1 - last_used,
+        };
+        self.last_used = Some(next);
+        next
     }
 }
 
@@ -342,10 +305,6 @@ impl<P> SurfaceBuffers<P> {
         &self.ring
     }
 
-    pub(crate) fn ring_mut(&mut self) -> &mut SurfaceRingState {
-        &mut self.ring
-    }
-
     pub(crate) fn payload(&self) -> &P {
         &self.payload
     }
@@ -357,16 +316,10 @@ impl<P> SurfaceBuffers<P> {
         &mut self.payload
     }
 
-    pub(crate) fn next_free(&self) -> Option<usize> {
-        self.ring.next_free()
-    }
-
-    pub(crate) fn reserve(&mut self, index: usize, generation: u64) {
-        self.ring.reserve(index, generation);
-    }
-
-    pub(crate) fn ack(&mut self, generation: u64) -> bool {
-        self.ring.ack(generation)
+    /// The buffer to render into this cycle: the one not used by the last
+    /// render.
+    pub(crate) fn next_buffer(&mut self) -> usize {
+        self.ring.next_buffer()
     }
 }
 
@@ -450,15 +403,6 @@ pub trait SurfaceRenderer {
     /// The webview a completed frame belongs to (used to look up the
     /// webview's renderer).
     fn render_done_webview_id(data: &Self::RenderData) -> WebviewId;
-
-    /// Free the ring buffer holding `generation` (the embedder's ack).
-    /// Returns true when a pending buffer was found and freed.
-    fn ack(&mut self, generation: u64) -> bool;
-
-    /// Submit the scene that was retained because every ring buffer was
-    /// busy. Returns the submit result when there was a deferred scene that
-    /// went out, so the run loop can emit its `SurfaceFrameSubmitted` event.
-    fn submit_deferred(&mut self) -> Option<RenderSubmit>;
 
     /// Register a video frame: wrap `pixel_buffer` as a Metal texture and
     /// blit it into an RGBA texture Vello can sample. Returns the fake

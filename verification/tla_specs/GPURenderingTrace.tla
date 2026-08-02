@@ -4,15 +4,14 @@ EXTENDS Naturals, Sequences, TLC, GPURenderingTraceData
 VARIABLES
     generation,
     buffer_size,
-    reserved,
-    pending,
+    last_buffer,
     submitted_size,
     sent,
     received,
     texture_size,
     trace_index
 
-vars == <<generation, buffer_size, reserved, pending, submitted_size,
+vars == <<generation, buffer_size, last_buffer, submitted_size,
           sent, received, texture_size, trace_index>>
 
 Base == INSTANCE GPURendering WITH
@@ -53,7 +52,7 @@ SurfaceFrameSubmittedTrace ==
        /\ Base!SurfaceFrameSubmitted(w, g, s, r)
        /\ Advance
 
-\* The GPU readback for g completed; the pixels were delivered and the frame
+\* The GPU render for g completed; the pixels were delivered and the frame
 \* was sent from region r.
 SurfaceFrameSentTrace ==
     /\ trace_index \in 1..TraceLength
@@ -65,17 +64,6 @@ SurfaceFrameSentTrace ==
            r == EventArg(4)
        IN
        /\ Base!SurfaceFrameSent(w, g, s, r)
-       /\ Advance
-
-\* Embedder acks frame g; the region holding it becomes free.
-TextureConsumedTrace ==
-    /\ trace_index \in 1..TraceLength
-    /\ CurrentEvent = "TextureConsumed"
-    /\ Len(CurrentArgs) = 2
-    /\ LET w == EventArg(1)
-           g == EventArg(2)
-       IN
-       /\ Base!TextureConsumed(w, g)
        /\ Advance
 
 \* Embedder consumes frame g at size s.
@@ -97,7 +85,6 @@ Done ==
 Next ==
     \/ SurfaceFrameSubmittedTrace
     \/ SurfaceFrameSentTrace
-    \/ TextureConsumedTrace
     \/ SurfaceFrameReceivedTrace
     \/ Done
 

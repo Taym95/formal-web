@@ -13,8 +13,8 @@ The verification crate owns trace recording, TLA+ validation, and the shutdown w
 | Spec | Events traced (producer) | Validates |
 |---|---|---|
 | `Navigation` | UA navigation lifecycle | navigable/navigation state machine |
-| `RenderingOpportunity` | UA `NoteRenderingOpportunity`/`NoteComposedScene`, content `UpdateTheRendering`, graphics `GraphicsComputed` (traced when the pixels are actually sent) | batched rendering-opportunity counters |
-| `GPURendering` | graphics `SurfaceFrameSubmitted`/`SurfaceFrameSent`/`TextureConsumed`, embedder `SurfaceFrameReceived` | per-webview surface buffer ring: strict +1 submit generations, sent frames are a subset of submitted frames delivered into the pre-selected region, a region is never rewritten while reserved or pending the embedder's ack, fresh free ring after resize, consumed frames match sent frames |
+| `RenderingOpportunity` | UA `NoteRenderingOpportunity`/`FrameNeeded`, content `UpdateTheRendering`, graphics `GraphicsComputed` (traced when the pixels are actually sent) | FrameNeeded-gated render cycle: a render starts only when the embedder needs a frame (paced by vsync) AND a rendering opportunity was noted; batched-opportunity counters |
+| `GPURendering` | graphics `SurfaceFrameSubmitted`/`SurfaceFrameSent`, embedder `SurfaceFrameReceived` | per-webview alternating double buffer: strict +1 submit generations, sent frames are a subset of submitted frames delivered from the region they were submitted into, consecutive renders alternate the two buffers (no ack needed), consumed frames match sent frames |
 | `MessagePort*` | (not written yet) | — |
 
 ### Adding a spec

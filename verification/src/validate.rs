@@ -744,9 +744,9 @@ fn collect_rendering_opportunity_trace_ids(
     for event in trace_events {
         match event.event.as_str() {
             "NoteRenderingOpportunity"
+            | "FrameNeeded"
             | "UpdateTheRendering"
-            | "GraphicsComputed"
-            | "NoteComposedScene" => {
+            | "GraphicsComputed" => {
                 if let Some(frame_id) = event.event_args.first() {
                     frame_ids.insert(frame_id.clone());
                 }
@@ -899,18 +899,6 @@ fn render_gpu_rendering_trace_event(event: &TraceEvent) -> String {
                 .unwrap_or_default()
                 .to_string(),
         ],
-        "TextureConsumed" => vec![
-            render_tla_string(
-                event
-                    .event_args
-                    .first()
-                    .map(String::as_str)
-                    .unwrap_or_default(),
-            ),
-            parse_trace_u64(event.event_args.get(1))
-                .unwrap_or_default()
-                .to_string(),
-        ],
         "SurfaceFrameReceived" => vec![
             render_tla_string(
                 event
@@ -970,11 +958,6 @@ fn render_gpu_rendering_trace_module(
                     generations.insert(generation);
                 }
             }
-            "TextureConsumed" => {
-                if let Some(generation) = generation {
-                    generations.insert(generation);
-                }
-            }
             "SurfaceFrameReceived" => {
                 if let Some(size) = event.event_args.get(2) {
                     sizes.insert(size.clone());
@@ -1013,7 +996,7 @@ fn render_gpu_rendering_trace_module(
          \nTraceWebview == {rendered_webviews}\n\
          \nTraceSize == {rendered_sizes}\n\
          \nTraceGeneration == {{{rendered_generations}}}\n\
-         \nTraceRegion == {{0, 1, 2}}\n\
+         \nTraceRegion == {{0, 1}}\n\
          \nTraceNone == \"NONEVAL\"\n\
          \n=============================================================================\n"
     )
@@ -1308,10 +1291,17 @@ common cause. "
         }
         "NoteRenderingOpportunity" => {
             "The model tried to note a rendering opportunity for a frame. When \
-no render is in flight (pending <= composed), pending is incremented to start \
-a new render. When a render is already in flight, op_count is incremented to \
-accumulate the opportunity for later batching. This step may fail if the \
-relevant counter has reached MaxCounter. "
+a render is in flight, op_count is incremented to batch the opportunity. \
+Otherwise, when the embedder needs a frame (frame_needed), pending is \
+incremented to start a new render; when no frame is needed, op_count is \
+incremented and the embedder is asked to paint (which sends FrameNeeded). \
+This step may fail if the relevant counter has reached MaxCounter. "
+        }
+        "FrameNeeded" => {
+            "The model tried to apply a FrameNeeded action: the embedder needs \
+a frame (sent at each paint, paced by vsync). The frame_needed flag is set; \
+when no render is in flight and a batched opportunity or animating content \
+exists, a render starts immediately. "
         }
         "UpdateTheRendering" => {
             "The model tried to apply an UpdateTheRendering action. Content has \
@@ -1323,12 +1313,6 @@ requires rendering_updated < pending (content is behind the request). "
 the frame's output, advancing composed to match rendering_updated. This step \
 requires rendering_updated > composed (content rendered something not yet \
 output). "
-        }
-        "NoteComposedScene" => {
-            "The model tried to apply a NoteComposedScene action. The UA processed \
-composition completion, resetting op_count to zero. If op_count was positive or \
-the frame was animating, pending is incremented to re-start the render cycle. \
-This step requires composed = pending (composition has caught up). "
         }
         _ => {
             "The model could not apply this event. Check the trace model \

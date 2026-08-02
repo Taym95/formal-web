@@ -27,21 +27,21 @@ Each frame travels through the processes as follows:
 
 | Step | Where | What happens |
 |---|---|---|
-| Compose | graphics | `submit_composed_scene` picks the next free buffer of a per-webview **3-slot ring** and reserves it |
+| Compose | graphics | `submit_scene` renders into the buffer of a per-webview **2-slot alternating double buffer** that the last render did not use |
 | Render + submit | graphics | the renderer renders the composed scene with Vello (CPU path: into an intermediate texture, then **submits** a GPU → CPU readback (`map_buffer_on_submit`) without blocking); a `PollRequest` goes to a dedicated **poll thread** |
 | Wait | poll thread | blocks on `device.poll(PollType::Wait)` until the submission completes; the map callback fires there and delivers `ReadbackReady` to the main loop |
-| Deliver | graphics | `handle_readback_ready` copies the completed pixels into the pre-selected shared-memory buffer, marks it pending, and sends `GraphicsEvent::PixelFrameReady` |
+| Deliver | graphics | `handle_readback_ready` copies the completed pixels into the pre-selected shared-memory buffer and sends `GraphicsEvent::PixelFrameReady` |
 | Upload | embedder | `NewWebContentSurface` uploads the shared-memory bytes with `queue.write_texture` into the webview's persistent texture |
 | Blit | embedder | `paint_frame` draws the texture at its natural size via a stable Vello resource (`PaintRef::Resource`) |
-| Ack | embedder → graphics | after the upload, the embedder sends `TextureConsumed` (via `WebviewProvider::texture_consumed` → UA → graphics), freeing the buffer for reuse |
+| Pace | embedder → UA | just before rendering, the embedder sends `FrameNeeded` (via `WebviewProvider::frame_needed` → UA), paced by vsync (the paint blocks on the drawable); the UA starts the next render cycle only when a frame is needed AND a rendering opportunity was noted |
 
 Key properties:
 
-- The ring is **acked**: a buffer is `Reserved` at submit, `Pending` after
-  delivery, and only rewritten after the embedder's `TextureConsumed` ack — the
-  embedder is guaranteed to have consumed the previous frame's pixels.
-- When every buffer is reserved or pending, the composed scene is **deferred**
-  (`deferred_scene`) and submitted as soon as an ack frees a buffer.
+- The buffers **alternate**: each render cycle renders into the buffer the last
+  render did not use. FrameNeeded pacing allows only one render per cycle, so
+  the chosen buffer holds the frame from two cycles ago — long since consumed
+  by the embedder. **No ack is sent**; the alternation guarantees the chosen
+  buffer is free.
 - The transport ships pixel bytes as Mach **out-of-line descriptors with
   `MACH_MSG_VIRTUAL_COPY`** — the receiver gets a kernel (copy-on-write)
   snapshot, not shared pages.
@@ -73,12 +73,12 @@ CPU → GPU upload, and Vello's internal atlas copy.
   (texture_from_raw + create_texture_from_hal)
   Vello render_to_texture INTO it       try_register_custom_resource (unchanged)
   create_mach_port + send the port      blit via PaintRef::Resource (unchanged)
-  ... await TextureConsumed ack ...     ... send TextureConsumed ack ...
+  ... alternate to the other buffer ... ... send FrameNeeded (next cycle) ...
 ```
 
-The producer renders directly into a ring of shared textures instead of the
-intermediate + readback path; the consumer imports the shared texture once and
-blits it. No readback, no IPC pixel bytes, no upload.
+The producer renders directly into one of the two shared textures,
+alternating per render cycle; the consumer imports the shared texture once and
+blits it. No readback, no IPC pixel bytes, no upload, no ack.
 
 ### Verified platform APIs (macOS, as used by this workspace)
 
@@ -144,16 +144,15 @@ Rejected alternatives, for the record:
 
 ## Generic surface backend abstraction
 
-The ring, the ack protocol, the deferral, the messages, and the embedder's draw
+The double buffer, the alternation, the messages, and the embedder's draw
 path are all transport-agnostic. The per-webview state is a `WebviewState<R>`
 struct holding the compositor (scene assembly, fonts, video frames) and the
-renderer (Vello + surface delivery). The ring is hidden entirely inside the
-renderer —
+renderer (Vello + surface delivery). The double buffer is hidden entirely
+inside the renderer —
 the graphics event loop only sees the `SurfaceRenderer` trait (`submit_scene`,
-`handle_render_done`, `ack`, `submit_deferred`). Each renderer owns its
-`SurfaceBuffers` (the generic ring lifecycle `SurfaceRingState` plus its
-backend's payloads: shared-memory regions or IOSurface textures), its deferred
-scene, and its texture id counter.
+`handle_render_done`). Each renderer owns its `SurfaceBuffers` (the generic
+alternating lifecycle `SurfaceRingState` plus its backend's payloads:
+shared-memory regions or IOSurface textures) and its texture id counter.
 
 `run_graphics_process` is generic over the renderer exactly like the media
 backend: `run_graphics_process<B: MediaBackend, R: SurfaceRenderer>`. The
@@ -164,8 +163,8 @@ on macOS by default) and the loop operates on it only through the trait.
 The renderers are two implementations of the `SurfaceRenderer` trait
 (`renderer/cpu.rs` and `renderer/iosurface.rs`): each defines its own
 `RenderData` associated type — the per-frame payload produced at submit time
-and consumed by its `handle_render_done`, which marks the ring buffer pending
-and sends `PixelFrameReady`. Completed frames arrive on a single channel whose
+and consumed by its `handle_render_done`, which sends `PixelFrameReady`.
+Completed frames arrive on a single channel whose
 message type is the backend's `RenderData` (chosen at compile time), delivered
 by the readback map callbacks (CPU) or the poll thread (zero-copy). The shared
 `GpuContext` holds what every backend needs (the wgpu device, the Vello
@@ -202,10 +201,9 @@ payload enum identifies the backend in use on the wire.
 
 ### What stays identical
 
-- The ack protocol (`TextureConsumed`), the deferral, and the ring logic.
 - The embedder's registration + draw path.
-- The GPURendering TLA model — it validates the shared ring/ack semantics and
-  would check both backends' traces unchanged.
+- The GPURendering TLA model — it validates the alternating-buffer semantics
+  (two regions, no ack) and would check both backends' traces unchanged.
 
 ## AVFoundation → shared texture
 
@@ -227,11 +225,11 @@ because Vello's `register_texture` requires `Rgba8Unorm`.
 
 ## Open risks and questions
 
-- **Resize**: on resize the whole 3-slot IOSurface ring is recreated and the
-  embedder re-imports + re-registers the new surfaces. The update happens in
-  one large step once the resize settles — there is no incremental (live)
-  resize animation. Known and accepted for now; a smoother resize would
-  re-render at intermediate sizes during the drag and/or reuse ring slots
+- **Resize**: on resize the whole 2-slot IOSurface double buffer is recreated
+  and the embedder re-imports + re-registers the new surfaces. The update
+  happens in one large step once the resize settles — there is no incremental
+  (live) resize animation. Known and accepted for now; a smoother resize would
+  re-render at intermediate sizes during the drag and/or reuse buffer slots
   whose size is unchanged.
 - **GPU sync across processes**: the producer waits for its render submission
   before signaling (coarse fence); a true zero-copy path may need a shared

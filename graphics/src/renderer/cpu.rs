@@ -30,7 +30,7 @@ use crate::ComposedScene;
 /// The number of readback buffers kept per renderer; must be >= the number
 /// of shared-memory surface buffers so each in-flight frame has its own
 /// staging buffer.
-pub const READBACK_SLOTS: usize = 3;
+pub const READBACK_SLOTS: usize = 2;
 
 /// Per-frame data for the CPU readback path: delivered by the readback map
 /// callback when the GPU completes the copy.
@@ -57,12 +57,9 @@ pub struct CpuRenderer {
     readback_buffers: [Option<(wgpu::Buffer, u32, u32)>; READBACK_SLOTS],
     /// Generation of the frame whose readback is in flight per slot.
     inflight_readbacks: [Option<u64>; READBACK_SLOTS],
-    /// The webview's shared-memory ring (three regions), reallocated on
-    /// resize.
-    buffers: Option<SurfaceBuffers<[ipc::IpcSharedRegion; 3]>>,
-    /// The most recent composed scene that could not be submitted because
-    /// every ring buffer was still awaiting the embedder's ack.
-    deferred_scene: Option<ComposedScene>,
+    /// The webview's shared-memory double buffer (two regions), reallocated
+    /// on resize.
+    buffers: Option<SurfaceBuffers<[ipc::IpcSharedRegion; 2]>>,
 }
 
 impl CpuRenderer {
@@ -100,14 +97,13 @@ impl CpuRenderer {
         self.render_tex = Some((tex, width, height));
     }
 
-    /// Three shared-memory pixel buffers for the ring, sized for `width`×
-    /// `height` RGBA8.
-    fn allocate_shmem(width: u32, height: u32) -> Result<[ipc::IpcSharedRegion; 3], ipc::IpcError> {
+    /// Two shared-memory pixel buffers for the double buffer, sized for
+    /// `width`×`height` RGBA8.
+    fn allocate_shmem(width: u32, height: u32) -> Result<[ipc::IpcSharedRegion; 2], ipc::IpcError> {
         let byte_count = (width as usize) * (height as usize) * 4;
         let region_zero = ipc::IpcSharedRegion::allocate(byte_count)?;
         let region_one = ipc::IpcSharedRegion::allocate(byte_count)?;
-        let region_two = ipc::IpcSharedRegion::allocate(byte_count)?;
-        Ok([region_zero, region_one, region_two])
+        Ok([region_zero, region_one])
     }
 
     /// Drop the in-flight marker for a readback slot (map failure path).
@@ -222,10 +218,9 @@ impl SurfaceRenderer for CpuRenderer {
             gpu: GpuContext::new()?,
             channels,
             render_tex: None,
-            readback_buffers: [None, None, None],
-            inflight_readbacks: [None, None, None],
+            readback_buffers: [None, None],
+            inflight_readbacks: [None, None],
             buffers: None,
-            deferred_scene: None,
         })
     }
 
@@ -272,25 +267,10 @@ impl SurfaceRenderer for CpuRenderer {
             ));
         }
         let buffers = self.buffers.as_mut().ok_or(RenderError::Failed)?;
-        let Some(buffer_index) = buffers.next_free() else {
-            // Every buffer is reserved or awaiting the embedder's ack: hold
-            // the composed scene and submit it once a buffer frees. This
-            // keeps the rendering-opportunity cycle alive instead of
-            // dropping the frame.
-            info!(
-                "[render-pipe] Graphics defer scene webview={} (all {} buffers busy)",
-                webview_id.0, 3
-            );
-            self.deferred_scene = Some(ComposedScene {
-                webview_id,
-                scene,
-                frame_hit_info,
-                child_viewports,
-                child_frame_to_webview,
-                animating,
-            });
-            return Err(RenderError::Deferred);
-        };
+        // Double buffering: each cycle renders into the buffer the last
+        // render did not use. The embedder's FrameNeeded pacing guarantees
+        // that buffer is free (it holds the frame from two cycles ago).
+        let buffer_index = buffers.next_buffer();
 
         let metadata = frame_metadata(
             webview_id,
@@ -408,7 +388,6 @@ impl SurfaceRenderer for CpuRenderer {
             error!("[gpu-renderer] failed to queue poll request: {send_error}");
         }
         self.inflight_readbacks[readback_index] = Some(generation);
-        buffers.reserve(buffer_index, generation);
         debug!(
             "[gpu-renderer] submitted {}x{} gen={} readback={}",
             width, height, generation, readback_index
@@ -486,9 +465,7 @@ impl SurfaceRenderer for CpuRenderer {
             );
             return delivery;
         }
-        buffers.ring_mut().mark_pending(shmem_index, generation);
         delivery.surface_frame_sent = true;
-
         let shmem_key = generation as usize;
         let mut shmem_map = HashMap::new();
         shmem_map.insert(shmem_key, buffers.payload()[shmem_index].clone());
@@ -522,28 +499,6 @@ impl SurfaceRenderer for CpuRenderer {
 
     fn render_done_webview_id(data: &CpuRenderData) -> WebviewId {
         data.webview_id
-    }
-
-    fn ack(&mut self, generation: u64) -> bool {
-        self.buffers
-            .as_mut()
-            .is_some_and(|buffers| buffers.ack(generation))
-    }
-
-    fn submit_deferred(&mut self) -> Option<RenderSubmit> {
-        let composed = self.deferred_scene.take()?;
-        let webview_id = composed.webview_id;
-        match self.submit_scene(composed) {
-            Ok(submit) => Some(submit),
-            Err(RenderError::Deferred) => None,
-            Err(RenderError::Failed) => {
-                error!(
-                    "[graphics] submit deferred scene failed for {:?}",
-                    webview_id
-                );
-                None
-            }
-        }
     }
 
     #[cfg(target_os = "macos")]

@@ -32,33 +32,29 @@ pub struct SharedRenderData {
 }
 
 /// The zero-copy IOSurface renderer: a [`GpuContext`] plus the webview's
-/// shared IOSurface ring and the shared-texture id counter.
+/// shared IOSurface double buffer and the shared-texture id counter.
 pub struct IosurfaceRenderer {
     gpu: GpuContext,
     channels: ReadbackChannels<SharedRenderData>,
-    /// The webview's shared IOSurface ring (three textures), reallocated on
-    /// resize.
-    buffers: Option<SurfaceBuffers<[IosurfaceTexture; 3]>>,
+    /// The webview's shared IOSurface double buffer (two textures),
+    /// reallocated on resize.
+    buffers: Option<SurfaceBuffers<[IosurfaceTexture; 2]>>,
     /// Monotonic identity for shared IOSurface textures; changes on resize.
     texture_id_counter: u64,
-    /// The most recent composed scene that could not be submitted because
-    /// every ring buffer was still awaiting the embedder's ack.
-    deferred_scene: Option<ComposedScene>,
 }
 
 impl IosurfaceRenderer {
-    /// Allocate the three shared IOSurface textures for the ring, using
-    /// `first_texture_id` as the id of the first texture.
+    /// Allocate the two shared IOSurface textures for the double buffer,
+    /// using `first_texture_id` as the id of the first texture.
     fn allocate_textures(
         renderer: &IosurfaceRenderer,
         width: u32,
         height: u32,
         first_texture_id: u64,
-    ) -> Option<[IosurfaceTexture; 3]> {
+    ) -> Option<[IosurfaceTexture; 2]> {
         Some([
             create_shared_texture(renderer, width, height, first_texture_id)?,
             create_shared_texture(renderer, width, height, first_texture_id + 1)?,
-            create_shared_texture(renderer, width, height, first_texture_id + 2)?,
         ])
     }
 
@@ -84,7 +80,6 @@ impl SurfaceRenderer for IosurfaceRenderer {
             channels,
             buffers: None,
             texture_id_counter: 1,
-            deferred_scene: None,
         })
     }
 
@@ -123,32 +118,17 @@ impl SurfaceRenderer for IosurfaceRenderer {
                     );
                     RenderError::Failed
                 })?;
-            self.texture_id_counter += 3;
+            self.texture_id_counter += 2;
             self.buffers = Some(SurfaceBuffers::new(
                 SurfaceRingState::new(width, height),
                 payload,
             ));
         }
         let buffers = self.buffers.as_mut().ok_or(RenderError::Failed)?;
-        let Some(buffer_index) = buffers.next_free() else {
-            // Every buffer is reserved or awaiting the embedder's ack: hold
-            // the composed scene and submit it once a buffer frees. This
-            // keeps the rendering-opportunity cycle alive instead of
-            // dropping the frame.
-            info!(
-                "[render-pipe] Graphics defer scene webview={} (all {} buffers busy)",
-                webview_id.0, 3
-            );
-            self.deferred_scene = Some(ComposedScene {
-                webview_id,
-                scene,
-                frame_hit_info,
-                child_viewports,
-                child_frame_to_webview,
-                animating,
-            });
-            return Err(RenderError::Deferred);
-        };
+        // Double buffering: each cycle renders into the buffer the last
+        // render did not use. The embedder's FrameNeeded pacing guarantees
+        // that buffer is free (it holds the frame from two cycles ago).
+        let buffer_index = buffers.next_buffer();
 
         let metadata = frame_metadata(
             webview_id,
@@ -190,7 +170,6 @@ impl SurfaceRenderer for IosurfaceRenderer {
             "[gpu-renderer] rendered into shared texture {}x{} gen={} buffer={}",
             width, height, generation, buffer_index
         );
-        buffers.reserve(buffer_index, generation);
 
         Ok(RenderSubmit {
             generation,
@@ -237,7 +216,6 @@ impl SurfaceRenderer for IosurfaceRenderer {
         };
         let texture_id = texture.texture_id;
         let port = texture.port_for_frame();
-        buffers.ring_mut().mark_pending(buffer_index, generation);
         delivery.surface_frame_sent = true;
 
         let frame_event = GraphicsEvent::PixelFrameReady {
@@ -264,28 +242,6 @@ impl SurfaceRenderer for IosurfaceRenderer {
 
     fn render_done_webview_id(data: &SharedRenderData) -> WebviewId {
         data.webview_id
-    }
-
-    fn ack(&mut self, generation: u64) -> bool {
-        self.buffers
-            .as_mut()
-            .is_some_and(|buffers| buffers.ack(generation))
-    }
-
-    fn submit_deferred(&mut self) -> Option<RenderSubmit> {
-        let composed = self.deferred_scene.take()?;
-        let webview_id = composed.webview_id;
-        match self.submit_scene(composed) {
-            Ok(submit) => Some(submit),
-            Err(RenderError::Deferred) => None,
-            Err(RenderError::Failed) => {
-                error!(
-                    "[graphics] submit deferred scene failed for {:?}",
-                    webview_id
-                );
-                None
-            }
-        }
     }
 
     fn import_video_frame(

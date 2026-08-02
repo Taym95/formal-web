@@ -36,14 +36,6 @@ pub enum GraphicsCommand {
     /// A paint frame (scene + composition metadata) from a content process.
     /// The full PaintFrame with its shmem regions is reconstructed before sending.
     PaintFrame { frame: PaintFrame },
-    /// The embedder has finished consuming the pixels of a rendered surface
-    /// frame (generation) for a webview; its shared-memory buffer is now
-    /// free to be reused. The graphics process must not rewrite a buffer
-    /// until this ack arrives for the frame that used it.
-    TextureConsumed {
-        webview_id: WebviewId,
-        generation: u64,
-    },
     /// Remove a video frame slot (pipeline destroyed).
     RemoveVideoFrame {
         webview_id: WebviewId,

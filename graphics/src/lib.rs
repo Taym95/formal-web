@@ -438,7 +438,6 @@ fn handle_command<B: MediaBackend + 'static, R: SurfaceRenderer>(
                                 submit.buffer_index
                             );
                         }
-                        Err(RenderError::Deferred) => {}
                         Err(RenderError::Failed) => {
                             error!(
                                 "[graphics] submit composed scene failed for {:?}",
@@ -455,49 +454,6 @@ fn handle_command<B: MediaBackend + 'static, R: SurfaceRenderer>(
         } => {
             if let Some(slot) = webviews.get_mut(&webview_id) {
                 slot.compositor.remove_video_frame(paint_id);
-            }
-        }
-        GraphicsCommand::TextureConsumed {
-            webview_id,
-            generation,
-        } => {
-            let Some(slot) = webviews.get_mut(&webview_id) else {
-                debug!(
-                    "[graphics] texture consumed for unknown webview {:?}",
-                    webview_id
-                );
-                return false;
-            };
-            if !slot.renderer.ack(generation) {
-                debug!(
-                    "[graphics] texture consumed for unknown generation {} (webview={:?})",
-                    generation, webview_id
-                );
-            } else {
-                debug!(
-                    "[graphics] texture consumed webview={:?} gen={}",
-                    webview_id.0, generation
-                );
-                verification::tla_log!(
-                    *tla_tracer,
-                    -> "GPURendering",
-                    "TextureConsumed",
-                    webview_id.0,
-                    generation
-                );
-            }
-            // A composed scene deferred for lack of a free buffer can now be
-            // submitted: an ack freed a buffer.
-            if let Some(submit) = slot.renderer.submit_deferred() {
-                verification::tla_log!(
-                    *tla_tracer,
-                    -> "GPURendering",
-                    "SurfaceFrameSubmitted",
-                    webview_id.0,
-                    submit.generation,
-                    format!("{}x{}", submit.width, submit.height),
-                    submit.buffer_index
-                );
             }
         }
         GraphicsCommand::RegisterChildNavigableHost {

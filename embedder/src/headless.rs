@@ -311,7 +311,16 @@ impl ApplicationHandler<FormalWebUserEvent> for HeadlessEmbedderApp {
 
     fn user_event(&mut self, el: &ActiveEventLoop, event: FormalWebUserEvent) {
         match event {
-            FormalWebUserEvent::RequestRedraw(_) => {}
+            FormalWebUserEvent::RequestRedraw(webview_id) => {
+                // Headless has no window to paint, but the FrameNeeded
+                // message is what paces the render cycle: forward it so the
+                // UA starts a render for the requested frame.
+                if let Some(provider) = self.provider.as_ref()
+                    && let Err(error) = provider.frame_needed(webview_id)
+                {
+                    error!("[embedder] frame needed: {error}");
+                }
+            }
             FormalWebUserEvent::NavigationRequested {
                 webview_id,
                 destination_url,
@@ -368,11 +377,15 @@ impl ApplicationHandler<FormalWebUserEvent> for HeadlessEmbedderApp {
                     generation,
                     format!("{}x{}", width, height)
                 );
-                // Ack the frame so the graphics process can reuse its buffer.
-                if let Some(provider) = self.provider.as_ref() {
-                    if let Err(error) = provider.texture_consumed(webview_id, generation) {
-                        error!("[embedder] texture consumed: {error}");
-                    }
+                // No ack is sent: the graphics process alternates its two
+                // buffers per render cycle. Headless has no display pacing,
+                // so the next frame is requested immediately after this one
+                // is received (the UA starts the next render only if there
+                // is something to render).
+                if let Some(provider) = self.provider.as_ref()
+                    && let Err(error) = provider.frame_needed(webview_id)
+                {
+                    error!("[embedder] frame needed: {error}");
                 }
             }
             FormalWebUserEvent::Exit => {
