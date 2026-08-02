@@ -7,16 +7,17 @@ VARIABLES
     composed,
     op_count,
     animating,
+    frame_needed,
     parent,
     trace_index
 
-vars == <<pending, rendering_updated, composed, op_count, animating, parent,
-         trace_index>>
+vars == <<pending, rendering_updated, composed, op_count, animating,
+          frame_needed, parent, trace_index>>
 
 Base == INSTANCE RenderingOpportunity WITH
     Frame <- TraceFrame,
     NONE <- TraceNone,
-    MaxCounter <- TraceMaxCounter
+    BufferCount <- TraceBufferCount
 
 TraceLength == Len(Trace)
 
@@ -45,6 +46,15 @@ NoteRenderingOpportunityTrace ==
        /\ Base!NoteRenderingOpportunity(f)
        /\ Advance
 
+FrameNeededTrace ==
+    /\ trace_index \in 1..TraceLength
+    /\ CurrentEvent = "FrameNeeded"
+    /\ Len(CurrentArgs) = 1
+    /\ LET f == EventArg(1)
+       IN
+       /\ Base!FrameNeeded(f)
+       /\ Advance
+
 UpdateTheRenderingTrace ==
     /\ trace_index \in 1..TraceLength
     /\ CurrentEvent = "UpdateTheRendering"
@@ -63,24 +73,15 @@ GraphicsComputedTrace ==
        /\ Base!GraphicsComputed(f)
        /\ Advance
 
-NoteComposedSceneTrace ==
-    /\ trace_index \in 1..TraceLength
-    /\ CurrentEvent = "NoteComposedScene"
-    /\ Len(CurrentArgs) = 1
-    /\ LET f == EventArg(1)
-       IN
-       /\ Base!NoteComposedScene(f)
-       /\ Advance
-
 Done ==
     /\ trace_index > TraceLength
     /\ UNCHANGED vars
 
 Next ==
     \/ NoteRenderingOpportunityTrace
+    \/ FrameNeededTrace
     \/ UpdateTheRenderingTrace
     \/ GraphicsComputedTrace
-    \/ NoteComposedSceneTrace
     \/ Done
 
 TypeOK == Base!TypeOK

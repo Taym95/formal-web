@@ -118,11 +118,10 @@ impl WebviewProvider {
             .set_traversable_viewport(traversable_id.0, snapshot, offset_x, offset_y)
     }
 
-    /// Notify the graphics process that the embedder has consumed the pixels
-    /// of surface frame `generation` for `webview_id`, freeing its
-    /// shared-memory buffer for reuse.
-    pub fn texture_consumed(&self, webview_id: WebviewId, generation: u64) -> Result<(), String> {
-        self.user_agent.texture_consumed(webview_id, generation)
+    /// Notify the UA that the embedder is about to paint a frame for
+    /// `webview_id`; the UA gates render cycles on this.
+    pub fn frame_needed(&self, webview_id: WebviewId) -> Result<(), String> {
+        self.user_agent.frame_needed(webview_id)
     }
 
     pub fn evaluate_script(

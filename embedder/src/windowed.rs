@@ -320,7 +320,6 @@ pub(super) struct WindowedApp {
     pub(super) windows: HashMap<WindowId, WindowState>,
     pub(super) provider: Option<WebviewProvider>,
     pub(super) active_window_id: Option<WindowId>,
-    pub(super) tla_tracer: verification::TLATracer,
 }
 
 impl Default for WindowedApp {
@@ -329,7 +328,6 @@ impl Default for WindowedApp {
             windows: HashMap::new(),
             provider: None,
             active_window_id: None,
-            tla_tracer: verification::TLATracer::new("GPURendering", "embedder", None),
         }
     }
 }
@@ -552,7 +550,7 @@ impl WindowedApp {
         state.active_tab = Some(webview_id);
     }
 
-    fn paint_frame(state: &mut WindowState) {
+    fn paint_frame(state: &mut WindowState, provider: &Option<WebviewProvider>) {
         if !Self::has_visible_viewport(state) {
             return;
         }
@@ -585,6 +583,15 @@ impl WindowedApp {
             if !surface.is_registered() {
                 Self::register_surface_texture(&mut state.renderer, surface);
             }
+        }
+
+        // Notify the UA that a frame is needed before rendering, so the
+        // next content render can start in parallel with this paint.
+        if let Some(webview_id) = state.active_tab
+            && let Some(provider) = provider.as_ref()
+            && let Err(error) = provider.frame_needed(webview_id)
+        {
+            error!("[embedder] frame needed: {error}");
         }
 
         state.renderer.render(|scene| {
@@ -838,9 +845,6 @@ impl WindowedApp {
                 error!("content event error: {error}");
             }
         });
-        if let Some(window_state) = self.windows.get(&window_id) {
-            Self::request_window_redraw(window_state);
-        }
     }
 
     fn try_run_automation<R>(
@@ -941,12 +945,17 @@ impl ApplicationHandler<FormalWebUserEvent> for WindowedApp {
                 if let Some(state) = self.windows.get_mut(&window_id)
                     && (self.provider.is_some() || state.chrome.is_some())
                 {
-                    Self::paint_frame(state);
+                    Self::paint_frame(state, &self.provider);
                 }
             }
             WindowEvent::Occluded(occluded) => {
                 if let Some(state) = self.windows.get_mut(&window_id) {
                     state.window_occluded = occluded;
+                }
+                // The window became visible again; request a redraw so
+                // painting resumes.
+                if !occluded && let Some(state) = self.windows.get(&window_id) {
+                    Self::request_window_redraw(state);
                 }
             }
             WindowEvent::Resized(size) => {
@@ -961,6 +970,9 @@ impl ApplicationHandler<FormalWebUserEvent> for WindowedApp {
                     if state.renderer.is_active() {
                         state.renderer.set_size(size.width, size.height);
                     }
+                    // The chrome (and the whole scene) needs repainting at
+                    // the new size.
+                    Self::request_window_redraw(state);
                 }
                 // Update provider viewport (separate borrow from state)
                 if let Some(state) = self.windows.get(&window_id) {
@@ -1037,11 +1049,6 @@ impl ApplicationHandler<FormalWebUserEvent> for WindowedApp {
                 }
             }
             WindowEvent::CursorMoved { position, .. } => {
-                let _chrome_height_physical = self
-                    .windows
-                    .get(&window_id)
-                    .map(Self::chrome_height_physical)
-                    .unwrap_or(0);
                 if Self::pointer_in_chrome_st(&self.windows, window_id, position) {
                     if let Some(state) = self.windows.get_mut(&window_id) {
                         state.pointer_pos = position;
@@ -1119,6 +1126,8 @@ impl ApplicationHandler<FormalWebUserEvent> for WindowedApp {
                             if let Some(chrome) = state.chrome.as_mut() {
                                 chrome.clear_focus();
                             }
+                            // The chrome loses text-input focus: repaint the
+                            // chrome's focus styling.
                             Self::request_window_redraw(state);
                         }
                         let event = BlitzPointerEvent {
@@ -1145,9 +1154,6 @@ impl ApplicationHandler<FormalWebUserEvent> for WindowedApp {
                                     error!("content event error: {error}");
                                 }
                             });
-                        }
-                        if let Some(state) = self.windows.get(&window_id) {
-                            Self::request_window_redraw(state);
                         }
                     }
                 }
@@ -1194,6 +1200,8 @@ impl ApplicationHandler<FormalWebUserEvent> for WindowedApp {
                             if let Some(chrome) = state.chrome.as_mut() {
                                 chrome.clear_focus();
                             }
+                            // The chrome loses text-input focus: repaint the
+                            // chrome's focus styling.
                             Self::request_window_redraw(state);
                         }
                         let webview_id = state.active_tab;
@@ -1211,9 +1219,6 @@ impl ApplicationHandler<FormalWebUserEvent> for WindowedApp {
                                     error!("touch event error: {error}");
                                 }
                             });
-                        }
-                        if let Some(state) = self.windows.get(&window_id) {
-                            Self::request_window_redraw(state);
                         }
                     }
                 }
@@ -1270,9 +1275,6 @@ impl ApplicationHandler<FormalWebUserEvent> for WindowedApp {
                                 error!("wheel event error: {error}");
                             }
                         });
-                    }
-                    if let Some(state) = self.windows.get(&window_id) {
-                        Self::request_window_redraw(state);
                     }
                 }
             }
@@ -1412,12 +1414,7 @@ impl ApplicationHandler<FormalWebUserEvent> for WindowedApp {
             FormalWebUserEvent::ClipboardWrite { text, reply } => {
                 let _ = reply.send(write_clipboard_text(text));
             }
-            FormalWebUserEvent::NewWebContentScene {
-                webview_id,
-                scene_bytes,
-                font_registrations,
-                font_data,
-            } => {
+            FormalWebUserEvent::NewWebContentScene { webview_id, .. } => {
                 // Removed: the IOSurface surface path replaces the old scene bytes path.
                 // Trigger a redraw so the surface-based path can render.
                 debug!(
@@ -1429,16 +1426,13 @@ impl ApplicationHandler<FormalWebUserEvent> for WindowedApp {
                 {
                     Self::request_window_redraw(state);
                 }
-                let _ = scene_bytes.len();
-                let _ = font_registrations;
-                let _ = font_data;
             }
             FormalWebUserEvent::NewWebContentSurface {
                 webview_id,
                 frame,
                 width,
                 height,
-                generation,
+                ..
             } => {
                 let Some(window_id) = Self::window_for_webview(self, webview_id) else {
                     info!(
@@ -1608,23 +1602,8 @@ impl ApplicationHandler<FormalWebUserEvent> for WindowedApp {
                     "[render-pipe] Embedder updated surface webview={:?} active={} tabs={:?} active_tab={:?} window={:?}",
                     webview_id, is_active, state.tab_order, state.active_tab, window_id
                 );
-                verification::tla_log!(
-                    self.tla_tracer,
-                    -> "GPURendering",
-                    "SurfaceFrameReceived",
-                    webview_id.0,
-                    generation,
-                    format!("{}x{}", width, height)
-                );
-                // The pixels are now consumed (the CPU path staged them into
-                // the persistent texture synchronously; the zero-copy path
-                // will blit the shared surface on the next paint). Ack the
-                // frame so the graphics process can reuse the buffer.
-                if let Some(provider) = self.provider.as_ref()
-                    && let Err(error) = provider.texture_consumed(webview_id, generation)
-                {
-                    error!("[embedder] texture consumed: {error}");
-                }
+                // A new surface frame is available; request a redraw so
+                // the next paint blits it.
                 Self::request_window_redraw(state);
                 info!(
                     "[render-pipe] Embedder requested redraw for window={:?}",

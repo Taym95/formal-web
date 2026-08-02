@@ -46,7 +46,6 @@ pub(super) struct HeadlessEmbedderApp {
     pub(super) buttons: MouseEventButtons,
     pub(super) composed_scenes: HashMap<WebviewId, RecordedScene>,
     pub(super) scene_font_receiver: FontTransportReceiver,
-    pub(super) tla_tracer: verification::TLATracer,
 }
 
 impl Default for HeadlessEmbedderApp {
@@ -61,7 +60,6 @@ impl Default for HeadlessEmbedderApp {
             buttons: MouseEventButtons::None,
             composed_scenes: HashMap::new(),
             scene_font_receiver: FontTransportReceiver::default(),
-            tla_tracer: verification::TLATracer::new("GPURendering", "embedder", None),
         }
     }
 }
@@ -311,7 +309,15 @@ impl ApplicationHandler<FormalWebUserEvent> for HeadlessEmbedderApp {
 
     fn user_event(&mut self, el: &ActiveEventLoop, event: FormalWebUserEvent) {
         match event {
-            FormalWebUserEvent::RequestRedraw(_) => {}
+            FormalWebUserEvent::RequestRedraw(webview_id) => {
+                // Headless has no window to paint; notify the UA that a
+                // frame is needed for the requested webview.
+                if let Some(provider) = self.provider.as_ref()
+                    && let Err(error) = provider.frame_needed(webview_id)
+                {
+                    error!("[embedder] frame needed: {error}");
+                }
+            }
             FormalWebUserEvent::NavigationRequested {
                 webview_id,
                 destination_url,
@@ -352,27 +358,14 @@ impl ApplicationHandler<FormalWebUserEvent> for HeadlessEmbedderApp {
                     }
                 }
             }
-            FormalWebUserEvent::NewWebContentSurface {
-                webview_id,
-                frame: _frame,
-                width,
-                height,
-                generation,
-            } => {
+            FormalWebUserEvent::NewWebContentSurface { webview_id, .. } => {
                 debug!("[embedder] headless NewWebContentSurface {:?}", webview_id);
-                verification::tla_log!(
-                    self.tla_tracer,
-                    -> "GPURendering",
-                    "SurfaceFrameReceived",
-                    webview_id.0,
-                    generation,
-                    format!("{}x{}", width, height)
-                );
-                // Ack the frame so the graphics process can reuse its buffer.
-                if let Some(provider) = self.provider.as_ref() {
-                    if let Err(error) = provider.texture_consumed(webview_id, generation) {
-                        error!("[embedder] texture consumed: {error}");
-                    }
+                // Headless has no display pacing; request the next frame
+                // immediately.
+                if let Some(provider) = self.provider.as_ref()
+                    && let Err(error) = provider.frame_needed(webview_id)
+                {
+                    error!("[embedder] frame needed: {error}");
                 }
             }
             FormalWebUserEvent::Exit => {

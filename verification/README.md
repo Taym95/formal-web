@@ -13,8 +13,7 @@ The verification crate owns trace recording, TLA+ validation, and the shutdown w
 | Spec | Events traced (producer) | Validates |
 |---|---|---|
 | `Navigation` | UA navigation lifecycle | navigable/navigation state machine |
-| `RenderingOpportunity` | UA `NoteRenderingOpportunity`/`NoteComposedScene`, content `UpdateTheRendering`, graphics `GraphicsComputed` (traced when the pixels are actually sent) | batched rendering-opportunity counters |
-| `GPURendering` | graphics `SurfaceFrameSubmitted`/`SurfaceFrameSent`/`TextureConsumed`, embedder `SurfaceFrameReceived` | per-webview surface buffer ring: strict +1 submit generations, sent frames are a subset of submitted frames delivered into the pre-selected region, a region is never rewritten while reserved or pending the embedder's ack, fresh free ring after resize, consumed frames match sent frames |
+| `RenderingOpportunity` | UA `NoteRenderingOpportunity`/`FrameNeeded`, content `UpdateTheRendering`, graphics `GraphicsComputed` (traced when the pixels are actually sent) | FrameNeeded-gated render cycle with double buffering: a render starts only when the embedder needs a frame (paced by vsync) AND a rendering opportunity was noted; the paint consumes the composed frames, and the pipeline never holds more than `BufferCount` (2) renders in flight (one displayed, one being rendered) |
 | `MessagePort*` | (not written yet) | — |
 
 ### Adding a spec
@@ -23,3 +22,10 @@ The verification crate owns trace recording, TLA+ validation, and the shutdown w
 2. Emit events from code with `verification::tla_log!(tracer, -> "{Name}", "Event", args...)`. Producers holding a `TraceSender`/`TLATracer` are the UA, the graphics process, and the embedder apps.
 3. For specs whose event args need TLA+ numeric types (e.g. generation counters), extend `collect_trace_ids_for_spec` / `render_trace_data_module_for_spec` in `verification/src/validate.rs` with a custom event renderer (see `render_gpu_rendering_trace_event`, which renders generation/region args as integer literals).
 4. `./verification/verify-specs.sh` picks the new spec up automatically; a `CHECK {Name} ... OK` line means the recorded trace is consistent with the model.
+
+### Spec file style
+
+- The `.tla` model files carry **no prose**: at most a one-line comment stating the
+  reason the spec exists. The model's definitions, action names, and invariants
+  are the documentation — explanatory paragraphs about the modeled system live in
+  this README and the owning feature's README, not in the spec.

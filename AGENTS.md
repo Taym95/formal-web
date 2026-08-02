@@ -416,7 +416,7 @@ feature never worked, instead of checking whether it did.
 - Use the `web_standards` extension tools (`spec_lookup`, `spec_ref_links`, `spec_search_id`) to read spec content instead of reading local copies or fetching directly. This is not a one-shot lookup — consult the spec **iteratively** as you write code: start by reading the algorithm to understand the structure, implement the corresponding code, then re-read the spec and compare each step against what you wrote. The spec is the source of truth for both the algorithm logic and the documentation annotations (`// Step N:`, anchor URLs, `// Note:` for discrepancies) that code must carry. The end-of-task spec-mapping review (step 4 below) is the final checkpoint that every algorithm in the changeset is consistently implemented and properly annotated.
 - **Reference URLs vs canonical URLs.** In web standards, every definition (`#dfn-foo`) has corresponding reference links (`#ref-for-dfn-foo`, `#ref-for-dfn-foo①`, …) at each usage site. When documenting code that implements a specific algorithm step, prefer the *reference URL* over the canonical concept URL — your code implements "the thing as used in a particular algorithm", not the thing itself. Use `spec_ref_links` to find all reference URLs for a concept.
 - Treat `vendor/` and vendored WPT resources as read-only unless the task explicitly requires vendor changes.
-- The words "runtime", "sidecar", "carrier", and "domain document" (or "domain_document") are forbidden in this repo.
+- The words "runtime", "sidecar", "carrier", "root", and "domain document" (or "domain_document") are forbidden in this repo.
 - **Method doc comments:** A method that implements a spec algorithm should have only the spec link as its doc comment. All explanation, step references, and context belong in `//` comments inside the method body. A `// Note:` below the link is acceptable only for brief continuations of the algorithm that cannot be expressed as body comments. Why? Because the entire thing is a runtime, one that implements the Web, and so neither concept should ever be used to model or document some component of what is basically one big integrated system. No component is more or less of a "sidecar" than any other — each plays a specific role. Instead of reaching for these forbidden words, think about what the thing you want to name does, what its role in the system is, and come up with something descriptive.
 - **Document only verified facts.** Never speculate about root causes, fixes, or
   explanations for observed behavior unless you have confirmed them through
@@ -432,6 +432,12 @@ feature never worked, instead of checking whether it did.
   RAII cleanup must be explicitly used during shutdown (send shutdown signal, wait for
   acknowledgement, join the child process). Remove the dead code instead of annotating
   around it.
+- **Remove unused bindings; never silence them with `_`-prefixed names or `let _ =`.**
+  If a pattern field, parameter, or local variable is not used, delete it: elide
+  unneeded struct/enum fields with `..` in the pattern, drop the binding or parameter,
+  and remove any code that existed only to consume it. An unused binding kept alive as
+  `_foo`, `_bar` or `let _ = ...` is dead code that silently accumulates — the warning
+  is a request to delete the binding, not to rename it.
 - **Comments describe what the code DOES, not what it USED TO DO.** Never write
   comments like "now comes from X instead of Y" or "previously maintained by Z."
   Those document a migration that is already complete. Delete stale comments and
