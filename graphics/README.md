@@ -145,9 +145,10 @@ Rejected alternatives, for the record:
 ## Generic surface backend abstraction
 
 The ring, the ack protocol, the deferral, the messages, and the embedder's draw
-path are all transport-agnostic. The per-webview state is a `(Compositor, R)`
-tuple: the compositor (scene assembly, fonts, video frames) and the renderer
-(Vello + surface delivery). The ring is hidden entirely inside the renderer —
+path are all transport-agnostic. The per-webview state is a `WebviewState<R>`
+struct holding the compositor (scene assembly, fonts, video frames) and the
+renderer (Vello + surface delivery). The ring is hidden entirely inside the
+renderer —
 the graphics event loop only sees the `SurfaceRenderer` trait (`submit_scene`,
 `handle_render_done`, `ack`, `submit_deferred`). Each renderer owns its
 `SurfaceBuffers` (the generic ring lifecycle `SurfaceRingState` plus its

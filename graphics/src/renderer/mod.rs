@@ -35,7 +35,6 @@ use vello::{
 use wgpu::{Texture, TextureViewDescriptor};
 
 use crate::ComposedScene;
-use verification::TLATracer;
 
 /// Frame metadata captured at submit time and delivered with the frame when
 /// the GPU completes it.
@@ -48,9 +47,30 @@ pub struct FrameMetadata {
     pub animating: bool,
 }
 
-/// The result of submitting a frame: the generation now in flight.
+/// The result of submitting a frame: the generation now in flight, the size
+/// it was submitted at, and the ring buffer it occupies. Reported to the run
+/// loop, which emits the `SurfaceFrameSubmitted` trace event.
 pub struct RenderSubmit {
     pub generation: u64,
+    pub width: u32,
+    pub height: u32,
+    pub buffer_index: usize,
+}
+
+/// The outcome of delivering a completed frame, reported to the run loop so
+/// the TLA tracing stays there. The two flags mirror the trace events:
+/// `surface_frame_sent` gates `SurfaceFrameSent` (the pixels were copied and
+/// the ring buffer marked pending), `graphics_computed` gates
+/// `GraphicsComputed` (PixelFrameReady was actually sent).
+pub struct FrameDelivery {
+    pub generation: u64,
+    pub width: u32,
+    pub height: u32,
+    pub buffer_index: usize,
+    /// The pixels were marked pending and the frame sent to the embedder.
+    pub surface_frame_sent: bool,
+    /// PixelFrameReady was delivered to the UA (the frame is fully computed).
+    pub graphics_computed: bool,
 }
 
 /// The outcome of submitting a composed scene.
@@ -412,21 +432,20 @@ pub trait SurfaceRenderer {
     /// size, (re)allocates its surface buffers on resize, picks a free ring
     /// buffer — or retains the scene when every buffer is busy — and submits
     /// the render. The GPU completion is delivered on
-    /// `ReadbackChannels::render_done_tx` as `Self::RenderData`.
-    fn submit_scene(
-        &mut self,
-        composed: ComposedScene,
-        tla_tracer: &mut TLATracer,
-    ) -> Result<(), RenderError>;
+    /// `ReadbackChannels::render_done_tx` as `Self::RenderData`. The run
+    /// loop emits the `SurfaceFrameSubmitted` trace event from the returned
+    /// [`RenderSubmit`].
+    fn submit_scene(&mut self, composed: ComposedScene) -> Result<RenderSubmit, RenderError>;
 
     /// The GPU completed a frame: mark the ring buffer pending and deliver
-    /// the frame to the embedder.
+    /// the frame to the embedder. The run loop emits the `SurfaceFrameSent`
+    /// and `GraphicsComputed` trace events from the returned
+    /// [`FrameDelivery`].
     fn handle_render_done(
         &mut self,
         data: Self::RenderData,
         sender: &ipc::IpcSender<GraphicsEvent>,
-        tla_tracer: &mut TLATracer,
-    );
+    ) -> FrameDelivery;
 
     /// The webview a completed frame belongs to (used to look up the
     /// webview's renderer).
@@ -437,8 +456,9 @@ pub trait SurfaceRenderer {
     fn ack(&mut self, generation: u64) -> bool;
 
     /// Submit the scene that was retained because every ring buffer was
-    /// busy. Returns true when there was a deferred scene.
-    fn submit_deferred(&mut self, tla_tracer: &mut TLATracer) -> bool;
+    /// busy. Returns the submit result when there was a deferred scene that
+    /// went out, so the run loop can emit its `SurfaceFrameSubmitted` event.
+    fn submit_deferred(&mut self) -> Option<RenderSubmit>;
 
     /// Register a video frame: wrap `pixel_buffer` as a Metal texture and
     /// blit it into an RGBA texture Vello can sample. Returns the fake

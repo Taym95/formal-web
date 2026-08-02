@@ -54,16 +54,18 @@ pub struct VisibleFrameViewport {
 /// A webview's per-webview state: the compositor (scene assembly, fonts,
 /// video frames) and the renderer (Vello + surface delivery, the ring, the
 /// deferred scene).
-type WebviewState<R> = (Compositor, R);
+struct WebviewState<R> {
+    compositor: Compositor,
+    renderer: R,
+}
 
-/// Create the per-webview compositor + renderer pair.
-fn new_webview_state<R: SurfaceRenderer>(
-    channels: ReadbackChannels<R::RenderData>,
-) -> WebviewState<R> {
-    (
-        Compositor::default(),
-        R::new(channels).unwrap_or_else(|error| panic!("renderer init: {error}")),
-    )
+impl<R: SurfaceRenderer> WebviewState<R> {
+    fn new(channels: ReadbackChannels<R::RenderData>) -> Self {
+        Self {
+            compositor: Compositor::default(),
+            renderer: R::new(channels).unwrap_or_else(|error| panic!("renderer init: {error}")),
+        }
+    }
 }
 
 /// Run the graphics process event loop.
@@ -250,7 +252,7 @@ fn handle_media_event<R: SurfaceRenderer>(
                 height: video_frame.height,
                 content: compositor::VideoFrameContent::Bytes(pixel_bytes),
             };
-            if let Some((compositor, _)) = webviews.get_mut(&webview_id) {
+            if let Some(slot) = webviews.get_mut(&webview_id) {
                 // Store the video frame. It will be included in the next normal
                 // composition (triggered by a content PaintFrame via the standard
                 // render cycle). The compositor's compose_frame already checks
@@ -258,7 +260,7 @@ fn handle_media_event<R: SurfaceRenderer>(
                 // Never compose independently from the video handler — doing so
                 // creates an orphan composition with no corresponding
                 // UpdateTheRendering, violating the TLA+ pipeline model.
-                compositor.update_video_frame(cf);
+                slot.compositor.update_video_frame(cf);
             }
         }
         // AVFoundation video frames arrive as GPU pixel buffers and are
@@ -279,10 +281,10 @@ fn handle_media_event<R: SurfaceRenderer>(
                 );
                 return;
             };
-            let Some((compositor, renderer)) = webviews.get_mut(&webview_id) else {
+            let Some(slot) = webviews.get_mut(&webview_id) else {
                 return;
             };
-            let Some(resource_id) = renderer.import_video_frame(
+            let Some(resource_id) = slot.renderer.import_video_frame(
                 paint_id,
                 &frame.pixel_buffer,
                 frame.width,
@@ -300,7 +302,7 @@ fn handle_media_event<R: SurfaceRenderer>(
                 height: frame.height,
                 content: compositor::VideoFrameContent::Texture(resource_id),
             };
-            compositor.update_video_frame(cf);
+            slot.compositor.update_video_frame(cf);
         }
         MediaBackendEvent::Eos { pipeline_id } => {
             if let Some(&(webview_id, paint_id)) = pipeline_webview_map.get(&pipeline_id) {
@@ -350,7 +352,7 @@ fn handle_command<B: MediaBackend + 'static, R: SurfaceRenderer>(
             debug!("[graphics] registering webview {:?}", webview_id);
             webviews
                 .entry(webview_id)
-                .or_insert_with(|| new_webview_state(channels.clone()));
+                .or_insert_with(|| WebviewState::new(channels.clone()));
         }
         GraphicsCommand::UnregisterWebview { webview_id } => {
             debug!("[graphics] unregistering webview {:?}", webview_id);
@@ -369,13 +371,13 @@ fn handle_command<B: MediaBackend + 'static, R: SurfaceRenderer>(
             let webview_id = target_webview_id;
             let slot = webviews
                 .entry(webview_id)
-                .or_insert_with(|| new_webview_state(channels.clone()));
+                .or_insert_with(|| WebviewState::new(channels.clone()));
             let composition = frame.composition.clone();
             let viewport_width = frame.viewport_width;
             let viewport_height = frame.viewport_height;
             let frame_id = actual_frame_id;
             let animating = frame.animating;
-            let recorded_scene = match slot.0.decode_frame(frame, shmem_regions) {
+            let recorded_scene = match slot.compositor.decode_frame(frame, shmem_regions) {
                 Ok(scene) => scene,
                 Err(error) => {
                     error!("[graphics] deserialize paint frame: {error}");
@@ -391,7 +393,7 @@ fn handle_command<B: MediaBackend + 'static, R: SurfaceRenderer>(
                 viewport_height,
                 composition.embed_sites.len()
             );
-            slot.0.store_frame(
+            slot.compositor.store_frame(
                 frame_id,
                 viewport_width,
                 viewport_height,
@@ -414,24 +416,34 @@ fn handle_command<B: MediaBackend + 'static, R: SurfaceRenderer>(
                     "[render-pipe] Graphics compose scene webview={} root_frame={}",
                     webview_id.0, frame_id.0
                 );
-                if let Some(mut composed) = slot.0.compose_scene(webview_id) {
+                if let Some(mut composed) = slot.compositor.compose_scene(webview_id) {
                     // Populate child data for the UA to publish and route.
-                    let (cv, cftw) = build_child_data(&mut slot.0, child_webview_to_parent);
+                    let (cv, cftw) =
+                        build_child_data(&mut slot.compositor, child_webview_to_parent);
                     composed.child_viewports = cv;
                     composed.child_frame_to_webview = cftw;
                     // animating comes from the content-process PaintFrame flag.
                     // Content knows what's animating (video, CSS animations)
                     // and sets this. Graphics just passes it through.
                     composed.animating = animating;
-                    if let Err(error) = slot.1.submit_scene(composed, tla_tracer) {
-                        match error {
-                            RenderError::Deferred => {}
-                            RenderError::Failed => {
-                                error!(
-                                    "[graphics] submit composed scene failed for {:?}",
-                                    webview_id
-                                );
-                            }
+                    match slot.renderer.submit_scene(composed) {
+                        Ok(submit) => {
+                            verification::tla_log!(
+                                *tla_tracer,
+                                -> "GPURendering",
+                                "SurfaceFrameSubmitted",
+                                webview_id.0,
+                                submit.generation,
+                                format!("{}x{}", submit.width, submit.height),
+                                submit.buffer_index
+                            );
+                        }
+                        Err(RenderError::Deferred) => {}
+                        Err(RenderError::Failed) => {
+                            error!(
+                                "[graphics] submit composed scene failed for {:?}",
+                                webview_id
+                            );
                         }
                     }
                 }
@@ -441,22 +453,22 @@ fn handle_command<B: MediaBackend + 'static, R: SurfaceRenderer>(
             webview_id,
             paint_id,
         } => {
-            if let Some((compositor, _)) = webviews.get_mut(&webview_id) {
-                compositor.remove_video_frame(paint_id);
+            if let Some(slot) = webviews.get_mut(&webview_id) {
+                slot.compositor.remove_video_frame(paint_id);
             }
         }
         GraphicsCommand::TextureConsumed {
             webview_id,
             generation,
         } => {
-            let Some((_, renderer)) = webviews.get_mut(&webview_id) else {
+            let Some(slot) = webviews.get_mut(&webview_id) else {
                 debug!(
                     "[graphics] texture consumed for unknown webview {:?}",
                     webview_id
                 );
                 return false;
             };
-            if !renderer.ack(generation) {
+            if !slot.renderer.ack(generation) {
                 debug!(
                     "[graphics] texture consumed for unknown generation {} (webview={:?})",
                     generation, webview_id
@@ -476,7 +488,17 @@ fn handle_command<B: MediaBackend + 'static, R: SurfaceRenderer>(
             }
             // A composed scene deferred for lack of a free buffer can now be
             // submitted: an ack freed a buffer.
-            renderer.submit_deferred(tla_tracer);
+            if let Some(submit) = slot.renderer.submit_deferred() {
+                verification::tla_log!(
+                    *tla_tracer,
+                    -> "GPURendering",
+                    "SurfaceFrameSubmitted",
+                    webview_id.0,
+                    submit.generation,
+                    format!("{}x{}", submit.width, submit.height),
+                    submit.buffer_index
+                );
+            }
         }
         GraphicsCommand::RegisterChildNavigableHost {
             child_webview_id,
@@ -490,13 +512,14 @@ fn handle_command<B: MediaBackend + 'static, R: SurfaceRenderer>(
             parent_traversable_id,
             content_frame_id,
         } => {
-            if let Some((compositor, _)) = webviews.get_mut(&parent_traversable_id) {
-                compositor.note_child_navigation_finalized(content_frame_id);
+            if let Some(slot) = webviews.get_mut(&parent_traversable_id) {
+                slot.compositor
+                    .note_child_navigation_finalized(content_frame_id);
             }
         }
         GraphicsCommand::NavigationFinalized { webview_id } => {
-            if let Some((compositor, _)) = webviews.get_mut(&webview_id) {
-                compositor.note_navigation_finalized();
+            if let Some(slot) = webviews.get_mut(&webview_id) {
+                slot.compositor.note_navigation_finalized();
             }
         }
         GraphicsCommand::CreateMediaPipeline {
@@ -590,9 +613,10 @@ fn build_child_data(
     (viewports, frame_to_webview)
 }
 
-/// Deliver a completed frame: look up the webview's renderer and hand the
-/// backend's `RenderData` to its `handle_render_done`, which marks the ring
-/// buffer pending and sends `PixelFrameReady`.
+/// Deliver a completed frame: look up the webview's renderer, hand the
+/// backend's `RenderData` to its `handle_render_done` (which marks the ring
+/// buffer pending and sends `PixelFrameReady`), then emit the trace events
+/// the delivery reports.
 fn handle_render_done<R: SurfaceRenderer>(
     webviews: &mut HashMap<WebviewId, WebviewState<R>>,
     sender: &ipc::IpcSender<GraphicsEvent>,
@@ -600,12 +624,34 @@ fn handle_render_done<R: SurfaceRenderer>(
     done: R::RenderData,
 ) {
     let webview_id = R::render_done_webview_id(&done);
-    let Some((_, renderer)) = webviews.get_mut(&webview_id) else {
+    let Some(slot) = webviews.get_mut(&webview_id) else {
         debug!(
             "[graphics] render done for unknown webview {:?}",
             webview_id
         );
         return;
     };
-    renderer.handle_render_done(done, sender, tla_tracer);
+    let delivery = slot.renderer.handle_render_done(done, sender);
+    if delivery.surface_frame_sent {
+        verification::tla_log!(
+            *tla_tracer,
+            -> "GPURendering",
+            "SurfaceFrameSent",
+            webview_id.0,
+            delivery.generation,
+            format!("{}x{}", delivery.width, delivery.height),
+            delivery.buffer_index
+        );
+    }
+    // The graphical output for the webview is done: the pixels were sent.
+    // Traced with the webview's navigable id so it matches the per-frame
+    // RenderingOpportunity model (the webview id is the root navigable).
+    if delivery.graphics_computed {
+        verification::tla_log!(
+            *tla_tracer,
+            -> "RenderingOpportunity",
+            "GraphicsComputed",
+            webview_id.0
+        );
+    }
 }

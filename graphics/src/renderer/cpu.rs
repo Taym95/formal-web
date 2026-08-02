@@ -5,14 +5,13 @@
 //! `cpu_readback` feature.
 
 use super::{
-    FrameMetadata, GpuContext, PollRequest, ReadbackChannels, RenderError, SurfaceBuffers,
-    SurfaceRenderer, SurfaceRingState, frame_metadata, render_size,
+    FrameDelivery, FrameMetadata, GpuContext, PollRequest, ReadbackChannels, RenderError,
+    RenderSubmit, SurfaceBuffers, SurfaceRenderer, SurfaceRingState, frame_metadata, render_size,
 };
 use ipc_messages::content::WebviewId;
 use ipc_messages::graphics::{GraphicsEvent, SurfacePayload};
 use log::{debug, error, info};
 use std::collections::HashMap;
-use verification::TLATracer;
 use wgpu::{
     BufferDescriptor, BufferUsages, CommandEncoderDescriptor, Extent3d, Origin3d,
     TexelCopyBufferInfo, TexelCopyBufferLayout, TexelCopyTextureInfo, TextureAspect,
@@ -230,11 +229,7 @@ impl SurfaceRenderer for CpuRenderer {
         })
     }
 
-    fn submit_scene(
-        &mut self,
-        composed: ComposedScene,
-        tla_tracer: &mut TLATracer,
-    ) -> Result<(), RenderError> {
+    fn submit_scene(&mut self, composed: ComposedScene) -> Result<RenderSubmit, RenderError> {
         let ComposedScene {
             webview_id,
             scene,
@@ -419,24 +414,19 @@ impl SurfaceRenderer for CpuRenderer {
             width, height, generation, readback_index
         );
 
-        verification::tla_log!(
-            *tla_tracer,
-            -> "GPURendering",
-            "SurfaceFrameSubmitted",
-            webview_id.0,
+        Ok(RenderSubmit {
             generation,
-            format!("{}x{}", width, height),
-            buffer_index
-        );
-        Ok(())
+            width,
+            height,
+            buffer_index,
+        })
     }
 
     fn handle_render_done(
         &mut self,
         data: CpuRenderData,
         sender: &ipc::IpcSender<GraphicsEvent>,
-        tla_tracer: &mut TLATracer,
-    ) {
+    ) -> FrameDelivery {
         let CpuRenderData {
             webview_id,
             generation,
@@ -447,20 +437,28 @@ impl SurfaceRenderer for CpuRenderer {
             result,
             metadata,
         } = data;
+        let mut delivery = FrameDelivery {
+            generation,
+            width,
+            height,
+            buffer_index: shmem_index,
+            surface_frame_sent: false,
+            graphics_computed: false,
+        };
         if let Err(error) = result {
             error!(
                 "[graphics] readback map failed for {:?} gen={}: {error:?}",
                 webview_id, generation
             );
             Self::release_readback(&mut self.inflight_readbacks, readback_index);
-            return;
+            return delivery;
         }
         let Some(buffers) = self.buffers.as_mut() else {
             error!(
                 "[graphics] no surface buffers for render done {:?}",
                 webview_id
             );
-            return;
+            return delivery;
         };
         let Some(region) = buffers.payload_mut().get_mut(shmem_index) else {
             error!(
@@ -468,7 +466,7 @@ impl SurfaceRenderer for CpuRenderer {
                 shmem_index, webview_id, generation
             );
             Self::release_readback(&mut self.inflight_readbacks, readback_index);
-            return;
+            return delivery;
         };
         // SAFETY: this buffer was reserved at submit time and its pixels are
         // delivered exactly once here, before it is marked pending; no other
@@ -486,19 +484,10 @@ impl SurfaceRenderer for CpuRenderer {
                 "[graphics] readback copy failed for {:?} gen={}",
                 webview_id, generation
             );
-            return;
+            return delivery;
         }
         buffers.ring_mut().mark_pending(shmem_index, generation);
-
-        verification::tla_log!(
-            *tla_tracer,
-            -> "GPURendering",
-            "SurfaceFrameSent",
-            webview_id.0,
-            generation,
-            format!("{}x{}", width, height),
-            shmem_index
-        );
+        delivery.surface_frame_sent = true;
 
         let shmem_key = generation as usize;
         let mut shmem_map = HashMap::new();
@@ -525,18 +514,10 @@ impl SurfaceRenderer for CpuRenderer {
                 "[graphics] failed to send PixelFrameReady for {:?} gen={}",
                 webview_id, generation
             );
-            return;
+            return delivery;
         }
-
-        // The graphical output for the webview is done: the pixels were sent.
-        // Traced with the webview's navigable id so it matches the per-frame
-        // RenderingOpportunity model (the webview id is the root navigable).
-        verification::tla_log!(
-            *tla_tracer,
-            -> "RenderingOpportunity",
-            "GraphicsComputed",
-            webview_id.0
-        );
+        delivery.graphics_computed = true;
+        delivery
     }
 
     fn render_done_webview_id(data: &CpuRenderData) -> WebviewId {
@@ -549,23 +530,20 @@ impl SurfaceRenderer for CpuRenderer {
             .is_some_and(|buffers| buffers.ack(generation))
     }
 
-    fn submit_deferred(&mut self, tla_tracer: &mut TLATracer) -> bool {
-        let Some(composed) = self.deferred_scene.take() else {
-            return false;
-        };
+    fn submit_deferred(&mut self) -> Option<RenderSubmit> {
+        let composed = self.deferred_scene.take()?;
         let webview_id = composed.webview_id;
-        if let Err(error) = self.submit_scene(composed, tla_tracer) {
-            match error {
-                RenderError::Deferred => {}
-                RenderError::Failed => {
-                    error!(
-                        "[graphics] submit deferred scene failed for {:?}",
-                        webview_id
-                    );
-                }
+        match self.submit_scene(composed) {
+            Ok(submit) => Some(submit),
+            Err(RenderError::Deferred) => None,
+            Err(RenderError::Failed) => {
+                error!(
+                    "[graphics] submit deferred scene failed for {:?}",
+                    webview_id
+                );
+                None
             }
         }
-        true
     }
 
     #[cfg(target_os = "macos")]

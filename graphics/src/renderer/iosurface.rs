@@ -4,8 +4,8 @@
 //! IPC pixel bytes.
 
 use super::{
-    FrameMetadata, GpuContext, PollRequest, ReadbackChannels, RenderError, SurfaceBuffers,
-    SurfaceRenderer, SurfaceRingState, frame_metadata, render_size,
+    FrameDelivery, FrameMetadata, GpuContext, PollRequest, ReadbackChannels, RenderError,
+    RenderSubmit, SurfaceBuffers, SurfaceRenderer, SurfaceRingState, frame_metadata, render_size,
 };
 use crate::iosurface::{IosurfaceTexture, create_shared_texture};
 use ipc_messages::content::WebviewId;
@@ -16,7 +16,6 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_core_video::CVPixelBuffer;
 use objc2_metal::MTLDevice;
-use verification::TLATracer;
 
 use crate::ComposedScene;
 
@@ -89,11 +88,7 @@ impl SurfaceRenderer for IosurfaceRenderer {
         })
     }
 
-    fn submit_scene(
-        &mut self,
-        composed: ComposedScene,
-        tla_tracer: &mut TLATracer,
-    ) -> Result<(), RenderError> {
+    fn submit_scene(&mut self, composed: ComposedScene) -> Result<RenderSubmit, RenderError> {
         let ComposedScene {
             webview_id,
             scene,
@@ -197,24 +192,19 @@ impl SurfaceRenderer for IosurfaceRenderer {
         );
         buffers.reserve(buffer_index, generation);
 
-        verification::tla_log!(
-            *tla_tracer,
-            -> "GPURendering",
-            "SurfaceFrameSubmitted",
-            webview_id.0,
+        Ok(RenderSubmit {
             generation,
-            format!("{}x{}", width, height),
-            buffer_index
-        );
-        Ok(())
+            width,
+            height,
+            buffer_index,
+        })
     }
 
     fn handle_render_done(
         &mut self,
         data: SharedRenderData,
         sender: &ipc::IpcSender<GraphicsEvent>,
-        tla_tracer: &mut TLATracer,
-    ) {
+    ) -> FrameDelivery {
         let SharedRenderData {
             webview_id,
             generation,
@@ -223,33 +213,32 @@ impl SurfaceRenderer for IosurfaceRenderer {
             buffer_index,
             metadata,
         } = data;
+        let mut delivery = FrameDelivery {
+            generation,
+            width,
+            height,
+            buffer_index,
+            surface_frame_sent: false,
+            graphics_computed: false,
+        };
         let Some(buffers) = self.buffers.as_mut() else {
             error!(
                 "[graphics] no surface buffers for render done {:?}",
                 webview_id
             );
-            return;
+            return delivery;
         };
         let Some(texture) = buffers.payload().get(buffer_index) else {
             error!(
                 "[graphics] bad buffer index {} for render done {:?} gen={}",
                 buffer_index, webview_id, generation
             );
-            return;
+            return delivery;
         };
         let texture_id = texture.texture_id;
         let port = texture.port_for_frame();
         buffers.ring_mut().mark_pending(buffer_index, generation);
-
-        verification::tla_log!(
-            *tla_tracer,
-            -> "GPURendering",
-            "SurfaceFrameSent",
-            webview_id.0,
-            generation,
-            format!("{}x{}", width, height),
-            buffer_index
-        );
+        delivery.surface_frame_sent = true;
 
         let frame_event = GraphicsEvent::PixelFrameReady {
             webview_id,
@@ -267,15 +256,10 @@ impl SurfaceRenderer for IosurfaceRenderer {
                 "[graphics] failed to send PixelFrameReady for {:?} gen={}: {send_error}",
                 webview_id, generation
             );
-            return;
+            return delivery;
         }
-
-        verification::tla_log!(
-            *tla_tracer,
-            -> "RenderingOpportunity",
-            "GraphicsComputed",
-            webview_id.0
-        );
+        delivery.graphics_computed = true;
+        delivery
     }
 
     fn render_done_webview_id(data: &SharedRenderData) -> WebviewId {
@@ -288,23 +272,20 @@ impl SurfaceRenderer for IosurfaceRenderer {
             .is_some_and(|buffers| buffers.ack(generation))
     }
 
-    fn submit_deferred(&mut self, tla_tracer: &mut TLATracer) -> bool {
-        let Some(composed) = self.deferred_scene.take() else {
-            return false;
-        };
+    fn submit_deferred(&mut self) -> Option<RenderSubmit> {
+        let composed = self.deferred_scene.take()?;
         let webview_id = composed.webview_id;
-        if let Err(error) = self.submit_scene(composed, tla_tracer) {
-            match error {
-                RenderError::Deferred => {}
-                RenderError::Failed => {
-                    error!(
-                        "[graphics] submit deferred scene failed for {:?}",
-                        webview_id
-                    );
-                }
+        match self.submit_scene(composed) {
+            Ok(submit) => Some(submit),
+            Err(RenderError::Deferred) => None,
+            Err(RenderError::Failed) => {
+                error!(
+                    "[graphics] submit deferred scene failed for {:?}",
+                    webview_id
+                );
+                None
             }
         }
-        true
     }
 
     fn import_video_frame(
