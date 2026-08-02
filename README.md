@@ -56,5 +56,35 @@ A set of core algorithms will be formalized using TLA+, and their Rust implement
 
 ## Pi coding agent extensions
 
-- [**`browser`**](.pi/extensions/browser/README.md) — browser automation for testing
-- [**`web_standards`**](.pi/extensions/web_standards/README.md) — interactive spec content
+Pi automatically discovers extensions in `.pi/extensions/` (one level deep, each
+directory containing an `index.ts` or a `package.json` with a `pi.extensions`
+field). The extensions are plain TypeScript with their own npm dependencies.
+
+### Setup
+
+`node_modules/` is git-ignored, so a fresh checkout must install the npm
+dependencies for each extension before pi can load it. From the repository root:
+
+```bash
+cd .pi/extensions/browser && npm ci && cd ../../..
+cd .pi/extensions/web_standards && npm ci && cd ../../..
+```
+
+After this, restart pi in the repository directory (or reload extensions if you
+are already in a session) and the tools and commands below become available.
+If an extension fails to load with `Cannot find module 'ws'` or
+`Cannot find module 'cheerio'`, the npm install step above was skipped.
+
+### Extensions
+
+- [**`browser`**](.pi/extensions/browser/README.md) — browser automation for
+  testing. Depends on [`ws`](https://www.npmjs.com/package/ws) for its WebSocket
+  CDP client. Connect it to formal-web's CDP server (`/browser-connect <port>`)
+  to drive live debugging sessions; the extension also works with standard
+  Chrome/Chromium instances.
+- [**`web_standards`**](.pi/extensions/web_standards/README.md) — interactive
+  spec reading (`spec_lookup`, `spec_ref_links`, `spec_search_id`). Depends on
+  [`cheerio`](https://www.npmjs.com/package/cheerio) for server-side HTML
+  parsing and traversal of WHATWG/W3C spec documents.
+- [**`readme-chain`**](.pi/extensions/readme-chain/README.md) — walks the
+  AGENTS.md/README.md documentation chain for a path; no npm dependencies.
