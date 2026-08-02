@@ -66,4 +66,3 @@ blitz-traits = { git = "https://github.com/gterzian/blitz", rev = "954b41f25e4fb
 blitz-dom = { git = "https://github.com/gterzian/blitz", rev = "954b41f25e4fbfae39d7c512016d8193ee53ee80", default-features = false }
 blitz-paint = { git = "https://github.com/gterzian/blitz", rev = "954b41f25e4fbfae39d7c512016d8193ee53ee80", default-features = false }
 blitz-html = { git = "https://github.com/gterzian/blitz", rev = "954b41f25e4fbfae39d7c512016d8193ee53ee80", default-features = false }
-

@@ -100,14 +100,14 @@ impl PipelineHandle for AvfPipeline {
         rl.runUntilDate(&until);
 
         // Duration check (once).
-        if !self.duration_reported.get() {
-            if self.item.status() == objc2_av_foundation::AVPlayerItemStatus::ReadyToPlay {
-                let secs = self.item.duration_secs();
-                if secs > 0.0 {
-                    log::info!("[avf] p{}: duration = {secs}s", self.id.0);
-                }
-                self.duration_reported.set(true);
+        if !self.duration_reported.get()
+            && self.item.status() == objc2_av_foundation::AVPlayerItemStatus::ReadyToPlay
+        {
+            let secs = self.item.duration_secs();
+            if secs > 0.0 {
+                log::info!("[avf] p{}: duration = {secs}s", self.id.0);
             }
+            self.duration_reported.set(true);
         }
 
         // Detect end of stream: rate dropped to 0 after playing.
@@ -125,9 +125,11 @@ impl PipelineHandle for AvfPipeline {
                         self.id.0
                     );
                     self.eos_sent.set(true);
-                    let _ = self.event_tx.send(MediaBackendEvent::Eos {
+                    if let Err(send_error) = self.event_tx.send(MediaBackendEvent::Eos {
                         pipeline_id: self.id,
-                    });
+                    }) {
+                        log::error!("[avf] p{}: eos send failed: {send_error}", self.id.0);
+                    }
                 }
             }
         }
@@ -135,17 +137,26 @@ impl PipelineHandle for AvfPipeline {
         // Poll for frames.
         let host_secs = super::av_sys::time::host_time_seconds();
         let item_time = self.video_output.item_time_for_host_time(host_secs);
-        if self.video_output.has_new_pixel_buffer(item_time) {
-            if let Some(pixel_buf) = self.video_output.copy_pixel_buffer(item_time) {
-                if let Some(lock) = super::av_sys::pixel_buffer::PixelBufferLock::new(pixel_buf) {
-                    if let Some(frame) =
-                        super::av_sys::pixel_buffer::pixel_buffer_to_frame(self.id, &lock)
-                    {
-                        let _ = self
-                            .event_tx
-                            .send(crate::backend::MediaBackendEvent::Frame(frame));
-                    }
-                }
+        if self.video_output.has_new_pixel_buffer(item_time)
+            && let Some(pixel_buf) = self.video_output.copy_pixel_buffer(item_time)
+        {
+            // Deliver the pixel buffer itself: the graphics process wraps
+            // it as a Metal texture (zero-copy when GPU-backed) instead
+            // of the CPU byte conversion.
+            let width = super::av_sys::pixel_buffer::pixel_buffer_width(&pixel_buf);
+            let height = super::av_sys::pixel_buffer::pixel_buffer_height(&pixel_buf);
+            if let Err(send_error) = self.event_tx.send(MediaBackendEvent::PixelBufferFrame(
+                crate::backend::PixelBufferVideoFrame {
+                    pipeline_id: self.id,
+                    width,
+                    height,
+                    pixel_buffer: pixel_buf,
+                },
+            )) {
+                log::error!(
+                    "[avf] p{}: pixel buffer frame send failed: {send_error}",
+                    self.id.0
+                );
             }
         }
     }

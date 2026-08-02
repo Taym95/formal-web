@@ -16,7 +16,7 @@ path = "src/bin/webdriver_screenshot_check.rs"
 base64 = "0.22"
 clap = { version = "4.5", features = ["derive"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
-ipc-channel = "0.21"
+ipc-channel = { git = "https://github.com/gterzian/ipc-channel" }
 serde = { version = "1", features = ["derive"] }
 log = "0.4"
 env_logger = "0.11"

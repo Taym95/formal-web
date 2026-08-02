@@ -25,9 +25,13 @@ fn main() {
         let receiver = ipc::crossbeam_proxy(server.connection.receiver);
         let event_tx = server.connection.sender.clone();
 
-        // Initialize the platform-specific media backend.
-        // On Apple platforms AVFoundation is used; elsewhere GStreamer.
-        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        // Initialize the media backend: AVFoundation on Apple platforms
+        // when it is the active backend (explicit feature, or the default
+        // when no backend feature is selected); GStreamer otherwise.
+        #[cfg(all(
+            any(target_os = "macos", target_os = "ios"),
+            any(feature = "backend-avfoundation", not(feature = "backend-gstreamer"))
+        ))]
         let backend: Option<media::backend::avfoundation::AvfBackend> =
             match media::backend::avfoundation::AvfBackend::init() {
                 Ok(b) => {
@@ -40,7 +44,10 @@ fn main() {
                 }
             };
 
-        #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+        #[cfg(not(all(
+            any(target_os = "macos", target_os = "ios"),
+            any(feature = "backend-avfoundation", not(feature = "backend-gstreamer"))
+        )))]
         let backend: Option<media::backend::gstreamer::GStreamerBackend> =
             match media::backend::gstreamer::GStreamerBackend::init() {
                 Ok(b) => {
@@ -53,7 +60,17 @@ fn main() {
                 }
             };
 
-        graphics::run_graphics_process(receiver, event_tx, backend);
+        // The surface renderer backend is chosen at compile time by feature:
+        // the zero-copy IOSurface renderer on macOS by default, the CPU
+        // readback renderer off macOS and with `cpu_readback`.
+        #[cfg(all(target_os = "macos", not(feature = "cpu_readback")))]
+        graphics::run_graphics_process::<_, graphics::renderer::IosurfaceRenderer>(
+            receiver, event_tx, backend,
+        );
+        #[cfg(any(not(target_os = "macos"), feature = "cpu_readback"))]
+        graphics::run_graphics_process::<_, graphics::renderer::CpuRenderer>(
+            receiver, event_tx, backend,
+        );
         Ok(())
     });
     if let Err(error) = result {

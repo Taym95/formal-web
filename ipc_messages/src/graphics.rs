@@ -4,6 +4,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use uuid::Uuid;
 
+#[cfg(target_os = "macos")]
+use ipc_channel::platform::OsMachPort;
+
 /// Identifies a per-webview compositor slot within the graphics process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct CompositorSlotId(pub Uuid);
@@ -118,13 +121,18 @@ pub struct FrameHitInfo {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum GraphicsEvent {
-    /// A rendered surface frame is ready for one webview. Pixels live in the
-    /// IPC shared memory region carried alongside the message; the embedder
-    /// uploads them in place into its persistent per-webview texture.
+    /// A rendered surface frame is ready for one webview. The pixels are
+    /// delivered according to `payload`:
+    ///
+    /// - `CpuShmem`: bytes live in the IPC shared memory region carried
+    ///   alongside the message; the embedder uploads them in place into its
+    ///   persistent per-webview texture.
+    /// - `SharedTexture` (macOS): the frame was rendered directly into a
+    ///   shared IOSurface; the embedder imports the surface and blits it.
     PixelFrameReady {
         webview_id: WebviewId,
-        /// Key into the IPC shared memory map for the rendered RGBA pixel buffer.
-        shmem_key: usize,
+        /// How the rendered pixels are delivered to the embedder.
+        payload: SurfacePayload,
         /// True when the composed scene contains animated content (video)
         /// that requires the UA to re-note a rendering opportunity even
         /// without user input.
@@ -146,6 +154,46 @@ pub enum GraphicsEvent {
     },
     /// The graphics process is shutting down.
     ShutdownComplete,
+}
+
+/// How a rendered frame's pixels are delivered to the embedder.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum SurfacePayload {
+    /// CPU readback pixels in the IPC shared-memory map (the default off
+    /// macOS, where the GStreamer media backend delivers CPU video bytes;
+    /// opt-in on macOS via the graphics crate's `cpu_readback` build).
+    CpuShmem {
+        /// Key into the IPC shared memory map for the rendered RGBA pixel buffer.
+        shmem_key: usize,
+    },
+    /// macOS zero-copy: the frame was rendered directly into a shared
+    /// IOSurface, whose Mach port travels in this variant. The embedder
+    /// looks the surface up from the port and blits it.
+    #[cfg(target_os = "macos")]
+    SharedTexture {
+        /// Stable identity of the shared IOSurface; changes on resize.
+        texture_id: u64,
+        /// Mach port (send right) to the IOSurface.
+        port: OsMachPort,
+    },
+}
+
+/// A rendered surface frame delivered to the embedder: the pixel delivery
+/// backend plus its payload. This is the boundary type (user agent →
+/// embedder event) — unlike the wire [`SurfacePayload`], the CPU path's
+/// shared-memory region is already extracted and carried here.
+#[derive(Debug)]
+pub enum SurfaceFrame {
+    /// CPU readback pixels in a shared-memory region.
+    CpuShmem(ipc::IpcSharedRegion),
+    /// macOS zero-copy: a shared IOSurface to import and blit.
+    #[cfg(target_os = "macos")]
+    SharedTexture {
+        /// Stable identity of the shared IOSurface; changes on resize.
+        texture_id: u64,
+        /// Mach port (send right) to the IOSurface.
+        port: OsMachPort,
+    },
 }
 
 /// Viewport data for a child frame (iframe), used by the UA to publish

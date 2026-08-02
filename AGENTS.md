@@ -252,7 +252,10 @@ cargo build --release -p media --bin formal-web-media \
 # Linux: GStreamer (only backend) — no special flags needed
 cargo build --release -p media --bin formal-web-media
 
-# Graphics process (composition + media backend)
+# Graphics process (composition + media backend). The surface backend is
+# zero-copy IOSurface by default on macOS; build with `--features cpu_readback`
+# for the CPU readback backend there. Off macOS the CPU readback backend is
+# the only one.
 cargo build --release -p graphics --bin formal-web-graphics
 ```
 

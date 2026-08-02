@@ -3,16 +3,17 @@
 //! info back to the user agent.
 
 use anyrender::{PaintScene, Scene as RenderScene};
+use ipc::IpcSharedRegion;
 use ipc_messages::content::{
     EmbedBackgroundPolicy, EmbedSite, FontTransportReceiver, FrameCompositionMetadata, FrameId,
-    IframeEmbedSite, RecordedScene,
+    IframeEmbedSite, PaintFrame, RecordedScene,
 };
 use ipc_messages::graphics::FrameHitInfo;
 
 use crate::ComposedScene;
 use ipc_messages::media::VideoPaintId;
-use kurbo::{Affine, Point, Rect, RoundedRect, Shape};
-use log::{info, trace};
+use kurbo::{Affine, Rect, RoundedRect, Shape};
+use log::{error, info, trace};
 use peniko::{Color, Fill, ImageAlphaType, ImageBrushRef, ImageData, ImageFormat};
 use std::collections::{HashMap, HashSet};
 use std::env;
@@ -30,10 +31,6 @@ struct ResolvedViewport {
 impl ResolvedViewport {
     fn new(width: f64, height: f64) -> Self {
         Self { width, height }
-    }
-
-    fn contains_local_point(&self, point: Point) -> bool {
-        point.x >= 0.0 && point.y >= 0.0 && point.x < self.width && point.y < self.height
     }
 
     fn intersects_local_rect(&self, rect: Rect) -> bool {
@@ -60,13 +57,17 @@ struct CachedFrame {
     scene: RecordedScene,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct HitTestResult {
-    pub frame_id: FrameId,
-    pub local_x: f32,
-    pub local_y: f32,
-    pub is_child_frame: bool,
-    pub has_child_frames: bool,
+/// The content of a decoded video frame: CPU bytes (cross-platform) or a
+/// GPU texture on the graphics device (macOS zero-copy).
+#[derive(Clone)]
+pub enum VideoFrameContent {
+    /// RGBA8 pixel data, width * height * 4 bytes.
+    Bytes(std::sync::Arc<[u8]>),
+    /// Fake image data referencing a GPU texture on the graphics device
+    /// (registered with the renderer's Vello via `override_image`); drawn
+    /// as a plain image brush.
+    #[cfg(target_os = "macos")]
+    Texture(peniko::ImageData),
 }
 
 /// Carries the latest decoded video frame for a given pipeline, ready to paint.
@@ -75,11 +76,15 @@ pub struct CompositorVideoFrame {
     pub video_paint_id: VideoPaintId,
     pub width: u32,
     pub height: u32,
-    /// RGBA8 pixel data, width * height * 4 bytes.
-    pub data: std::sync::Arc<[u8]>,
+    pub content: VideoFrameContent,
 }
 
-#[derive(Clone, Default)]
+/// The per-webview compositor: receives PaintFrames and VideoFrames,
+/// composes them into a single final scene, and publishes the result plus
+/// hit-testing info back to the user agent. Owns the webview's font
+/// transport state (fonts registered from content PaintFrames, resolved
+/// when recorded scenes are turned into render scenes).
+#[derive(Default)]
 pub struct Compositor {
     root_frame_id: Option<FrameId>,
     committed_frames: HashMap<FrameId, CachedFrame>,
@@ -88,6 +93,10 @@ pub struct Compositor {
     resolved_tree_dirty: bool,
     /// Latest frame per video paint id.
     video_frames: HashMap<VideoPaintId, CompositorVideoFrame>,
+    /// Font transport state for this webview: fonts registered from content
+    /// PaintFrames, resolved when recorded scenes are turned into render
+    /// scenes.
+    font_receiver: FontTransportReceiver,
 }
 
 impl Compositor {
@@ -188,59 +197,27 @@ impl Compositor {
         self.resolved_tree_dirty = true;
     }
 
-    pub fn committed_root_frame_id(&self) -> Option<FrameId> {
-        self.root_frame_id
-    }
-
-    /// True when the compositor has active video content that requires
-    /// continuous re-rendering even without user input.
-    /// True when the compositor has active video content that requires
-    /// continuous re-rendering even without user input.
-    pub fn has_animated_content(&self) -> bool {
-        !self.video_frames.is_empty()
-    }
-
-    pub fn has_valid_viewport(&self) -> bool {
-        self.root_frame_id
-            .and_then(|id| self.committed_frames.get(&id))
-            .map(|frame| frame.viewport_width > 0 && frame.viewport_height > 0)
-            .unwrap_or(false)
-    }
-
-    /// True when the root frame is committed and all child frames listed in
-    /// the root's embed sites have also been received. Used by the graphics
-    /// process to delay composition until all embedded content is available.
-    pub fn all_children_received(&self) -> bool {
-        let root_id = match self.root_frame_id {
-            Some(id) => id,
-            None => return false,
-        };
-        let root = match self.committed_frames.get(&root_id) {
-            Some(frame) => frame,
-            None => return false,
-        };
-        for site in &root.composition.embed_sites {
-            if let EmbedSite::Frame(iframe) = site {
-                if !self.committed_frames.contains_key(&iframe.child_frame_id) {
-                    return false;
-                }
-            }
-        }
-        true
+    /// Decode a content PaintFrame into a recorded scene, registering its
+    /// fonts in this compositor's font transport state.
+    pub fn decode_frame(
+        &mut self,
+        frame: PaintFrame,
+        shmem_regions: &HashMap<usize, IpcSharedRegion>,
+    ) -> Result<RecordedScene, String> {
+        frame.into_recorded_scene(&mut self.font_receiver, shmem_regions)
     }
 
     /// Compose the final scene for this compositor and return it with
     /// hit-testing info. Caller is responsible for resetting state.
     pub fn compose_scene(
         &mut self,
-        font_receiver: &FontTransportReceiver,
         webview_id: ipc_messages::content::WebviewId,
     ) -> Option<ComposedScene> {
         let root_frame_id = self.root_frame_id?;
         self.reset_composed_frame_state();
         self.prepare_root_frame(root_frame_id)?;
         let mut stack = HashSet::from([root_frame_id]);
-        let scene = self.compose_frame(root_frame_id, font_receiver, &mut stack, Affine::IDENTITY);
+        let scene = self.compose_frame(root_frame_id, &mut stack, Affine::IDENTITY);
         self.resolved_tree_dirty = false;
 
         let scene = scene?;
@@ -364,30 +341,28 @@ impl Compositor {
         }
     }
 
-    pub fn visible_frame_viewports(
-        &mut self,
-        font_receiver: &FontTransportReceiver,
-    ) -> Vec<super::VisibleFrameViewport> {
+    pub fn visible_frame_viewports(&mut self) -> Vec<super::VisibleFrameViewport> {
         let refresh_needed = self.resolved_tree_dirty
             || self
                 .root_frame_id
                 .and_then(|frame_id| self.committed_frames.get(&frame_id))
                 .and_then(|frame| frame.resolved_viewport.as_ref())
                 .is_none();
-        if refresh_needed {
-            if let Some(root_frame_id) = self.root_frame_id {
-                self.reset_composed_frame_state();
-                if self.prepare_root_frame(root_frame_id).is_some() {
-                    let mut stack = HashSet::from([root_frame_id]);
-                    let _ = self.compose_frame(
-                        root_frame_id,
-                        font_receiver,
-                        &mut stack,
-                        Affine::IDENTITY,
+        if refresh_needed && let Some(root_frame_id) = self.root_frame_id {
+            self.reset_composed_frame_state();
+            if self.prepare_root_frame(root_frame_id).is_some() {
+                let mut stack = HashSet::from([root_frame_id]);
+                if self
+                    .compose_frame(root_frame_id, &mut stack, Affine::IDENTITY)
+                    .is_none()
+                {
+                    error!(
+                        "[compositor] refresh compose failed for root frame {}",
+                        root_frame_id.0
                     );
                 }
-                self.resolved_tree_dirty = false;
             }
+            self.resolved_tree_dirty = false;
         }
 
         let Some(root_frame_id) = self.root_frame_id else {
@@ -399,48 +374,9 @@ impl Compositor {
         viewports
     }
 
-    pub fn hit_test(
-        &mut self,
-        x: f64,
-        y: f64,
-        font_receiver: &FontTransportReceiver,
-    ) -> Option<HitTestResult> {
-        let refresh_needed = self.resolved_tree_dirty
-            || self
-                .root_frame_id
-                .and_then(|frame_id| self.committed_frames.get(&frame_id))
-                .and_then(|frame| frame.resolved_viewport.as_ref())
-                .is_none();
-        if input_debug_enabled() {
-            trace!(
-                "[input-debug][compositor] hit_test client=({x:.1},{y:.1}) refresh_needed={refresh_needed}"
-            );
-        }
-        if refresh_needed {
-            let root_frame_id = self.root_frame_id?;
-            self.reset_composed_frame_state();
-            self.prepare_root_frame(root_frame_id)?;
-            let mut stack = HashSet::from([root_frame_id]);
-            let _ = self.compose_frame(root_frame_id, font_receiver, &mut stack, Affine::IDENTITY);
-            self.resolved_tree_dirty = false;
-        }
-
-        let root_frame_id = self.root_frame_id?;
-        if self
-            .committed_frames
-            .get(&root_frame_id)
-            .and_then(|frame| frame.resolved_viewport.as_ref())
-            .is_none()
-        {
-            self.prepare_root_frame(root_frame_id)?;
-        }
-        self.hit_test_frame(root_frame_id, Point::new(x, y))
-    }
-
     fn compose_frame(
         &mut self,
         frame_id: FrameId,
-        font_receiver: &FontTransportReceiver,
         stack: &mut HashSet<FrameId>,
         frame_local_to_root: Affine,
     ) -> Option<RenderScene> {
@@ -457,7 +393,7 @@ impl Compositor {
         let (embed_sites, decoded_scene) = {
             let frame = self.committed_frames.get(&frame_id)?;
             let embed_sites = frame.composition.embed_sites.clone();
-            let scene = frame.scene.clone().into_scene(font_receiver);
+            let scene = frame.scene.clone().into_scene(&self.font_receiver);
 
             (embed_sites, scene)
         };
@@ -499,12 +435,9 @@ impl Compositor {
                         continue;
                     }
 
-                    if let Some(child_scene) = self.compose_frame(
-                        child_frame_id,
-                        font_receiver,
-                        stack,
-                        child_local_to_root,
-                    ) {
+                    if let Some(child_scene) =
+                        self.compose_frame(child_frame_id, stack, child_local_to_root)
+                    {
                         let clip = Self::embed_local_clip(iframe_site);
                         let transform = Affine::new(iframe_site.layout.transform);
                         let child_transform = self
@@ -563,15 +496,6 @@ impl Compositor {
                     };
                     let local_clip = clip_rect;
 
-                    let pixel_data = video_frame.data.clone();
-                    let image_data = ImageData {
-                        data: peniko::Blob::from(pixel_data.to_vec()),
-                        format: ImageFormat::Rgba8,
-                        alpha_type: ImageAlphaType::Alpha,
-                        width: video_frame.width,
-                        height: video_frame.height,
-                    };
-
                     let local_w = local_clip.width();
                     let local_h = local_clip.height();
                     let scale_x = if video_frame.width > 0 {
@@ -590,7 +514,27 @@ impl Compositor {
                         Some(ref rc) => composed_scene.push_clip_layer(transform, rc),
                         None => composed_scene.push_clip_layer(transform, &local_clip),
                     };
-                    composed_scene.draw_image(ImageBrushRef::from(&image_data), video_transform);
+                    match &video_frame.content {
+                        VideoFrameContent::Bytes(pixel_bytes) => {
+                            let image_data = ImageData {
+                                data: peniko::Blob::from(pixel_bytes.to_vec()),
+                                format: ImageFormat::Rgba8,
+                                alpha_type: ImageAlphaType::Alpha,
+                                width: video_frame.width,
+                                height: video_frame.height,
+                            };
+                            composed_scene
+                                .draw_image(ImageBrushRef::from(&image_data), video_transform);
+                        }
+                        #[cfg(target_os = "macos")]
+                        VideoFrameContent::Texture(image_data) => {
+                            // The texture is sampled by the graphics Vello
+                            // renderer via its override_image registration;
+                            // the scene just references the fake image data.
+                            composed_scene
+                                .draw_image(ImageBrushRef::from(image_data), video_transform);
+                        }
+                    }
                     composed_scene.pop_layer();
                 }
             }
@@ -780,39 +724,6 @@ impl Compositor {
             self.collect_scene_descendant_frames(child_frame_id, frames, stack);
             stack.remove(&child_frame_id);
         }
-    }
-
-    fn hit_test_frame(&self, frame_id: FrameId, point: Point) -> Option<HitTestResult> {
-        let frame = self.committed_frames.get(&frame_id)?;
-        let resolved_viewport = frame.resolved_viewport.as_ref()?;
-        if !resolved_viewport.contains_local_point(point) {
-            return None;
-        }
-
-        for child in frame.child_frames.iter().rev() {
-            if child.clip_bounds.contains(point) {
-                let child_point = child.child_local_from_parent * point;
-                if let Some(hit) = self.hit_test_frame(child.child_frame_id, child_point) {
-                    return Some(hit);
-                }
-                if let Some(hit) = self.local_hit(child.child_frame_id, child_point) {
-                    return Some(hit);
-                }
-            }
-        }
-
-        self.local_hit(frame_id, point)
-    }
-
-    fn local_hit(&self, frame_id: FrameId, point: Point) -> Option<HitTestResult> {
-        let frame = self.committed_frames.get(&frame_id);
-        Some(HitTestResult {
-            frame_id,
-            local_x: point.x as f32,
-            local_y: point.y as f32,
-            is_child_frame: frame.is_none_or(|frame| frame.parent_frame_id.is_some()),
-            has_child_frames: frame.is_some_and(|frame| !frame.child_frames.is_empty()),
-        })
     }
 
     fn child_scene_transform(&self, clip: &impl Shape, child_frame_id: FrameId) -> Option<Affine> {

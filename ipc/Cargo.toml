@@ -22,7 +22,7 @@ postcard = { version = "1", features = ["use-std"] }
 
 # Always available: content uses ipc-channel when not using ipc-channel-backend
 # (see Module docs in backend.rs).
-ipc-channel = "0.21"
+ipc-channel = { git = "https://github.com/gterzian/ipc-channel" }
 
 # xpc-sys is only needed on Apple targets without ipc-channel-backend.
 # Cargo cfg-gated dependencies don't support feature selectors in the

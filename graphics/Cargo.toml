@@ -8,6 +8,21 @@ autobins = false
 [features]
 default = []
 ipc-channel-backend = ["ipc/ipc-channel-backend"]
+# Surface backend selection. The zero-copy IOSurface backend is the default
+# on macOS (matching the default AVFoundation media backend); enabling
+# `cpu_readback` selects the CPU readback + shared-memory backend there
+# instead. Off macOS the CPU readback backend is the only one (the GStreamer
+# media backend delivers CPU video bytes).
+cpu_readback = []
+# Force the zero-copy IOSurface backend. It is already the default on macOS;
+# on other platforms it is a compile error (IOSurface sharing is macOS-only).
+zero_copy = []
+# Media backend selection, forwarded to the media crate so this crate's
+# AVFoundation-specific code matches the backend that will actually deliver
+# video frames. Off macOS the CPU readback surface backend is the only one
+# (the GStreamer media backend delivers CPU video bytes).
+backend-avfoundation = ["media/backend-avfoundation"]
+backend-gstreamer = ["media/backend-gstreamer"]
 
 [lib]
 path = "src/lib.rs"
@@ -23,6 +38,7 @@ anyrender_vello = "0.10.1"
 ipc = { path = "../ipc" }
 ipc_messages = { path = "../ipc_messages" }
 media = { path = "../media" }
+ipc-channel = { git = "https://github.com/gterzian/ipc-channel" }
 kurbo = "0.13"
 peniko = "0.6"
 serde = { version = "1", features = ["derive"] }
@@ -36,6 +52,7 @@ pollster = "0.4"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
-objc2-metal = "0.3"
+objc2-metal = { version = "0.3", features = ["objc2-io-surface"] }
 objc2-core-foundation = "0.3"
 objc2-io-surface = "0.3"
+objc2-core-video = "0.3"
