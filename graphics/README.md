@@ -225,6 +225,32 @@ because Vello's `register_texture` requires `Rgba8Unorm`.
 
 ## Open risks and questions
 
+- **The `animating` flag is the wrong signal for video (follow-up).** Content
+  currently sets `PaintFrame.animating = has_video` (the document has a non-
+  ended video element), which the UA uses to keep re-noting rendering
+  opportunities. That flag drives the render cycle even when the video is not
+  producing frames (failed/blocked load, ended-but-not-marked, muted
+  autoplay blocked): the content re-renders the same scene, the graphics
+  process re-composes an identical frame, and the embedder repaints identical
+  pixels — observed as the same content frame id re-rendered continuously at
+  ~30fps. Planned follow-up:
+  - Set `animating` only when the document has a **pending rAF callback**
+    (script-driven animation).
+  - Handle video-driven continuous flow separately: either a dedicated
+    flag, or — preferred — have the graphics process (which receives both
+    the media backend's video frames and content's `PaintFrame`) produce a
+    new surface texture only when the composition actually changed (a new
+    video frame arrived since the last composition, or a new content
+    frame). The media backend delivers frames to the graphics compositor
+    directly (`MediaBackendEvent::Frame`/`PixelBufferFrame`), so graphics
+    is the natural place to gate on "a proper video frame".
+  - Constraint: compositions must stay tied to render cycles (the
+    "never compose independently from the video handler" rule, to keep the
+    GPURendering/RenderingOpportunity TLA pipeline models valid). A
+    video-frame arrival should therefore re-note a rendering opportunity
+    through the UA (e.g. a `VideoFrameReady` trace event), and the
+    composition itself still happens on the root `PaintFrame` within the
+    cycle.
 - **Resize**: on resize the whole 2-slot IOSurface double buffer is recreated
   and the embedder re-imports + re-registers the new surfaces. The update
   happens in one large step once the resize settles — there is no incremental
