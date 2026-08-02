@@ -31,24 +31,6 @@ cargo run --release --no-default-features --features v8,media
 cargo build --release --no-default-features --features backend-gstreamer,boa,media
 ```
 
-The graphics process has two independent backends — scene delivery
-(zero-copy IOSurface, macOS only, or CPU readback, all platforms) and
-video frames (AVFoundation keeps decoded frames on the GPU, GStreamer
-delivers CPU bytes):
-
-| Build | Scene delivery | Video | Result |
-|---|---|---|---|
-| macOS default | zero-copy (IOSurface) | AVFoundation (GPU) | fully zero-copy |
-| macOS + `--no-default-features --features backend-gstreamer,boa,media` | zero-copy (IOSurface) | GStreamer (CPU bytes) | video via CPU, scene zero-copy |
-| macOS + `-p graphics --features cpu_readback` | CPU readback | either | scene via shared memory |
-| Linux | CPU readback | GStreamer (CPU bytes) | no zero-copy |
-
-Trade-offs: zero-copy avoids a GPU→CPU readback, IPC pixel bytes, and a
-CPU→GPU upload per frame but needs macOS (IOSurface); CPU readback works
-everywhere. AVFoundation keeps video on the GPU (macOS only); GStreamer
-runs everywhere but copies each decoded video frame through the CPU.
-
-
 ## Project architecture
 
 A multiprocess approach is chosen by default, with the goal of having the possibility to meet [Apple's guidelines for an independent browser engine](https://developer.apple.com/documentation/BrowserEngineKit/designing-your-browser-architecture). 
@@ -67,21 +49,35 @@ The following procesess are used:
 - **Graphics** (`graphics/src/bin/graphics_process.rs`): runs the `graphics` and `media` crates.
 - **Net** (`user_agent/src/fetch.rs`): runs the `net` crate.
 
-### External dependency: forked ipc-channel
+## Modular design
 
-The zero-copy IOSurface surface path needs to transport arbitrary Mach ports
-(an IOSurface's) inside IPC messages, which upstream ipc-channel cannot do. The
-workspace depends on a fork at
-<https://github.com/gterzian/ipc-channel> that adds an `OsMachPort`
-serde-transportable type (each crate declares it as a git dependency; the
-`Cargo.lock` pins the fork revision). The CPU-only surface path also builds
-from the fork.
+The graphics process has two independent backends — scene delivery
+(zero-copy IOSurface, macOS only, or CPU readback, all platforms) and
+video frames (AVFoundation keeps decoded frames on the GPU, GStreamer
+delivers CPU bytes):
+
+| Build | Scene delivery | Video | Result |
+|---|---|---|---|
+| macOS default | zero-copy (IOSurface) | AVFoundation (GPU) | fully zero-copy |
+| macOS + `--no-default-features --features backend-gstreamer,boa,media` | zero-copy (IOSurface) | GStreamer (CPU bytes) | video via CPU, scene zero-copy |
+| macOS + `-p graphics --features cpu_readback` | CPU readback | either | scene via shared memory |
+
+Trade-offs: zero-copy avoids a GPU→CPU readback, IPC pixel bytes, and a
+CPU→GPU upload per frame but needs macOS (IOSurface); CPU readback works
+everywhere. AVFoundation keeps video on the GPU (macOS only); GStreamer
+runs everywhere but copies each decoded video frame through the CPU.
+
+The main idea behind the current modular implementations:
+- one fast Apple path (tested on Mac OS only for now, intent for it to work in IOS as well)
+- one slow cross platform path (tested on Mac OS only for now).
 
 ## Formal verification
 
 A set of core algorithms will be formalized using TLA+, and their Rust implementation model-checked against those formal specification using the tracing approach described in [Validating Traces of Distributed Programs Against TLA+ Specifications](https://arxiv.org/abs/2404.16075). For further details, see [the verification folder](verification/README.md).
 
 ## Pi coding agent extensions
+
+The project is build using the Pi agent, and comes with a a few extensions to it.
 
 Pi automatically discovers extensions in `.pi/extensions/` (one level deep, each
 directory containing an `index.ts` or a `package.json` with a `pi.extensions`
