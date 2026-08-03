@@ -71,58 +71,78 @@ pub(crate) fn try_set_event_target_reflector(
     ec: &mut dyn ExecutionContext<Types>,
 ) {
     if let Some(obj) = <Types as JsTypes>::value_as_object(value) {
-        let obj_clone = obj.clone();
-        // AbortSignal exposes its EventTarget through a shared cell, so its
-        // reflector is set after the registry borrow ends (its setter needs
-        // `ec`). Clone the handle out; the clone shares the same cell. The
-        // reflector is cloned up front because the walk below moves
-        // `obj_clone` into whichever branch matches.
-        let signal_reflector = obj_clone.clone();
-        let mut signal_to_update: Option<AbortSignal> = None;
-        if let Some(data) = ec.with_object_any_mut(&obj) {
-            // Walk all known platform object types that embed an EventTarget.
-            if let Some(window) = data.downcast_mut::<Window>() {
-                window.event_target.reflector = Some(obj_clone);
-            } else if let Some(document) = data.downcast_mut::<Document>() {
-                document.node.event_target.reflector = Some(obj_clone);
-            } else if let Some(element) = data.downcast_mut::<Element>() {
-                element.node.event_target.reflector = Some(obj_clone);
-            } else if let Some(html_element) = data.downcast_mut::<HTMLElement>() {
-                html_element.element.node.event_target.reflector = Some(obj_clone);
-            } else if let Some(anchor) = data.downcast_mut::<HTMLAnchorElement>() {
-                anchor.html_element.element.node.event_target.reflector = Some(obj_clone);
-            } else if let Some(iframe) = data.downcast_mut::<HTMLIFrameElement>() {
-                iframe.html_element.element.node.event_target.reflector = Some(obj_clone);
-            } else if let Some(media) = data.downcast_mut::<HTMLMediaElement>() {
-                media.html_element.element.node.event_target.reflector = Some(obj_clone);
-            } else if let Some(input) = data.downcast_mut::<HTMLInputElement>() {
-                input.html_element.element.node.event_target.reflector = Some(obj_clone);
-            } else if let Some(video) = data.downcast_mut::<HTMLVideoElement>() {
-                video
-                    .media_element
-                    .html_element
-                    .element
-                    .node
-                    .event_target
-                    .reflector = Some(obj_clone);
-            } else if let Some(node) = data.downcast_mut::<Node>() {
-                node.event_target.reflector = Some(obj_clone);
-            } else if let Some(target) = data.downcast_mut::<EventTarget>() {
-                target.reflector = Some(obj_clone);
-            } else if let Some(signal) = data.downcast_mut::<AbortSignal>() {
-                signal_to_update = Some(signal.clone());
-            } else if let Some(event) = data.downcast_mut::<Event>() {
-                event.reflector = Some(obj_clone);
-            } else if let Some(ui_event) = data.downcast_mut::<UIEvent>() {
-                ui_event.event.reflector = Some(obj_clone);
-            }
-        }
-        if let Some(signal) = signal_to_update {
-            signal.with_event_target_mut(
-                |event_target, _ec| event_target.reflector = Some(signal_reflector),
-                ec,
-            );
-        }
+        let reflector = obj.clone();
+        // Walk all known platform object types that embed an EventTarget.
+        // The reflector slot is written through `store_js_object` so the V8
+        // backend converts the stored handle into a cppgc edge (the cycle
+        // between the wrapper and its platform object becomes collectable).
+        ec.with_object_any_mut_with(
+            &obj,
+            Box::new(move |data, ec| {
+                if let Some(window) = data.downcast_mut::<Window>() {
+                    ec.store_js_object(&mut window.event_target.reflector, reflector);
+                } else if let Some(document) = data.downcast_mut::<Document>() {
+                    ec.store_js_object(&mut document.node.event_target.reflector, reflector);
+                } else if let Some(element) = data.downcast_mut::<Element>() {
+                    ec.store_js_object(&mut element.node.event_target.reflector, reflector);
+                } else if let Some(html_element) = data.downcast_mut::<HTMLElement>() {
+                    ec.store_js_object(
+                        &mut html_element.element.node.event_target.reflector,
+                        reflector,
+                    );
+                } else if let Some(anchor) = data.downcast_mut::<HTMLAnchorElement>() {
+                    ec.store_js_object(
+                        &mut anchor.html_element.element.node.event_target.reflector,
+                        reflector,
+                    );
+                } else if let Some(iframe) = data.downcast_mut::<HTMLIFrameElement>() {
+                    ec.store_js_object(
+                        &mut iframe.html_element.element.node.event_target.reflector,
+                        reflector,
+                    );
+                } else if let Some(media) = data.downcast_mut::<HTMLMediaElement>() {
+                    ec.store_js_object(
+                        &mut media.html_element.element.node.event_target.reflector,
+                        reflector,
+                    );
+                } else if let Some(input) = data.downcast_mut::<HTMLInputElement>() {
+                    ec.store_js_object(
+                        &mut input.html_element.element.node.event_target.reflector,
+                        reflector,
+                    );
+                } else if let Some(video) = data.downcast_mut::<HTMLVideoElement>() {
+                    ec.store_js_object(
+                        &mut video
+                            .media_element
+                            .html_element
+                            .element
+                            .node
+                            .event_target
+                            .reflector,
+                        reflector,
+                    );
+                } else if let Some(node) = data.downcast_mut::<Node>() {
+                    ec.store_js_object(&mut node.event_target.reflector, reflector);
+                } else if let Some(target) = data.downcast_mut::<EventTarget>() {
+                    ec.store_js_object(&mut target.reflector, reflector);
+                } else if let Some(signal) = data.downcast_mut::<AbortSignal>() {
+                    // AbortSignal exposes its EventTarget through a shared
+                    // cell, so its setter borrows the cell (the clone shares
+                    // the same cell).
+                    let signal = signal.clone();
+                    signal.with_event_target_mut(
+                        move |event_target, ec| {
+                            ec.store_js_object(&mut event_target.reflector, reflector)
+                        },
+                        ec,
+                    );
+                } else if let Some(event) = data.downcast_mut::<Event>() {
+                    ec.store_js_object(&mut event.reflector, reflector);
+                } else if let Some(ui_event) = data.downcast_mut::<UIEvent>() {
+                    ec.store_js_object(&mut ui_event.event.reflector, reflector);
+                }
+            }),
+        );
     }
 }
 

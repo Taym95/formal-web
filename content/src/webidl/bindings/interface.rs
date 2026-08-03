@@ -130,7 +130,7 @@ where
 }
 
 /// <https://webidl.spec.whatwg.org/#internally-create-a-new-object-implementing-the-interface>
-#[cfg(not(feature = "boa"))]
+#[cfg(all(not(feature = "boa"), not(feature = "v8")))]
 pub(crate) fn create_interface_instance<Ty, T>(
     data: T,
     ec: &mut dyn ExecutionContext<Ty>,
@@ -155,6 +155,50 @@ where
     // Steps 3-8: newTarget handling, MakeBasicObject — handled below.
     // Step 9: "Set instance.[[Prototype]] to prototype."
     let instance = ec.create_object_with_any(prototype, Box::new(data));
+
+    // Steps 10-11: "Let interfaces be the inclusive inherited interfaces..."
+    //   TODO: Unforgeable property copying from ancestor interface objects.
+    // Step 12: "If interface is declared with the [Global] extended attribute..."
+    //   [Global] handling is done during registration (see register_interface_spec).
+
+    // Step 13: "Otherwise, if interfaces contains an interface which supports
+    //   indexed properties, named properties, or both:"
+    //   Not yet implemented.
+    // Step 14: "Return instance."
+    <Ty as PostCreateReflector<Ty>>::set_reflector(&instance, ec);
+
+    Ok(instance)
+}
+
+/// <https://webidl.spec.whatwg.org/#internally-create-a-new-object-implementing-the-interface>
+#[cfg(feature = "v8")]
+pub(crate) fn create_interface_instance<Ty, T>(
+    data: T,
+    ec: &mut dyn ExecutionContext<Ty>,
+) -> Completion<Ty::JsObject, Ty>
+where
+    Ty: JsTypes + JsTypesWithRealm + PostCreateReflector<Ty>,
+    T: js_engine::gc::Trace + 'static,
+{
+    // <https://webidl.spec.whatwg.org/#internally-create-a-new-object-implementing-the-interface>
+
+    // Step 1: "Assert: interface is exposed in realm."
+    let prototype =
+        super::registry::get_prototype_from_host_defined::<Ty, T>(ec).ok_or_else(|| {
+            ec.new_type_error(&format!(
+                "interface not registered: {}",
+                std::any::type_name::<T>()
+            ))
+        })?;
+
+    // Step 2: "If newTarget is undefined, then:"
+    //   Domain callers (not constructors) always use the standard prototype.
+    // Steps 3-8: newTarget handling, MakeBasicObject — handled below.
+    // Step 9: "Set instance.[[Prototype]] to prototype."
+    //   Wrap the platform object in a cppgc `V8PlatformData` so its cells and
+    //   JS edges are traced from the JS wrapper by the unified heap.
+    let boxed = js_engine::v8::V8PlatformData::new(data);
+    let instance = ec.create_object_with_any(prototype, Box::new(boxed));
 
     // Steps 10-11: "Let interfaces be the inclusive inherited interfaces..."
     //   TODO: Unforgeable property copying from ancestor interface objects.

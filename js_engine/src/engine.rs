@@ -700,6 +700,15 @@ pub trait ExecutionContext<T: JsTypes + JsTypesWithRealm>: EcmascriptHost<T> {
     /// needs to call back into ECMA-262 operations.
     fn with_object_any_mut_with(&mut self, object: &T::JsObject, f: ObjectDataMutation<'_, T>);
 
+    /// Store a JS object into a traced platform-object slot.
+    ///
+    /// On V8 the value's rooted handles are converted into cppgc edges before
+    /// the slot is written, so the slot participates in the unified heap's
+    /// cycle collection; other engines assign directly.
+    fn store_js_object(&mut self, slot: &mut Option<T::JsObject>, value: T::JsObject) {
+        *slot = Some(value);
+    }
+
     // ── Error Construction ──────────────────────────────────────────────
 
     /// <https://tc39.es/ecma262/#sec-native-error-types-used-in-this-standard-typeerror>

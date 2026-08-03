@@ -19,8 +19,11 @@ impl Callback {
         Self { object }
     }
 
-    pub(crate) fn equals(&self, other: &Self) -> bool {
-        self.object == other.object
+    pub(crate) fn equals(&self, other: &Self, ec: &mut dyn ExecutionContext<Types>) -> bool {
+        ec.same_value(
+            &Types::value_from_object(self.object.clone()),
+            &Types::value_from_object(other.object.clone()),
+        )
     }
 
     /// <https://webidl.spec.whatwg.org/#callback-function-to-js>

@@ -216,9 +216,31 @@ where
     finished: Rc<Cell<bool>>,
 }
 
-#[cfg(not(feature = "boa"))]
+#[cfg(all(not(feature = "boa"), not(feature = "v8")))]
 unsafe impl<T: AsyncValueIterable + 'static> js_engine::gc::Trace for DefaultAsyncIterator<T> {}
-#[cfg(not(feature = "boa"))]
+#[cfg(all(not(feature = "boa"), not(feature = "v8")))]
+impl<T: AsyncValueIterable + 'static> js_engine::gc::Finalize for DefaultAsyncIterator<T> {}
+
+// V8: the iterator walks its traced fields; the promise cell keeps its JS
+// object alive while this iterator is traced.
+#[cfg(feature = "v8")]
+unsafe impl<T: AsyncValueIterable + 'static> js_engine::gc::Trace for DefaultAsyncIterator<T> {
+    unsafe fn trace(&self, visitor: &mut js_engine::v8_gc::Visitor) {
+        // SAFETY: Delegated to the field traces.
+        unsafe {
+            js_engine::gc::Trace::trace(&self.target, visitor);
+            js_engine::gc::Trace::trace(&self.state, visitor);
+            js_engine::gc::Trace::trace(&self.ongoing_promise, visitor);
+        }
+    }
+
+    fn store(&mut self, ec: &mut dyn js_engine::ExecutionContext<crate::js::Types>) {
+        self.target.store(ec);
+        self.state.store(ec);
+        self.ongoing_promise.store(ec);
+    }
+}
+#[cfg(feature = "v8")]
 impl<T: AsyncValueIterable + 'static> js_engine::gc::Finalize for DefaultAsyncIterator<T> {}
 
 impl<T> DefaultAsyncIterator<T>

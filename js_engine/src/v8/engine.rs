@@ -23,7 +23,8 @@ use crate::{
     Numeric, PreferredType, PropertyDescriptor,
 };
 
-use super::types::{CachedPrimitive, ObjectProfile, V8ArrayBufferState};
+use super::gc::V8PlatformData;
+use super::types::{CachedPrimitive, ObjectProfile, V8ArrayBufferState, V8Handle};
 use super::{
     V8ArrayBuffer, V8BigInt, V8Constructor, V8DataView, V8Function, V8Generator, V8Map, V8Object,
     V8Promise, V8PropertyKey, V8Realm, V8Set, V8SharedArrayBuffer, V8String, V8Symbol,
@@ -56,10 +57,6 @@ struct CallbackRecord {
     behaviour: StoredBehaviour,
 }
 
-struct HostObjectRecord {
-    data: Box<dyn Any>,
-}
-
 #[derive(Default)]
 struct RealmHostData {
     values: HashMap<TypeId, Box<dyn Any>>,
@@ -86,7 +83,6 @@ struct SharedIsolate {
     isolate_id: u64,
     realm_states: RefCell<Vec<RcWeak<V8RealmState>>>,
     queued_jobs: RefCell<VecDeque<QueuedJob>>,
-    host_object_handles: RefCell<Vec<v8::Weak<v8::Object>>>,
     callback_handles: RefCell<Vec<v8::Weak<v8::Function>>>,
     isolate: RefCell<v8::OwnedIsolate>,
     microtask_queue: v8::UniqueRef<v8::MicrotaskQueue>,
@@ -95,14 +91,29 @@ struct SharedIsolate {
 impl SharedIsolate {
     fn new() -> Rc<Self> {
         initialize_v8();
-        let mut isolate = v8::Isolate::new(v8::CreateParams::default());
+        // The cppgc heap is created with atomic marking and sweeping: the
+        // trace callbacks run stop-the-world on the isolate thread (so Rust
+        // never mutates a cell concurrently with the marker) and the
+        // destructors of the traced values (which drop V8 handles) also run
+        // on the isolate thread.
+        let platform = V8_PLATFORM
+            .get()
+            .expect("V8 platform must be initialized before the isolate")
+            .clone();
+        let heap = v8::cppgc::Heap::create(
+            platform,
+            v8::cppgc::HeapCreateParams {
+                marking_support: v8::cppgc::MarkingType::Atomic,
+                sweeping_support: v8::cppgc::SweepingType::Atomic,
+            },
+        );
+        let mut isolate = v8::Isolate::new(v8::CreateParams::default().cpp_heap(heap));
         isolate.set_microtasks_policy(v8::MicrotasksPolicy::Explicit);
         let microtask_queue = v8::MicrotaskQueue::new(&mut isolate, v8::MicrotasksPolicy::Explicit);
         Rc::new(Self {
             isolate_id: NEXT_ISOLATE_ID.fetch_add(1, Ordering::Relaxed),
             realm_states: RefCell::new(Vec::new()),
             queued_jobs: RefCell::new(VecDeque::new()),
-            host_object_handles: RefCell::new(Vec::new()),
             callback_handles: RefCell::new(Vec::new()),
             isolate: RefCell::new(isolate),
             microtask_queue,
@@ -119,31 +130,6 @@ impl SharedIsolate {
 }
 
 impl V8Engine {
-    /// Run a closure with the isolate borrowed immutably, mirroring the scope
-    /// macros: inside a native callback the isolate is reborrowed from the
-    /// pinned callback scope, otherwise the shared isolate RefCell is used.
-    pub(crate) fn with_isolate<R>(&self, f: impl FnOnce(&v8::Isolate) -> R) -> R {
-        let callback_scope_pointer = CURRENT_CALLBACK_SCOPE.get();
-        if callback_scope_pointer.is_null() {
-            let isolate_for_operation = self.shared_isolate.borrow(self.isolate_id);
-            f(&*isolate_for_operation)
-        } else {
-            assert_eq!(
-                CURRENT_CALLBACK_ISOLATE_ID.get(),
-                self.isolate_id,
-                "reentrant V8 scope belongs to another isolate"
-            );
-            // SAFETY: `native_callback` installs this pointer from the pinned
-            // scope V8 supplied for the synchronous callback. The guard clears
-            // it before that scope ends, and the isolate identity is checked
-            // above. Reusing the callback scope avoids creating a second
-            // mutable reference to the isolate owned by the outer V8 call.
-            let callback_scope = unsafe { &mut *callback_scope_pointer };
-            let isolate = &***callback_scope;
-            f(isolate)
-        }
-    }
-
     /// Run a closure with the isolate borrowed mutably, mirroring the scope
     /// macros: inside a native callback the isolate is reborrowed from the
     /// pinned callback scope, otherwise the shared isolate RefCell is used.
@@ -151,7 +137,7 @@ impl V8Engine {
         let callback_scope_pointer = CURRENT_CALLBACK_SCOPE.get();
         if callback_scope_pointer.is_null() {
             let mut isolate_for_operation = self.shared_isolate.borrow(self.isolate_id);
-            f(&mut *isolate_for_operation)
+            f(&mut isolate_for_operation)
         } else {
             assert_eq!(
                 CURRENT_CALLBACK_ISOLATE_ID.get(),
@@ -174,20 +160,6 @@ impl V8Engine {
                 .expect("V8 isolate has no cppgc heap");
             f(heap)
         })
-    }
-
-    /// Allocate a cppgc heap object and root it with a strong `Persistent`.
-    pub(crate) fn allocate_gc_cell<T: 'static>(
-        &self,
-        heap_cell: crate::v8::gc::HeapCell<T>,
-    ) -> v8::cppgc::Persistent<crate::v8::gc::HeapCell<T>> {
-        let pointer = self.with_cpp_heap(|heap| {
-            // SAFETY: `make_garbage_collected` returns an `UnsafePtr` which is
-            // immediately moved into a `Persistent` root below — the required
-            // destination for a stack-created pointer.
-            unsafe { v8::cppgc::make_garbage_collected(heap, heap_cell) }
-        });
-        v8::cppgc::Persistent::new(&pointer)
     }
 }
 
@@ -284,6 +256,17 @@ macro_rules! v8_shared_isolate {
     }};
 }
 
+impl V8Engine {
+    /// Run a closure with a scope over the realm context, for operations that
+    /// need V8 locals (edge conversion, handle materialization).
+    pub(crate) fn with_value_scope<R>(
+        &mut self,
+        f: impl FnOnce(&mut v8::PinScope<'_, '_>) -> R,
+    ) -> R {
+        v8_engine_scope_with_context!(scope, self, &self.realm_state.realm.context, { f(scope) })
+    }
+}
+
 struct CurrentEngineGuard {
     previous: *mut V8Engine,
 }
@@ -333,11 +316,17 @@ pub struct V8Engine {
     shared_isolate: Rc<SharedIsolate>,
 }
 
+static V8_PLATFORM: std::sync::OnceLock<v8::SharedRef<v8::Platform>> = std::sync::OnceLock::new();
+
 fn initialize_v8() {
     static INITIALIZE: Once = Once::new();
     INITIALIZE.call_once(|| {
         v8::V8::set_flags_from_string("--expose-gc");
-        v8::V8::initialize_platform(v8::new_default_platform(0, false).make_shared());
+        let platform = v8::new_default_platform(0, false).make_shared();
+        v8::V8::initialize_platform(platform.clone());
+        // cppgc needs the platform page allocator before any heap is created.
+        v8::cppgc::initialize_process(platform.clone());
+        let _ = V8_PLATFORM.set(platform);
         v8::V8::initialize();
     });
 }
@@ -363,11 +352,16 @@ fn host_data_pointer<'scope>(
 
     // SAFETY: Field 1 is read only after field 0 proves that this object was
     // created by `create_object_with_any`. That constructor stores an aligned
-    // `HostObjectRecord` pointer in field 1 with this exact tag. The weak
-    // handle keeps the record alive for at least as long as the JS object.
+    // `V8PlatformData` pointer in field 1 with this exact tag. The cppgc
+    // platform object is traced from the JS wrapper, so it stays alive for at
+    // least as long as the JS object.
     let pointer = unsafe { object.get_aligned_pointer_from_internal_field(1, HOST_OBJECT_TAG) }
         as *mut c_void;
     NonNull::new(pointer)
+}
+
+fn root_handle<T>(scope: &mut v8::PinScope<'_, '_>, handle: v8::Local<'_, T>) -> V8Handle<T> {
+    V8Handle::Root(v8::Global::new(scope, handle))
 }
 
 fn wrap_local_value(
@@ -392,6 +386,8 @@ fn wrap_local_value(
             .map(|string| string.to_rust_string_lossy(scope))
             .unwrap_or_default();
         CachedPrimitive::BigInt(Arc::from(canonical))
+    } else if value.is_symbol() {
+        CachedPrimitive::Symbol
     } else {
         CachedPrimitive::Other
     };
@@ -402,28 +398,28 @@ fn wrap_local_value(
         host_data = host_data_pointer(scope, object);
         let array_buffer_handle = v8::Local::<v8::ArrayBuffer>::try_from(value)
             .ok()
-            .map(|handle| v8::Global::new(scope, handle));
+            .map(|handle| root_handle(scope, handle));
         let shared_array_buffer_handle = v8::Local::<v8::SharedArrayBuffer>::try_from(value)
             .ok()
-            .map(|handle| v8::Global::new(scope, handle));
+            .map(|handle| root_handle(scope, handle));
         let typed_array_handle = v8::Local::<v8::TypedArray>::try_from(value)
             .ok()
-            .map(|handle| v8::Global::new(scope, handle));
+            .map(|handle| root_handle(scope, handle));
         let data_view_handle = v8::Local::<v8::DataView>::try_from(value)
             .ok()
-            .map(|handle| v8::Global::new(scope, handle));
+            .map(|handle| root_handle(scope, handle));
         let promise_handle = v8::Local::<v8::Promise>::try_from(value)
             .ok()
-            .map(|handle| v8::Global::new(scope, handle));
+            .map(|handle| root_handle(scope, handle));
         let function_handle = v8::Local::<v8::Function>::try_from(value)
             .ok()
-            .map(|handle| v8::Global::new(scope, handle));
+            .map(|handle| root_handle(scope, handle));
         let map_handle = v8::Local::<v8::Map>::try_from(value)
             .ok()
-            .map(|handle| v8::Global::new(scope, handle));
+            .map(|handle| root_handle(scope, handle));
         let set_handle = v8::Local::<v8::Set>::try_from(value)
             .ok()
-            .map(|handle| v8::Global::new(scope, handle));
+            .map(|handle| root_handle(scope, handle));
         let array_buffer_state = if value.is_array_buffer() {
             let array_buffer = v8::Local::<v8::ArrayBuffer>::try_from(value)
                 .expect("V8 ArrayBuffer type check failed");
@@ -464,7 +460,7 @@ fn wrap_local_value(
             None
         };
         Some(Box::new(ObjectProfile {
-            object_handle: v8::Global::new(scope, object),
+            object_handle: root_handle(scope, object),
             array_buffer_handle,
             shared_array_buffer_handle,
             typed_array_handle,
@@ -493,7 +489,7 @@ fn wrap_local_value(
 
     V8Value {
         isolate_id,
-        handle: v8::Global::new(scope, value),
+        handle: root_handle(scope, value),
         primitive,
         object_profile,
         host_data,
@@ -515,7 +511,12 @@ fn local_value<'scope>(
         let exception = v8::Exception::type_error(scope, message);
         return Err(wrap_local_value(scope, isolate_id, exception));
     }
-    Ok(v8::Local::new(scope, &value.handle))
+    value.handle.to_local(scope).ok_or_else(|| {
+        let message = v8::String::new(scope, "value has been reclaimed by the garbage collector")
+            .expect("static V8 error string allocation failed");
+        let exception = v8::Exception::type_error(scope, message);
+        wrap_local_value(scope, isolate_id, exception)
+    })
 }
 
 fn local_object<'scope>(
@@ -529,14 +530,19 @@ fn local_object<'scope>(
         let exception = v8::Exception::type_error(scope, message);
         return Err(wrap_local_value(scope, isolate_id, exception));
     }
-    Ok(v8::Local::new(scope, &object.1))
+    object.1.to_local(scope).ok_or_else(|| {
+        let message = v8::String::new(scope, "value has been reclaimed by the garbage collector")
+            .expect("static V8 error string allocation failed");
+        let exception = v8::Exception::type_error(scope, message);
+        wrap_local_value(scope, isolate_id, exception)
+    })
 }
 
 fn local_typed_object<'scope, T>(
     scope: &mut v8::PinScope<'scope, '_>,
     isolate_id: u64,
     object: &V8Object,
-    handle: &v8::Global<T>,
+    handle: &V8Handle<T>,
 ) -> Result<v8::Local<'scope, T>, V8Value> {
     if object.0.isolate_id != isolate_id {
         let message = v8::String::new(scope, "value belongs to a different V8 isolate")
@@ -544,7 +550,12 @@ fn local_typed_object<'scope, T>(
         let exception = v8::Exception::type_error(scope, message);
         return Err(wrap_local_value(scope, isolate_id, exception));
     }
-    Ok(v8::Local::new(scope, handle))
+    handle.to_local(scope).ok_or_else(|| {
+        let message = v8::String::new(scope, "value has been reclaimed by the garbage collector")
+            .expect("static V8 error string allocation failed");
+        let exception = v8::Exception::type_error(scope, message);
+        wrap_local_value(scope, isolate_id, exception)
+    })
 }
 
 fn local_property_key<'scope>(
@@ -666,7 +677,7 @@ fn native_callback(
                 // `new.target` (matching Boa's [[Construct]] convention), so
                 // pass `new_target` instead.
                 let this_value = if arguments.is_construct_call() {
-                    wrap_local_value(scope, record.isolate_id, arguments.new_target().into())
+                    wrap_local_value(scope, record.isolate_id, arguments.new_target())
                 } else {
                     wrap_local_value(scope, record.isolate_id, arguments.this().into())
                 };
@@ -689,13 +700,19 @@ fn native_callback(
         Ok(value) => match local_value(scope, callback_isolate_id, &value) {
             Ok(value) => return_value.set(value),
             Err(exception) => {
-                let exception = v8::Local::new(scope, &exception.handle);
+                let exception = exception
+                    .handle
+                    .to_local(scope)
+                    .expect("callback exception handle must be valid");
                 scope.throw_exception(exception);
             }
         },
         Err(exception) => {
             if exception.isolate_id == callback_isolate_id {
-                let exception = v8::Local::new(scope, &exception.handle);
+                let exception = exception
+                    .handle
+                    .to_local(scope)
+                    .expect("callback exception handle must be valid");
                 scope.throw_exception(exception);
             } else {
                 let message = v8::String::new(scope, "callback returned a cross-isolate exception")
@@ -1208,15 +1225,6 @@ impl JsTypesGcExt for V8Types {
     }
 }
 
-// SAFETY: Each V8 wrapper owns a `v8::Global` handle, so its JavaScript value
-// remains rooted independently of Rust-side tracing. The marker implementation
-// therefore cannot hide an unrooted V8 reference from the collector.
-unsafe impl Trace for V8Value {}
-unsafe impl Trace for V8Object {}
-unsafe impl Trace for V8String {}
-unsafe impl Trace for V8Symbol {}
-unsafe impl Trace for V8BigInt {}
-
 pub fn create_builtin_fn_with_captures<T, C>(
     execution_context: &mut dyn ExecutionContext<T>,
     captures: C,
@@ -1376,6 +1384,11 @@ impl EcmascriptHost<V8Types> for V8Engine {
         v8_shared_isolate!(isolate, shared_isolate, self.isolate_id, {
             isolate.request_garbage_collection_for_testing(v8::GarbageCollectionType::Full);
         });
+        // Sweep the cppgc heap as well: platform objects and cells are
+        // cppgc-managed, and the isolate test hook collects the JS heap only.
+        self.with_cpp_heap(|heap| unsafe {
+            heap.collect_garbage_for_testing(v8::cppgc::EmbedderStackState::NoHeapPointers);
+        });
     }
 
     fn value_undefined(&mut self) -> V8Value {
@@ -1467,7 +1480,7 @@ impl ExecutionContext<V8Types> for V8Engine {
             CachedPrimitive::Number(number) => *number != 0.0 && !number.is_nan(),
             CachedPrimitive::String(string) => !string.is_empty(),
             CachedPrimitive::BigInt(canonical) => canonical.as_ref() != "0",
-            CachedPrimitive::Other => true,
+            CachedPrimitive::Symbol | CachedPrimitive::Other => true,
         }
     }
 
@@ -1646,7 +1659,26 @@ impl ExecutionContext<V8Types> for V8Engine {
             }
             (CachedPrimitive::String(left), CachedPrimitive::String(right)) => left == right,
             (CachedPrimitive::BigInt(left), CachedPrimitive::BigInt(right)) => left == right,
-            (CachedPrimitive::Other, CachedPrimitive::Other) => left.handle == right.handle,
+            (
+                CachedPrimitive::Other | CachedPrimitive::Symbol,
+                CachedPrimitive::Other | CachedPrimitive::Symbol,
+            ) => {
+                // Root handles compare scope-free; edges (or mixed modes)
+                // compare through locals in a scope.
+                if left.handle.same_identity(&right.handle) {
+                    return true;
+                }
+                let isolate_id = self.isolate_id;
+                v8_engine_scope_with_context!(scope, self, &self.realm_state.realm.context, {
+                    match (
+                        local_value(scope, isolate_id, left),
+                        local_value(scope, isolate_id, right),
+                    ) {
+                        (Ok(left_local), Ok(right_local)) => left_local.same_value(right_local),
+                        _ => false,
+                    }
+                })
+            }
             _ => false,
         }
     }
@@ -2992,6 +3024,24 @@ impl ExecutionContext<V8Types> for V8Engine {
         prototype: V8Object,
         data: Box<dyn Any + 'static>,
     ) -> V8Object {
+        // The platform object lives on the cppgc heap, wrapped in a
+        // type-erased [`V8PlatformData`] that traces through the concrete
+        // type. `create_interface_instance` wraps the platform object in
+        // advance; other callers (prototypes, namespace objects) have no
+        // edges and get a no-op trace.
+        let platform = match V8PlatformData::try_recover(data) {
+            Ok(platform) => platform,
+            Err(raw) => V8PlatformData::noop(raw),
+        };
+        let platform_ptr = self.with_cpp_heap(|heap| {
+            // SAFETY: The returned `UnsafePtr` is immediately stored into the
+            // JS wrapper's cpp heap wrappable slot by `wrap` below — the
+            // required destination for a stack-created pointer.
+            unsafe { v8::cppgc::make_garbage_collected(heap, platform) }
+        });
+        // cppgc is non-moving; the platform data address is stable for the
+        // lifetime of the wrapper, so it can be cached in the internal field.
+        let platform_data_pointer = unsafe { platform_ptr.as_ref() } as *const V8PlatformData;
         let isolate_id = self.isolate_id;
         v8_engine_scope_with_context!(scope, self, &self.realm_state.realm.context, {
             let object_template = v8::ObjectTemplate::new(scope);
@@ -3005,46 +3055,41 @@ impl ExecutionContext<V8Types> for V8Engine {
                 .set_prototype(scope, prototype)
                 .expect("V8 failed to set a platform-object prototype");
 
-            let record = Box::new(HostObjectRecord { data });
-            let record_pointer = Box::into_raw(record);
             let marker = v8::External::new(
                 scope,
                 std::ptr::addr_of!(HOST_OBJECT_MARKER).cast_mut().cast(),
             );
             assert!(object.set_internal_field(0, marker.into()));
-            object.set_aligned_pointer_in_internal_field(1, record_pointer.cast(), HOST_OBJECT_TAG);
-
-            let value =
-                object_from_wrapped_value(wrap_local_value(scope, isolate_id, object.into()));
-            let weak = v8::Weak::with_guaranteed_finalizer(
-                scope,
-                object,
-                Box::new(move || {
-                    // SAFETY: `record_pointer` is created by the single
-                    // Box::into_raw above. This guaranteed finalizer is its sole
-                    // owner and V8 invokes it at most once after the JS object can
-                    // no longer expose its internal field.
-                    unsafe {
-                        drop(Box::from_raw(record_pointer));
-                    }
-                }),
+            object.set_aligned_pointer_in_internal_field(
+                1,
+                platform_data_pointer.cast(),
+                HOST_OBJECT_TAG,
             );
-            self.shared_isolate
-                .host_object_handles
-                .borrow_mut()
-                .push(weak);
-            value
+
+            // Register the cppgc platform object with the wrapper so the
+            // unified heap traces it (and through it its cells and JS edges)
+            // while the wrapper is alive.
+            let isolate = &mut ****scope;
+            // SAFETY: `wrap` stores the wrappable pointer in the wrapper's cpp
+            // heap slot; the tag is unique within this embedder. The isolate
+            // is reborrowed from the active scope, matching the scope-macro
+            // reborrow pattern.
+            unsafe {
+                v8::Object::wrap::<HOST_OBJECT_TAG, V8PlatformData>(isolate, object, &platform_ptr)
+            }
+
+            object_from_wrapped_value(wrap_local_value(scope, isolate_id, object.into()))
         })
     }
 
     fn with_object_any(&self, object: &V8Object) -> Option<&dyn Any> {
         if let Some(pointer) = object.0.host_data {
             // SAFETY: `host_data_pointer` validates the marker and tag before
-            // placing this pointer in a V8Value. A Global handle in `object`
-            // keeps the JS object reachable, so its guaranteed finalizer cannot
-            // release the record during this borrow.
-            let record = unsafe { &*pointer.cast::<HostObjectRecord>().as_ptr() };
-            return Some(record.data.as_ref());
+            // placing this pointer in a V8Value. The cppgc platform object is
+            // traced from the JS wrapper, so it stays alive while the wrapper
+            // is reachable (cppgc is non-moving, so the pointer is stable).
+            let platform = unsafe { &*pointer.cast::<V8PlatformData>().as_ptr() };
+            return Some(platform.as_any());
         }
         self.realm_host_data()
             .associated_objects
@@ -3055,12 +3100,13 @@ impl ExecutionContext<V8Types> for V8Engine {
 
     fn with_object_any_mut(&mut self, object: &V8Object) -> Option<&mut dyn Any> {
         if let Some(pointer) = object.0.host_data {
-            // SAFETY: The marker, reachability, and finalization invariants are
-            // the same as in `with_object_any`. The `&mut self` receiver makes
-            // this the exclusive host-data access path for the duration of the
-            // returned borrow.
-            let record = unsafe { &mut *pointer.cast::<HostObjectRecord>().as_ptr() };
-            return Some(record.data.as_mut());
+            // SAFETY: The marker and reachability invariants are the same as
+            // in `with_object_any`. The `&mut self` receiver makes this the
+            // exclusive host-data access path for the duration of the returned
+            // borrow; marking is atomic, so no concurrent marker reads the
+            // platform data while it is mutated.
+            let platform = unsafe { &mut *pointer.cast::<V8PlatformData>().as_ptr() };
+            return Some(platform.as_any_mut());
         }
         self.realm_host_data_mut()
             .associated_objects
@@ -3075,12 +3121,13 @@ impl ExecutionContext<V8Types> for V8Engine {
         operation: Box<dyn FnOnce(&mut dyn Any, &mut dyn ExecutionContext<V8Types>) + '_>,
     ) {
         let data_pointer: Option<*mut dyn Any> = if let Some(pointer) = object.0.host_data {
-            // SAFETY: The validated host pointer remains alive because
-            // `object` owns a Global handle. Converting to a raw trait-object
-            // pointer lets the callback borrow both the record and the engine;
-            // no other access to the record occurs until the callback returns.
-            let record = unsafe { &mut *pointer.cast::<HostObjectRecord>().as_ptr() };
-            Some(record.data.as_mut())
+            // SAFETY: The validated host pointer remains alive because the
+            // platform object is traced from the JS wrapper. Converting to a
+            // raw trait-object pointer lets the callback borrow both the
+            // platform data and the engine; no other access occurs until the
+            // callback returns.
+            let platform = unsafe { &mut *pointer.cast::<V8PlatformData>().as_ptr() };
+            Some(platform.as_any_mut())
         } else {
             self.realm_host_data_mut()
                 .associated_objects
@@ -3095,6 +3142,13 @@ impl ExecutionContext<V8Types> for V8Engine {
                 operation(&mut *data_pointer, self);
             }
         }
+    }
+
+    fn store_js_object(&mut self, slot: &mut Option<V8Object>, value: V8Object) {
+        *slot = Some(value);
+        // Convert the stored object's rooted handles into cppgc edges so the
+        // slot participates in unified-heap cycle collection.
+        crate::gc::Trace::store(slot, self);
     }
 
     fn new_type_error(&mut self, message: &str) -> V8Value {
@@ -3247,6 +3301,7 @@ mod tests {
 
     use crate::{EcmascriptHost, ExecutionContext, JsTypes};
 
+    use super::super::types::V8Handle;
     use super::super::{V8AsyncGenerator, V8WeakMap, V8WeakRef, V8WeakSet};
     use super::{
         CURRENT_CALLBACK_ISOLATE_ID, CURRENT_CALLBACK_SCOPE, V8ArrayBuffer, V8Constructor,
@@ -3254,7 +3309,7 @@ mod tests {
         V8SharedArrayBuffer, V8TypedArray, V8Types,
     };
 
-    struct DropFlag(Rc<Cell<bool>>);
+    pub(crate) struct DropFlag(pub(crate) Rc<Cell<bool>>);
 
     struct RealmMarker(&'static str);
 
@@ -3296,41 +3351,65 @@ mod tests {
 
         let array_buffer = evaluate_object("new ArrayBuffer(8)");
         let array_buffer = V8Types::object_as_array_buffer(&array_buffer)
-            .expect("ArrayBuffer must retain a Global<ArrayBuffer>");
-        let _: &v8::Global<v8::ArrayBuffer> = &array_buffer.1;
+            .expect("ArrayBuffer must retain a typed handle");
+        assert!(
+            !matches!(array_buffer.1, V8Handle::Edge(_)),
+            "fresh values are rooted"
+        );
 
         let shared_array_buffer = evaluate_object("new SharedArrayBuffer(8)");
         let shared_array_buffer = V8Types::object_as_shared_array_buffer(&shared_array_buffer)
-            .expect("SharedArrayBuffer must retain a Global<SharedArrayBuffer>");
-        let _: &v8::Global<v8::SharedArrayBuffer> = &shared_array_buffer.1;
+            .expect("SharedArrayBuffer must retain a typed handle");
+        assert!(
+            !matches!(shared_array_buffer.1, V8Handle::Edge(_)),
+            "fresh values are rooted"
+        );
 
         let typed_array = evaluate_object("new Uint8Array(8)");
         let typed_array = V8Types::object_as_typed_array(&typed_array)
-            .expect("TypedArray must retain a Global<TypedArray>");
-        let _: &v8::Global<v8::TypedArray> = &typed_array.1;
+            .expect("TypedArray must retain a typed handle");
+        assert!(
+            !matches!(typed_array.1, V8Handle::Edge(_)),
+            "fresh values are rooted"
+        );
 
         let data_view = evaluate_object("new DataView(new ArrayBuffer(8))");
-        let data_view = V8Types::object_as_data_view(&data_view)
-            .expect("DataView must retain a Global<DataView>");
-        let _: &v8::Global<v8::DataView> = &data_view.1;
+        let data_view =
+            V8Types::object_as_data_view(&data_view).expect("DataView must retain a typed handle");
+        assert!(
+            !matches!(data_view.1, V8Handle::Edge(_)),
+            "fresh values are rooted"
+        );
 
         let promise = evaluate_object("Promise.resolve(1)");
         let promise =
-            V8Types::object_as_promise(&promise).expect("Promise must retain a Global<Promise>");
-        let _: &v8::Global<v8::Promise> = &promise.1;
+            V8Types::object_as_promise(&promise).expect("Promise must retain a typed handle");
+        assert!(
+            !matches!(promise.1, V8Handle::Edge(_)),
+            "fresh values are rooted"
+        );
 
         let map = evaluate_object("new Map()");
-        let map = V8Types::object_as_map(&map).expect("Map must retain a Global<Map>");
-        let _: &v8::Global<v8::Map> = &map.1;
+        let map = V8Types::object_as_map(&map).expect("Map must retain a typed handle");
+        assert!(
+            !matches!(map.1, V8Handle::Edge(_)),
+            "fresh values are rooted"
+        );
 
         let set = evaluate_object("new Set()");
-        let set = V8Types::object_as_set(&set).expect("Set must retain a Global<Set>");
-        let _: &v8::Global<v8::Set> = &set.1;
+        let set = V8Types::object_as_set(&set).expect("Set must retain a typed handle");
+        assert!(
+            !matches!(set.1, V8Handle::Edge(_)),
+            "fresh values are rooted"
+        );
 
         let function = evaluate_object("(function typedFunction() {})");
-        let function = V8Types::object_as_function(&function)
-            .expect("Function must retain a Global<Function>");
-        let _: &v8::Global<v8::Function> = &function.1;
+        let function =
+            V8Types::object_as_function(&function).expect("Function must retain a typed handle");
+        assert!(
+            !matches!(function.1, V8Handle::Edge(_)),
+            "fresh values are rooted"
+        );
     }
 
     #[test]

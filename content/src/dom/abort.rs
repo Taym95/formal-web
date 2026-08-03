@@ -149,7 +149,8 @@ impl AbortSignal {
     }
 
     pub(crate) fn set_reflector(&self, reflector: JsObject, ec: &mut dyn ExecutionContext<Types>) {
-        self.shared.borrow_mut(ec).reflector = Some(reflector);
+        let mut state = self.shared.borrow_mut(ec);
+        ec.store_js_object(&mut state.reflector, reflector);
     }
 
     pub(crate) fn object(&self, ec: &mut dyn ExecutionContext<Types>) -> Option<JsObject> {

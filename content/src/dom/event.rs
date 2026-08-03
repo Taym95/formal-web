@@ -176,7 +176,7 @@ impl EventTarget {
                 && listener
                     .callback
                     .as_ref()
-                    .is_some_and(|existing| existing.equals(&callback))
+                    .is_some_and(|existing| existing.equals(&callback, ec))
         });
 
         if !duplicate {
@@ -225,7 +225,7 @@ impl EventTarget {
                 && listener
                     .callback
                     .as_ref()
-                    .is_some_and(|existing| existing.equals(callback))
+                    .is_some_and(|existing| existing.equals(callback, ec))
             {
                 listener.removed = true;
             }

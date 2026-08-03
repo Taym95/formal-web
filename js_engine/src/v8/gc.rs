@@ -1,92 +1,173 @@
 //! V8 backend GC cells backed by `rusty_v8::cppgc`.
 //!
-//! A [`V8GcCell`] is a strong cppgc root (`Persistent`) to a heap object
-//! allocated on the isolate's `cppgc::Heap`. The wrapped value lives inside a
-//! `rusty_v8::cppgc::GcCell` (an `UnsafeCell`), so mutation is only granted
-//! with isolate-scoped proof — the execution context. A runtime borrow counter
-//! restores the double-borrow checks `RefCell` provides on other engines.
+//! A [`V8GcCell`] is a cppgc `Member` edge to a [`HeapCell`] allocated on the
+//! isolate's `cppgc::Heap`. Cloning a cell creates a second `Member` edge to
+//! the same heap cell (via `GetRustObj`), mirroring the clone semantics of
+//! Boa's `Gc<GcRefCell<T>>`: the cell stays alive while any edge is traced by
+//! a live owner, and is reclaimed once the last owner dies. The wrapped value
+//! lives in an `UnsafeCell`, so mutation is only granted with isolate-scoped
+//! proof — the execution context. A runtime borrow counter restores the
+//! double-borrow checks `RefCell` provides on other engines.
 
-use std::cell::Cell;
-use std::ffi::CStr;
+use std::any::Any;
+use std::cell::{Cell, UnsafeCell};
 use std::marker::PhantomData;
 use std::ops::{Deref, DerefMut};
 
 use rusty_v8 as v8;
-use v8::cppgc::{self, GarbageCollected, GetRustObj};
+use v8::cppgc::{self, GarbageCollected, GetRustObj, Member};
 
 use crate::ExecutionContext;
+use crate::gc::Trace;
 use crate::v8::{V8Engine, V8Types};
+use crate::v8_gc::{Traced, Visitor};
+
+/// Type-erased cppgc platform object: the domain data lives inside a
+/// cppgc-managed heap object, and its edges are traced through the concrete
+/// type's `Trace` implementation. The JS wrapper traces this object through
+/// the `v8::Object::wrap` link, so the unified heap collects wrapper/platform
+/// pairs (and cycles through their cells) together.
+pub struct V8PlatformData {
+    data: Box<dyn Any>,
+    trace_fn: unsafe fn(&dyn Any, &mut cppgc::Visitor),
+}
+
+impl V8PlatformData {
+    /// Wrap traceable domain data (a `#[gc_struct]` platform object).
+    pub fn new<T: Any + Trace>(data: T) -> Self {
+        Self {
+            data: Box::new(data),
+            trace_fn: |data, visitor| {
+                // SAFETY: The box holds exactly the `T` this closure was
+                // created for; the trace implementation visits its edges.
+                unsafe {
+                    <T as Trace>::trace(
+                        data.downcast_ref::<T>()
+                            .expect("platform data type mismatch"),
+                        visitor,
+                    )
+                }
+            },
+        }
+    }
+
+    /// Wrap non-traceable data (prototypes, namespace objects) with no edges.
+    pub fn noop(data: Box<dyn Any>) -> Self {
+        Self {
+            data,
+            trace_fn: |_data, _visitor| {},
+        }
+    }
+
+    /// Whether `data` is already a [`V8PlatformData`] wrapper.
+    pub fn try_recover(data: Box<dyn Any>) -> Result<Self, Box<dyn Any>> {
+        data.downcast().map(|boxed| *boxed)
+    }
+
+    pub fn as_any(&self) -> &dyn Any {
+        &*self.data
+    }
+
+    pub fn as_any_mut(&mut self) -> &mut dyn Any {
+        &mut *self.data
+    }
+}
+
+// SAFETY: The trace delegates to the concrete platform type's `Trace` impl,
+// which visits every edge exactly once. The `Box` heap allocation is stable;
+// only the trace reads it during stop-the-world marking.
+unsafe impl GarbageCollected for V8PlatformData {
+    fn trace(&self, visitor: &mut cppgc::Visitor) {
+        // SAFETY: The trace runs during stop-the-world marking on the isolate
+        // thread; no Rust code mutates the platform data concurrently.
+        unsafe { (self.trace_fn)(&*self.data, visitor) }
+    }
+
+    fn get_name(&self) -> &'static std::ffi::CStr {
+        c"js_engine::platform object"
+    }
+}
 
 /// The cppgc heap object backing a [`V8GcCell`].
 ///
-/// `value` uses rusty_v8's `cppgc::GcCell`, whose access methods require
-/// isolate-scoped proof. `readers`/`writer` track active borrows so mutable
-/// access stays exclusive, matching `RefCell` semantics on the other engines.
+/// `value` is guarded by the isolate-scoped access discipline: reads and
+/// writes are only granted through the execution context's engine. A runtime
+/// borrow counter (`readers`/`writer`) restores the double-borrow checks
+/// `RefCell` provides on the other engines.
 pub(crate) struct HeapCell<T> {
-    value: cppgc::GcCell<T>,
+    value: UnsafeCell<T>,
     readers: Cell<u32>,
     writer: Cell<bool>,
 }
 
-// SAFETY: `HeapCell` holds no cppgc `Member`/`WeakMember`/`TracedReference`
-// edges of its own: `T` is opaque to the engine and any JS references inside
-// it are `v8::Global` handles, which are strong roots. There is nothing to
-// visit during marking. `get_name` returns a static string.
-unsafe impl<T: 'static> GarbageCollected for HeapCell<T> {
-    fn trace(&self, _visitor: &mut cppgc::Visitor) {}
+impl<T> HeapCell<T> {
+    fn new(value: T) -> Self {
+        Self {
+            value: UnsafeCell::new(value),
+            readers: Cell::new(0),
+            writer: Cell::new(false),
+        }
+    }
+}
 
-    fn get_name(&self) -> &'static CStr {
+// SAFETY: `HeapCell` is traced by delegating to `T`'s trace — every
+// `TracedReference` edge and nested cell reachable from `T` is visited during
+// marking. Marking is stop-the-world (the heap is created with atomic marking
+// support), so the `UnsafeCell` is never read concurrently with a write.
+unsafe impl<T: Trace + 'static> GarbageCollected for HeapCell<T> {
+    fn trace(&self, visitor: &mut cppgc::Visitor) {
+        // SAFETY: The trace runs during stop-the-world marking on the isolate
+        // thread; no Rust code mutates the cell while the marker reads it.
+        unsafe { <T as Trace>::trace(&*self.value.get(), visitor) }
+    }
+
+    fn get_name(&self) -> &'static std::ffi::CStr {
         c"js_engine::GcCell"
     }
 }
 
-/// A shared, cloneable GC-managed cell: a strong cppgc root to a heap cell.
+/// A shared, cloneable GC-managed cell: a cppgc `Member` edge to a heap cell.
 ///
-/// The cell is kept alive while any clone exists and is reclaimed by the
-/// isolate's cppgc heap once the last root drops.
-pub struct V8GcCell<T: 'static>(cppgc::Persistent<HeapCell<T>>);
+/// The cell is kept alive while any clone (edge) is traced by a live owner
+/// and is reclaimed by the isolate's cppgc heap once the last edge is
+/// unreachable.
+pub struct V8GcCell<T: Trace + 'static>(Member<HeapCell<T>>);
 
-impl<T: 'static> Clone for V8GcCell<T> {
+impl<T: Trace + 'static> Clone for V8GcCell<T> {
     fn clone(&self) -> Self {
-        // SAFETY: `Persistent::new` creates a second strong root to the same
-        // heap cell; the object stays alive while any root is live. Clones
-        // are only created on the isolate thread, satisfying the C++ handle
-        // construction/destruction thread rule.
-        Self(cppgc::Persistent::new(&self.0))
+        // `Member::new` reads the pointee through `GetRustObj` and creates a
+        // second strong edge to the same heap cell; the cell stays alive while
+        // any edge is traced.
+        Self(Member::new(&self.0))
     }
 }
 
-impl<T: 'static> V8GcCell<T> {
+impl<T: Trace + 'static> V8GcCell<T> {
     /// Allocate a new cell on the engine's isolate cppgc heap.
     pub(crate) fn new(value: T, engine: &V8Engine) -> Self {
-        let heap_cell = HeapCell {
-            value: cppgc::GcCell::new(value),
-            readers: Cell::new(0),
-            writer: Cell::new(false),
-        };
-        Self(engine.allocate_gc_cell(heap_cell))
+        let heap_cell = HeapCell::new(value);
+        let pointer = engine.with_cpp_heap(|heap| {
+            // SAFETY: `make_garbage_collected` returns an `UnsafePtr` which is
+            // immediately moved into the `Member` edge below — the required
+            // destination for a stack-created pointer.
+            unsafe { v8::cppgc::make_garbage_collected(heap, heap_cell) }
+        });
+        Self(Member::new(&pointer))
     }
 
     /// Immutably borrow the wrapped value.
     ///
     /// The returned guard's lifetime is tied to `&self`, not to the execution
     /// context, so other engine operations remain callable while a borrow is
-    /// held. The heap cell is kept alive by this root (`Persistent`) for the
-    /// whole borrow, and the borrow counter prevents mutable aliasing.
-    pub(crate) fn borrow<'a, 'e>(
-        &'a self,
-        ec: &'e dyn ExecutionContext<V8Types>,
-    ) -> V8GcRef<'a, T> {
-        let engine = ec
-            .as_any()
-            .downcast_ref::<V8Engine>()
-            .expect("V8 GcCell borrowed with a non-V8 execution context");
-        let heap_cell = self.0.get().expect("V8 GcCell root holds no heap cell");
+    /// held. The heap cell is kept alive by this edge (`Member`) for the whole
+    /// borrow, and the borrow counter prevents mutable aliasing.
+    pub(crate) fn borrow<'a>(&'a self, _ec: &dyn ExecutionContext<V8Types>) -> V8GcRef<'a, T> {
+        let heap_cell = unsafe { self.0.get() }.expect("V8 GcCell edge holds no heap cell");
         if heap_cell.writer.get() {
             panic!("GcCell<T> already mutably borrowed");
         }
         heap_cell.readers.set(heap_cell.readers.get() + 1);
-        let value = engine.with_isolate(|isolate| heap_cell.value.get(isolate) as *const T);
+        let value = heap_cell.value.get() as *const T;
         V8GcRef {
             value,
             cell: heap_cell as *const HeapCell<T>,
@@ -95,20 +176,16 @@ impl<T: 'static> V8GcCell<T> {
     }
 
     /// Mutably borrow the wrapped value.
-    pub(crate) fn borrow_mut<'a, 'e>(
+    pub(crate) fn borrow_mut<'a>(
         &'a self,
-        ec: &'e mut dyn ExecutionContext<V8Types>,
+        _ec: &mut dyn ExecutionContext<V8Types>,
     ) -> V8GcRefMut<'a, T> {
-        let engine = ec
-            .as_any_mut()
-            .downcast_mut::<V8Engine>()
-            .expect("V8 GcCell mutably borrowed with a non-V8 execution context");
-        let heap_cell = self.0.get().expect("V8 GcCell root holds no heap cell");
+        let heap_cell = unsafe { self.0.get() }.expect("V8 GcCell edge holds no heap cell");
         if heap_cell.writer.get() || heap_cell.readers.get() > 0 {
             panic!("GcCell<T> already borrowed");
         }
         heap_cell.writer.set(true);
-        let value = engine.with_isolate_mut(|isolate| heap_cell.value.get_mut(isolate) as *mut T);
+        let value = heap_cell.value.get();
         V8GcRefMut {
             value,
             cell: heap_cell as *const HeapCell<T>,
@@ -117,23 +194,29 @@ impl<T: 'static> V8GcCell<T> {
     }
 
     /// Replace the wrapped value.
-    pub(crate) fn set<'a, 'e>(&'a self, value: T, ec: &'e mut dyn ExecutionContext<V8Types>) {
-        let engine = ec
-            .as_any_mut()
-            .downcast_mut::<V8Engine>()
-            .expect("V8 GcCell set with a non-V8 execution context");
-        let heap_cell = self.0.get().expect("V8 GcCell root holds no heap cell");
+    pub(crate) fn set(&self, value: T, _ec: &mut dyn ExecutionContext<V8Types>) {
+        let heap_cell = unsafe { self.0.get() }.expect("V8 GcCell edge holds no heap cell");
         if heap_cell.writer.get() || heap_cell.readers.get() > 0 {
             panic!("GcCell<T> already borrowed");
         }
-        engine.with_isolate_mut(|isolate| {
-            *heap_cell.value.get_mut(isolate) = value;
-        });
+        // SAFETY: The borrow counter proves exclusive access.
+        unsafe {
+            *heap_cell.value.get() = value;
+        }
     }
 
     /// Compare two cells for pointer equality.
     pub(crate) fn ptr_eq(&self, other: &Self) -> bool {
         self.0.get_rust_obj() == other.0.get_rust_obj()
+    }
+}
+
+// The cell edge is traced by visiting the underlying `Member`: a parent heap
+// object tracing a nested `GcCell` field keeps the cell alive and traces its
+// contents.
+impl<T: Trace + 'static> Traced for V8GcCell<T> {
+    fn trace(&self, visitor: &mut Visitor) {
+        visitor.trace(&self.0);
     }
 }
 
@@ -148,7 +231,7 @@ impl<T> Deref for V8GcRef<'_, T> {
     type Target = T;
 
     fn deref(&self) -> &T {
-        // SAFETY: The root held by the originating `V8GcCell` keeps the heap
+        // SAFETY: The edge held by the originating `V8GcCell` keeps the heap
         // cell alive for the lifetime of this guard (`'a`), and the borrow
         // counter guarantees no mutable borrow is active.
         unsafe { &*self.value }
@@ -158,7 +241,7 @@ impl<T> Deref for V8GcRef<'_, T> {
 impl<T> Drop for V8GcRef<'_, T> {
     fn drop(&mut self) {
         // SAFETY: `cell` points into the same heap cell that supplied `value`;
-        // it is kept alive by the root for the guard's lifetime.
+        // it is kept alive by the edge for the guard's lifetime.
         unsafe {
             (*self.cell).readers.set((*self.cell).readers.get() - 1);
         }

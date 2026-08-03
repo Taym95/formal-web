@@ -43,11 +43,35 @@ pub type UnrootAction<T> = Box<dyn FnOnce(&<T as JsTypes>::JsValue)>;
 ///
 /// Implementations must ensure that every field capable of holding a JavaScript
 /// value is also made known to the engine's GC mechanism.
-#[cfg(not(feature = "boa"))]
-pub unsafe trait Trace {}
+#[cfg(feature = "v8")]
+pub unsafe trait Trace {
+    /// Visit every cppgc edge (`TracedReference` to a JS object, nested
+    /// `GcCell` `Member`) reachable from this value during marking.
+    ///
+    /// # Safety
+    ///
+    /// Implementations must visit every edge exactly once; missing an edge
+    /// leaves a dangling pointer in the cppgc heap once the referent is
+    /// collected. The visitor is only valid during stop-the-world marking on
+    /// the isolate thread.
+    unsafe fn trace(&self, visitor: &mut crate::v8_gc::Visitor);
+
+    /// Convert every rooted JS handle inside this value into a cppgc edge.
+    ///
+    /// Called when the value is stored into traced storage (a `GcCell`, or a
+    /// traced platform-object field through the engine's store helpers): a
+    /// `v8::Global` root would keep the referent alive unconditionally, while
+    /// a `TracedReference` edge keeps it alive only while the owning heap
+    /// object is traced — which is what lets cycles spanning the JS heap and
+    /// the cppgc heap be collected.
+    fn store(&mut self, ec: &mut dyn crate::ExecutionContext<crate::v8::V8Types>);
+}
 
 #[cfg(feature = "boa")]
 pub unsafe trait Trace: boa_gc::Trace {}
+
+#[cfg(all(not(feature = "boa"), not(feature = "v8")))]
+pub unsafe trait Trace {}
 
 /// Lifecycle hook executed when the host engine reclaims the object's backing
 /// memory.
@@ -268,28 +292,35 @@ mod jsc_cells {
 
 // ── V8 backend ─────────────────────────────────────────────────────────────
 //
-// `GcCell<T>` is a strong cppgc root (`Persistent`) to a heap object
-// allocated on the isolate's `cppgc::Heap`. The value itself lives in a
-// `rusty_v8::cppgc::GcCell` (an `UnsafeCell`), so mutation is only granted
-// with isolate-scoped proof — supplied by the execution context. The borrow
-// counter restores the runtime double-borrow checks of `RefCell`.
+// `GcCell<T>` is a cppgc `Member` edge to a heap cell allocated on the
+// isolate's `cppgc::Heap`. Cloning creates a second edge (via `GetRustObj`),
+// mirroring Boa's `Gc<GcRefCell<T>>` clone semantics. The value itself lives
+// in an `UnsafeCell` guarded by the isolate-scoped access discipline; the
+// borrow counter restores the runtime double-borrow checks of `RefCell`.
 #[cfg(feature = "v8")]
 pub use v8_cells::*;
 
 #[cfg(feature = "v8")]
 mod v8_cells {
     use super::*;
+    use crate::gc::Trace;
     use crate::v8::gc::{V8GcCell, V8GcRef, V8GcRefMut};
     use crate::v8::{V8Engine, V8Types};
 
     /// Unified GC-managed cell providing interior mutability.
     #[derive(Clone)]
-    pub struct GcCell<T: 'static>(pub(crate) V8GcCell<T>);
+    pub struct GcCell<T: Trace + 'static>(pub(crate) V8GcCell<T>);
 
     /// Construct a [`GcCell`] with the given value.
     ///
     /// Allocates the cell on the execution context's isolate cppgc heap.
-    pub fn gc_cell_new<T: 'static>(value: T, ec: &mut dyn ExecutionContext<V8Types>) -> GcCell<T> {
+    pub fn gc_cell_new<T: Trace + 'static>(
+        mut value: T,
+        ec: &mut dyn ExecutionContext<V8Types>,
+    ) -> GcCell<T> {
+        // Convert any rooted JS handles into cppgc edges before the value
+        // enters traced storage.
+        value.store(ec);
         let engine = ec
             .as_any()
             .downcast_ref::<V8Engine>()
@@ -297,22 +328,22 @@ mod v8_cells {
         GcCell(V8GcCell::new(value, engine))
     }
 
-    impl<T: 'static> GcCell<T> {
+    impl<T: Trace + 'static> GcCell<T> {
         /// Immutably borrow the wrapped value.
-        pub fn borrow<'a, 'e>(&'a self, ec: &'e dyn ExecutionContext<V8Types>) -> GcRef<'a, T> {
+        pub fn borrow<'a>(&'a self, ec: &dyn ExecutionContext<V8Types>) -> GcRef<'a, T> {
             self.0.borrow(ec)
         }
 
         /// Mutably borrow the wrapped value.
-        pub fn borrow_mut<'a, 'e>(
-            &'a self,
-            ec: &'e mut dyn ExecutionContext<V8Types>,
-        ) -> GcRefMut<'a, T> {
+        pub fn borrow_mut<'a>(&'a self, ec: &mut dyn ExecutionContext<V8Types>) -> GcRefMut<'a, T> {
             self.0.borrow_mut(ec)
         }
 
         /// Replace the wrapped value.
-        pub fn set<'a, 'e>(&'a self, value: T, ec: &'e mut dyn ExecutionContext<V8Types>) {
+        pub fn set(&self, mut value: T, ec: &mut dyn ExecutionContext<V8Types>) {
+            // Convert any rooted JS handles into cppgc edges before the value
+            // enters traced storage.
+            value.store(ec);
             self.0.set(value, ec);
         }
 
@@ -347,7 +378,10 @@ pub fn gc_cell_new<T>(value: T, ec: &mut dyn ExecutionContext<JscTypes>) -> GcCe
 
 /// Construct a [`GcCell`] with the given value.
 #[cfg(feature = "v8")]
-pub fn gc_cell_new<T: 'static>(value: T, ec: &mut dyn ExecutionContext<V8Types>) -> GcCell<T> {
+pub fn gc_cell_new<T: Trace + 'static>(
+    value: T,
+    ec: &mut dyn ExecutionContext<V8Types>,
+) -> GcCell<T> {
     v8_cells::gc_cell_new(value, ec)
 }
 
@@ -360,8 +394,14 @@ pub fn gc_cell_ptr_eq<T: boa_gc::Trace + 'static>(a: &GcCell<T>, b: &GcCell<T>) 
 }
 
 /// Compare two [`GcCell`] references for pointer equality.
-#[cfg(any(feature = "jsc", feature = "v8"))]
+#[cfg(feature = "jsc")]
 pub fn gc_cell_ptr_eq<T: 'static>(a: &GcCell<T>, b: &GcCell<T>) -> bool {
+    a.ptr_eq(b)
+}
+
+/// Compare two [`GcCell`] references for pointer equality.
+#[cfg(feature = "v8")]
+pub fn gc_cell_ptr_eq<T: Trace + 'static>(a: &GcCell<T>, b: &GcCell<T>) -> bool {
     a.ptr_eq(b)
 }
 
@@ -374,8 +414,8 @@ pub fn gc_cell_ptr_eq<T: 'static>(a: &GcCell<T>, b: &GcCell<T>) -> bool {
 /// directly through its host hooks, so it has no need for this.)
 ///
 /// The data must be GC-traceable (`Trace` + `Finalize`): the bound is
-/// satisfied by `#[gc_struct]` types and the JavaScript references inside
-/// them are strong roots.
+/// satisfied by `#[gc_struct]` types, whose cells and JS edges participate in
+/// the engine's tracing.
 #[cfg(feature = "jsc")]
 pub fn associate_existing_object<D>(
     ec: &mut dyn ExecutionContext<JscTypes>,
@@ -583,7 +623,7 @@ mod jsc_gc_impl {
     }
 }
 
-#[cfg(any(feature = "jsc", feature = "v8"))]
+#[cfg(all(not(feature = "boa"), not(feature = "v8")))]
 mod persistent_handle_trace_impls {
     use super::Trace;
 
@@ -608,4 +648,83 @@ mod persistent_handle_trace_impls {
     unsafe impl<A: Trace, B: Trace, C: Trace> Trace for (A, B, C) {}
     unsafe impl<A: Trace, B: Trace, C: Trace, D: Trace> Trace for (A, B, C, D) {}
     unsafe impl<A: Trace, B: Trace, C: Trace, D: Trace, E: Trace> Trace for (A, B, C, D, E) {}
+}
+
+// V8: the same blanket impls with real trace bodies. `Cell<T>` values are
+// Copy-only, so they hold no edges; the others walk their contents.
+#[cfg(feature = "v8")]
+mod v8_trace_impls {
+    use super::Trace;
+    use crate::v8_gc::Visitor;
+
+    macro_rules! empty_trace {
+        ($($ty:ty),* $(,)?) => {
+            $(
+                unsafe impl Trace for $ty {
+                    unsafe fn trace(&self, _visitor: &mut Visitor) {}
+
+                    fn store(&mut self, _ec: &mut dyn crate::ExecutionContext<crate::v8::V8Types>) {}
+                }
+            )*
+        };
+    }
+
+    empty_trace!(
+        (),
+        bool,
+        char,
+        u8,
+        u16,
+        u32,
+        u64,
+        usize,
+        i8,
+        i16,
+        i32,
+        i64,
+        isize,
+        f32,
+        f64,
+        String,
+    );
+
+    unsafe impl<T: Trace> Trace for std::rc::Rc<std::cell::Cell<T>> {
+        unsafe fn trace(&self, _visitor: &mut Visitor) {}
+
+        fn store(&mut self, _ec: &mut dyn crate::ExecutionContext<crate::v8::V8Types>) {}
+    }
+
+    unsafe impl<T: Trace + 'static> Trace for super::GcCell<T> {
+        unsafe fn trace(&self, visitor: &mut Visitor) {
+            crate::v8_gc::Traced::trace(&self.0, visitor);
+        }
+
+        fn store(&mut self, _ec: &mut dyn crate::ExecutionContext<crate::v8::V8Types>) {
+            // The cell's contents are converted when they are written.
+        }
+    }
+
+    macro_rules! tuple_trace {
+        ($(($t:ident, $i:tt)),* $(,)?) => {
+            unsafe impl<$($t: Trace),*> Trace for ($($t,)*) {
+                unsafe fn trace(&self, visitor: &mut Visitor) {
+                    $(
+                        // SAFETY: Delegated to the element's own trace.
+                        unsafe { Trace::trace(&self.$i, visitor) }
+                    )*
+                }
+
+                fn store(&mut self, ec: &mut dyn crate::ExecutionContext<crate::v8::V8Types>) {
+                    $(
+                        self.$i.store(ec);
+                    )*
+                }
+            }
+        };
+    }
+
+    tuple_trace!((A, 0), (B, 1));
+    tuple_trace!((A, 0), (B, 1), (C, 2));
+    tuple_trace!((A, 0), (B, 1), (C, 2), (D, 3));
+    tuple_trace!((A, 0), (B, 1), (C, 2), (D, 3), (E, 4));
 }
