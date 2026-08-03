@@ -1,10 +1,10 @@
 use std::{cell::RefCell, rc::Rc};
 
+use crate::js::Types;
 use blitz_dom::BaseDocument;
 use html5ever::{LocalName, Prefix, QualName, ns};
-use js_engine::gc_struct;
 use js_engine::ExecutionContext;
-use crate::js::Types;
+use js_engine::gc_struct;
 use style::dom_apis::{
     MayUseInvalidation, QueryAll, QueryFirst, QuerySelectorAllResult,
     query_selector as style_query_selector,

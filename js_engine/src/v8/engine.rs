@@ -661,8 +661,15 @@ fn native_callback(
                 let callback_arguments: Vec<_> = (0..arguments.length())
                     .map(|index| wrap_local_value(scope, record.isolate_id, arguments.get(index)))
                     .collect();
-                let this_value =
-                    wrap_local_value(scope, record.isolate_id, arguments.this().into());
+                // For construct calls, V8's `this` is the newly created
+                // receiver; the Web IDL constructor logic expects `this` to be
+                // `new.target` (matching Boa's [[Construct]] convention), so
+                // pass `new_target` instead.
+                let this_value = if arguments.is_construct_call() {
+                    wrap_local_value(scope, record.isolate_id, arguments.new_target().into())
+                } else {
+                    wrap_local_value(scope, record.isolate_id, arguments.this().into())
+                };
                 match catch_unwind(AssertUnwindSafe(|| {
                     (record.behaviour)(&callback_arguments, this_value, engine)
                 })) {
@@ -952,7 +959,7 @@ impl V8Engine {
             object_prototype: self.intrinsic_object("Object.prototype"),
             function_prototype: self.intrinsic_object("Function.prototype"),
             async_iterator_prototype: self.intrinsic_object(
-                "Object.getPrototypeOf(Object.getPrototypeOf(async function*(){}()))",
+                "Object.getPrototypeOf(Object.getPrototypeOf(async function* () {}).prototype)",
             ),
         }
     }

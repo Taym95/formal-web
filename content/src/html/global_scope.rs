@@ -15,7 +15,7 @@ use ipc_messages::content::{
 };
 use ipc_messages::media::VideoPaintId;
 use js_engine::gc::{GcCell, gc_cell_new};
-use js_engine::{JsTypes, gc_struct};
+use js_engine::{ExecutionContext, JsTypes, gc_struct};
 use log::{debug, error};
 
 use crate::js::{Engine, Types};
@@ -147,31 +147,31 @@ pub struct GlobalScope {
     current_timer_nesting_level: Cell<Option<u32>>,
 
     #[ignore_trace]
-    timer_host: RefCell<Option<TimerHost>>,
+    timer_host: Rc<RefCell<Option<TimerHost>>>,
 
     /// <https://html.spec.whatwg.org/#concept-navigable>
     #[ignore_trace]
-    source_navigable_id: Cell<Option<NavigableId>>,
+    source_navigable_id: Rc<Cell<Option<NavigableId>>>,
 
     /// <https://html.spec.whatwg.org/#parent-navigable>
     /// The parent of this document's navigable in the navigable tree.
     /// None indicates a top-level traversable.
     #[ignore_trace]
-    parent_traversable_id: Cell<Option<NavigableId>>,
+    parent_traversable_id: Rc<Cell<Option<NavigableId>>>,
 
     /// <https://html.spec.whatwg.org/#traversable-navigable>
     /// The top-level traversable for this navigable tree.
     #[ignore_trace]
-    top_level_traversable_id: Cell<Option<NavigableId>>,
+    top_level_traversable_id: Rc<Cell<Option<NavigableId>>>,
 
     /// <https://html.spec.whatwg.org/#concept-document>
     /// The document id for the document associated with this global scope.
     #[ignore_trace]
-    document_id: RefCell<Option<DocumentId>>,
+    document_id: Rc<RefCell<Option<DocumentId>>>,
 
     /// Sender for content-to-user-agent IPC events (e.g. navigation requests).
     #[ignore_trace]
-    event_sender: RefCell<Option<IpcSender<ContentEvent>>>,
+    event_sender: Rc<RefCell<Option<IpcSender<ContentEvent>>>>,
 
     /// Shared registry for newly-created traversable documents (window.open).
     /// Set by `ContentProcess` before running JS that may trigger
@@ -179,11 +179,13 @@ pub struct GlobalScope {
     /// and ContentProcess (to retrieve) share the same `Rc`, so no separate
     /// flush step is needed.
     #[ignore_trace]
-    new_document_registry: RefCell<
-        Option<
-            Rc<
-                RefCell<
-                    HashMap<DocumentId, (EnvironmentSettingsObject, Rc<RefCell<BaseDocument>>)>,
+    new_document_registry: Rc<
+        RefCell<
+            Option<
+                Rc<
+                    RefCell<
+                        HashMap<DocumentId, (EnvironmentSettingsObject, Rc<RefCell<BaseDocument>>)>,
+                    >,
                 >,
             >,
         >,
@@ -195,16 +197,17 @@ pub struct GlobalScope {
     /// `ContentProcess::build_frame_composition_metadata` (to read) share
     /// the same `Rc`.
     #[ignore_trace]
-    video_paint_registry: RefCell<Option<Rc<RefCell<HashMap<(DocumentId, usize), VideoPaintId>>>>>,
+    video_paint_registry:
+        Rc<RefCell<Option<Rc<RefCell<HashMap<(DocumentId, usize), VideoPaintId>>>>>>,
 
     /// Direct sender to the graphics process (composition + media).
     #[ignore_trace]
-    graphics_sender: RefCell<Option<IpcSender<ipc_messages::graphics::GraphicsCommand>>>,
+    graphics_sender: Rc<RefCell<Option<IpcSender<ipc_messages::graphics::GraphicsCommand>>>>,
 
     /// <https://html.spec.whatwg.org/#concept-document-creation-url>
     /// The creation URL of this window's Document.
     #[ignore_trace]
-    creation_url: RefCell<Option<url::Url>>,
+    creation_url: Rc<RefCell<Option<url::Url>>>,
 
     /// Consolidated wasm state (pending requests, resolvers, counter).
     #[cfg(all(boa_backend, feature = "wasm"))]
@@ -212,7 +215,11 @@ pub struct GlobalScope {
 }
 
 impl GlobalScope {
-    pub fn new(kind: GlobalScopeKind, document: Rc<RefCell<BaseDocument>>) -> Self {
+    pub fn new(
+        kind: GlobalScopeKind,
+        document: Rc<RefCell<BaseDocument>>,
+        ec: &mut dyn ExecutionContext<Types>,
+    ) -> Self {
         Self {
             kind,
             document,
@@ -224,24 +231,24 @@ impl GlobalScope {
             timer_callback_identifier: Cell::new(0),
             window_timers: gc_cell_new(Vec::new(), ec),
             current_timer_nesting_level: Cell::new(None),
-            timer_host: RefCell::new(None),
-            source_navigable_id: Cell::new(None),
-            parent_traversable_id: Cell::new(None),
-            top_level_traversable_id: Cell::new(None),
-            document_id: RefCell::new(None),
-            event_sender: RefCell::new(None),
+            timer_host: Rc::new(RefCell::new(None)),
+            source_navigable_id: Rc::new(Cell::new(None)),
+            parent_traversable_id: Rc::new(Cell::new(None)),
+            top_level_traversable_id: Rc::new(Cell::new(None)),
+            document_id: Rc::new(RefCell::new(None)),
+            event_sender: Rc::new(RefCell::new(None)),
 
-            new_document_registry: RefCell::new(None),
-            video_paint_registry: RefCell::new(None),
-            graphics_sender: RefCell::new(None),
+            new_document_registry: Rc::new(RefCell::new(None)),
+            video_paint_registry: Rc::new(RefCell::new(None)),
+            graphics_sender: Rc::new(RefCell::new(None)),
 
-            creation_url: RefCell::new(None),
+            creation_url: Rc::new(RefCell::new(None)),
             #[cfg(all(boa_backend, feature = "wasm"))]
-            wasm_state: gc_cell_new(Some(crate::wasm::WasmState::new())),
+            wasm_state: gc_cell_new(Some(crate::wasm::WasmState::new()), ec),
         }
     }
 
-    fn next_timer_id(&self) -> u32 {
+    fn next_timer_id(&self, ec: &mut dyn ExecutionContext<Types>) -> u32 {
         let timers = self.window_timers.borrow(ec);
         let mut handle = self.timer_callback_identifier.get();
 
@@ -326,23 +333,35 @@ impl GlobalScope {
         });
     }
 
-    pub(crate) fn document_object(&self) -> Option<JsObject> {
+    pub(crate) fn document_object(&self, ec: &mut dyn ExecutionContext<Types>) -> Option<JsObject> {
         self.document_object.borrow(ec).clone()
     }
 
-    pub(crate) fn store_document_object(&self, object: JsObject) {
+    pub(crate) fn store_document_object(
+        &self,
+        object: JsObject,
+        ec: &mut dyn ExecutionContext<Types>,
+    ) {
         self.document_object.borrow_mut(ec).replace(object);
     }
 
-    pub(crate) fn location_object(&self) -> Option<JsObject> {
+    pub(crate) fn location_object(&self, ec: &mut dyn ExecutionContext<Types>) -> Option<JsObject> {
         self.location_object.borrow(ec).clone()
     }
 
-    pub(crate) fn store_location_object(&self, object: JsObject) {
+    pub(crate) fn store_location_object(
+        &self,
+        object: JsObject,
+        ec: &mut dyn ExecutionContext<Types>,
+    ) {
         self.location_object.borrow_mut(ec).replace(object);
     }
 
-    pub(crate) fn cached_node_object(&self, node_id: usize) -> Option<JsObject> {
+    pub(crate) fn cached_node_object(
+        &self,
+        node_id: usize,
+        ec: &mut dyn ExecutionContext<Types>,
+    ) -> Option<JsObject> {
         self.node_objects
             .borrow(ec)
             .iter()
@@ -350,13 +369,22 @@ impl GlobalScope {
             .map(|entry| entry.object.clone())
     }
 
-    pub(crate) fn cache_node_object(&self, node_id: usize, object: JsObject) {
+    pub(crate) fn cache_node_object(
+        &self,
+        node_id: usize,
+        object: JsObject,
+        ec: &mut dyn ExecutionContext<Types>,
+    ) {
         self.node_objects
             .borrow_mut(ec)
             .push(CachedNodeObject { node_id, object });
     }
 
-    pub(crate) fn invalidate_cached_node_ids(&self, node_ids: &[usize]) {
+    pub(crate) fn invalidate_cached_node_ids(
+        &self,
+        node_ids: &[usize],
+        ec: &mut dyn ExecutionContext<Types>,
+    ) {
         if node_ids.is_empty() {
             return;
         }
@@ -368,7 +396,11 @@ impl GlobalScope {
     }
 
     /// <https://html.spec.whatwg.org/#dom-animationframeprovider-requestanimationframe>
-    pub(crate) fn request_animation_frame(&self, callback: Callback) -> u32 {
+    pub(crate) fn request_animation_frame(
+        &self,
+        callback: Callback,
+        ec: &mut dyn ExecutionContext<Types>,
+    ) -> u32 {
         let callbacks = self.animation_frame_callbacks.borrow(ec);
         let mut handle = self.animation_frame_callback_identifier.get();
 
@@ -414,11 +446,12 @@ impl GlobalScope {
         repeat: bool,
         timeout_ms: u32,
         nesting_level: u32,
+        ec: &mut dyn ExecutionContext<Types>,
     ) -> Result<u32, String> {
         // Note: This helper continues the `timer initialization steps` algorithm at the `GlobalScope`-owned pieces. The mixin implementation already handled the preliminary timeout conversion, clamping, and task setup.
 
         // Step 2: "If previousId was given, let id be previousId; otherwise, let id be an implementation-defined integer that is greater than zero and does not already exist in global's map of setTimeout and setInterval IDs."
-        let timer_id = previous_id.unwrap_or_else(|| self.next_timer_id());
+        let timer_id = previous_id.unwrap_or_else(|| self.next_timer_id(ec));
 
         // Step 11: "Set uniqueHandle to the result of running steps after a timeout given global, \"setTimeout/setInterval\", timeout, and completionStep."
         // Note: The content/embedder boundary forwards this request into the dedicated timer worker, which models `run steps after a timeout`.
@@ -459,7 +492,7 @@ impl GlobalScope {
     }
 
     /// <https://html.spec.whatwg.org/#dom-cleartimeout>
-    pub(crate) fn clear_timer(&self, timer_id: u32) {
+    pub(crate) fn clear_timer(&self, timer_id: u32, ec: &mut dyn ExecutionContext<Types>) {
         // Note: This is the shared storage helper used by both `clearTimeout()` and `clearInterval()`.
 
         // Step 1: "Remove this's map of setTimeout and setInterval IDs[id]."
@@ -498,6 +531,7 @@ impl GlobalScope {
         &self,
         timer_id: u32,
         timer_key: WindowTimerKey,
+        ec: &mut dyn ExecutionContext<Types>,
     ) -> Option<WindowTimer> {
         // Note: This model-local lookup exposes the stored `(id, uniqueHandle)` registration so the queued timer task can check whether the timer still exists and still maps to the same handle before running the handler.
         self.window_timers
@@ -512,9 +546,10 @@ impl GlobalScope {
         &self,
         timer_id: u32,
         timer_key: WindowTimerKey,
+        ec: &mut dyn ExecutionContext<Types>,
     ) -> Result<(), String> {
         // Note: This helper continues the queued timer task after the handler and the stale-handle checks have already run inside `EnvironmentSettingsObject::run_window_timer`.
-        let timer = self.window_timer(timer_id, timer_key);
+        let timer = self.window_timer(timer_id, timer_key, ec);
         let Some(timer) = timer else {
             log_timer_debug(format!(
                 "complete timer id={} key={} skipped_missing",
@@ -570,7 +605,7 @@ impl GlobalScope {
         Ok(())
     }
 
-    pub(crate) fn clear_all_timers(&self) {
+    pub(crate) fn clear_all_timers(&self, ec: &mut dyn ExecutionContext<Types>) {
         let cleared_timers = {
             let mut timers = self.window_timers.borrow_mut(ec);
             std::mem::take(&mut *timers)
@@ -713,14 +748,17 @@ impl GlobalScope {
         self.creation_url.borrow().clone()
     }
 
-    pub(crate) fn cancel_animation_frame(&self, handle: u32) {
+    pub(crate) fn cancel_animation_frame(&self, handle: u32, ec: &mut dyn ExecutionContext<Types>) {
         self.animation_frame_callbacks
             .borrow_mut(ec)
             .retain(|entry| entry.handle != handle);
     }
 
     /// <https://html.spec.whatwg.org/#run-the-animation-frame-callbacks>
-    pub(crate) fn take_animation_frame_callbacks(&self) -> Vec<Callback> {
+    pub(crate) fn take_animation_frame_callbacks(
+        &self,
+        ec: &mut dyn ExecutionContext<Types>,
+    ) -> Vec<Callback> {
         let callback_handles: Vec<u32> = self
             .animation_frame_callbacks
             .borrow(ec)

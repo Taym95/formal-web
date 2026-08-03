@@ -740,7 +740,10 @@ pub(crate) fn set_up_readable_stream_default_controller(
     *controller.cancel_algorithm.borrow_mut(ec) = Some(cancel_algorithm);
 
     // Step 8: "Set stream.[[controller]] to controller."
-    stream.set_controller_slot(Some(ReadableStreamController::Default(controller.clone())), ec);
+    stream.set_controller_slot(
+        Some(ReadableStreamController::Default(controller.clone())),
+        ec,
+    );
     stream.set_controller_object_slot(Some(controller_object.clone()), ec);
 
     // Step 9: "Let startResult be the result of performing startAlgorithm. (This might throw an exception.)"

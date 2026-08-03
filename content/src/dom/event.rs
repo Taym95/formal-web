@@ -235,7 +235,11 @@ impl EventTarget {
     }
 
     /// <https://dom.spec.whatwg.org/#remove-an-event-listener>
-    pub(crate) fn remove_event_listener_by_id(&self, listener_id: u64, ec: &mut dyn ExecutionContext<Types>) {
+    pub(crate) fn remove_event_listener_by_id(
+        &self,
+        listener_id: u64,
+        ec: &mut dyn ExecutionContext<Types>,
+    ) {
         // Step 2: Set listener's removed to true and remove listener from
         // eventTarget's event listener list.
         let mut listeners = self.event_listener_list.borrow_mut(ec);
@@ -251,7 +255,11 @@ impl EventTarget {
     // Note: Defined by the spec but not yet used by the current dispatch code.
     // <https://dom.spec.whatwg.org/#concept-event-listener>
     #[allow(dead_code)]
-    pub(crate) fn listener_is_active(&self, listener_id: u64, ec: &mut dyn ExecutionContext<Types>) -> bool {
+    pub(crate) fn listener_is_active(
+        &self,
+        listener_id: u64,
+        ec: &mut dyn ExecutionContext<Types>,
+    ) -> bool {
         self.event_listener_list
             .borrow(ec)
             .iter()
@@ -374,7 +382,10 @@ impl Event {
     }
 
     /// <https://dom.spec.whatwg.org/#dom-event-currenttarget>
-    pub(crate) fn current_target_value(&self, ec: &mut dyn ExecutionContext<Types>) -> Option<EventTarget> {
+    pub(crate) fn current_target_value(
+        &self,
+        ec: &mut dyn ExecutionContext<Types>,
+    ) -> Option<EventTarget> {
         self.current_target.borrow(ec).clone()
     }
 
@@ -485,7 +496,11 @@ impl UIEvent {
         self.detail
     }
 
-    pub fn apply_to_event_state(&self, event_state: &mut EventState, ec: &mut dyn ExecutionContext<Types>) {
+    pub fn apply_to_event_state(
+        &self,
+        event_state: &mut EventState,
+        ec: &mut dyn ExecutionContext<Types>,
+    ) {
         if *self.event.canceled_flag.borrow(ec) {
             event_state.prevent_default();
         }

@@ -1,6 +1,6 @@
-use js_engine::gc_struct;
-use js_engine::ExecutionContext;
 use crate::js::Types;
+use js_engine::ExecutionContext;
+use js_engine::gc_struct;
 use std::{cell::RefCell, rc::Rc};
 
 use blitz_dom::{BaseDocument, NodeData};

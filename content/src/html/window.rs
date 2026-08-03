@@ -40,10 +40,7 @@ impl EventTargetAccess for Window {
 }
 
 impl Window {
-    pub(crate) fn new(
-        global_scope: GlobalScope,
-        ec: &mut dyn ExecutionContext<Types>,
-    ) -> Self {
+    pub(crate) fn new(global_scope: GlobalScope, ec: &mut dyn ExecutionContext<Types>) -> Self {
         Self {
             event_target: EventTarget::new(ec),
             global_scope,

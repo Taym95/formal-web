@@ -213,8 +213,10 @@ fn query_selector_all(
 ) -> Completion<JsValue, crate::js::Types> {
     let value_undefined = ec.value_undefined();
     let selector = ec.to_rust_string(args.first().cloned().unwrap_or(value_undefined.clone()))?;
-    let node_ids = try_with_document(this, ec, |document, _ec| document.query_selector_all(&selector))?
-        .map_err(|error| ec.new_syntax_error(&error))?;
+    let node_ids = try_with_document(this, ec, |document, _ec| {
+        document.query_selector_all(&selector)
+    })?
+    .map_err(|error| ec.new_syntax_error(&error))?;
     let array = ec.create_empty_array();
     for node_id in node_ids {
         let obj = resolve_element_object(node_id, ec)?;
@@ -250,7 +252,9 @@ fn create_element(
 ) -> Completion<JsValue, crate::js::Types> {
     let value_undefined = ec.value_undefined();
     let local_name = ec.to_rust_string(args.first().cloned().unwrap_or(value_undefined))?;
-    let node_id = try_with_document(this, ec, |document, _ec| document.create_element(&local_name))?;
+    let node_id = try_with_document(this, ec, |document, _ec| {
+        document.create_element(&local_name)
+    })?;
     let obj = resolve_element_object(node_id, ec)?;
     Ok(crate::js::Types::value_from_object(obj))
 }
@@ -334,7 +338,9 @@ fn get_document_element(
     _: &[JsValue],
     ec: &mut dyn ExecutionContext<crate::js::Types>,
 ) -> Completion<JsValue, crate::js::Types> {
-    match try_with_document(this, ec, |document, _ec| Document::document_element(document))? {
+    match try_with_document(this, ec, |document, _ec| {
+        Document::document_element(document)
+    })? {
         Some(node_id) => {
             let obj = resolve_element_object(node_id, ec)?;
             Ok(crate::js::Types::value_from_object(obj))
@@ -359,8 +365,9 @@ fn set_title(
 ) -> Completion<JsValue, crate::js::Types> {
     let value_undefined = ec.value_undefined();
     let title = ec.to_rust_string(args.first().cloned().unwrap_or(value_undefined))?;
-    let dropped_node_ids =
-        try_with_document(this, ec, |document, _ec| Document::title_subtree_node_ids(document))?;
+    let dropped_node_ids = try_with_document(this, ec, |document, _ec| {
+        Document::title_subtree_node_ids(document)
+    })?;
     invalidate_cached_node_ids(ec, &dropped_node_ids)?;
     try_with_document(this, ec, |document, ec| document.set_title(&title, ec))?;
     Ok(ec.value_undefined())

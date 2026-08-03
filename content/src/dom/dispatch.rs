@@ -256,7 +256,11 @@ fn invoke(
     *event.current_target.borrow_mut(ec) = Some(entry.invocation_target.clone());
 
     // Step 8: Let listeners be a clone of event's currentTarget attribute value's event listener list.
-    let listeners = entry.invocation_target.event_listener_list.borrow(ec).clone();
+    let listeners = entry
+        .invocation_target
+        .event_listener_list
+        .borrow(ec)
+        .clone();
 
     // Step 9: Let invocationTargetInShadowTree be pathItem's invocation-target-in-shadow-tree.
     // TODO: Shadow tree is not yet modeled.

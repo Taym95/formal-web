@@ -4,9 +4,9 @@ use blitz_dom::BaseDocument;
 
 use crate::dom::event::EventTargetAccess;
 use crate::dom::{Element, EventTarget};
-use js_engine::gc_struct;
-use js_engine::ExecutionContext;
 use crate::js::Types;
+use js_engine::ExecutionContext;
+use js_engine::gc_struct;
 
 /// <https://html.spec.whatwg.org/#htmlelement>
 #[gc_struct]

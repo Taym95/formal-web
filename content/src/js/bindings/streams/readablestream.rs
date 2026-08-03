@@ -366,7 +366,8 @@ fn cancel_method(
 ) -> Completion<JsValue, Types> {
     let stream_object = <Types as JsTypes>::value_as_object(this)
         .ok_or_else(|| ec.new_type_error("ReadableStream receiver is not an object"))?;
-    let mut stream = with_readable_stream_ref(&stream_object, ec, |s: &ReadableStream, _ec| s.clone())?;
+    let mut stream =
+        with_readable_stream_ref(&stream_object, ec, |s: &ReadableStream, _ec| s.clone())?;
     let promise = stream.cancel(
         args.get(0).cloned().unwrap_or_else(|| ec.value_undefined()),
         ec,
@@ -381,7 +382,8 @@ fn get_reader_method(
 ) -> Completion<JsValue, Types> {
     let stream_object = <Types as JsTypes>::value_as_object(this)
         .ok_or_else(|| ec.new_type_error("ReadableStream receiver is not an object"))?;
-    let mut stream = with_readable_stream_ref(&stream_object, ec, |s: &ReadableStream, _ec| s.clone())?;
+    let mut stream =
+        with_readable_stream_ref(&stream_object, ec, |s: &ReadableStream, _ec| s.clone())?;
     let reader = stream.get_reader(
         &args.get(0).cloned().unwrap_or_else(|| ec.value_undefined()),
         ec,
@@ -396,7 +398,8 @@ fn pipe_through_method(
 ) -> Completion<JsValue, Types> {
     let stream_object = <Types as JsTypes>::value_as_object(this)
         .ok_or_else(|| ec.new_type_error("ReadableStream receiver is not an object"))?;
-    let mut stream = with_readable_stream_ref(&stream_object, ec, |s: &ReadableStream, _ec| s.clone())?;
+    let mut stream =
+        with_readable_stream_ref(&stream_object, ec, |s: &ReadableStream, _ec| s.clone())?;
     stream.pipe_through(
         &args.get(0).cloned().unwrap_or_else(|| ec.value_undefined()),
         &args.get(1).cloned().unwrap_or_else(|| ec.value_undefined()),
@@ -411,7 +414,8 @@ fn pipe_to_operation(
 ) -> Completion<JsObject, Types> {
     let stream_object = <Types as JsTypes>::value_as_object(this)
         .ok_or_else(|| ec.new_type_error("ReadableStream receiver is not an object"))?;
-    let mut stream = with_readable_stream_ref(&stream_object, ec, |s: &ReadableStream, _ec| s.clone())?;
+    let mut stream =
+        with_readable_stream_ref(&stream_object, ec, |s: &ReadableStream, _ec| s.clone())?;
     stream.pipe_to(
         &args.get(0).cloned().unwrap_or_else(|| ec.value_undefined()),
         &args.get(1).cloned().unwrap_or_else(|| ec.value_undefined()),
@@ -450,7 +454,8 @@ fn tee_method(
 ) -> Completion<JsValue, Types> {
     let stream_object = <Types as JsTypes>::value_as_object(this)
         .ok_or_else(|| ec.new_type_error("ReadableStream receiver is not an object"))?;
-    let mut stream = with_readable_stream_ref(&stream_object, ec, |s: &ReadableStream, _ec| s.clone())?;
+    let mut stream =
+        with_readable_stream_ref(&stream_object, ec, |s: &ReadableStream, _ec| s.clone())?;
     stream.tee(ec)
 }
 

@@ -137,7 +137,10 @@ impl TransformStream {
         self.backpressure.get()
     }
 
-    pub(crate) fn backpressure_change_promise(&self, ec: &mut dyn ExecutionContext<Types>) -> Option<JsObject> {
+    pub(crate) fn backpressure_change_promise(
+        &self,
+        ec: &mut dyn ExecutionContext<Types>,
+    ) -> Option<JsObject> {
         self.backpressure_change_promise.borrow(ec).clone()
     }
 }
@@ -1446,9 +1449,10 @@ pub(crate) fn with_transform_stream_default_controller_ref<R>(
     // Clone the handle out of the object registry so `f` can borrow `ec`
     // mutably; the clone shares all GC-managed state with the registered
     // platform object.
-    let controller = ec
-        .with_object_any(object)
-        .and_then(|a| a.downcast_ref::<TransformStreamDefaultController>().cloned());
+    let controller = ec.with_object_any(object).and_then(|a| {
+        a.downcast_ref::<TransformStreamDefaultController>()
+            .cloned()
+    });
     let Some(controller) = controller else {
         return Err(ec.new_type_error("object is not a TransformStreamDefaultController"));
     };

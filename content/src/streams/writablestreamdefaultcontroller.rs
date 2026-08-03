@@ -216,11 +216,19 @@ impl WritableStreamDefaultController {
             })
     }
 
-    pub(crate) fn set_stream_slot(&self, stream: Option<WritableStream>, ec: &mut dyn ExecutionContext<Types>) {
+    pub(crate) fn set_stream_slot(
+        &self,
+        stream: Option<WritableStream>,
+        ec: &mut dyn ExecutionContext<Types>,
+    ) {
         *self.stream.borrow_mut(ec) = stream;
     }
 
-    pub(crate) fn set_abort_signal_slot(&self, signal: AbortSignal, ec: &mut dyn ExecutionContext<Types>) {
+    pub(crate) fn set_abort_signal_slot(
+        &self,
+        signal: AbortSignal,
+        ec: &mut dyn ExecutionContext<Types>,
+    ) {
         *self.abort_signal.borrow_mut(ec) = Some(signal);
     }
 
@@ -393,7 +401,8 @@ impl WritableStreamDefaultController {
             return Ok(());
         }
 
-        if !stream.close_queued_or_in_flight(ec) && stream.state() == WritableStreamState::Writable {
+        if !stream.close_queued_or_in_flight(ec) && stream.state() == WritableStreamState::Writable
+        {
             let backpressure = self.get_backpressure(ec)?;
             stream.update_backpressure(backpressure, ec)?;
         }
@@ -633,7 +642,10 @@ pub(crate) fn set_up_writable_stream_default_controller(
     controller.set_stream_slot(Some(stream.clone()), ec);
 
     // Step 4: "Set stream.[[controller]] to controller."
-    stream.set_controller_slot(Some(WritableStreamController::Default(controller.clone())), ec);
+    stream.set_controller_slot(
+        Some(WritableStreamController::Default(controller.clone())),
+        ec,
+    );
     stream.set_controller_object_slot(Some(controller_object.clone()), ec);
 
     // Step 5: "Perform ! ResetQueue(controller)."
@@ -865,7 +877,10 @@ fn get_callable_method(
     Ok(Some(method.clone()))
 }
 
-fn reset_controller_queue(controller: &WritableStreamDefaultController, ec: &mut dyn ExecutionContext<crate::js::Types>) {
+fn reset_controller_queue(
+    controller: &WritableStreamDefaultController,
+    ec: &mut dyn ExecutionContext<crate::js::Types>,
+) {
     controller.reset_queue(ec);
 }
 

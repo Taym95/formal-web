@@ -33,10 +33,9 @@ fn build_context_inner(document: Rc<RefCell<BaseDocument>>) -> Result<Engine, St
     #[cfg(boa_backend)]
     let mut engine = {
         use crate::html::{GlobalScope, Window};
-        use js_engine::ExecutionContext as _;
 
         let document = Rc::clone(&document);
-        let factory = move |ec: &mut dyn ExecutionContext<crate::js::Types>| {
+        let factory = move |ec: &mut dyn js_engine::ExecutionContext<crate::js::Types>| {
             let global_scope = GlobalScope::new(
                 crate::html::GlobalScopeKind::Window,
                 Rc::clone(&document),
@@ -83,14 +82,18 @@ fn build_realm_inner(
 
 /// Shared setup for engines using the generic interface-registration path.
 /// Initializes the global object, Window, Document, prototypes, etc.
-fn setup_realm(engine: &mut Engine, document: Rc<RefCell<BaseDocument>>) -> Result<(), String> {
+fn setup_realm(engine: &mut Engine, _document: Rc<RefCell<BaseDocument>>) -> Result<(), String> {
+    #[cfg(not(boa_backend))]
+    let document = _document;
     use crate::dom::{
         AbortController, AbortSignal, DOMException, Document, Element, Event, EventTarget, Node,
         UIEvent,
     };
+    #[cfg(not(boa_backend))]
+    use crate::html::GlobalScope;
     use crate::html::{
-        GlobalScope, HTMLAnchorElement, HTMLElement, HTMLIFrameElement, HTMLInputElement,
-        HTMLMediaElement, HTMLVideoElement, Location, Window,
+        HTMLAnchorElement, HTMLElement, HTMLIFrameElement, HTMLInputElement, HTMLMediaElement,
+        HTMLVideoElement, Location, Window,
     };
     use crate::streams::{
         ByteLengthQueuingStrategy, CountQueuingStrategy, ReadableByteStreamController,
@@ -213,7 +216,9 @@ fn setup_realm(engine: &mut Engine, document: Rc<RefCell<BaseDocument>>) -> Resu
     wire_registry_constructor_prototype::<crate::js::Types, HTMLAnchorElement, HTMLElement>(engine);
     wire_registry_constructor_prototype::<crate::js::Types, HTMLIFrameElement, HTMLElement>(engine);
     wire_registry_constructor_prototype::<crate::js::Types, HTMLMediaElement, HTMLElement>(engine);
-    wire_registry_constructor_prototype::<crate::js::Types, HTMLVideoElement, HTMLMediaElement>(engine);
+    wire_registry_constructor_prototype::<crate::js::Types, HTMLVideoElement, HTMLMediaElement>(
+        engine,
+    );
     wire_registry_constructor_prototype::<crate::js::Types, HTMLInputElement, HTMLElement>(engine);
     wire_registry_constructor_prototype::<crate::js::Types, Window, EventTarget>(engine);
 
@@ -221,8 +226,7 @@ fn setup_realm(engine: &mut Engine, document: Rc<RefCell<BaseDocument>>) -> Resu
     if let Some(de_proto) = get_registry_prototype::<crate::js::Types, DOMException>(engine) {
         let realm = engine.current_realm();
         let intrinsics = engine.realm_intrinsics(&realm);
-        if let Err(error) =
-            engine.set_prototype(de_proto, Some(intrinsics.error_prototype.clone()))
+        if let Err(error) = engine.set_prototype(de_proto, Some(intrinsics.error_prototype.clone()))
         {
             error!("failed to wire DOMException to Error.prototype: {error:?}");
         }
@@ -256,9 +260,11 @@ fn setup_realm(engine: &mut Engine, document: Rc<RefCell<BaseDocument>>) -> Resu
                             engine.get_own_property(proto.clone(), key.clone())
                         {
                             if descriptor.value.is_some() || descriptor.get.is_some() {
-                                if let Err(error) =
-                                    engine.define_property_or_throw(global_obj.clone(), key, descriptor)
-                                {
+                                if let Err(error) = engine.define_property_or_throw(
+                                    global_obj.clone(),
+                                    key,
+                                    descriptor,
+                                ) {
                                     error!(
                                         "failed to copy a Window prototype property to the global object: {error:?}"
                                     );

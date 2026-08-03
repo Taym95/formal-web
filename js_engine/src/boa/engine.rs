@@ -359,7 +359,9 @@ impl BoaContext {
         let mut engine = BoaContext::from_context(context);
         // Store the execution context on the host hooks so
         // `create_global_object` can build the real platform object.
-        hooks.ec.replace(Some(&mut engine as *mut dyn ExecutionContext<BoaTypes>));
+        hooks
+            .ec
+            .replace(Some(&mut engine as *mut dyn ExecutionContext<BoaTypes>));
         // Create the real realm: `Context::create_realm` runs
         // `Realm::create` with the context's host hooks, whose stored
         // execution context is now set, then installs the default global

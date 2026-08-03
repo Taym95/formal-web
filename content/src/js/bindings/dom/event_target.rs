@@ -136,7 +136,8 @@ fn dispatch_event(
     let path = crate::js::platform_objects::build_path_from_target_js_object(&target_object, ec);
 
     let target_value = <crate::js::Types as JsTypes>::value_from_object(target_object);
-    let target = crate::js::try_with_event_target_mut(&target_value, ec, |target, _ec| target.clone())?;
+    let target =
+        crate::js::try_with_event_target_mut(&target_value, ec, |target, _ec| target.clone())?;
     let canceled = target.dispatch_event(&event, &path, ec)?;
     Ok(ec.value_from_bool(!canceled))
 }

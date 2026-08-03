@@ -359,21 +359,27 @@ impl EnvironmentSettingsObject {
             }
         }
 
-        if let Err(error) = with_global_scope(&mut self.realm_execution_context, |global_scope, ec| {
-            if let Err(error) = global_scope.complete_window_timer(timer_id, timer_key, ec) {
-                error!("failed to complete window timer (id={timer_id} key={timer_key}): {error}");
-            }
-            Ok(())
-        }) {
+        if let Err(error) =
+            with_global_scope(&mut self.realm_execution_context, |global_scope, ec| {
+                if let Err(error) = global_scope.complete_window_timer(timer_id, timer_key, ec) {
+                    error!(
+                        "failed to complete window timer (id={timer_id} key={timer_key}): {error}"
+                    );
+                }
+                Ok(())
+            })
+        {
             error!(
                 "failed to access global scope for timer completion: {}",
                 self.error_to_string(error)
             );
         }
-        if let Err(error) = with_global_scope(&mut self.realm_execution_context, |global_scope, _ec| {
-            global_scope.set_current_timer_nesting_level(previous_nesting_level);
-            Ok(())
-        }) {
+        if let Err(error) =
+            with_global_scope(&mut self.realm_execution_context, |global_scope, _ec| {
+                global_scope.set_current_timer_nesting_level(previous_nesting_level);
+                Ok(())
+            })
+        {
             error!(
                 "failed to access global scope for timer nesting level: {}",
                 self.error_to_string(error)

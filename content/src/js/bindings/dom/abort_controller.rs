@@ -53,9 +53,8 @@ fn get_signal(
 ) -> Completion<JsValue, crate::js::Types> {
     let obj = crate::js::Types::value_as_object(this)
         .ok_or_else(|| ec.new_type_error("AbortController receiver is not an object"))?;
-    let signal_object = try_with_abort_controller_ref(&obj, ec, |controller, ec| {
-        controller.signal_object(ec)
-    })?;
+    let signal_object =
+        try_with_abort_controller_ref(&obj, ec, |controller, ec| controller.signal_object(ec))?;
     let signal_object = signal_object
         .ok_or_else(|| ec.new_type_error("AbortSignal is missing its JavaScript object"))?;
     Ok(crate::js::Types::value_from_object(signal_object))

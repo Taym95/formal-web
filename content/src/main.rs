@@ -736,7 +736,7 @@ impl ContentProcess {
             .documents
             .get_mut(&document_id)
             .ok_or_else(|| format!("unknown document {document_id}"))?;
-        with_global_scope(content_document.settings.ec(), |global_scope| {
+        with_global_scope(content_document.settings.ec(), |global_scope, _ec| {
             global_scope.set_new_document_registry(registry);
             Ok(())
         })
@@ -757,7 +757,7 @@ impl ContentProcess {
             .documents
             .get_mut(&document_id)
             .ok_or_else(|| format!("unknown document {document_id}"))?;
-        with_global_scope(content_document.settings.ec(), |global_scope| {
+        with_global_scope(content_document.settings.ec(), |global_scope, _ec| {
             global_scope.clear_new_document_registry();
             Ok(())
         })
@@ -783,7 +783,7 @@ impl ContentProcess {
                 continue;
             }
             // Read the traversable_id from the new document's own GlobalScope.
-            let new_traversable_id = with_global_scope(settings.ec(), |global_scope| {
+            let new_traversable_id = with_global_scope(settings.ec(), |global_scope, _ec| {
                 Ok(global_scope.source_navigable_id())
             })
             .map_err(|error| format!("failed to read new traversable id: {}", error.display()))?
@@ -891,7 +891,7 @@ impl ContentProcess {
 
         let window_target = ec
             .with_object_any(&window)
-            .and_then(|data| data.downcast_ref::<crate::html::Window>())
+            .and_then(|data| data.downcast_ref::<crate::html::Window>().cloned())
             .map(|w| w.get_event_target(ec))
             .ok_or_else(|| {
                 let msg = "failed to extract EventTarget from Window".to_string();
@@ -949,7 +949,7 @@ impl ContentProcess {
 
         // Set the video-paint registry on GlobalScope so that
         // resource_selection_algorithm can register paint IDs.
-        if let Err(error) = with_global_scope(settings.ec(), |global_scope| {
+        if let Err(error) = with_global_scope(settings.ec(), |global_scope, _ec| {
             global_scope.set_video_paint_registry(Rc::clone(&self.video_paint_registry));
             if let Some(ref sender) = self.graphics_sender {
                 global_scope.set_graphics_sender(sender.clone());
@@ -1050,7 +1050,7 @@ impl ContentProcess {
 
         // Set the video-paint registry on GlobalScope so that
         // resource_selection_algorithm can register paint IDs.
-        if let Err(error) = with_global_scope(settings.ec(), |global_scope| {
+        if let Err(error) = with_global_scope(settings.ec(), |global_scope, _ec| {
             global_scope.set_video_paint_registry(Rc::clone(&self.video_paint_registry));
             if let Some(ref sender) = self.graphics_sender {
                 global_scope.set_graphics_sender(sender.clone());
@@ -1901,7 +1901,7 @@ impl ContentProcess {
         };
         let parent_traversable_id = content_document.parent_traversable_id;
         let top_level_traversable_id = content_document.top_level_traversable_id;
-        with_global_scope(content_document.settings.ec(), |global_scope| {
+        with_global_scope(content_document.settings.ec(), |global_scope, _ec| {
             global_scope.set_navigable_hierarchy(parent_traversable_id, top_level_traversable_id);
             Ok(())
         })

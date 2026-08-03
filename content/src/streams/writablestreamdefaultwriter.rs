@@ -41,16 +41,30 @@ impl WritableStreamDefaultWriter {
             closed_resolvers: gc_cell_new(None, ec),
         }
     }
-    pub(crate) fn stream_slot_value(&self, ec: &mut dyn ExecutionContext<Types>) -> Option<WritableStream> {
+    pub(crate) fn stream_slot_value(
+        &self,
+        ec: &mut dyn ExecutionContext<Types>,
+    ) -> Option<WritableStream> {
         self.stream.borrow(ec).clone()
     }
-    pub(crate) fn set_stream_slot_value(&self, stream: Option<WritableStream>, ec: &mut dyn ExecutionContext<Types>) {
+    pub(crate) fn set_stream_slot_value(
+        &self,
+        stream: Option<WritableStream>,
+        ec: &mut dyn ExecutionContext<Types>,
+    ) {
         *self.stream.borrow_mut(ec) = stream;
     }
-    pub(crate) fn ready_promise_value(&self, ec: &mut dyn ExecutionContext<Types>) -> Option<JsObject> {
+    pub(crate) fn ready_promise_value(
+        &self,
+        ec: &mut dyn ExecutionContext<Types>,
+    ) -> Option<JsObject> {
         self.ready_promise.borrow(ec).clone()
     }
-    pub(crate) fn set_ready_promise_value(&self, promise: Option<JsObject>, ec: &mut dyn ExecutionContext<Types>) {
+    pub(crate) fn set_ready_promise_value(
+        &self,
+        promise: Option<JsObject>,
+        ec: &mut dyn ExecutionContext<Types>,
+    ) {
         // JSC: protect new value from GC, unprotect old value
         #[cfg(feature = "jsc")]
         {
@@ -68,16 +82,30 @@ impl WritableStreamDefaultWriter {
         }
         *self.ready_promise.borrow_mut(ec) = promise;
     }
-    pub(crate) fn ready_resolvers_value(&self, ec: &mut dyn ExecutionContext<Types>) -> Option<PromiseResolvers<Types>> {
+    pub(crate) fn ready_resolvers_value(
+        &self,
+        ec: &mut dyn ExecutionContext<Types>,
+    ) -> Option<PromiseResolvers<Types>> {
         self.ready_resolvers.borrow(ec).clone()
     }
-    pub(crate) fn set_ready_resolvers_value(&self, resolvers: Option<PromiseResolvers<Types>>, ec: &mut dyn ExecutionContext<Types>) {
+    pub(crate) fn set_ready_resolvers_value(
+        &self,
+        resolvers: Option<PromiseResolvers<Types>>,
+        ec: &mut dyn ExecutionContext<Types>,
+    ) {
         *self.ready_resolvers.borrow_mut(ec) = resolvers;
     }
-    pub(crate) fn closed_promise_value(&self, ec: &mut dyn ExecutionContext<Types>) -> Option<JsObject> {
+    pub(crate) fn closed_promise_value(
+        &self,
+        ec: &mut dyn ExecutionContext<Types>,
+    ) -> Option<JsObject> {
         self.closed_promise.borrow(ec).clone()
     }
-    pub(crate) fn set_closed_promise_value(&self, promise: Option<JsObject>, ec: &mut dyn ExecutionContext<Types>) {
+    pub(crate) fn set_closed_promise_value(
+        &self,
+        promise: Option<JsObject>,
+        ec: &mut dyn ExecutionContext<Types>,
+    ) {
         // JSC: protect new value from GC, unprotect old value
         #[cfg(feature = "jsc")]
         {
@@ -95,10 +123,17 @@ impl WritableStreamDefaultWriter {
         }
         *self.closed_promise.borrow_mut(ec) = promise;
     }
-    pub(crate) fn closed_resolvers_value(&self, ec: &mut dyn ExecutionContext<Types>) -> Option<PromiseResolvers<Types>> {
+    pub(crate) fn closed_resolvers_value(
+        &self,
+        ec: &mut dyn ExecutionContext<Types>,
+    ) -> Option<PromiseResolvers<Types>> {
         self.closed_resolvers.borrow(ec).clone()
     }
-    pub(crate) fn set_closed_resolvers_value(&self, resolvers: Option<PromiseResolvers<Types>>, ec: &mut dyn ExecutionContext<Types>) {
+    pub(crate) fn set_closed_resolvers_value(
+        &self,
+        resolvers: Option<PromiseResolvers<Types>>,
+        ec: &mut dyn ExecutionContext<Types>,
+    ) {
         *self.closed_resolvers.borrow_mut(ec) = resolvers;
     }
 

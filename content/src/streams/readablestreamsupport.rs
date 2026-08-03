@@ -43,7 +43,11 @@ pub(crate) struct SourceMethod {
 }
 
 impl SourceMethod {
-    pub(crate) fn new(this_value: JsObject, callback: Callback, ec: &mut dyn ExecutionContext<Types>) -> Self {
+    pub(crate) fn new(
+        this_value: JsObject,
+        callback: Callback,
+        ec: &mut dyn ExecutionContext<Types>,
+    ) -> Self {
         Self {
             this_value: gc_cell_new(Some(this_value), ec),
             callback,

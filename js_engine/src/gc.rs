@@ -163,10 +163,7 @@ mod boa_cells {
 
     impl<T: boa_gc::Trace + 'static> GcCell<T> {
         /// Immutably borrow the wrapped value.
-        pub fn borrow<'a, 'e>(
-            &'a self,
-            _ec: &'e dyn ExecutionContext<BoaTypes>,
-        ) -> GcRef<'a, T> {
+        pub fn borrow<'a, 'e>(&'a self, _ec: &'e dyn ExecutionContext<BoaTypes>) -> GcRef<'a, T> {
             self.0.borrow()
         }
 
@@ -242,10 +239,7 @@ mod jsc_cells {
 
     impl<T> GcCell<T> {
         /// Immutably borrow the wrapped value.
-        pub fn borrow<'a, 'e>(
-            &'a self,
-            _ec: &'e dyn ExecutionContext<JscTypes>,
-        ) -> GcRef<'a, T> {
+        pub fn borrow<'a, 'e>(&'a self, _ec: &'e dyn ExecutionContext<JscTypes>) -> GcRef<'a, T> {
             self.0.borrow()
         }
 
@@ -305,10 +299,7 @@ mod v8_cells {
 
     impl<T: 'static> GcCell<T> {
         /// Immutably borrow the wrapped value.
-        pub fn borrow<'a, 'e>(
-            &'a self,
-            ec: &'e dyn ExecutionContext<V8Types>,
-        ) -> GcRef<'a, T> {
+        pub fn borrow<'a, 'e>(&'a self, ec: &'e dyn ExecutionContext<V8Types>) -> GcRef<'a, T> {
             self.0.borrow(ec)
         }
 

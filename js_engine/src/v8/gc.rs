@@ -14,8 +14,8 @@ use std::ops::{Deref, DerefMut};
 use rusty_v8 as v8;
 use v8::cppgc::{self, GarbageCollected, GetRustObj};
 
-use crate::v8::{V8Engine, V8Types};
 use crate::ExecutionContext;
+use crate::v8::{V8Engine, V8Types};
 
 /// The cppgc heap object backing a [`V8GcCell`].
 ///

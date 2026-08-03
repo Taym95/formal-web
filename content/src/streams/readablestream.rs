@@ -73,27 +73,48 @@ impl ReadableStream {
         }
     }
 
-    pub(crate) fn controller_slot(&self, ec: &mut dyn ExecutionContext<Types>) -> Option<ReadableStreamController> {
+    pub(crate) fn controller_slot(
+        &self,
+        ec: &mut dyn ExecutionContext<Types>,
+    ) -> Option<ReadableStreamController> {
         self.controller.borrow(ec).clone()
     }
 
-    pub(crate) fn set_controller_slot(&self, controller: Option<ReadableStreamController>, ec: &mut dyn ExecutionContext<Types>) {
+    pub(crate) fn set_controller_slot(
+        &self,
+        controller: Option<ReadableStreamController>,
+        ec: &mut dyn ExecutionContext<Types>,
+    ) {
         *self.controller.borrow_mut(ec) = controller;
     }
 
-    pub(crate) fn controller_object_slot(&self, ec: &mut dyn ExecutionContext<Types>) -> Option<JsObject> {
+    pub(crate) fn controller_object_slot(
+        &self,
+        ec: &mut dyn ExecutionContext<Types>,
+    ) -> Option<JsObject> {
         self.controller_object.borrow(ec).clone()
     }
 
-    pub(crate) fn set_controller_object_slot(&self, controller_object: Option<JsObject>, ec: &mut dyn ExecutionContext<Types>) {
+    pub(crate) fn set_controller_object_slot(
+        &self,
+        controller_object: Option<JsObject>,
+        ec: &mut dyn ExecutionContext<Types>,
+    ) {
         self.controller_object.set(controller_object, ec);
     }
 
-    pub(crate) fn reader_slot(&self, ec: &mut dyn ExecutionContext<Types>) -> Option<ReadableStreamReader> {
+    pub(crate) fn reader_slot(
+        &self,
+        ec: &mut dyn ExecutionContext<Types>,
+    ) -> Option<ReadableStreamReader> {
         self.reader.borrow(ec).clone()
     }
 
-    pub(crate) fn set_reader_slot(&self, reader: Option<ReadableStreamReader>, ec: &mut dyn ExecutionContext<Types>) {
+    pub(crate) fn set_reader_slot(
+        &self,
+        reader: Option<ReadableStreamReader>,
+        ec: &mut dyn ExecutionContext<Types>,
+    ) {
         *self.reader.borrow_mut(ec) = reader;
     }
 
@@ -252,7 +273,8 @@ impl ReadableStream {
         let options = normalize_pipe_options(options, ec)?;
 
         // Step 2: "If ! IsWritableStreamLocked(transform[\"writable\"]) is true, throw a TypeError exception."
-        let writable_locked = super::with_writable_stream_ref(&writable_obj, ec, |ws, ec| ws.locked(ec))?;
+        let writable_locked =
+            super::with_writable_stream_ref(&writable_obj, ec, |ws, ec| ws.locked(ec))?;
         if writable_locked {
             return Err(ec.new_type_error(
                 "ReadableStream.pipeThrough(): destination writable stream is locked",
@@ -997,7 +1019,10 @@ pub(crate) struct ReadableStreamFromIterableState {
 }
 
 impl ReadableStreamFromIterableState {
-    fn new(iterator_record: ReadableStreamFromIteratorRecord, ec: &mut dyn ExecutionContext<Types>) -> Self {
+    fn new(
+        iterator_record: ReadableStreamFromIteratorRecord,
+        ec: &mut dyn ExecutionContext<Types>,
+    ) -> Self {
         Self {
             iterator_record,
             stream: gc_cell_new(None, ec),
@@ -1195,11 +1220,10 @@ pub(crate) fn readable_stream_from_iterable(
     ec: &mut dyn ExecutionContext<crate::js::Types>,
 ) -> Completion<JsObject, crate::js::Types> {
     // Step 1: "Let stream be undefined."
-    let state = ReadableStreamFromIterableState::new(get_readable_stream_from_iterator_record(
-        async_iterable,
+    let state = ReadableStreamFromIterableState::new(
+        get_readable_stream_from_iterator_record(async_iterable, ec)?,
         ec,
-    )?,
-    ec);
+    );
 
     // Step 2: "Let iteratorRecord be ? GetIterator(asyncIterable, async)."
     // Note: `get_readable_stream_from_iterator_record()` normalizes async iterators and the
@@ -1768,7 +1792,10 @@ pub(crate) fn readable_stream_fulfill_read_request(
 }
 
 /// <https://streams.spec.whatwg.org/#readable-stream-get-num-read-requests>
-pub(crate) fn readable_stream_get_num_read_requests(stream: ReadableStream, ec: &mut dyn ExecutionContext<crate::js::Types>) -> usize {
+pub(crate) fn readable_stream_get_num_read_requests(
+    stream: ReadableStream,
+    ec: &mut dyn ExecutionContext<crate::js::Types>,
+) -> usize {
     // Step 1: "Assert: ! ReadableStreamHasDefaultReader(stream) is true."
     debug_assert!(readable_stream_has_default_reader(&stream, ec));
 
@@ -1781,7 +1808,10 @@ pub(crate) fn readable_stream_get_num_read_requests(stream: ReadableStream, ec: 
 }
 
 /// <https://streams.spec.whatwg.org/#readable-stream-has-default-reader>
-pub(crate) fn readable_stream_has_default_reader(stream: &ReadableStream, ec: &mut dyn ExecutionContext<crate::js::Types>) -> bool {
+pub(crate) fn readable_stream_has_default_reader(
+    stream: &ReadableStream,
+    ec: &mut dyn ExecutionContext<crate::js::Types>,
+) -> bool {
     // Step 1: "Let reader be stream.[[reader]]."
     let reader = stream.reader_slot(ec);
 
@@ -2025,7 +2055,10 @@ fn byte_tee_switch_to_byob_reader(
     tee_state: &GcCell<ByteTeeState>,
     ec: &mut dyn ExecutionContext<crate::js::Types>,
 ) -> Completion<(), crate::js::Types> {
-    if !matches!(tee_state.borrow(ec).reader, ReadableStreamReader::Default(_)) {
+    if !matches!(
+        tee_state.borrow(ec).reader,
+        ReadableStreamReader::Default(_)
+    ) {
         return Ok(());
     }
 
@@ -2462,7 +2495,8 @@ fn byte_tee_pull_byob_on_fulfilled_fn(
 
                             // Step 19.4 chunk steps 1.5.2.3: "Resolve cancelPromise with ! ReadableStreamCancel(stream, cloneResult.[[Value]])."
                             let source_stream = tee_state.borrow(job_ec).source_stream.clone();
-                            let cancel_resolvers = tee_state.borrow(job_ec).cancel_resolvers.clone();
+                            let cancel_resolvers =
+                                tee_state.borrow(job_ec).cancel_resolvers.clone();
                             let cancel_result =
                                 readable_stream_cancel(source_stream, error, job_ec)?;
                             let undefined = job_ec.value_undefined();
@@ -2517,7 +2551,10 @@ fn byte_tee_pull_byob_on_fulfilled_fn(
                         readable_byte_stream_tee_pull2_algorithm(tee_state.clone(), job_ec),
                         job_ec,
                     )?;
-                } else if matches!(tee_state.borrow(job_ec).reader, ReadableStreamReader::BYOB(_)) {
+                } else if matches!(
+                    tee_state.borrow(job_ec).reader,
+                    ReadableStreamReader::BYOB(_)
+                ) {
                     // Note: Switch back to the default reader when no branch has an outstanding BYOB pull.
                     byte_tee_switch_to_default_reader(&tee_state, job_ec)?;
                 }
@@ -3452,7 +3489,8 @@ impl PipeToState {
             return Ok(());
         }
 
-        if dest.state() != super::WritableStreamState::Closed && !dest.close_queued_or_in_flight(ec) {
+        if dest.state() != super::WritableStreamState::Closed && !dest.close_queued_or_in_flight(ec)
+        {
             return Ok(());
         }
 
@@ -3716,7 +3754,8 @@ impl PipeToState {
             );
         }
 
-        if dest.state() == super::WritableStreamState::Closed || dest.close_queued_or_in_flight(ec) {
+        if dest.state() == super::WritableStreamState::Closed || dest.close_queued_or_in_flight(ec)
+        {
             if !source_is_readable {
                 return Ok(None);
             }
@@ -3734,7 +3773,10 @@ impl PipeToState {
         Ok(action)
     }
 
-    fn pending_write_front(&self, ec: &mut dyn ExecutionContext<crate::js::Types>) -> Option<JsObject> {
+    fn pending_write_front(
+        &self,
+        ec: &mut dyn ExecutionContext<crate::js::Types>,
+    ) -> Option<JsObject> {
         self.0
             .borrow(ec)
             .pending_writes

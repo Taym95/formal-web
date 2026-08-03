@@ -114,15 +114,17 @@ tag, add a domain struct in `content/src/html/`, a `WebIdlInterface` impl in
 
 1. **`content/src/html.rs`** — declare the module and re-export the type.
 2. **`content/src/js/bindings/html/mod.rs`** — declare the bindings module.
-3. **`content/src/js/bindings/html/host_hooks.rs`** —
+3. **`content/src/js/build_context.rs`** (`setup_realm`) —
    - Call `reg!(NewType);` alongside the existing `reg!` calls.
-   - Add a `wire_registry_prototype::<NewType, ParentType>(&mut context);`
+   - Add a `wire_registry_prototype::<NewType, ParentType>(engine);`
      line to link the new type's prototype into the inheritance chain.
      This is **required** even though `parent_name()` returns `Some(...)`
      — the parent lookup via `parent_name()` is not yet automatic.  Without
      this call the new type's prototype falls back to `%Object.prototype%`
      and inherited methods (`addEventListener`, `dispatchEvent`, etc.)
      will not be found.
+   - Add a `wire_registry_constructor_prototype::<NewType, ParentType>(engine);`
+     line so the interface object inherits from its parent's interface object.
 4. **`content/src/js/platform_objects.rs`** — add a new `kind` value in
    `resolve_element_object` for the tag name, and a matching
    `create_interface_instance` arm.
@@ -138,9 +140,10 @@ tag, add a domain struct in `content/src/html/`, a `WebIdlInterface` impl in
 
 The prototype chain is only partially automatic.  The `register_interface_spec`
 code sets up each prototype object and registers its members, but the
-prototype-to-parent linkage is done by explicit `wire_registry_prototype`
-calls in `host_hooks.rs`.  Each new type that inherits from an existing
-interface must have a corresponding `wire_registry_prototype` line.
+prototype-to-parent and constructor-to-parent linkages are done by explicit
+`wire_registry_prototype` / `wire_registry_constructor_prototype` calls in
+`build_context.rs`.  Each new type that inherits from an existing interface
+must have the corresponding wiring lines.
 
 ## Related
 

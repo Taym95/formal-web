@@ -21,7 +21,11 @@ type JsObject = <Types as JsTypes>::JsObject;
 /// default readers and BYOB readers.
 pub(crate) trait ReadableStreamGenericReader: Clone {
     fn stream_slot_value(&self, ec: &mut dyn ExecutionContext<Types>) -> Option<ReadableStream>;
-    fn set_stream_slot_value(&self, stream: Option<ReadableStream>, ec: &mut dyn ExecutionContext<Types>);
+    fn set_stream_slot_value(
+        &self,
+        stream: Option<ReadableStream>,
+        ec: &mut dyn ExecutionContext<Types>,
+    );
     fn closed_promise_slot_value(&self, ec: &mut dyn ExecutionContext<Types>) -> Option<JsObject>;
     fn set_closed_promise_slot_value(
         &self,
@@ -140,7 +144,9 @@ pub(crate) trait ReadableStreamGenericReader: Clone {
         // Step 1: "Let stream be reader.[[stream]]."
         let not_attached_error =
             ec.new_type_error("ReadableStream reader is not attached to a stream");
-        let stream = self.stream_slot_value(ec).ok_or_else(|| not_attached_error)?;
+        let stream = self
+            .stream_slot_value(ec)
+            .ok_or_else(|| not_attached_error)?;
 
         // Step 2: "Assert: stream is not undefined."
         debug_assert!(self.stream_slot_value(ec).is_some());
@@ -229,16 +235,26 @@ impl ReadableStreamDefaultReader {
         self.read_requests.borrow_mut(ec).clear();
         Ok(())
     }
-    pub(crate) fn take_read_requests(&self, ec: &mut dyn ExecutionContext<Types>) -> Vec<ReadRequest> {
+    pub(crate) fn take_read_requests(
+        &self,
+        ec: &mut dyn ExecutionContext<Types>,
+    ) -> Vec<ReadRequest> {
         mem::take(&mut self.read_requests.borrow_mut(ec))
     }
     pub(crate) fn read_requests_len(&self, ec: &mut dyn ExecutionContext<Types>) -> usize {
         self.read_requests.borrow(ec).len()
     }
-    pub(crate) fn push_read_request(&self, read_request: ReadRequest, ec: &mut dyn ExecutionContext<Types>) {
+    pub(crate) fn push_read_request(
+        &self,
+        read_request: ReadRequest,
+        ec: &mut dyn ExecutionContext<Types>,
+    ) {
         self.read_requests.borrow_mut(ec).push(read_request);
     }
-    pub(crate) fn shift_read_request(&self, ec: &mut dyn ExecutionContext<crate::js::Types>) -> Option<ReadRequest> {
+    pub(crate) fn shift_read_request(
+        &self,
+        ec: &mut dyn ExecutionContext<crate::js::Types>,
+    ) -> Option<ReadRequest> {
         let mut read_requests = self.read_requests.borrow_mut(ec);
         if read_requests.is_empty() {
             None
@@ -356,7 +372,11 @@ impl ReadableStreamGenericReader for ReadableStreamDefaultReader {
         self.stream.borrow(ec).clone()
     }
 
-    fn set_stream_slot_value(&self, stream: Option<ReadableStream>, ec: &mut dyn ExecutionContext<Types>) {
+    fn set_stream_slot_value(
+        &self,
+        stream: Option<ReadableStream>,
+        ec: &mut dyn ExecutionContext<Types>,
+    ) {
         *self.stream.borrow_mut(ec) = stream;
     }
 
@@ -364,7 +384,11 @@ impl ReadableStreamGenericReader for ReadableStreamDefaultReader {
         self.closed_promise.borrow(ec).clone()
     }
 
-    fn set_closed_promise_slot_value(&self, promise: Option<JsObject>, ec: &mut dyn ExecutionContext<Types>) {
+    fn set_closed_promise_slot_value(
+        &self,
+        promise: Option<JsObject>,
+        ec: &mut dyn ExecutionContext<Types>,
+    ) {
         // JSC: protect new value from GC, unprotect old value
         #[cfg(feature = "jsc")]
         {
@@ -383,11 +407,18 @@ impl ReadableStreamGenericReader for ReadableStreamDefaultReader {
         *self.closed_promise.borrow_mut(ec) = promise;
     }
 
-    fn closed_resolvers_slot_value(&self, ec: &mut dyn ExecutionContext<Types>) -> Option<PromiseResolvers<Types>> {
+    fn closed_resolvers_slot_value(
+        &self,
+        ec: &mut dyn ExecutionContext<Types>,
+    ) -> Option<PromiseResolvers<Types>> {
         self.closed_resolvers.borrow(ec).clone()
     }
 
-    fn set_closed_resolvers_slot_value(&self, resolvers: Option<PromiseResolvers<Types>>, ec: &mut dyn ExecutionContext<Types>) {
+    fn set_closed_resolvers_slot_value(
+        &self,
+        resolvers: Option<PromiseResolvers<Types>>,
+        ec: &mut dyn ExecutionContext<Types>,
+    ) {
         *self.closed_resolvers.borrow_mut(ec) = resolvers;
     }
 
@@ -410,8 +441,9 @@ pub(crate) fn construct_readable_stream_default_reader(
         .ok_or_else(|| {
             ec.new_type_error("ReadableStreamDefaultReader requires a ReadableStream")
         })?;
-    let stream =
-        with_readable_stream_ref(&stream_object, ec, |stream: &ReadableStream, _ec| stream.clone())?;
+    let stream = with_readable_stream_ref(&stream_object, ec, |stream: &ReadableStream, _ec| {
+        stream.clone()
+    })?;
     let reader = ReadableStreamDefaultReader::new(ec);
 
     // Step 1: "Perform ? SetUpReadableStreamDefaultReader(this, stream)."

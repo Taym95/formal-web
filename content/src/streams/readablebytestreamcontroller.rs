@@ -398,7 +398,11 @@ impl ReadableStreamBYOBRequest {
         self.view.borrow(ec).clone()
     }
 
-    pub(crate) fn set_view_slot(&self, view: Option<JsObject>, ec: &mut dyn ExecutionContext<crate::js::Types>) {
+    pub(crate) fn set_view_slot(
+        &self,
+        view: Option<JsObject>,
+        ec: &mut dyn ExecutionContext<crate::js::Types>,
+    ) {
         *self.view.borrow_mut(ec) = view;
     }
 
@@ -551,7 +555,10 @@ impl ReadableByteStreamController {
         })
     }
 
-    pub(crate) fn pending_pull_intos_len(&self, ec: &mut dyn ExecutionContext<crate::js::Types>) -> usize {
+    pub(crate) fn pending_pull_intos_len(
+        &self,
+        ec: &mut dyn ExecutionContext<crate::js::Types>,
+    ) -> usize {
         self.pending_pull_intos.borrow(ec).len()
     }
 
@@ -559,7 +566,10 @@ impl ReadableByteStreamController {
     /// materialising a new BYOB request object.  Used by the byte-stream tee to
     /// inspect the pending pull-into view synchronously (non-spec helper).
     #[allow(dead_code)]
-    pub(crate) fn byob_request_immediate(&self, ec: &mut dyn ExecutionContext<crate::js::Types>) -> Option<JsValue> {
+    pub(crate) fn byob_request_immediate(
+        &self,
+        ec: &mut dyn ExecutionContext<crate::js::Types>,
+    ) -> Option<JsValue> {
         let pending = self.pending_pull_intos.borrow(ec);
         let descriptor = pending.front()?;
         if let Some(ref obj) = *self.byob_request_object.borrow(ec) {
@@ -1136,10 +1146,16 @@ impl ReadableByteStreamController {
     }
 
     /// <https://streams.spec.whatwg.org/#readable-byte-stream-controller-enqueue-chunk-to-queue>
-    fn enqueue_chunk(&self, view: ArrayBufferViewDescriptor, ec: &mut dyn ExecutionContext<crate::js::Types>) {
+    fn enqueue_chunk(
+        &self,
+        view: ArrayBufferViewDescriptor,
+        ec: &mut dyn ExecutionContext<crate::js::Types>,
+    ) {
         self.queue_total_size
             .set(self.queue_total_size.get() + view.byte_length());
-        self.queue.borrow_mut(ec).push_back(ByteQueueEntry::new(view));
+        self.queue
+            .borrow_mut(ec)
+            .push_back(ByteQueueEntry::new(view));
     }
 
     fn dequeue_chunk_as_value(

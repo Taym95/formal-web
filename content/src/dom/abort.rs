@@ -135,10 +135,7 @@ impl EventTargetAccess for AbortSignal {
 impl AbortSignal {
     pub(crate) fn new(ec: &mut dyn ExecutionContext<Types>) -> Self {
         Self {
-            shared: gc_cell_new(
-                AbortSignalState::new(false, ec.value_undefined(), ec),
-                ec,
-            ),
+            shared: gc_cell_new(AbortSignalState::new(false, ec.value_undefined(), ec), ec),
         }
     }
 
@@ -272,7 +269,10 @@ impl AbortSignal {
     }
 
     /// <https://dom.spec.whatwg.org/#run-the-abort-steps>
-    pub(crate) fn take_abort_algorithms(&self, ec: &mut dyn ExecutionContext<Types>) -> Vec<AbortAlgorithm> {
+    pub(crate) fn take_abort_algorithms(
+        &self,
+        ec: &mut dyn ExecutionContext<Types>,
+    ) -> Vec<AbortAlgorithm> {
         let mut state = self.shared.borrow_mut(ec);
         mem::take(&mut state.abort_algorithms)
     }
@@ -288,7 +288,10 @@ impl AbortSignal {
     }
 
     /// <https://dom.spec.whatwg.org/#abortsignal-source-signals>
-    pub(crate) fn source_signals_value(&self, ec: &mut dyn ExecutionContext<Types>) -> Vec<AbortSignal> {
+    pub(crate) fn source_signals_value(
+        &self,
+        ec: &mut dyn ExecutionContext<Types>,
+    ) -> Vec<AbortSignal> {
         self.shared.borrow(ec).source_signals.clone()
     }
 

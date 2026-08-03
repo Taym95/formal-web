@@ -91,7 +91,7 @@ the bindings layer (`content/src/js/bindings/`) calls into.
 **Gaps:**
 | Step | Status |
 |---|---|
-| Step 3: constructorProto inheritance from parent interface | Not wired — parent constructorProto falls back to `%Function.prototype%`. Prototype chain wiring is done explicitly in `host_hooks.rs` via `wire_registry_prototype`. |
+| Step 3: constructorProto inheritance from parent interface | Wired for registered interfaces via `wire_registry_constructor_prototype` in `build_context.rs`; prototype chain wiring via `wire_registry_prototype` there too. |
 | Steps 4-7: `[[Unforgeables]]` slot | Not implemented. Unforgeable attributes/operations are handled by `configurable: false` on the descriptor but not stored on a shared `[[Unforgeables]]` object. |
 | Step 1.1-1.7: Overloaded constructor resolution | Not implemented — only single-argument constructors. Overload resolution is deferred. |
 

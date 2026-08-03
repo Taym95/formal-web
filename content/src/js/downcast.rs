@@ -53,9 +53,8 @@ pub(crate) fn try_with_abort_controller_ref<R>(
     ec: &mut dyn ExecutionContext<Types>,
     f: impl FnOnce(&AbortController, &mut dyn ExecutionContext<Types>) -> R,
 ) -> Completion<R, Types> {
-    let controller_pointer: Option<*const AbortController> = ec
-        .with_object_any(object)
-        .and_then(|data| {
+    let controller_pointer: Option<*const AbortController> =
+        ec.with_object_any(object).and_then(|data| {
             data.downcast_ref::<AbortController>()
                 .map(|controller| controller as *const AbortController)
         });
@@ -157,9 +156,8 @@ pub(crate) fn try_with_event_target_mut<R>(
     let obj = <Types as JsTypes>::value_as_object(this)
         .ok_or_else(|| ec.new_type_error("event target receiver is not an object"))?;
 
-    let event_target_pointer: Option<*mut EventTarget> = ec
-        .with_object_any_mut(&obj)
-        .and_then(|data| {
+    let event_target_pointer: Option<*mut EventTarget> =
+        ec.with_object_any_mut(&obj).and_then(|data| {
             if let Some(window) = data.downcast_mut::<Window>() {
                 Some(&mut window.event_target as *mut EventTarget)
             } else if let Some(document) = data.downcast_mut::<Document>() {
@@ -177,7 +175,10 @@ pub(crate) fn try_with_event_target_mut<R>(
             } else if let Some(input) = data.downcast_mut::<HTMLInputElement>() {
                 Some(&mut input.html_element.element.node.event_target as *mut EventTarget)
             } else if let Some(video) = data.downcast_mut::<HTMLVideoElement>() {
-                Some(&mut video.media_element.html_element.element.node.event_target as *mut EventTarget)
+                Some(
+                    &mut video.media_element.html_element.element.node.event_target
+                        as *mut EventTarget,
+                )
             } else if let Some(node) = data.downcast_mut::<Node>() {
                 Some(&mut node.event_target as *mut EventTarget)
             } else if let Some(target) = data.downcast_mut::<EventTarget>() {

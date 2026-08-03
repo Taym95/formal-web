@@ -626,7 +626,10 @@ fn run_iframe_load_event_steps(
 
     let event_target = ec
         .with_object_any(&iframe_object)
-        .and_then(|data| data.downcast_ref::<crate::html::HTMLIFrameElement>().cloned())
+        .and_then(|data| {
+            data.downcast_ref::<crate::html::HTMLIFrameElement>()
+                .cloned()
+        })
         .map(|iframe| iframe.get_event_target(ec))
         .ok_or_else(|| {
             let msg = "run_iframe_load_event_steps: iframe_object is not an HTMLIFrameElement"

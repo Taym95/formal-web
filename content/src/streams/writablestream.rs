@@ -80,22 +80,43 @@ impl WritableStream {
             backpressure: Rc::new(Cell::new(false)),
         }
     }
-    pub(crate) fn controller_slot(&self, ec: &mut dyn ExecutionContext<Types>) -> Option<WritableStreamController> {
+    pub(crate) fn controller_slot(
+        &self,
+        ec: &mut dyn ExecutionContext<Types>,
+    ) -> Option<WritableStreamController> {
         self.controller.borrow(ec).clone()
     }
-    pub(crate) fn set_controller_slot(&self, controller: Option<WritableStreamController>, ec: &mut dyn ExecutionContext<Types>) {
+    pub(crate) fn set_controller_slot(
+        &self,
+        controller: Option<WritableStreamController>,
+        ec: &mut dyn ExecutionContext<Types>,
+    ) {
         *self.controller.borrow_mut(ec) = controller;
     }
-    pub(crate) fn controller_object_slot(&self, ec: &mut dyn ExecutionContext<Types>) -> Option<JsObject> {
+    pub(crate) fn controller_object_slot(
+        &self,
+        ec: &mut dyn ExecutionContext<Types>,
+    ) -> Option<JsObject> {
         self.controller_object.borrow(ec).clone()
     }
-    pub(crate) fn set_controller_object_slot(&self, controller_object: Option<JsObject>, ec: &mut dyn ExecutionContext<Types>) {
+    pub(crate) fn set_controller_object_slot(
+        &self,
+        controller_object: Option<JsObject>,
+        ec: &mut dyn ExecutionContext<Types>,
+    ) {
         self.controller_object.set(controller_object, ec);
     }
-    pub(crate) fn writer_slot(&self, ec: &mut dyn ExecutionContext<Types>) -> Option<WritableStreamWriter> {
+    pub(crate) fn writer_slot(
+        &self,
+        ec: &mut dyn ExecutionContext<Types>,
+    ) -> Option<WritableStreamWriter> {
         self.writer.borrow(ec).clone()
     }
-    pub(crate) fn set_writer_slot(&self, writer: Option<WritableStreamWriter>, ec: &mut dyn ExecutionContext<Types>) {
+    pub(crate) fn set_writer_slot(
+        &self,
+        writer: Option<WritableStreamWriter>,
+        ec: &mut dyn ExecutionContext<Types>,
+    ) {
         *self.writer.borrow_mut(ec) = writer;
     }
     pub(crate) fn state(&self) -> WritableStreamState {
@@ -116,46 +137,93 @@ impl WritableStream {
     pub(crate) fn set_backpressure(&self, backpressure: bool) {
         self.backpressure.set(backpressure);
     }
-    pub(crate) fn close_request_slot(&self, ec: &mut dyn ExecutionContext<Types>) -> Option<WriteRequest> {
+    pub(crate) fn close_request_slot(
+        &self,
+        ec: &mut dyn ExecutionContext<Types>,
+    ) -> Option<WriteRequest> {
         self.close_request.borrow(ec).clone()
     }
-    pub(crate) fn set_close_request_slot(&self, request: Option<WriteRequest>, ec: &mut dyn ExecutionContext<Types>) {
+    pub(crate) fn set_close_request_slot(
+        &self,
+        request: Option<WriteRequest>,
+        ec: &mut dyn ExecutionContext<Types>,
+    ) {
         *self.close_request.borrow_mut(ec) = request;
     }
-    pub(crate) fn take_close_request_slot(&self, ec: &mut dyn ExecutionContext<Types>) -> Option<WriteRequest> {
+    pub(crate) fn take_close_request_slot(
+        &self,
+        ec: &mut dyn ExecutionContext<Types>,
+    ) -> Option<WriteRequest> {
         self.close_request.borrow_mut(ec).take()
     }
-    pub(crate) fn in_flight_write_request_slot(&self, ec: &mut dyn ExecutionContext<Types>) -> Option<WriteRequest> {
+    pub(crate) fn in_flight_write_request_slot(
+        &self,
+        ec: &mut dyn ExecutionContext<Types>,
+    ) -> Option<WriteRequest> {
         self.in_flight_write_request.borrow(ec).clone()
     }
-    pub(crate) fn set_in_flight_write_request_slot(&self, request: Option<WriteRequest>, ec: &mut dyn ExecutionContext<Types>) {
+    pub(crate) fn set_in_flight_write_request_slot(
+        &self,
+        request: Option<WriteRequest>,
+        ec: &mut dyn ExecutionContext<Types>,
+    ) {
         *self.in_flight_write_request.borrow_mut(ec) = request;
     }
-    pub(crate) fn take_in_flight_write_request_slot(&self, ec: &mut dyn ExecutionContext<Types>) -> Option<WriteRequest> {
+    pub(crate) fn take_in_flight_write_request_slot(
+        &self,
+        ec: &mut dyn ExecutionContext<Types>,
+    ) -> Option<WriteRequest> {
         self.in_flight_write_request.borrow_mut(ec).take()
     }
-    pub(crate) fn in_flight_close_request_slot(&self, ec: &mut dyn ExecutionContext<Types>) -> Option<WriteRequest> {
+    pub(crate) fn in_flight_close_request_slot(
+        &self,
+        ec: &mut dyn ExecutionContext<Types>,
+    ) -> Option<WriteRequest> {
         self.in_flight_close_request.borrow(ec).clone()
     }
-    pub(crate) fn set_in_flight_close_request_slot(&self, request: Option<WriteRequest>, ec: &mut dyn ExecutionContext<Types>) {
+    pub(crate) fn set_in_flight_close_request_slot(
+        &self,
+        request: Option<WriteRequest>,
+        ec: &mut dyn ExecutionContext<Types>,
+    ) {
         *self.in_flight_close_request.borrow_mut(ec) = request;
     }
-    pub(crate) fn take_in_flight_close_request_slot(&self, ec: &mut dyn ExecutionContext<Types>) -> Option<WriteRequest> {
+    pub(crate) fn take_in_flight_close_request_slot(
+        &self,
+        ec: &mut dyn ExecutionContext<Types>,
+    ) -> Option<WriteRequest> {
         self.in_flight_close_request.borrow_mut(ec).take()
     }
-    pub(crate) fn pending_abort_request_slot(&self, ec: &mut dyn ExecutionContext<Types>) -> Option<PendingAbortRequest> {
+    pub(crate) fn pending_abort_request_slot(
+        &self,
+        ec: &mut dyn ExecutionContext<Types>,
+    ) -> Option<PendingAbortRequest> {
         self.pending_abort_request.borrow(ec).clone()
     }
-    pub(crate) fn set_pending_abort_request_slot(&self, request: Option<PendingAbortRequest>, ec: &mut dyn ExecutionContext<Types>) {
+    pub(crate) fn set_pending_abort_request_slot(
+        &self,
+        request: Option<PendingAbortRequest>,
+        ec: &mut dyn ExecutionContext<Types>,
+    ) {
         *self.pending_abort_request.borrow_mut(ec) = request;
     }
-    pub(crate) fn take_pending_abort_request_slot(&self, ec: &mut dyn ExecutionContext<Types>) -> Option<PendingAbortRequest> {
+    pub(crate) fn take_pending_abort_request_slot(
+        &self,
+        ec: &mut dyn ExecutionContext<Types>,
+    ) -> Option<PendingAbortRequest> {
         self.pending_abort_request.borrow_mut(ec).take()
     }
-    pub(crate) fn push_write_request(&self, request: WriteRequest, ec: &mut dyn ExecutionContext<Types>) {
+    pub(crate) fn push_write_request(
+        &self,
+        request: WriteRequest,
+        ec: &mut dyn ExecutionContext<Types>,
+    ) {
         self.write_requests.borrow_mut(ec).push(request);
     }
-    pub(crate) fn shift_write_request(&self, ec: &mut dyn ExecutionContext<Types>) -> Option<WriteRequest> {
+    pub(crate) fn shift_write_request(
+        &self,
+        ec: &mut dyn ExecutionContext<Types>,
+    ) -> Option<WriteRequest> {
         let mut write_requests = self.write_requests.borrow_mut(ec);
         if write_requests.is_empty() {
             None
@@ -163,7 +231,10 @@ impl WritableStream {
             Some(write_requests.remove(0))
         }
     }
-    pub(crate) fn take_write_requests(&self, ec: &mut dyn ExecutionContext<Types>) -> Vec<WriteRequest> {
+    pub(crate) fn take_write_requests(
+        &self,
+        ec: &mut dyn ExecutionContext<Types>,
+    ) -> Vec<WriteRequest> {
         std::mem::take(&mut self.write_requests.borrow_mut(ec))
     }
 
@@ -525,7 +596,10 @@ impl WritableStream {
     }
 
     /// <https://streams.spec.whatwg.org/#writable-stream-has-operation-marked-in-flight>
-    pub(crate) fn has_operation_marked_in_flight(&self, ec: &mut dyn ExecutionContext<Types>) -> bool {
+    pub(crate) fn has_operation_marked_in_flight(
+        &self,
+        ec: &mut dyn ExecutionContext<Types>,
+    ) -> bool {
         self.in_flight_write_request_slot(ec).is_some()
             || self.in_flight_close_request_slot(ec).is_some()
     }
@@ -598,7 +672,8 @@ impl WritableStream {
             }
         }
 
-        if !self.has_operation_marked_in_flight(ec) && controller.as_default_controller().started() {
+        if !self.has_operation_marked_in_flight(ec) && controller.as_default_controller().started()
+        {
             self.finish_erroring(ec)?;
         }
 
