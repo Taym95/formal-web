@@ -20,16 +20,16 @@ pub(crate) fn try_with_abort_signal_mut<R>(
 ) -> Completion<R, Types> {
     let obj = <Types as JsTypes>::value_as_object(this)
         .ok_or_else(|| ec.new_type_error("abort signal receiver is not an object"))?;
-    let signal_pointer: Option<*mut AbortSignal> = ec.with_object_any_mut(&obj).and_then(|data| {
-        data.downcast_mut::<AbortSignal>()
-            .map(|signal| signal as *mut AbortSignal)
-    });
-    let Some(signal_pointer) = signal_pointer else {
-        return Err(ec.new_type_error("receiver is not an AbortSignal"));
-    };
-    // SAFETY: `obj` keeps the platform object alive for this call and the
-    // reference is used only on the isolate thread.
-    Ok(f(unsafe { &mut *signal_pointer }, ec))
+    let mut result = Err(ec.new_type_error("receiver is not an AbortSignal"));
+    ec.with_object_any_mut_with(
+        &obj,
+        Box::new(|data, ec| {
+            if let Some(signal) = data.downcast_mut::<AbortSignal>() {
+                result = Ok(f(signal, ec));
+            }
+        }),
+    );
+    result
 }
 
 pub(crate) fn try_with_abort_signal_ref<R>(
@@ -37,15 +37,16 @@ pub(crate) fn try_with_abort_signal_ref<R>(
     ec: &mut dyn ExecutionContext<Types>,
     f: impl FnOnce(&AbortSignal, &mut dyn ExecutionContext<Types>) -> R,
 ) -> Completion<R, Types> {
-    let signal_pointer: Option<*const AbortSignal> = ec.with_object_any(object).and_then(|data| {
-        data.downcast_ref::<AbortSignal>()
-            .map(|signal| signal as *const AbortSignal)
-    });
-    let Some(signal_pointer) = signal_pointer else {
+    // Clone the handle out of the object registry so `f` can borrow `ec`
+    // mutably; the clone shares all GC-managed state with the registered
+    // platform object.
+    let signal = ec
+        .with_object_any(object)
+        .and_then(|data| data.downcast_ref::<AbortSignal>().cloned());
+    let Some(signal) = signal else {
         return Err(ec.new_type_error("object is not an AbortSignal"));
     };
-    // SAFETY: `object` keeps the platform object alive for this call.
-    Ok(f(unsafe { &*signal_pointer }, ec))
+    Ok(f(&signal, ec))
 }
 
 pub(crate) fn try_with_abort_controller_ref<R>(
@@ -53,16 +54,16 @@ pub(crate) fn try_with_abort_controller_ref<R>(
     ec: &mut dyn ExecutionContext<Types>,
     f: impl FnOnce(&AbortController, &mut dyn ExecutionContext<Types>) -> R,
 ) -> Completion<R, Types> {
-    let controller_pointer: Option<*const AbortController> =
-        ec.with_object_any(object).and_then(|data| {
-            data.downcast_ref::<AbortController>()
-                .map(|controller| controller as *const AbortController)
-        });
-    let Some(controller_pointer) = controller_pointer else {
+    // Clone the handle out of the object registry so `f` can borrow `ec`
+    // mutably; the clone shares all GC-managed state with the registered
+    // platform object.
+    let controller = ec
+        .with_object_any(object)
+        .and_then(|data| data.downcast_ref::<AbortController>().cloned());
+    let Some(controller) = controller else {
         return Err(ec.new_type_error("object is not an AbortController"));
     };
-    // SAFETY: `object` keeps the platform object alive for this call.
-    Ok(f(unsafe { &*controller_pointer }, ec))
+    Ok(f(&controller, ec))
 }
 
 pub(crate) fn try_set_event_target_reflector(
@@ -156,56 +157,51 @@ pub(crate) fn try_with_event_target_mut<R>(
     let obj = <Types as JsTypes>::value_as_object(this)
         .ok_or_else(|| ec.new_type_error("event target receiver is not an object"))?;
 
-    let event_target_pointer: Option<*mut EventTarget> =
-        ec.with_object_any_mut(&obj).and_then(|data| {
+    // `with_object_any_mut_with` passes both the registry data and the
+    // execution context to the closure, so the platform object can be
+    // mutated in place while `f` uses `ec`. The AbortSignal path (which
+    // exposes its EventTarget through the shared cell) is handled in the
+    // same closure so `f` runs exactly once.
+    let mut result = Err(ec.new_type_error("receiver is not an EventTarget"));
+    ec.with_object_any_mut_with(
+        &obj,
+        Box::new(|data, ec| {
+            // Walk all known platform object types that embed an EventTarget.
             if let Some(window) = data.downcast_mut::<Window>() {
-                Some(&mut window.event_target as *mut EventTarget)
+                result = Ok(f(&mut window.event_target, ec));
             } else if let Some(document) = data.downcast_mut::<Document>() {
-                Some(&mut document.node.event_target as *mut EventTarget)
+                result = Ok(f(&mut document.node.event_target, ec));
             } else if let Some(element) = data.downcast_mut::<Element>() {
-                Some(&mut element.node.event_target as *mut EventTarget)
+                result = Ok(f(&mut element.node.event_target, ec));
             } else if let Some(html_element) = data.downcast_mut::<HTMLElement>() {
-                Some(&mut html_element.element.node.event_target as *mut EventTarget)
+                result = Ok(f(&mut html_element.element.node.event_target, ec));
             } else if let Some(anchor) = data.downcast_mut::<HTMLAnchorElement>() {
-                Some(&mut anchor.html_element.element.node.event_target as *mut EventTarget)
+                result = Ok(f(&mut anchor.html_element.element.node.event_target, ec));
             } else if let Some(iframe) = data.downcast_mut::<HTMLIFrameElement>() {
-                Some(&mut iframe.html_element.element.node.event_target as *mut EventTarget)
+                result = Ok(f(&mut iframe.html_element.element.node.event_target, ec));
             } else if let Some(media) = data.downcast_mut::<HTMLMediaElement>() {
-                Some(&mut media.html_element.element.node.event_target as *mut EventTarget)
+                result = Ok(f(&mut media.html_element.element.node.event_target, ec));
             } else if let Some(input) = data.downcast_mut::<HTMLInputElement>() {
-                Some(&mut input.html_element.element.node.event_target as *mut EventTarget)
+                result = Ok(f(&mut input.html_element.element.node.event_target, ec));
             } else if let Some(video) = data.downcast_mut::<HTMLVideoElement>() {
-                Some(
-                    &mut video.media_element.html_element.element.node.event_target
-                        as *mut EventTarget,
-                )
+                result = Ok(f(
+                    &mut video.media_element.html_element.element.node.event_target,
+                    ec,
+                ));
             } else if let Some(node) = data.downcast_mut::<Node>() {
-                Some(&mut node.event_target as *mut EventTarget)
+                result = Ok(f(&mut node.event_target, ec));
             } else if let Some(target) = data.downcast_mut::<EventTarget>() {
-                Some(target as *mut EventTarget)
-            } else {
-                None
+                result = Ok(f(target, ec));
+            } else if let Some(signal) = data.downcast_mut::<AbortSignal>() {
+                // The closure receives the execution context that
+                // `with_event_target_mut` passes alongside the borrowed
+                // event target.
+                result =
+                    Ok(signal.with_event_target_mut(|event_target, ec| f(event_target, ec), ec));
             }
-        });
-    if let Some(event_target_pointer) = event_target_pointer {
-        // SAFETY: `obj` keeps the platform object alive for this call and the
-        // reference is used only on the isolate thread.
-        return Ok(f(unsafe { &mut *event_target_pointer }, ec));
-    }
-    // Fall back to the AbortSignal path, which exposes its EventTarget through
-    // the shared cell.
-    let signal_pointer: Option<*const AbortSignal> = ec.with_object_any(&obj).and_then(|data| {
-        data.downcast_ref::<AbortSignal>()
-            .map(|signal| signal as *const AbortSignal)
-    });
-    let Some(signal_pointer) = signal_pointer else {
-        return Err(ec.new_type_error("receiver is not an EventTarget"));
-    };
-    // SAFETY: `obj` keeps the platform object alive for this call.
-    let signal = unsafe { &*signal_pointer };
-    // The closure receives the execution context that
-    // `with_event_target_mut` passes alongside the borrowed event target.
-    Ok(signal.with_event_target_mut(|event_target, ec| f(event_target, ec), ec))
+        }),
+    );
+    result
 }
 
 pub(crate) fn with_abort_signal_ref<R>(
@@ -213,13 +209,12 @@ pub(crate) fn with_abort_signal_ref<R>(
     ec: &mut dyn ExecutionContext<Types>,
     f: impl FnOnce(&AbortSignal, &mut dyn ExecutionContext<Types>) -> R,
 ) -> Completion<R, Types> {
-    let type_error = ec.new_type_error("object is not an AbortSignal");
-    let signal_pointer = ec
+    // Clone the handle out of the object registry so `f` can borrow `ec`
+    // mutably; the clone shares all GC-managed state with the registered
+    // platform object.
+    let signal = ec
         .with_object_any(object)
-        .and_then(|data| data.downcast_ref::<AbortSignal>())
-        .map(|signal| signal as *const AbortSignal)
-        .ok_or(type_error)?;
-    // SAFETY: `object` keeps the platform object alive for this call.
-    let signal = unsafe { &*signal_pointer };
-    Ok(f(signal, ec))
+        .and_then(|data| data.downcast_ref::<AbortSignal>().cloned())
+        .ok_or_else(|| ec.new_type_error("object is not an AbortSignal"))?;
+    Ok(f(&signal, ec))
 }
