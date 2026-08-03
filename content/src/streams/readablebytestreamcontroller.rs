@@ -373,10 +373,13 @@ pub struct ReadableStreamBYOBRequest {
 }
 
 impl ReadableStreamBYOBRequest {
-    pub(crate) fn new(controller: ReadableByteStreamController) -> Self {
+    pub(crate) fn new(
+        controller: ReadableByteStreamController,
+        ec: &mut dyn ExecutionContext<crate::js::Types>,
+    ) -> Self {
         Self {
-            controller: gc_cell_new(Some(controller)),
-            view: gc_cell_new(None),
+            controller: gc_cell_new(Some(controller), ec),
+            view: gc_cell_new(None, ec),
         }
     }
 
@@ -385,18 +388,18 @@ impl ReadableStreamBYOBRequest {
         ec: &mut dyn ExecutionContext<crate::js::Types>,
     ) -> Completion<ReadableByteStreamController, crate::js::Types> {
         self.controller
-            .borrow()
+            .borrow(ec)
             .clone()
             .ok_or_else(|| ec.new_type_error("ReadableStreamBYOBRequest is missing its controller"))
     }
 
     /// <https://streams.spec.whatwg.org/#rs-byob-request-view>
-    pub(crate) fn view(&self) -> Option<JsObject> {
-        self.view.borrow().clone()
+    pub(crate) fn view(&self, ec: &mut dyn ExecutionContext<crate::js::Types>) -> Option<JsObject> {
+        self.view.borrow(ec).clone()
     }
 
-    pub(crate) fn set_view_slot(&self, view: Option<JsObject>) {
-        *self.view.borrow_mut() = view;
+    pub(crate) fn set_view_slot(&self, view: Option<JsObject>, ec: &mut dyn ExecutionContext<crate::js::Types>) {
+        *self.view.borrow_mut(ec) = view;
     }
 
     /// <https://streams.spec.whatwg.org/#rs-byob-request-respond>
@@ -463,10 +466,10 @@ pub struct ReadableByteStreamController {
 }
 
 impl ReadableByteStreamController {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(ec: &mut dyn ExecutionContext<crate::js::Types>) -> Self {
         Self {
-            stream: gc_cell_new(None),
-            queue: gc_cell_new(VecDeque::new()),
+            stream: gc_cell_new(None, ec),
+            queue: gc_cell_new(VecDeque::new(), ec),
             queue_total_size: Rc::new(Cell::new(0)),
             started: Rc::new(Cell::new(false)),
             close_requested: Rc::new(Cell::new(false)),
@@ -474,10 +477,10 @@ impl ReadableByteStreamController {
             pulling: Rc::new(Cell::new(false)),
             strategy_high_water_mark: Rc::new(Cell::new(0.0)),
             auto_allocate_chunk_size: Rc::new(Cell::new(None)),
-            pull_algorithm: gc_cell_new(None),
-            cancel_algorithm: gc_cell_new(None),
-            pending_pull_intos: gc_cell_new(VecDeque::new()),
-            byob_request_object: gc_cell_new(None),
+            pull_algorithm: gc_cell_new(None, ec),
+            cancel_algorithm: gc_cell_new(None, ec),
+            pending_pull_intos: gc_cell_new(VecDeque::new(), ec),
+            byob_request_object: gc_cell_new(None, ec),
         }
     }
 
@@ -486,7 +489,7 @@ impl ReadableByteStreamController {
         ec: &mut dyn ExecutionContext<crate::js::Types>,
     ) -> Completion<ReadableStream, crate::js::Types> {
         self.stream
-            .borrow()
+            .borrow(ec)
             .clone()
             .ok_or_else(|| ec.new_type_error("ReadableByteStreamController is missing its stream"))
     }
@@ -496,21 +499,21 @@ impl ReadableByteStreamController {
         ec: &mut dyn ExecutionContext<crate::js::Types>,
     ) -> Completion<JsObject, crate::js::Types> {
         self.stream_slot(ec)?
-            .controller_object_slot()
+            .controller_object_slot(ec)
             .ok_or_else(|| {
                 ec.new_type_error("ReadableByteStreamController is missing its JavaScript object")
             })
     }
 
     /// <https://streams.spec.whatwg.org/#readable-byte-stream-controller-clear-algorithms>
-    fn clear_algorithms(&self) {
-        *self.pull_algorithm.borrow_mut() = None;
-        *self.cancel_algorithm.borrow_mut() = None;
+    fn clear_algorithms(&self, ec: &mut dyn ExecutionContext<crate::js::Types>) {
+        *self.pull_algorithm.borrow_mut(ec) = None;
+        *self.cancel_algorithm.borrow_mut(ec) = None;
     }
 
     /// <https://streams.spec.whatwg.org/#reset-queue>
-    fn reset_queue(&self) {
-        self.queue.borrow_mut().clear();
+    fn reset_queue(&self, ec: &mut dyn ExecutionContext<crate::js::Types>) {
+        self.queue.borrow_mut(ec).clear();
         self.queue_total_size.set(0);
     }
 
@@ -519,9 +522,9 @@ impl ReadableByteStreamController {
         &self,
         ec: &mut dyn ExecutionContext<crate::js::Types>,
     ) -> Completion<(), crate::js::Types> {
-        if let Some(object) = self.byob_request_object.borrow_mut().take() {
-            with_readable_stream_byob_request_ref(&object, ec, |request| {
-                request.set_view_slot(None)
+        if let Some(object) = self.byob_request_object.borrow_mut(ec).take() {
+            with_readable_stream_byob_request_ref(&object, ec, |request, ec| {
+                request.set_view_slot(None, ec)
             })?;
         }
         Ok(())
@@ -531,10 +534,10 @@ impl ReadableByteStreamController {
         &self,
         ec: &mut dyn ExecutionContext<crate::js::Types>,
     ) -> Completion<(), crate::js::Types> {
-        let Some(object) = self.byob_request_object.borrow().clone() else {
+        let Some(object) = self.byob_request_object.borrow(ec).clone() else {
             return Ok(());
         };
-        let maybe_view = if let Some(descriptor) = self.pending_pull_intos.borrow().front() {
+        let maybe_view = if let Some(descriptor) = self.pending_pull_intos.borrow(ec).front() {
             Some(
                 descriptor
                     .view
@@ -543,23 +546,23 @@ impl ReadableByteStreamController {
         } else {
             None
         };
-        with_readable_stream_byob_request_ref(&object, ec, |request| {
-            request.set_view_slot(maybe_view)
+        with_readable_stream_byob_request_ref(&object, ec, |request, ec| {
+            request.set_view_slot(maybe_view, ec)
         })
     }
 
-    pub(crate) fn pending_pull_intos_len(&self) -> usize {
-        self.pending_pull_intos.borrow().len()
+    pub(crate) fn pending_pull_intos_len(&self, ec: &mut dyn ExecutionContext<crate::js::Types>) -> usize {
+        self.pending_pull_intos.borrow(ec).len()
     }
 
     /// Returns a snapshot of the current BYOB request view as a JS value, without
     /// materialising a new BYOB request object.  Used by the byte-stream tee to
     /// inspect the pending pull-into view synchronously (non-spec helper).
     #[allow(dead_code)]
-    pub(crate) fn byob_request_immediate(&self) -> Option<JsValue> {
-        let pending = self.pending_pull_intos.borrow();
+    pub(crate) fn byob_request_immediate(&self, ec: &mut dyn ExecutionContext<crate::js::Types>) -> Option<JsValue> {
+        let pending = self.pending_pull_intos.borrow(ec);
         let descriptor = pending.front()?;
-        if let Some(ref obj) = *self.byob_request_object.borrow() {
+        if let Some(ref obj) = *self.byob_request_object.borrow(ec) {
             return Some(JsValue::from(obj.clone()));
         }
         let _ = descriptor;
@@ -585,20 +588,20 @@ impl ReadableByteStreamController {
         &self,
         ec: &mut dyn ExecutionContext<crate::js::Types>,
     ) -> Completion<Option<JsObject>, crate::js::Types> {
-        if self.pending_pull_intos.borrow().is_empty() {
+        if self.pending_pull_intos.borrow(ec).is_empty() {
             self.invalidate_byob_request(ec)?;
             return Ok(None);
         }
 
-        if let Some(object) = self.byob_request_object.borrow().clone() {
+        if let Some(object) = self.byob_request_object.borrow(ec).clone() {
             return Ok(Some(object));
         }
 
-        let request = ReadableStreamBYOBRequest::new(self.clone());
+        let request = ReadableStreamBYOBRequest::new(self.clone(), ec);
         let object: JsObject =
             create_interface_instance::<crate::js::Types, ReadableStreamBYOBRequest>(request, ec)?
                 .into();
-        *self.byob_request_object.borrow_mut() = Some(object.clone());
+        *self.byob_request_object.borrow_mut(ec) = Some(object.clone());
         self.update_byob_request_view(ec)?;
         Ok(Some(object))
     }
@@ -643,14 +646,14 @@ impl ReadableByteStreamController {
         reason: JsValue,
         ec: &mut dyn ExecutionContext<crate::js::Types>,
     ) -> Completion<JsObject, crate::js::Types> {
-        self.reset_queue();
-        let pending = std::mem::take(&mut *self.pending_pull_intos.borrow_mut());
+        self.reset_queue(ec);
+        let pending = std::mem::take(&mut *self.pending_pull_intos.borrow_mut(ec));
         self.invalidate_byob_request(ec)?;
         for descriptor in pending {
             descriptor.cancel(ec)?;
         }
 
-        let cancel_algorithm = self.cancel_algorithm.borrow().clone();
+        let cancel_algorithm = self.cancel_algorithm.borrow(ec).clone();
         let result = match cancel_algorithm {
             Some(cancel_algorithm) => match cancel_algorithm.call(reason, ec) {
                 Ok(promise) => promise,
@@ -658,7 +661,7 @@ impl ReadableByteStreamController {
             },
             None => resolved_promise(ec.value_undefined(), ec)?,
         };
-        self.clear_algorithms();
+        self.clear_algorithms(ec);
         Ok(result)
     }
 
@@ -687,7 +690,7 @@ impl ReadableByteStreamController {
                 minimum_fill: 1,
                 request: PullRequest::Default(read_request),
             };
-            self.pending_pull_intos.borrow_mut().push_back(descriptor);
+            self.pending_pull_intos.borrow_mut(ec).push_back(descriptor);
             let _ = self.byob_request(ec)?;
             return self.call_pull_if_needed(ec);
         }
@@ -724,18 +727,18 @@ impl ReadableByteStreamController {
                     ec,
                 )?;
                 descriptor.error(error.clone(), ec)?;
-                self.clear_algorithms();
+                self.clear_algorithms(ec);
                 readable_stream_error(stream, error, ec)?;
                 return Ok(());
             }
 
-            self.clear_algorithms();
+            self.clear_algorithms(ec);
             descriptor.close(ec)?;
             readable_stream_close(stream, ec)?;
             return Ok(());
         }
 
-        self.pending_pull_intos.borrow_mut().push_back(descriptor);
+        self.pending_pull_intos.borrow_mut(ec).push_back(descriptor);
         let _ = self.byob_request(ec)?;
         self.call_pull_if_needed(ec)
     }
@@ -745,7 +748,7 @@ impl ReadableByteStreamController {
         &self,
         ec: &mut dyn ExecutionContext<crate::js::Types>,
     ) -> Completion<(), crate::js::Types> {
-        let pending = std::mem::take(&mut *self.pending_pull_intos.borrow_mut());
+        let pending = std::mem::take(&mut *self.pending_pull_intos.borrow_mut(ec));
         self.invalidate_byob_request(ec)?;
         let release_error = type_error_value("Reader was released", ec)?;
         for descriptor in pending {
@@ -769,9 +772,9 @@ impl ReadableByteStreamController {
             return Ok(());
         }
 
-        if !self.pending_pull_intos.borrow().is_empty() {
+        if !self.pending_pull_intos.borrow(ec).is_empty() {
             let has_misaligned_pending = {
-                let pending_pull_intos = self.pending_pull_intos.borrow();
+                let pending_pull_intos = self.pending_pull_intos.borrow(ec);
                 pending_pull_intos.front().is_some_and(|descriptor| {
                     descriptor.bytes_filled > 0
                         && descriptor.bytes_filled % descriptor.view.element_size() != 0
@@ -794,7 +797,7 @@ impl ReadableByteStreamController {
             return Ok(());
         }
 
-        self.clear_algorithms();
+        self.clear_algorithms(ec);
         readable_stream_close(stream, ec)
     }
 
@@ -835,7 +838,7 @@ impl ReadableByteStreamController {
 
         // Step 8: If controller.[[pendingPullIntos]] is not empty:
         let has_pending_pull_into = {
-            let pending = self.pending_pull_intos.borrow();
+            let pending = self.pending_pull_intos.borrow(ec);
             if let Some(first_pending) = pending.front() {
                 // Step 8.2: If ! IsDetachedBuffer(firstPendingPullInto's buffer) is true,
                 //           throw a TypeError exception.
@@ -854,7 +857,7 @@ impl ReadableByteStreamController {
         if has_pending_pull_into {
             self.invalidate_byob_request(ec)?;
             {
-                let mut pending = self.pending_pull_intos.borrow_mut();
+                let mut pending = self.pending_pull_intos.borrow_mut(ec);
                 if let Some(first_pending) = pending.front_mut() {
                     let new_buffer = ec.clone_array_buffer(
                         first_pending.view.buffer.clone(),
@@ -869,7 +872,7 @@ impl ReadableByteStreamController {
         }
 
         // Step 9-11: Route based on reader type — reuse existing helpers.
-        self.enqueue_chunk(transferred_view);
+        self.enqueue_chunk(transferred_view, ec);
         self.process_pending_pull_intos_using_queue(ec)?;
         self.process_read_requests_using_queue(ec)?;
 
@@ -888,14 +891,14 @@ impl ReadableByteStreamController {
             return Ok(());
         }
 
-        self.reset_queue();
-        let pending = std::mem::take(&mut *self.pending_pull_intos.borrow_mut());
+        self.reset_queue(ec);
+        let pending = std::mem::take(&mut *self.pending_pull_intos.borrow_mut(ec));
         self.invalidate_byob_request(ec)?;
 
         for descriptor in pending {
             descriptor.error(error.clone(), ec)?;
         }
-        self.clear_algorithms();
+        self.clear_algorithms(ec);
         readable_stream_error(stream, error, ec)
     }
 
@@ -908,7 +911,7 @@ impl ReadableByteStreamController {
         let err_no_pending = ec.new_type_error("There is no pending BYOB request to respond to");
         let err_too_large = ec.new_range_error("bytesWritten exceeds the available view size");
         let descriptor = {
-            let mut pending = self.pending_pull_intos.borrow_mut();
+            let mut pending = self.pending_pull_intos.borrow_mut(ec);
             let descriptor = match pending.front_mut() {
                 Some(desc) => desc,
                 None => {
@@ -956,9 +959,9 @@ impl ReadableByteStreamController {
 
         if self.close_requested.get()
             && self.queue_total_size.get() == 0
-            && self.pending_pull_intos.borrow().is_empty()
+            && self.pending_pull_intos.borrow(ec).is_empty()
         {
-            self.clear_algorithms();
+            self.clear_algorithms(ec);
             readable_stream_close(stream, ec)?;
             return Ok(());
         }
@@ -980,7 +983,7 @@ impl ReadableByteStreamController {
         let err_large =
             ec.new_range_error("respondWithNewView() view is larger than the remaining request");
         let descriptor_to_commit = {
-            let mut pending = self.pending_pull_intos.borrow_mut();
+            let mut pending = self.pending_pull_intos.borrow_mut(ec);
             let descriptor = match pending.front_mut() {
                 Some(desc) => desc,
                 None => {
@@ -1040,9 +1043,9 @@ impl ReadableByteStreamController {
 
         if self.close_requested.get()
             && self.queue_total_size.get() == 0
-            && self.pending_pull_intos.borrow().is_empty()
+            && self.pending_pull_intos.borrow(ec).is_empty()
         {
-            self.clear_algorithms();
+            self.clear_algorithms(ec);
             readable_stream_close(stream, ec)?;
             return Ok(());
         }
@@ -1066,7 +1069,7 @@ impl ReadableByteStreamController {
 
         self.pulling.set(true);
         let controller_object = self.controller_object(ec)?;
-        let pull_algorithm = self.pull_algorithm.borrow().clone();
+        let pull_algorithm = self.pull_algorithm.borrow(ec).clone();
         let pull_promise_result = match pull_algorithm {
             Some(pull_algorithm) => pull_algorithm.call(&controller_object, ec),
             None => Ok(resolved_promise(ec.value_undefined(), ec)?),
@@ -1116,15 +1119,15 @@ impl ReadableByteStreamController {
             return Ok(false);
         }
 
-        if !self.pending_pull_intos.borrow().is_empty() {
+        if !self.pending_pull_intos.borrow(ec).is_empty() {
             return Ok(true);
         }
 
         if stream
-            .reader_slot()
+            .reader_slot(ec)
             .and_then(|reader| reader.as_default_reader())
             .is_some()
-            && readable_stream_get_num_read_requests(stream.clone()) > 0
+            && readable_stream_get_num_read_requests(stream.clone(), ec) > 0
         {
             return Ok(self.queue_total_size.get() == 0);
         }
@@ -1133,10 +1136,10 @@ impl ReadableByteStreamController {
     }
 
     /// <https://streams.spec.whatwg.org/#readable-byte-stream-controller-enqueue-chunk-to-queue>
-    fn enqueue_chunk(&self, view: ArrayBufferViewDescriptor) {
+    fn enqueue_chunk(&self, view: ArrayBufferViewDescriptor, ec: &mut dyn ExecutionContext<crate::js::Types>) {
         self.queue_total_size
             .set(self.queue_total_size.get() + view.byte_length());
-        self.queue.borrow_mut().push_back(ByteQueueEntry::new(view));
+        self.queue.borrow_mut(ec).push_back(ByteQueueEntry::new(view));
     }
 
     fn dequeue_chunk_as_value(
@@ -1145,7 +1148,7 @@ impl ReadableByteStreamController {
     ) -> Completion<JsValue, crate::js::Types> {
         let entry = self
             .queue
-            .borrow_mut()
+            .borrow_mut(ec)
             .pop_front()
             .ok_or_else(|| ec.new_type_error("Readable byte stream queue is empty"))?;
         let remaining_len = entry.remaining_len();
@@ -1166,7 +1169,7 @@ impl ReadableByteStreamController {
         let chunk = self.dequeue_chunk_as_value(ec)?;
         read_request.chunk_steps(chunk, ec)?;
         if self.close_requested.get() && self.queue_total_size.get() == 0 {
-            self.clear_algorithms();
+            self.clear_algorithms(ec);
             readable_stream_close(stream, ec)?;
         }
         Ok(())
@@ -1180,10 +1183,10 @@ impl ReadableByteStreamController {
         // readable_stream_fulfill_read_request and readable_stream_close still require &mut Context.
         while self.queue_total_size.get() > 0
             && stream
-                .reader_slot()
+                .reader_slot(ec)
                 .and_then(|reader| reader.as_default_reader())
                 .is_some()
-            && readable_stream_get_num_read_requests(stream.clone()) > 0
+            && readable_stream_get_num_read_requests(stream.clone(), ec) > 0
         {
             let chunk = self.dequeue_chunk_as_value(ec)?;
             readable_stream_fulfill_read_request(stream.clone(), chunk, false, ec)?;
@@ -1191,9 +1194,9 @@ impl ReadableByteStreamController {
 
         if self.close_requested.get()
             && self.queue_total_size.get() == 0
-            && self.pending_pull_intos.borrow().is_empty()
+            && self.pending_pull_intos.borrow(ec).is_empty()
         {
-            self.clear_algorithms();
+            self.clear_algorithms(ec);
             readable_stream_close(stream, ec)?;
         }
 
@@ -1216,7 +1219,7 @@ impl ReadableByteStreamController {
         let mut copied = Vec::with_capacity(total_to_copy);
         let mut remaining = total_to_copy;
         {
-            let mut queue = self.queue.borrow_mut();
+            let mut queue = self.queue.borrow_mut(ec);
             while remaining > 0 {
                 let mut entry = queue
                     .pop_front()
@@ -1273,7 +1276,7 @@ impl ReadableByteStreamController {
             if self.queue_total_size.get() == 0 {
                 break;
             }
-            let mut popped = self.pending_pull_intos.borrow_mut().pop_front();
+            let mut popped = self.pending_pull_intos.borrow_mut(ec).pop_front();
             let Some(mut descriptor) = popped.as_mut() else {
                 break;
             };
@@ -1284,7 +1287,7 @@ impl ReadableByteStreamController {
             }
             // Cannot commit — push back and stop.
             self.pending_pull_intos
-                .borrow_mut()
+                .borrow_mut(ec)
                 .push_front(popped.take().unwrap());
             self.update_byob_request_view(ec)?;
             break;
@@ -1304,31 +1307,35 @@ impl ReadableByteStreamController {
 pub(crate) fn with_readable_byte_stream_controller_ref<R>(
     object: &JsObject,
     ec: &mut dyn ExecutionContext<crate::js::Types>,
-    f: impl FnOnce(&ReadableByteStreamController) -> R,
+    f: impl FnOnce(&ReadableByteStreamController, &mut dyn ExecutionContext<crate::js::Types>) -> R,
 ) -> Completion<R, crate::js::Types> {
-    let ctrl_ref = ec
+    // Clone the handle out of the object registry so `f` can borrow `ec`
+    // mutably; the clone shares all GC-managed state with the registered
+    // platform object.
+    let controller = ec
         .with_object_any(object)
-        .and_then(|a| a.downcast_ref::<ReadableByteStreamController>());
-    let controller = match ctrl_ref {
-        Some(c) => c,
-        None => return Err(ec.new_type_error("object is not a ReadableByteStreamController")),
+        .and_then(|a| a.downcast_ref::<ReadableByteStreamController>().cloned());
+    let Some(controller) = controller else {
+        return Err(ec.new_type_error("object is not a ReadableByteStreamController"));
     };
-    Ok(f(controller))
+    Ok(f(&controller, ec))
 }
 
 pub(crate) fn with_readable_stream_byob_request_ref<R>(
     object: &JsObject,
     ec: &mut dyn ExecutionContext<crate::js::Types>,
-    f: impl FnOnce(&ReadableStreamBYOBRequest) -> R,
+    f: impl FnOnce(&ReadableStreamBYOBRequest, &mut dyn ExecutionContext<crate::js::Types>) -> R,
 ) -> Completion<R, crate::js::Types> {
-    let req_ref = ec
+    // Clone the handle out of the object registry so `f` can borrow `ec`
+    // mutably; the clone shares all GC-managed state with the registered
+    // platform object.
+    let request = ec
         .with_object_any(object)
-        .and_then(|a| a.downcast_ref::<ReadableStreamBYOBRequest>());
-    let request = match req_ref {
-        Some(r) => r,
-        None => return Err(ec.new_type_error("object is not a ReadableStreamBYOBRequest")),
+        .and_then(|a| a.downcast_ref::<ReadableStreamBYOBRequest>().cloned());
+    let Some(request) = request else {
+        return Err(ec.new_type_error("object is not a ReadableStreamBYOBRequest"));
     };
-    Ok(f(request))
+    Ok(f(&request, ec))
 }
 
 /// <https://streams.spec.whatwg.org/#set-up-readable-byte-stream-controller-from-underlying-source>
@@ -1338,7 +1345,7 @@ pub(crate) fn set_up_readable_byte_stream_controller_from_underlying_source(
     high_water_mark: f64,
     ec: &mut dyn ExecutionContext<crate::js::Types>,
 ) -> Completion<(), crate::js::Types> {
-    let controller = ReadableByteStreamController::new();
+    let controller = ReadableByteStreamController::new(ec);
     let controller_object: JsObject = create_interface_instance::<
         crate::js::Types,
         ReadableByteStreamController,
@@ -1393,11 +1400,11 @@ pub(crate) fn set_up_readable_byte_stream_controller(
     ec: &mut dyn ExecutionContext<crate::js::Types>,
 ) -> Completion<(), crate::js::Types> {
     // Step 2 (implicit): Set controller.[[stream]] to stream.
-    *controller.stream.borrow_mut() = Some(stream.clone());
+    *controller.stream.borrow_mut(ec) = Some(stream.clone());
 
     // Step 3 (implicit): Set stream.[[controller]] to controller.
-    stream.set_controller_slot(Some(ReadableStreamController::Byte(controller.clone())));
-    stream.set_controller_object_slot(Some(controller_object.clone()));
+    stream.set_controller_slot(Some(ReadableStreamController::Byte(controller.clone())), ec);
+    stream.set_controller_object_slot(Some(controller_object.clone()), ec);
 
     controller.close_requested.set(false);
     controller.started.set(false);
@@ -1407,9 +1414,9 @@ pub(crate) fn set_up_readable_byte_stream_controller(
     controller
         .auto_allocate_chunk_size
         .set(auto_allocate_chunk_size);
-    *controller.pull_algorithm.borrow_mut() = Some(pull_algorithm.clone());
-    *controller.cancel_algorithm.borrow_mut() = Some(cancel_algorithm.clone());
-    controller.pending_pull_intos.borrow_mut().clear();
+    *controller.pull_algorithm.borrow_mut(ec) = Some(pull_algorithm.clone());
+    *controller.cancel_algorithm.borrow_mut(ec) = Some(cancel_algorithm.clone());
+    controller.pending_pull_intos.borrow_mut(ec).clear();
     let start_result = start_algorithm.call(controller_object, ec)?;
     let start_promise = resolved_promise(start_result, ec)?;
 

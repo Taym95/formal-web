@@ -4,7 +4,8 @@ use std::rc::Rc;
 use blitz_dom::BaseDocument;
 
 use crate::html::html_media_element::HTMLMediaElement;
-use js_engine::gc_struct;
+use crate::js::Types;
+use js_engine::{ExecutionContext, gc_struct};
 
 /// <https://html.spec.whatwg.org/#the-video-element>
 #[gc_struct]
@@ -20,9 +21,13 @@ pub struct HTMLVideoElement {
 }
 
 impl HTMLVideoElement {
-    pub fn new(document: Rc<RefCell<BaseDocument>>, node_id: usize) -> Self {
+    pub fn new(
+        document: Rc<RefCell<BaseDocument>>,
+        node_id: usize,
+        ec: &mut dyn ExecutionContext<Types>,
+    ) -> Self {
         Self {
-            media_element: HTMLMediaElement::new(document, node_id),
+            media_element: HTMLMediaElement::new(document, node_id, ec),
             video_width: 0,
             video_height: 0,
         }

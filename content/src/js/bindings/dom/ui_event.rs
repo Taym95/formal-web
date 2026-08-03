@@ -4,16 +4,20 @@ type JsValue = <crate::js::Types as JsTypes>::JsValue;
 fn with_ui_event_ref<R>(
     this: &JsValue,
     ec: &mut dyn ExecutionContext<crate::js::Types>,
-    f: impl FnOnce(&UIEvent) -> R,
+    f: impl FnOnce(&UIEvent, &mut dyn ExecutionContext<crate::js::Types>) -> R,
 ) -> Completion<R, crate::js::Types> {
     let obj = crate::js::Types::value_as_object(this)
         .ok_or_else(|| ec.new_type_error("UIEvent receiver is not an object"))?;
-    if let Some(data) = ec.with_object_any(&obj) {
-        if let Some(ui_event) = data.downcast_ref::<UIEvent>() {
-            return Ok(f(ui_event));
-        }
-    }
-    Err(ec.new_type_error("receiver is not a UIEvent"))
+    // Clone the handle out of the object registry so `f` can borrow `ec`
+    // mutably while the platform object is accessed. The clone shares all
+    // GC-managed state with the registered platform object.
+    let ui_event = ec
+        .with_object_any(&obj)
+        .and_then(|data| data.downcast_ref::<UIEvent>().cloned());
+    let Some(ui_event) = ui_event else {
+        return Err(ec.new_type_error("receiver is not a UIEvent"));
+    };
+    Ok(f(&ui_event, ec))
 }
 
 use crate::webidl::bindings::{AttributeDef, InterfaceDefinition, WebIdlInterface};
@@ -52,6 +56,7 @@ impl WebIdlInterface<crate::js::Types> for UIEvent {
                 init_flag(&init, "composed", ec)?,
                 false,
                 0.0,
+                ec,
             ),
             view: None,
             detail,
@@ -93,7 +98,7 @@ fn get_view(
     _: &[JsValue],
     ec: &mut dyn ExecutionContext<crate::js::Types>,
 ) -> Completion<JsValue, crate::js::Types> {
-    let view = with_ui_event_ref(this, ec, |ui_event| ui_event.view_value())?;
+    let view = with_ui_event_ref(this, ec, |ui_event, _ec| ui_event.view_value())?;
     Ok(view
         .map(crate::js::Types::value_from_object)
         .unwrap_or_else(|| ec.value_null()))
@@ -104,6 +109,6 @@ fn get_detail(
     _: &[JsValue],
     ec: &mut dyn ExecutionContext<crate::js::Types>,
 ) -> Completion<JsValue, crate::js::Types> {
-    let val = with_ui_event_ref(this, ec, |ui_event| ui_event.detail_value())?;
+    let val = with_ui_event_ref(this, ec, |ui_event, _ec| ui_event.detail_value())?;
     Ok(ec.value_from_number(val as f64))
 }

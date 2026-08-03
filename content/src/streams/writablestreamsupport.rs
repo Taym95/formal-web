@@ -1,4 +1,4 @@
-use js_engine::gc::{JsObjectCell, JsValueCell};
+use js_engine::gc::{GcCell, gc_cell_new};
 use js_engine::gc_struct;
 use js_engine::{Completion, ExecutionContext, JsTypes, PromiseResolvers};
 
@@ -51,11 +51,11 @@ impl WriteRequest {
 }
 #[gc_struct]
 pub(crate) struct PendingAbortRequest {
-    promise: JsObjectCell,
+    promise: GcCell<Option<JsObject>>,
     resolvers: PromiseResolvers<Types>,
 
     /// <https://streams.spec.whatwg.org/#pending-abort-request-reason>
-    reason: JsValueCell,
+    reason: GcCell<JsValue>,
 
     /// <https://streams.spec.whatwg.org/#pending-abort-request-was-already-erroring>
     was_already_erroring: bool,
@@ -72,17 +72,17 @@ impl PendingAbortRequest {
             .as_object()
             .ok_or_else(|| ec.new_type_error("new_promise_pending did not return an object"))?;
         Ok(Self {
-            promise: JsObjectCell::new(Some(promise_obj)),
+            promise: gc_cell_new(Some(promise_obj), ec),
             resolvers,
-            reason: JsValueCell::new(reason),
+            reason: gc_cell_new(reason, ec),
             was_already_erroring,
         })
     }
-    pub(crate) fn promise(&self) -> JsObject {
-        self.promise.borrow().clone().unwrap()
+    pub(crate) fn promise(&self, ec: &mut dyn ExecutionContext<Types>) -> JsObject {
+        self.promise.borrow(ec).clone().unwrap()
     }
-    pub(crate) fn reason(&self) -> JsValue {
-        self.reason.borrow().clone()
+    pub(crate) fn reason(&self, ec: &mut dyn ExecutionContext<Types>) -> JsValue {
+        self.reason.borrow(ec).clone()
     }
     pub(crate) fn was_already_erroring(&self) -> bool {
         self.was_already_erroring
@@ -118,9 +118,9 @@ impl WritableStreamController {
             Self::Default(controller) => controller.abort_steps(reason, ec),
         }
     }
-    pub(crate) fn error_steps(&self) {
+    pub(crate) fn error_steps(&self, ec: &mut dyn ExecutionContext<Types>) {
         match self {
-            Self::Default(controller) => controller.error_steps(),
+            Self::Default(controller) => controller.error_steps(ec),
         }
     }
     pub(crate) fn signal_abort(

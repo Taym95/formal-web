@@ -3,7 +3,8 @@ use std::{cell::RefCell, rc::Rc};
 use blitz_dom::BaseDocument;
 
 use crate::html::HTMLElement;
-use js_engine::gc_struct;
+use crate::js::Types;
+use js_engine::{ExecutionContext, gc_struct};
 
 /// <https://html.spec.whatwg.org/#the-input-element>
 #[gc_struct]
@@ -13,9 +14,13 @@ pub struct HTMLInputElement {
 }
 
 impl HTMLInputElement {
-    pub fn new(document: Rc<RefCell<BaseDocument>>, node_id: usize) -> Self {
+    pub fn new(
+        document: Rc<RefCell<BaseDocument>>,
+        node_id: usize,
+        ec: &mut dyn ExecutionContext<Types>,
+    ) -> Self {
         Self {
-            html_element: HTMLElement::new(document, node_id),
+            html_element: HTMLElement::new(document, node_id, ec),
         }
     }
 

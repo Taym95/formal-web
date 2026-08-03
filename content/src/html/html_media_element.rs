@@ -124,9 +124,13 @@ impl HTMLMediaElement {
 }
 
 impl HTMLMediaElement {
-    pub fn new(document: Rc<RefCell<BaseDocument>>, node_id: usize) -> Self {
+    pub fn new(
+        document: Rc<RefCell<BaseDocument>>,
+        node_id: usize,
+        ec: &mut dyn ExecutionContext<Types>,
+    ) -> Self {
         Self {
-            html_element: HTMLElement::new(document, node_id),
+            html_element: HTMLElement::new(document, node_id, ec),
             network_state: Self::NETWORK_EMPTY,
             ready_state: Self::HAVE_NOTHING,
             current_src: String::new(),
@@ -337,7 +341,7 @@ impl HTMLMediaElement {
         // Resolve the src attribute value to an absolute URL against the document's
         // base URL (creation URL), as required by the spec's current_src definition.
         let resolved_src = src.as_ref().and_then(|s| {
-            with_global_scope(ec, |global_scope| Ok(global_scope.creation_url()))
+            with_global_scope(ec, |global_scope, _ec| Ok(global_scope.creation_url()))
                 .ok()
                 .flatten()
                 .and_then(|base_url| base_url.join(s).ok().map(|url| url.to_string()))
@@ -349,7 +353,7 @@ impl HTMLMediaElement {
         let video_paint_id = self.video_paint_id;
 
         // Extract document_id and navigable_id from the GlobalScope.
-        let global_scope_data = with_global_scope(ec, |global_scope| {
+        let global_scope_data = with_global_scope(ec, |global_scope, _ec| {
             Ok((
                 global_scope.document_id(),
                 global_scope.source_navigable_id(),
@@ -367,7 +371,7 @@ impl HTMLMediaElement {
         // Register the paint_id via GlobalScope so the composition
         // metadata builder can find the same UUID for this video element.
         if let Some(document_id) = document_id {
-            let _ = with_global_scope(ec, |global_scope| {
+            let _ = with_global_scope(ec, |global_scope, _ec| {
                 global_scope.register_video_paint_id(document_id, node_id, video_paint_id);
                 Ok(())
             });
@@ -395,14 +399,14 @@ impl HTMLMediaElement {
                     (event_sender, traversable_id, document_id)
                 {
                     // Allocate pipeline ID and send CreatePipeline+Play directly to media.
-                    let pipeline_id = with_global_scope(job_ec, |global_scope| {
+                    let pipeline_id = with_global_scope(job_ec, |global_scope, _ec| {
                         Ok(global_scope.allocate_media_pipeline_id())
                     })
                     .ok();
 
                     if let Some(pipeline_id) = pipeline_id {
                         // Send CreatePipeline + Play directly to the graphics process.
-                        let graphics_sender = with_global_scope(job_ec, |global_scope| {
+                        let graphics_sender = with_global_scope(job_ec, |global_scope, _ec| {
                             Ok(global_scope.graphics_sender())
                         })
                         .ok()

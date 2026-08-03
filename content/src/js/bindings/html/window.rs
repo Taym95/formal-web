@@ -432,7 +432,7 @@ fn clear_timeout_method(
         &window_object,
         Box::new(|data, _ec2| {
             if let Some(window) = data.downcast_mut::<Window>() {
-                window.clear_timeout(timer_id);
+                window.clear_timeout(timer_id, ec);
             }
         }),
     );
@@ -475,7 +475,7 @@ fn clear_interval_method(
         &window_object,
         Box::new(|data, _ec2| {
             if let Some(window) = data.downcast_mut::<Window>() {
-                window.clear_interval(timer_id);
+                window.clear_interval(timer_id, ec);
             }
         }),
     );

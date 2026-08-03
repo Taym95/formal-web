@@ -290,7 +290,7 @@ impl EventHandler for BlitzJSEventHandler<'_> {
 
         let ec = &mut self.settings.realm_execution_context;
         let view = Some(ec.realm_global_object());
-        let ui_event = JsUiEvent::from_dom_event(event, view, time_stamp);
+        let ui_event = JsUiEvent::from_dom_event(event, view, time_stamp, ec);
         let event_object = create_interface_instance::<Types, JsUiEvent>(ui_event, ec)
             .expect("UIEvent construction must succeed");
         let domain_event: Event = ec
@@ -314,7 +314,7 @@ impl EventHandler for BlitzJSEventHandler<'_> {
             .with_object_any(&event_object)
             .and_then(|d| d.downcast_ref::<JsUiEvent>().cloned())
         {
-            ui_event.apply_to_event_state(event_state);
+            ui_event.apply_to_event_state(event_state, ec);
         }
 
         if let DomEventData::KeyDown(key_event) = &event.data
@@ -415,7 +415,7 @@ pub(crate) fn dispatch_trusted_click_event(
     let event_domain = {
         let ec = handler.settings.ec();
         let event_object = create_interface_instance::<Types, Event>(
-            Event::new("click".into(), true, true, true, true, time_millis),
+            Event::new("click".into(), true, true, true, true, time_millis, ec),
             ec,
         )
         .map_err(|error| format!("failed to create trusted click event: {error:?}"))?;
@@ -524,7 +524,7 @@ mod tests {
             let ec = child_settings.ec();
             let event_object = create_interface_instance::<Types, JsUiEvent>(
                 JsUiEvent {
-                    event: Event::new("click".into(), true, true, false, true, 0.0),
+                    event: Event::new("click".into(), true, true, false, true, 0.0, ec),
                     view: None,
                     detail: 0,
                 },

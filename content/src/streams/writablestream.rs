@@ -10,7 +10,7 @@ use crate::js::{Types, create_builtin_fn_with_traced_captures};
 use crate::streams::{SizeAlgorithm, extract_high_water_mark, extract_size_algorithm};
 use crate::webidl::bindings::create_interface_instance;
 use crate::webidl::{resolved_promise, upon_settlement};
-use js_engine::gc::{GcCell, JsObjectCell, JsValueCell, gc_cell_new};
+use js_engine::gc::{GcCell, gc_cell_new};
 use js_engine::gc_struct;
 
 use super::{
@@ -31,7 +31,7 @@ type JsObject = <Types as JsTypes>::JsObject;
 pub struct WritableStream {
     /// <https://streams.spec.whatwg.org/#writablestream-controller>
     controller: GcCell<Option<WritableStreamController>>,
-    controller_object: JsObjectCell,
+    controller_object: GcCell<Option<JsObject>>,
 
     /// <https://streams.spec.whatwg.org/#writablestream-writer>
     writer: GcCell<Option<WritableStreamWriter>>,
@@ -41,7 +41,7 @@ pub struct WritableStream {
     state: Rc<RefCell<WritableStreamState>>,
 
     /// <https://streams.spec.whatwg.org/#writablestream-storederror>
-    stored_error: JsValueCell,
+    stored_error: GcCell<JsValue>,
 
     /// <https://streams.spec.whatwg.org/#writablestream-writerequests>
     write_requests: GcCell<Vec<WriteRequest>>,
@@ -67,36 +67,36 @@ impl WritableStream {
     pub(crate) fn new(ec: &mut dyn ExecutionContext<Types>) -> Self {
         let undefined = ec.value_undefined();
         Self {
-            controller: gc_cell_new(None),
-            controller_object: JsObjectCell::new(None),
-            writer: gc_cell_new(None),
+            controller: gc_cell_new(None, ec),
+            controller_object: gc_cell_new(None, ec),
+            writer: gc_cell_new(None, ec),
             state: Rc::new(RefCell::new(WritableStreamState::Writable)),
-            stored_error: JsValueCell::new(undefined),
-            write_requests: gc_cell_new(Vec::new()),
-            in_flight_write_request: gc_cell_new(None),
-            close_request: gc_cell_new(None),
-            in_flight_close_request: gc_cell_new(None),
-            pending_abort_request: gc_cell_new(None),
+            stored_error: gc_cell_new(undefined, ec),
+            write_requests: gc_cell_new(Vec::new(), ec),
+            in_flight_write_request: gc_cell_new(None, ec),
+            close_request: gc_cell_new(None, ec),
+            in_flight_close_request: gc_cell_new(None, ec),
+            pending_abort_request: gc_cell_new(None, ec),
             backpressure: Rc::new(Cell::new(false)),
         }
     }
-    pub(crate) fn controller_slot(&self) -> Option<WritableStreamController> {
-        self.controller.borrow().clone()
+    pub(crate) fn controller_slot(&self, ec: &mut dyn ExecutionContext<Types>) -> Option<WritableStreamController> {
+        self.controller.borrow(ec).clone()
     }
-    pub(crate) fn set_controller_slot(&self, controller: Option<WritableStreamController>) {
-        *self.controller.borrow_mut() = controller;
+    pub(crate) fn set_controller_slot(&self, controller: Option<WritableStreamController>, ec: &mut dyn ExecutionContext<Types>) {
+        *self.controller.borrow_mut(ec) = controller;
     }
-    pub(crate) fn controller_object_slot(&self) -> Option<JsObject> {
-        self.controller_object.borrow().clone()
+    pub(crate) fn controller_object_slot(&self, ec: &mut dyn ExecutionContext<Types>) -> Option<JsObject> {
+        self.controller_object.borrow(ec).clone()
     }
-    pub(crate) fn set_controller_object_slot(&self, controller_object: Option<JsObject>) {
-        self.controller_object.set(controller_object);
+    pub(crate) fn set_controller_object_slot(&self, controller_object: Option<JsObject>, ec: &mut dyn ExecutionContext<Types>) {
+        self.controller_object.set(controller_object, ec);
     }
-    pub(crate) fn writer_slot(&self) -> Option<WritableStreamWriter> {
-        self.writer.borrow().clone()
+    pub(crate) fn writer_slot(&self, ec: &mut dyn ExecutionContext<Types>) -> Option<WritableStreamWriter> {
+        self.writer.borrow(ec).clone()
     }
-    pub(crate) fn set_writer_slot(&self, writer: Option<WritableStreamWriter>) {
-        *self.writer.borrow_mut() = writer;
+    pub(crate) fn set_writer_slot(&self, writer: Option<WritableStreamWriter>, ec: &mut dyn ExecutionContext<Types>) {
+        *self.writer.borrow_mut(ec) = writer;
     }
     pub(crate) fn state(&self) -> WritableStreamState {
         self.state.borrow().clone()
@@ -104,11 +104,11 @@ impl WritableStream {
     pub(crate) fn set_state(&self, state: WritableStreamState) {
         *self.state.borrow_mut() = state;
     }
-    pub(crate) fn stored_error(&self) -> JsValue {
-        self.stored_error.borrow().clone()
+    pub(crate) fn stored_error(&self, ec: &mut dyn ExecutionContext<Types>) -> JsValue {
+        self.stored_error.borrow(ec).clone()
     }
-    pub(crate) fn set_stored_error(&self, error: JsValue) {
-        self.stored_error.set(error);
+    pub(crate) fn set_stored_error(&self, error: JsValue, ec: &mut dyn ExecutionContext<Types>) {
+        self.stored_error.set(error, ec);
     }
     pub(crate) fn backpressure(&self) -> bool {
         self.backpressure.get()
@@ -116,55 +116,55 @@ impl WritableStream {
     pub(crate) fn set_backpressure(&self, backpressure: bool) {
         self.backpressure.set(backpressure);
     }
-    pub(crate) fn close_request_slot(&self) -> Option<WriteRequest> {
-        self.close_request.borrow().clone()
+    pub(crate) fn close_request_slot(&self, ec: &mut dyn ExecutionContext<Types>) -> Option<WriteRequest> {
+        self.close_request.borrow(ec).clone()
     }
-    pub(crate) fn set_close_request_slot(&self, request: Option<WriteRequest>) {
-        *self.close_request.borrow_mut() = request;
+    pub(crate) fn set_close_request_slot(&self, request: Option<WriteRequest>, ec: &mut dyn ExecutionContext<Types>) {
+        *self.close_request.borrow_mut(ec) = request;
     }
-    pub(crate) fn take_close_request_slot(&self) -> Option<WriteRequest> {
-        self.close_request.borrow_mut().take()
+    pub(crate) fn take_close_request_slot(&self, ec: &mut dyn ExecutionContext<Types>) -> Option<WriteRequest> {
+        self.close_request.borrow_mut(ec).take()
     }
-    pub(crate) fn in_flight_write_request_slot(&self) -> Option<WriteRequest> {
-        self.in_flight_write_request.borrow().clone()
+    pub(crate) fn in_flight_write_request_slot(&self, ec: &mut dyn ExecutionContext<Types>) -> Option<WriteRequest> {
+        self.in_flight_write_request.borrow(ec).clone()
     }
-    pub(crate) fn set_in_flight_write_request_slot(&self, request: Option<WriteRequest>) {
-        *self.in_flight_write_request.borrow_mut() = request;
+    pub(crate) fn set_in_flight_write_request_slot(&self, request: Option<WriteRequest>, ec: &mut dyn ExecutionContext<Types>) {
+        *self.in_flight_write_request.borrow_mut(ec) = request;
     }
-    pub(crate) fn take_in_flight_write_request_slot(&self) -> Option<WriteRequest> {
-        self.in_flight_write_request.borrow_mut().take()
+    pub(crate) fn take_in_flight_write_request_slot(&self, ec: &mut dyn ExecutionContext<Types>) -> Option<WriteRequest> {
+        self.in_flight_write_request.borrow_mut(ec).take()
     }
-    pub(crate) fn in_flight_close_request_slot(&self) -> Option<WriteRequest> {
-        self.in_flight_close_request.borrow().clone()
+    pub(crate) fn in_flight_close_request_slot(&self, ec: &mut dyn ExecutionContext<Types>) -> Option<WriteRequest> {
+        self.in_flight_close_request.borrow(ec).clone()
     }
-    pub(crate) fn set_in_flight_close_request_slot(&self, request: Option<WriteRequest>) {
-        *self.in_flight_close_request.borrow_mut() = request;
+    pub(crate) fn set_in_flight_close_request_slot(&self, request: Option<WriteRequest>, ec: &mut dyn ExecutionContext<Types>) {
+        *self.in_flight_close_request.borrow_mut(ec) = request;
     }
-    pub(crate) fn take_in_flight_close_request_slot(&self) -> Option<WriteRequest> {
-        self.in_flight_close_request.borrow_mut().take()
+    pub(crate) fn take_in_flight_close_request_slot(&self, ec: &mut dyn ExecutionContext<Types>) -> Option<WriteRequest> {
+        self.in_flight_close_request.borrow_mut(ec).take()
     }
-    pub(crate) fn pending_abort_request_slot(&self) -> Option<PendingAbortRequest> {
-        self.pending_abort_request.borrow().clone()
+    pub(crate) fn pending_abort_request_slot(&self, ec: &mut dyn ExecutionContext<Types>) -> Option<PendingAbortRequest> {
+        self.pending_abort_request.borrow(ec).clone()
     }
-    pub(crate) fn set_pending_abort_request_slot(&self, request: Option<PendingAbortRequest>) {
-        *self.pending_abort_request.borrow_mut() = request;
+    pub(crate) fn set_pending_abort_request_slot(&self, request: Option<PendingAbortRequest>, ec: &mut dyn ExecutionContext<Types>) {
+        *self.pending_abort_request.borrow_mut(ec) = request;
     }
-    pub(crate) fn take_pending_abort_request_slot(&self) -> Option<PendingAbortRequest> {
-        self.pending_abort_request.borrow_mut().take()
+    pub(crate) fn take_pending_abort_request_slot(&self, ec: &mut dyn ExecutionContext<Types>) -> Option<PendingAbortRequest> {
+        self.pending_abort_request.borrow_mut(ec).take()
     }
-    pub(crate) fn push_write_request(&self, request: WriteRequest) {
-        self.write_requests.borrow_mut().push(request);
+    pub(crate) fn push_write_request(&self, request: WriteRequest, ec: &mut dyn ExecutionContext<Types>) {
+        self.write_requests.borrow_mut(ec).push(request);
     }
-    pub(crate) fn shift_write_request(&self) -> Option<WriteRequest> {
-        let mut write_requests = self.write_requests.borrow_mut();
+    pub(crate) fn shift_write_request(&self, ec: &mut dyn ExecutionContext<Types>) -> Option<WriteRequest> {
+        let mut write_requests = self.write_requests.borrow_mut(ec);
         if write_requests.is_empty() {
             None
         } else {
             Some(write_requests.remove(0))
         }
     }
-    pub(crate) fn take_write_requests(&self) -> Vec<WriteRequest> {
-        std::mem::take(&mut self.write_requests.borrow_mut())
+    pub(crate) fn take_write_requests(&self, ec: &mut dyn ExecutionContext<Types>) -> Vec<WriteRequest> {
+        std::mem::take(&mut self.write_requests.borrow_mut(ec))
     }
 
     pub(crate) fn same_instance(&self, other: &Self) -> bool {
@@ -174,26 +174,26 @@ impl WritableStream {
     /// <https://streams.spec.whatwg.org/#initialize-writable-stream>
     fn initialize_writable_stream(&mut self, ec: &mut dyn ExecutionContext<Types>) {
         *self.state.borrow_mut() = WritableStreamState::Writable;
-        self.stored_error.set(ec.value_undefined());
-        *self.writer.borrow_mut() = None;
-        *self.controller.borrow_mut() = None;
-        self.controller_object.set(None);
-        *self.in_flight_write_request.borrow_mut() = None;
-        *self.close_request.borrow_mut() = None;
-        *self.in_flight_close_request.borrow_mut() = None;
-        *self.pending_abort_request.borrow_mut() = None;
-        self.write_requests.borrow_mut().clear();
+        self.stored_error.set(ec.value_undefined(), ec);
+        *self.writer.borrow_mut(ec) = None;
+        *self.controller.borrow_mut(ec) = None;
+        self.controller_object.set(None, ec);
+        *self.in_flight_write_request.borrow_mut(ec) = None;
+        *self.close_request.borrow_mut(ec) = None;
+        *self.in_flight_close_request.borrow_mut(ec) = None;
+        *self.pending_abort_request.borrow_mut(ec) = None;
+        self.write_requests.borrow_mut(ec).clear();
         self.backpressure.set(false);
     }
 
     /// <https://streams.spec.whatwg.org/#is-writable-stream-locked>
-    pub(crate) fn is_writable_stream_locked(&self) -> bool {
-        self.writer_slot().is_some()
+    pub(crate) fn is_writable_stream_locked(&self, ec: &mut dyn ExecutionContext<Types>) -> bool {
+        self.writer_slot(ec).is_some()
     }
 
     /// <https://streams.spec.whatwg.org/#ws-locked>
-    pub(crate) fn locked(&self) -> bool {
-        self.is_writable_stream_locked()
+    pub(crate) fn locked(&self, ec: &mut dyn ExecutionContext<Types>) -> bool {
+        self.is_writable_stream_locked(ec)
     }
 
     /// <https://streams.spec.whatwg.org/#ws-abort>
@@ -202,7 +202,7 @@ impl WritableStream {
         reason: JsValue,
         ec: &mut dyn ExecutionContext<Types>,
     ) -> Completion<JsObject, Types> {
-        if self.is_writable_stream_locked() {
+        if self.is_writable_stream_locked(ec) {
             return rejected_type_error_promise(
                 "Cannot abort a WritableStream that already has a writer",
                 ec,
@@ -217,14 +217,14 @@ impl WritableStream {
         &self,
         ec: &mut dyn ExecutionContext<Types>,
     ) -> Completion<JsObject, Types> {
-        if self.is_writable_stream_locked() {
+        if self.is_writable_stream_locked(ec) {
             return rejected_type_error_promise(
                 "Cannot close a WritableStream that already has a writer",
                 ec,
             );
         }
 
-        if self.close_queued_or_in_flight() {
+        if self.close_queued_or_in_flight(ec) {
             return rejected_type_error_promise(
                 "Cannot close a WritableStream that is already closing",
                 ec,
@@ -256,7 +256,7 @@ impl WritableStream {
         }
 
         let controller = self
-            .controller_slot()
+            .controller_slot(ec)
             .ok_or_else(|| ec.new_type_error("WritableStream is missing its controller"))?;
         controller.signal_abort(reason.clone(), ec)?;
 
@@ -267,8 +267,8 @@ impl WritableStream {
             return resolved_promise(ec.value_undefined(), ec);
         }
 
-        if let Some(abort_request) = self.pending_abort_request_slot() {
-            return Ok(abort_request.promise());
+        if let Some(abort_request) = self.pending_abort_request_slot(ec) {
+            return Ok(abort_request.promise(ec));
         }
 
         let mut was_already_erroring = false;
@@ -280,8 +280,8 @@ impl WritableStream {
 
         let abort_request =
             PendingAbortRequest::new(abort_reason.clone(), was_already_erroring, ec)?;
-        let promise = abort_request.promise();
-        self.set_pending_abort_request_slot(Some(abort_request));
+        let promise = abort_request.promise(ec);
+        self.set_pending_abort_request_slot(Some(abort_request), ec);
 
         if !was_already_erroring {
             self.start_erroring(abort_reason, ec)?;
@@ -305,12 +305,12 @@ impl WritableStream {
             _ => {}
         }
 
-        debug_assert!(!self.close_queued_or_in_flight());
+        debug_assert!(!self.close_queued_or_in_flight(ec));
 
         let (close_request, promise) = WriteRequest::new(ec)?;
-        self.set_close_request_slot(Some(close_request));
+        self.set_close_request_slot(Some(close_request), ec);
 
-        if let Some(writer_slot) = self.writer_slot() {
+        if let Some(writer_slot) = self.writer_slot(ec) {
             if let Some(writer) = writer_slot.as_default_writer() {
                 if self.backpressure() && self.state() == WritableStreamState::Writable {
                     writer.resolve_ready_promise(ec)?;
@@ -319,7 +319,7 @@ impl WritableStream {
         }
 
         let controller = self
-            .controller_slot()
+            .controller_slot(ec)
             .ok_or_else(|| ec.new_type_error("WritableStream is missing its controller"))?;
         writable_stream_default_controller_close(controller.as_default_controller(), ec)?;
         Ok(promise)
@@ -330,17 +330,17 @@ impl WritableStream {
         &self,
         ec: &mut dyn ExecutionContext<Types>,
     ) -> Completion<JsObject, Types> {
-        debug_assert!(self.is_writable_stream_locked());
+        debug_assert!(self.is_writable_stream_locked(ec));
         debug_assert_eq!(self.state(), WritableStreamState::Writable);
 
         let (write_request, promise) = WriteRequest::new(ec)?;
-        self.push_write_request(write_request);
+        self.push_write_request(write_request, ec);
         Ok(promise)
     }
 
     /// <https://streams.spec.whatwg.org/#writable-stream-close-queued-or-in-flight>
-    pub(crate) fn close_queued_or_in_flight(&self) -> bool {
-        self.close_request_slot().is_some() || self.in_flight_close_request_slot().is_some()
+    pub(crate) fn close_queued_or_in_flight(&self, ec: &mut dyn ExecutionContext<Types>) -> bool {
+        self.close_request_slot(ec).is_some() || self.in_flight_close_request_slot(ec).is_some()
     }
 
     /// <https://streams.spec.whatwg.org/#writable-stream-deal-with-rejection>
@@ -364,20 +364,20 @@ impl WritableStream {
         ec: &mut dyn ExecutionContext<Types>,
     ) -> Completion<(), Types> {
         debug_assert_eq!(self.state(), WritableStreamState::Erroring);
-        debug_assert!(!self.has_operation_marked_in_flight());
+        debug_assert!(!self.has_operation_marked_in_flight(ec));
 
         self.set_state(WritableStreamState::Errored);
         let controller = self
-            .controller_slot()
+            .controller_slot(ec)
             .ok_or_else(|| ec.new_type_error("WritableStream is missing its controller"))?;
-        controller.error_steps();
+        controller.error_steps(ec);
 
-        let stored_error = self.stored_error();
-        for write_request in self.take_write_requests().into_iter() {
+        let stored_error = self.stored_error(ec);
+        for write_request in self.take_write_requests(ec).into_iter() {
             write_request.reject(stored_error.clone(), ec)?;
         }
 
-        let Some(abort_request) = self.take_pending_abort_request_slot() else {
+        let Some(abort_request) = self.take_pending_abort_request_slot(ec) else {
             self.reject_close_and_closed_promise_if_needed(ec)?;
             return Ok(());
         };
@@ -388,7 +388,7 @@ impl WritableStream {
             return Ok(());
         }
 
-        let promise = controller.abort_steps(abort_request.reason(), ec)?;
+        let promise = controller.abort_steps(abort_request.reason(ec), ec)?;
         let abort_request_for_fulfilled = abort_request.clone();
         let stream_for_fulfilled = self.clone();
         let stream_for_rejected = self.clone();
@@ -453,7 +453,7 @@ impl WritableStream {
         &self,
         ec: &mut dyn ExecutionContext<Types>,
     ) -> Completion<(), Types> {
-        let close_request = self.take_in_flight_close_request_slot().ok_or_else(|| {
+        let close_request = self.take_in_flight_close_request_slot(ec).ok_or_else(|| {
             ec.new_type_error("WritableStream is missing its in-flight close request")
         })?;
         close_request.resolve(ec)?;
@@ -463,21 +463,21 @@ impl WritableStream {
             state == WritableStreamState::Writable || state == WritableStreamState::Erroring
         );
         if state == WritableStreamState::Erroring {
-            self.set_stored_error(ec.value_undefined());
-            if let Some(abort_request) = self.take_pending_abort_request_slot() {
+            self.set_stored_error(ec.value_undefined(), ec);
+            if let Some(abort_request) = self.take_pending_abort_request_slot(ec) {
                 abort_request.resolve(ec)?;
             }
         }
 
         self.set_state(WritableStreamState::Closed);
-        if let Some(writer_slot) = self.writer_slot() {
+        if let Some(writer_slot) = self.writer_slot(ec) {
             if let Some(writer) = writer_slot.as_default_writer() {
                 writer.resolve_closed_promise(ec)?;
             }
         }
 
-        debug_assert!(self.pending_abort_request_slot().is_none());
-        debug_assert!(self.stored_error().is_undefined());
+        debug_assert!(self.pending_abort_request_slot(ec).is_none());
+        debug_assert!(self.stored_error(ec).is_undefined());
         Ok(())
     }
 
@@ -487,12 +487,12 @@ impl WritableStream {
         error: JsValue,
         ec: &mut dyn ExecutionContext<Types>,
     ) -> Completion<(), Types> {
-        let close_request = self.take_in_flight_close_request_slot().ok_or_else(|| {
+        let close_request = self.take_in_flight_close_request_slot(ec).ok_or_else(|| {
             ec.new_type_error("WritableStream is missing its in-flight close request")
         })?;
         close_request.reject(error.clone(), ec)?;
 
-        if let Some(abort_request) = self.take_pending_abort_request_slot() {
+        if let Some(abort_request) = self.take_pending_abort_request_slot(ec) {
             abort_request.reject(error.clone(), ec)?;
         }
 
@@ -504,7 +504,7 @@ impl WritableStream {
         &self,
         ec: &mut dyn ExecutionContext<Types>,
     ) -> Completion<(), Types> {
-        let write_request = self.take_in_flight_write_request_slot().ok_or_else(|| {
+        let write_request = self.take_in_flight_write_request_slot(ec).ok_or_else(|| {
             ec.new_type_error("WritableStream is missing its in-flight write request")
         })?;
         write_request.resolve(ec)?;
@@ -517,7 +517,7 @@ impl WritableStream {
         error: JsValue,
         ec: &mut dyn ExecutionContext<Types>,
     ) -> Completion<(), Types> {
-        let write_request = self.take_in_flight_write_request_slot().ok_or_else(|| {
+        let write_request = self.take_in_flight_write_request_slot(ec).ok_or_else(|| {
             ec.new_type_error("WritableStream is missing its in-flight write request")
         })?;
         write_request.reject(error.clone(), ec)?;
@@ -525,9 +525,9 @@ impl WritableStream {
     }
 
     /// <https://streams.spec.whatwg.org/#writable-stream-has-operation-marked-in-flight>
-    pub(crate) fn has_operation_marked_in_flight(&self) -> bool {
-        self.in_flight_write_request_slot().is_some()
-            || self.in_flight_close_request_slot().is_some()
+    pub(crate) fn has_operation_marked_in_flight(&self, ec: &mut dyn ExecutionContext<Types>) -> bool {
+        self.in_flight_write_request_slot(ec).is_some()
+            || self.in_flight_close_request_slot(ec).is_some()
     }
 
     /// <https://streams.spec.whatwg.org/#writable-stream-mark-close-request-in-flight>
@@ -535,11 +535,11 @@ impl WritableStream {
         &self,
         ec: &mut dyn ExecutionContext<Types>,
     ) -> Completion<(), Types> {
-        debug_assert!(self.in_flight_close_request_slot().is_none());
+        debug_assert!(self.in_flight_close_request_slot(ec).is_none());
         let close_request = self
-            .take_close_request_slot()
+            .take_close_request_slot(ec)
             .ok_or_else(|| ec.new_type_error("WritableStream is missing its close request"))?;
-        self.set_in_flight_close_request_slot(Some(close_request));
+        self.set_in_flight_close_request_slot(Some(close_request), ec);
         Ok(())
     }
 
@@ -548,11 +548,11 @@ impl WritableStream {
         &self,
         ec: &mut dyn ExecutionContext<Types>,
     ) -> Completion<(), Types> {
-        debug_assert!(self.in_flight_write_request_slot().is_none());
+        debug_assert!(self.in_flight_write_request_slot(ec).is_none());
         let write_request = self
-            .shift_write_request()
+            .shift_write_request(ec)
             .ok_or_else(|| ec.new_type_error("WritableStream has no pending write request"))?;
-        self.set_in_flight_write_request_slot(Some(write_request));
+        self.set_in_flight_write_request_slot(Some(write_request), ec);
         Ok(())
     }
 
@@ -563,14 +563,14 @@ impl WritableStream {
     ) -> Completion<(), Types> {
         debug_assert_eq!(self.state(), WritableStreamState::Errored);
 
-        if let Some(close_request) = self.take_close_request_slot() {
-            debug_assert!(self.in_flight_close_request_slot().is_none());
-            close_request.reject(self.stored_error(), ec)?;
+        if let Some(close_request) = self.take_close_request_slot(ec) {
+            debug_assert!(self.in_flight_close_request_slot(ec).is_none());
+            close_request.reject(self.stored_error(ec), ec)?;
         }
 
-        if let Some(writer_slot) = self.writer_slot() {
+        if let Some(writer_slot) = self.writer_slot(ec) {
             if let Some(writer) = writer_slot.as_default_writer() {
-                writer.ensure_closed_promise_rejected(self.stored_error(), ec)?;
+                writer.ensure_closed_promise_rejected(self.stored_error(ec), ec)?;
             }
         }
 
@@ -583,22 +583,22 @@ impl WritableStream {
         reason: JsValue,
         ec: &mut dyn ExecutionContext<Types>,
     ) -> Completion<(), Types> {
-        debug_assert!(self.stored_error().is_undefined());
+        debug_assert!(self.stored_error(ec).is_undefined());
         debug_assert_eq!(self.state(), WritableStreamState::Writable);
 
         let controller = self
-            .controller_slot()
+            .controller_slot(ec)
             .ok_or_else(|| ec.new_type_error("WritableStream is missing its controller"))?;
         self.set_state(WritableStreamState::Erroring);
-        self.set_stored_error(reason.clone());
+        self.set_stored_error(reason.clone(), ec);
 
-        if let Some(writer_slot) = self.writer_slot() {
+        if let Some(writer_slot) = self.writer_slot(ec) {
             if let Some(writer) = writer_slot.as_default_writer() {
                 writer.ensure_ready_promise_rejected(reason, ec)?;
             }
         }
 
-        if !self.has_operation_marked_in_flight() && controller.as_default_controller().started() {
+        if !self.has_operation_marked_in_flight(ec) && controller.as_default_controller().started() {
             self.finish_erroring(ec)?;
         }
 
@@ -612,9 +612,9 @@ impl WritableStream {
         ec: &mut dyn ExecutionContext<Types>,
     ) -> Completion<(), Types> {
         debug_assert_eq!(self.state(), WritableStreamState::Writable);
-        debug_assert!(!self.close_queued_or_in_flight());
+        debug_assert!(!self.close_queued_or_in_flight(ec));
 
-        if let Some(writer_slot) = self.writer_slot() {
+        if let Some(writer_slot) = self.writer_slot(ec) {
             if let Some(writer) = writer_slot.as_default_writer() {
                 if backpressure != self.backpressure() {
                     if backpressure {
@@ -723,16 +723,18 @@ fn create_writable_stream_object(
 pub(crate) fn with_writable_stream_ref<R>(
     object: &JsObject,
     ec: &mut dyn ExecutionContext<Types>,
-    f: impl FnOnce(&WritableStream) -> R,
+    f: impl FnOnce(&WritableStream, &mut dyn ExecutionContext<Types>) -> R,
 ) -> Completion<R, Types> {
-    let stream_ref = ec
+    // Clone the handle out of the object registry so `f` can borrow `ec`
+    // mutably; the clone shares all GC-managed state with the registered
+    // platform object.
+    let stream = ec
         .with_object_any(object)
-        .and_then(|a| a.downcast_ref::<WritableStream>());
-    let stream = match stream_ref {
-        Some(s) => s,
-        None => return Err(ec.new_type_error("object is not a WritableStream")),
+        .and_then(|a| a.downcast_ref::<WritableStream>().cloned());
+    let Some(stream) = stream else {
+        return Err(ec.new_type_error("object is not a WritableStream"));
     };
-    Ok(f(stream))
+    Ok(f(&stream, ec))
 }
 
 fn underlying_sink_type(

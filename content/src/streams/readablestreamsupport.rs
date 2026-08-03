@@ -19,7 +19,7 @@ use super::readablestream::{
 use super::readablestreambyobreader::ReadableStreamBYOBReader;
 use super::readablestreamdefaultcontroller::ReadableStreamDefaultController;
 use super::readablestreamdefaultreader::ReadableStreamDefaultReader;
-use js_engine::gc::{GcCell, JsObjectCell};
+use js_engine::gc::{GcCell, gc_cell_new};
 use js_engine::gc_struct;
 
 type JsValue = <Types as JsTypes>::JsValue;
@@ -36,16 +36,16 @@ pub(crate) enum ReadableStreamState {
 // Note: This struct stores an underlying source method together with its callback `this` value so the surrounding Streams algorithms can later invoke it through Web IDL callback invocation.
 #[gc_struct]
 pub(crate) struct SourceMethod {
-    this_value: JsObjectCell,
+    this_value: GcCell<Option<JsObject>>,
 
     /// <https://webidl.spec.whatwg.org/#idl-callback-function>
     callback: Callback,
 }
 
 impl SourceMethod {
-    pub(crate) fn new(this_value: JsObject, callback: Callback) -> Self {
+    pub(crate) fn new(this_value: JsObject, callback: Callback, ec: &mut dyn ExecutionContext<Types>) -> Self {
         Self {
-            this_value: JsObjectCell::new(Some(this_value)),
+            this_value: gc_cell_new(Some(this_value), ec),
             callback,
         }
     }
@@ -56,7 +56,7 @@ impl SourceMethod {
         args: &[JsValue],
         ec: &mut dyn ExecutionContext<Types>,
     ) -> Completion<JsValue, Types> {
-        let this_value = JsValue::from(self.this_value.borrow().clone().unwrap());
+        let this_value = JsValue::from(self.this_value.borrow(ec).clone().unwrap());
         invoke_callback_function(
             ec,
             &self.callback,
@@ -215,11 +215,11 @@ impl ReadRequest {
                 ec.call(&resolvers.reject, &undefined, &[error]).map(|_| ())
             }
             Self::ReadableStreamDefaultTee { tee_state, .. } => {
-                readable_stream_default_tee_read_request_error_steps(tee_state.clone());
+                readable_stream_default_tee_read_request_error_steps(tee_state.clone(), ec);
                 Ok(())
             }
             Self::ReadableByteStreamTee { tee_state } => {
-                readable_byte_stream_tee_default_reader_error_steps(tee_state.clone());
+                readable_byte_stream_tee_default_reader_error_steps(tee_state.clone(), ec);
                 Ok(())
             }
             Self::ReadableStreamPipeTo { state } => {

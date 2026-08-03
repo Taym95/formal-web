@@ -118,6 +118,79 @@ impl SharedIsolate {
     }
 }
 
+impl V8Engine {
+    /// Run a closure with the isolate borrowed immutably, mirroring the scope
+    /// macros: inside a native callback the isolate is reborrowed from the
+    /// pinned callback scope, otherwise the shared isolate RefCell is used.
+    pub(crate) fn with_isolate<R>(&self, f: impl FnOnce(&v8::Isolate) -> R) -> R {
+        let callback_scope_pointer = CURRENT_CALLBACK_SCOPE.get();
+        if callback_scope_pointer.is_null() {
+            let isolate_for_operation = self.shared_isolate.borrow(self.isolate_id);
+            f(&*isolate_for_operation)
+        } else {
+            assert_eq!(
+                CURRENT_CALLBACK_ISOLATE_ID.get(),
+                self.isolate_id,
+                "reentrant V8 scope belongs to another isolate"
+            );
+            // SAFETY: `native_callback` installs this pointer from the pinned
+            // scope V8 supplied for the synchronous callback. The guard clears
+            // it before that scope ends, and the isolate identity is checked
+            // above. Reusing the callback scope avoids creating a second
+            // mutable reference to the isolate owned by the outer V8 call.
+            let callback_scope = unsafe { &mut *callback_scope_pointer };
+            let isolate = &***callback_scope;
+            f(isolate)
+        }
+    }
+
+    /// Run a closure with the isolate borrowed mutably, mirroring the scope
+    /// macros: inside a native callback the isolate is reborrowed from the
+    /// pinned callback scope, otherwise the shared isolate RefCell is used.
+    pub(crate) fn with_isolate_mut<R>(&self, f: impl FnOnce(&mut v8::Isolate) -> R) -> R {
+        let callback_scope_pointer = CURRENT_CALLBACK_SCOPE.get();
+        if callback_scope_pointer.is_null() {
+            let mut isolate_for_operation = self.shared_isolate.borrow(self.isolate_id);
+            f(&mut *isolate_for_operation)
+        } else {
+            assert_eq!(
+                CURRENT_CALLBACK_ISOLATE_ID.get(),
+                self.isolate_id,
+                "reentrant V8 scope belongs to another isolate"
+            );
+            // SAFETY: The pointer and lifetime invariants are established by
+            // `CurrentCallbackScopeGuard` and checked above.
+            let callback_scope = unsafe { &mut *callback_scope_pointer };
+            let isolate = &mut ***callback_scope;
+            f(isolate)
+        }
+    }
+
+    /// Run a closure with the isolate's cppgc heap.
+    pub(crate) fn with_cpp_heap<R>(&self, f: impl FnOnce(&v8::cppgc::Heap) -> R) -> R {
+        self.with_isolate_mut(|isolate| {
+            let heap = isolate
+                .get_cpp_heap()
+                .expect("V8 isolate has no cppgc heap");
+            f(heap)
+        })
+    }
+
+    /// Allocate a cppgc heap object and root it with a strong `Persistent`.
+    pub(crate) fn allocate_gc_cell<T: 'static>(
+        &self,
+        heap_cell: crate::v8::gc::HeapCell<T>,
+    ) -> v8::cppgc::Persistent<crate::v8::gc::HeapCell<T>> {
+        let pointer = self.with_cpp_heap(|heap| {
+            // SAFETY: `make_garbage_collected` returns an `UnsafePtr` which is
+            // immediately moved into a `Persistent` root below — the required
+            // destination for a stack-created pointer.
+            unsafe { v8::cppgc::make_garbage_collected(heap, heap_cell) }
+        });
+        v8::cppgc::Persistent::new(&pointer)
+    }
+}
+
 macro_rules! v8_engine_scope_with_context {
     ($scope:ident, $engine:expr, $context:expr, $body:block) => {{
         let callback_scope_pointer = CURRENT_CALLBACK_SCOPE.get();
@@ -1353,6 +1426,10 @@ impl EcmascriptHost<V8Types> for V8Engine {
 
 impl ExecutionContext<V8Types> for V8Engine {
     fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+
+    fn as_any(&self) -> &dyn Any {
         self
     }
 

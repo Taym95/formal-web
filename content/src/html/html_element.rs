@@ -5,6 +5,8 @@ use blitz_dom::BaseDocument;
 use crate::dom::event::EventTargetAccess;
 use crate::dom::{Element, EventTarget};
 use js_engine::gc_struct;
+use js_engine::ExecutionContext;
+use crate::js::Types;
 
 /// <https://html.spec.whatwg.org/#htmlelement>
 #[gc_struct]
@@ -14,15 +16,19 @@ pub struct HTMLElement {
 }
 
 impl EventTargetAccess for HTMLElement {
-    fn get_event_target(&self) -> EventTarget {
-        self.element.get_event_target()
+    fn get_event_target(&self, ec: &mut dyn ExecutionContext<Types>) -> EventTarget {
+        self.element.get_event_target(ec)
     }
 }
 
 impl HTMLElement {
-    pub fn new(document: Rc<RefCell<BaseDocument>>, node_id: usize) -> Self {
+    pub fn new(
+        document: Rc<RefCell<BaseDocument>>,
+        node_id: usize,
+        ec: &mut dyn ExecutionContext<Types>,
+    ) -> Self {
         Self {
-            element: Element::new(document, node_id),
+            element: Element::new(document, node_id, ec),
         }
     }
 

@@ -1,6 +1,6 @@
 use js_engine::{Completion, ExecutionContext};
 
-use crate::dom::event::Event;
+use crate::dom::event::{Event, EventTarget};
 use crate::dom::{dispatch_event, simple_path};
 use crate::html::Window;
 use crate::js::Types;
@@ -37,7 +37,7 @@ pub(crate) fn steps_to_fire_beforeunload(
         .with_object_any(&target_object)
         .and_then(|data| data.downcast_ref::<Window>())
         .map(|window| window.event_target.clone())
-        .unwrap_or_default();
+        .unwrap_or_else(|| EventTarget::new(ec));
 
     // Step 4, sub-step 2: Let event be the result of creating an event given
     //                     eventConstructor, in the relevant realm of target.
@@ -51,6 +51,7 @@ pub(crate) fn steps_to_fire_beforeunload(
         false,
         true,
         time_millis,
+        ec,
     );
     let event_object = create_interface_instance::<Types, Event>(event, ec)?;
     let event: Event = ec
@@ -59,7 +60,7 @@ pub(crate) fn steps_to_fire_beforeunload(
         .ok_or_else(|| ec.new_type_error("event_object is not an Event"))?;
 
     // Step 4, sub-step 5: Return the result of dispatching event at target.
-    let path = simple_path(&event_target);
+    let path = simple_path(&event_target, ec);
     dispatch_event(ec, &path, &event)
 
     // Step 5: Decrease document's relevant agent's event loop's termination

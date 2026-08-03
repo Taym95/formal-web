@@ -216,13 +216,13 @@ impl GlobalScope {
         Self {
             kind,
             document,
-            document_object: gc_cell_new(None),
-            location_object: gc_cell_new(None),
-            node_objects: gc_cell_new(Vec::new()),
+            document_object: gc_cell_new(None, ec),
+            location_object: gc_cell_new(None, ec),
+            node_objects: gc_cell_new(Vec::new(), ec),
             animation_frame_callback_identifier: Cell::new(0),
-            animation_frame_callbacks: gc_cell_new(Vec::new()),
+            animation_frame_callbacks: gc_cell_new(Vec::new(), ec),
             timer_callback_identifier: Cell::new(0),
-            window_timers: gc_cell_new(Vec::new()),
+            window_timers: gc_cell_new(Vec::new(), ec),
             current_timer_nesting_level: Cell::new(None),
             timer_host: RefCell::new(None),
             source_navigable_id: Cell::new(None),
@@ -242,7 +242,7 @@ impl GlobalScope {
     }
 
     fn next_timer_id(&self) -> u32 {
-        let timers = self.window_timers.borrow();
+        let timers = self.window_timers.borrow(ec);
         let mut handle = self.timer_callback_identifier.get();
 
         loop {
@@ -327,24 +327,24 @@ impl GlobalScope {
     }
 
     pub(crate) fn document_object(&self) -> Option<JsObject> {
-        self.document_object.borrow().clone()
+        self.document_object.borrow(ec).clone()
     }
 
     pub(crate) fn store_document_object(&self, object: JsObject) {
-        self.document_object.borrow_mut().replace(object);
+        self.document_object.borrow_mut(ec).replace(object);
     }
 
     pub(crate) fn location_object(&self) -> Option<JsObject> {
-        self.location_object.borrow().clone()
+        self.location_object.borrow(ec).clone()
     }
 
     pub(crate) fn store_location_object(&self, object: JsObject) {
-        self.location_object.borrow_mut().replace(object);
+        self.location_object.borrow_mut(ec).replace(object);
     }
 
     pub(crate) fn cached_node_object(&self, node_id: usize) -> Option<JsObject> {
         self.node_objects
-            .borrow()
+            .borrow(ec)
             .iter()
             .find(|entry| entry.node_id == node_id)
             .map(|entry| entry.object.clone())
@@ -352,7 +352,7 @@ impl GlobalScope {
 
     pub(crate) fn cache_node_object(&self, node_id: usize, object: JsObject) {
         self.node_objects
-            .borrow_mut()
+            .borrow_mut(ec)
             .push(CachedNodeObject { node_id, object });
     }
 
@@ -363,13 +363,13 @@ impl GlobalScope {
 
         let node_ids = node_ids.iter().copied().collect::<HashSet<_>>();
         self.node_objects
-            .borrow_mut()
+            .borrow_mut(ec)
             .retain(|entry| !node_ids.contains(&entry.node_id));
     }
 
     /// <https://html.spec.whatwg.org/#dom-animationframeprovider-requestanimationframe>
     pub(crate) fn request_animation_frame(&self, callback: Callback) -> u32 {
-        let callbacks = self.animation_frame_callbacks.borrow();
+        let callbacks = self.animation_frame_callbacks.borrow(ec);
         let mut handle = self.animation_frame_callback_identifier.get();
 
         loop {
@@ -385,7 +385,7 @@ impl GlobalScope {
         drop(callbacks);
         self.animation_frame_callback_identifier.set(handle);
         self.animation_frame_callbacks
-            .borrow_mut()
+            .borrow_mut(ec)
             .push(AnimationFrameCallback { handle, callback });
         handle
     }
@@ -441,7 +441,7 @@ impl GlobalScope {
             })?;
 
         // Step 12: "Set global's map of setTimeout and setInterval IDs[id] to uniqueHandle."
-        let mut timers = self.window_timers.borrow_mut();
+        let mut timers = self.window_timers.borrow_mut(ec);
         if let Some(index) = timers.iter().position(|entry| entry.id == timer_id) {
             timers.remove(index);
         }
@@ -464,7 +464,7 @@ impl GlobalScope {
 
         // Step 1: "Remove this's map of setTimeout and setInterval IDs[id]."
         let removed_timer = {
-            let mut timers = self.window_timers.borrow_mut();
+            let mut timers = self.window_timers.borrow_mut(ec);
             timers
                 .iter()
                 .position(|entry| entry.id == timer_id)
@@ -501,7 +501,7 @@ impl GlobalScope {
     ) -> Option<WindowTimer> {
         // Note: This model-local lookup exposes the stored `(id, uniqueHandle)` registration so the queued timer task can check whether the timer still exists and still maps to the same handle before running the handler.
         self.window_timers
-            .borrow()
+            .borrow(ec)
             .iter()
             .find(|entry| entry.id == timer_id && entry.timer_key == timer_key)
             .cloned()
@@ -531,7 +531,7 @@ impl GlobalScope {
         // Step 12: "Otherwise, remove global's map of setTimeout and setInterval IDs[id]."
         if !timer.repeat {
             self.window_timers
-                .borrow_mut()
+                .borrow_mut(ec)
                 .retain(|entry| !(entry.id == timer_id && entry.timer_key == timer_key));
             return Ok(());
         }
@@ -559,7 +559,7 @@ impl GlobalScope {
                 format!("failed to reschedule window timer with the embedder: {error}")
             })?;
 
-        let mut timers = self.window_timers.borrow_mut();
+        let mut timers = self.window_timers.borrow_mut(ec);
         let Some(entry) = timers
             .iter_mut()
             .find(|entry| entry.id == timer_id && entry.timer_key == timer_key)
@@ -572,7 +572,7 @@ impl GlobalScope {
 
     pub(crate) fn clear_all_timers(&self) {
         let cleared_timers = {
-            let mut timers = self.window_timers.borrow_mut();
+            let mut timers = self.window_timers.borrow_mut(ec);
             std::mem::take(&mut *timers)
         };
         let Ok(host) = self.timer_host() else {
@@ -715,7 +715,7 @@ impl GlobalScope {
 
     pub(crate) fn cancel_animation_frame(&self, handle: u32) {
         self.animation_frame_callbacks
-            .borrow_mut()
+            .borrow_mut(ec)
             .retain(|entry| entry.handle != handle);
     }
 
@@ -723,12 +723,12 @@ impl GlobalScope {
     pub(crate) fn take_animation_frame_callbacks(&self) -> Vec<Callback> {
         let callback_handles: Vec<u32> = self
             .animation_frame_callbacks
-            .borrow()
+            .borrow(ec)
             .iter()
             .map(|entry| entry.handle)
             .collect();
 
-        let mut callbacks = self.animation_frame_callbacks.borrow_mut();
+        let mut callbacks = self.animation_frame_callbacks.borrow_mut(ec);
         let mut taken = Vec::with_capacity(callback_handles.len());
         for handle in callback_handles {
             let Some(index) = callbacks.iter().position(|entry| entry.handle == handle) else {

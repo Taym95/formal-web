@@ -50,15 +50,15 @@ pub(crate) trait WindowOrWorkerGlobalScope {
     }
 
     /// <https://html.spec.whatwg.org/#dom-cleartimeout>
-    fn clear_timeout(&self, timer_id: u32) {
+    fn clear_timeout(&self, timer_id: u32, ec: &mut dyn ExecutionContext<crate::js::Types>) {
         // Step 1: "Remove handle from this's map of setTimeout and setInterval IDs."
-        self.global_scope().clear_timer(timer_id);
+        self.global_scope().clear_timer(timer_id, ec);
     }
 
     /// <https://html.spec.whatwg.org/#dom-clearinterval>
-    fn clear_interval(&self, timer_id: u32) {
+    fn clear_interval(&self, timer_id: u32, ec: &mut dyn ExecutionContext<crate::js::Types>) {
         // Step 1: "Remove handle from this's map of setTimeout and setInterval IDs."
-        self.global_scope().clear_timer(timer_id);
+        self.global_scope().clear_timer(timer_id, ec);
     }
 
     /// <https://html.spec.whatwg.org/#timer-initialisation-steps>
@@ -98,6 +98,7 @@ pub(crate) trait WindowOrWorkerGlobalScope {
                 repeat,
                 timeout_ms,
                 task_nesting_level,
+                ec,
             )
             .map_err(|message| ec.new_type_error(&message))
     }

@@ -225,11 +225,11 @@ impl<T> DefaultAsyncIterator<T>
 where
     T: AsyncValueIterable,
 {
-    fn new(target: T, state: T::State) -> Self {
+    fn new(target: T, state: T::State, ec: &mut dyn ExecutionContext<crate::js::Types>) -> Self {
         Self {
             target,
             state,
-            ongoing_promise: gc_cell_new(None),
+            ongoing_promise: gc_cell_new(None, ec),
             finished: Rc::new(Cell::new(false)),
         }
     }
@@ -246,7 +246,7 @@ where
         // the GcCell borrow guard across the entire block, which would
         // prevent a subsequent borrow_mut() (the temporary in `if let`
         // lives until the end of the block in Rust).
-        let ongoing = self.ongoing_promise.borrow().clone();
+        let ongoing = self.ongoing_promise.borrow(ec).clone();
         if let Some(previous) = ongoing {
             // Step 10: "If ongoingPromise is not null, then:"
             // Step 10.1: "Let afterOngoingPromiseCapability be ! NewPromiseCapability(%Promise%)."
@@ -282,13 +282,13 @@ where
             // Step 10.4: "Set object's ongoing promise to afterOngoingPromiseCapability.[[Promise]]."
             let result_obj = Types::value_as_object(&then_value)
                 .ok_or_else(|| ec.new_type_error("PerformPromiseThen did not return an object"))?;
-            *self.ongoing_promise.borrow_mut() = Some(result_obj.clone());
+            *self.ongoing_promise.borrow_mut(ec) = Some(result_obj.clone());
             Ok(result_obj)
         } else {
             // Step 11: "Otherwise:"
             // Step 11.1: "Set object's ongoing promise to the result of running nextSteps."
             let promise = self.start_operation(operation, ec)?;
-            *self.ongoing_promise.borrow_mut() = Some(promise.clone());
+            *self.ongoing_promise.borrow_mut(ec) = Some(promise.clone());
             Ok(promise)
         }
     }
@@ -683,7 +683,7 @@ where
     // Step 7: "Run the asynchronous iterator initialization steps for definition with idlObject, iterator, and idlArgs, if any such steps exist."
     let state = target.create_async_iterator_state(args, ec)?;
 
-    let iterator = DefaultAsyncIterator::new(target, state);
+    let iterator = DefaultAsyncIterator::new(target, state, ec);
 
     // Step 8: "Return iterator."
     Ok(create_default_async_iterator_object(iterator, ec))

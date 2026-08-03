@@ -34,15 +34,18 @@ pub struct Window {
 }
 
 impl EventTargetAccess for Window {
-    fn get_event_target(&self) -> EventTarget {
+    fn get_event_target(&self, _ec: &mut dyn ExecutionContext<Types>) -> EventTarget {
         self.event_target.clone()
     }
 }
 
 impl Window {
-    pub(crate) fn new(global_scope: GlobalScope) -> Self {
+    pub(crate) fn new(
+        global_scope: GlobalScope,
+        ec: &mut dyn ExecutionContext<Types>,
+    ) -> Self {
         Self {
-            event_target: EventTarget::default(),
+            event_target: EventTarget::new(ec),
             global_scope,
             onload: None,
         }

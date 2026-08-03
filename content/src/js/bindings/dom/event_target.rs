@@ -17,9 +17,9 @@ impl WebIdlInterface<crate::js::Types> for EventTarget {
     fn create_platform_object(
         _new_target: &JsValue,
         _args: &[JsValue],
-        _ec: &mut dyn ExecutionContext<crate::js::Types>,
+        ec: &mut dyn ExecutionContext<crate::js::Types>,
     ) -> Completion<Self, crate::js::Types> {
-        Ok(EventTarget::default())
+        Ok(EventTarget::new(ec))
     }
 
     fn define_members(def: &mut InterfaceDefinition<crate::js::Types>) {
@@ -71,7 +71,7 @@ fn add_event_listener(
     )?;
     let receiver = crate::js::Types::value_from_object(event_target.clone());
 
-    try_with_event_target_mut(&receiver, ec, |target| {
+    try_with_event_target_mut(&receiver, ec, |target, ec| {
         target.add_event_listener(
             target.clone(),
             type_,
@@ -80,6 +80,7 @@ fn add_event_listener(
             options.once,
             options.passive,
             options.signal,
+            ec,
         );
     })?;
 
@@ -107,8 +108,8 @@ fn remove_event_listener(
     let capture = crate::dom::flatten(&options_union);
     let receiver = crate::js::Types::value_from_object(event_target);
 
-    try_with_event_target_mut(&receiver, ec, |target| {
-        target.remove_event_listener_entry(&type_, &callback, capture);
+    try_with_event_target_mut(&receiver, ec, |target, ec| {
+        target.remove_event_listener_entry(&type_, &callback, capture, ec);
     })?;
 
     Ok(ec.value_undefined())
@@ -135,7 +136,7 @@ fn dispatch_event(
     let path = crate::js::platform_objects::build_path_from_target_js_object(&target_object, ec);
 
     let target_value = <crate::js::Types as JsTypes>::value_from_object(target_object);
-    let target = crate::js::try_with_event_target_mut(&target_value, ec, |target| target.clone())?;
+    let target = crate::js::try_with_event_target_mut(&target_value, ec, |target, _ec| target.clone())?;
     let canceled = target.dispatch_event(&event, &path, ec)?;
     Ok(ec.value_from_bool(!canceled))
 }

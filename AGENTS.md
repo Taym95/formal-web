@@ -33,6 +33,14 @@ Never write any unsafe code withou the user's explicit approval.
 
 When using `grep` (or `rg`/`find`), **never** search paths outside the repository root or under `vendor/` without explicit narrowing. In particular, avoid searching `~/.cargo/registry/` or other system-wide locations — those directories are large and the search will hang indefinitely. Instead, use `cargo doc` and check the generated docs, or browse the relevant source files directly with `read`.
 
+# Search loops over large outputs
+
+Never run multi-line `awk`/`sed` loops that walk the entire output of a compiler or test run line by line (e.g. `awk '/error/{...} while(...)'` over a full `cargo check` log). These run at 100% CPU and take far too long to complete. When you need to inspect compiler errors or other large logs:
+
+- Read the log file in chunks with the `read` tool (it truncates at 2000 lines / 50KB with an offset to continue).
+- Use single simple `grep` invocations with narrow patterns (e.g. `grep -E "error\[E" file | head`) — one pass, no loops.
+- Prefer filtering at the source: run the command with `2>&1 | tail -N` or pipe to `grep` once, then save the output to a file and `read` it.
+
 # Documentation Chain
 
 Read repository documentation from general to specific:

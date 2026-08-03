@@ -16,7 +16,7 @@ use url::Url;
 use crate::{
     ContentDocument, ContentProcess, EMPTY_HTML_DOCUMENT, NavigableContainerState,
     dom::event::EventTargetAccess, dom::fire_event, html::HTMLElement,
-    html::create_a_new_browsing_context_and_document, html::navigate, webidl::Callback,
+    html::create_a_new_browsing_context_and_document, html::navigate, js::Types, webidl::Callback,
 };
 
 /// <https://html.spec.whatwg.org/#htmliframeelement>
@@ -33,15 +33,19 @@ pub struct HTMLIFrameElement {
 }
 
 impl EventTargetAccess for HTMLIFrameElement {
-    fn get_event_target(&self) -> crate::dom::EventTarget {
-        self.html_element.element.node.get_event_target()
+    fn get_event_target(&self, ec: &mut dyn ExecutionContext<Types>) -> crate::dom::EventTarget {
+        self.html_element.element.node.get_event_target(ec)
     }
 }
 
 impl HTMLIFrameElement {
-    pub fn new(document: Rc<RefCell<BaseDocument>>, node_id: usize) -> Self {
+    pub fn new(
+        document: Rc<RefCell<BaseDocument>>,
+        node_id: usize,
+        ec: &mut dyn ExecutionContext<Types>,
+    ) -> Self {
         Self {
-            html_element: HTMLElement::new(document, node_id),
+            html_element: HTMLElement::new(document, node_id, ec),
             onload: None,
             onerror: None,
         }
@@ -622,8 +626,8 @@ fn run_iframe_load_event_steps(
 
     let event_target = ec
         .with_object_any(&iframe_object)
-        .and_then(|data| data.downcast_ref::<crate::html::HTMLIFrameElement>())
-        .map(|iframe| iframe.get_event_target())
+        .and_then(|data| data.downcast_ref::<crate::html::HTMLIFrameElement>().cloned())
+        .map(|iframe| iframe.get_event_target(ec))
         .ok_or_else(|| {
             let msg = "run_iframe_load_event_steps: iframe_object is not an HTMLIFrameElement"
                 .to_string();

@@ -224,12 +224,15 @@ where
 {
     // Step 1: Let fulfilledCount be 0.
     // Step 2: Let rejected be false.
-    let state = gc_cell_new(WaitAllState {
-        fulfilled_count: 0,
-        rejected: false,
-        total: 0,
-        result: Vec::new(),
-    });
+    let state = gc_cell_new(
+        WaitAllState {
+            fulfilled_count: 0,
+            rejected: false,
+            total: 0,
+            result: Vec::new(),
+        },
+        ec,
+    );
 
     // Wrap FnOnce steps in Rc<RefCell<Option<...>>> so they can be shared
     // across multiple closures (the rejection handler and each iteration's
@@ -267,7 +270,7 @@ where
             .first()
             .cloned()
             .unwrap_or_else(|| handler_ec.value_undefined());
-        let mut state_ref = captures.state_clone.borrow_mut();
+        let mut state_ref = captures.state_clone.borrow_mut(handler_ec);
 
         // Step 3.1: If rejected is true, abort these steps.
         if state_ref.rejected {
@@ -300,7 +303,7 @@ where
 
     // Step 5: Let total be promises's size.
     let total = promises.len();
-    state.borrow_mut().total = total;
+    state.borrow_mut(ec).total = total;
 
     // Step 6: If total is 0, then:
     if total == 0 {
@@ -323,7 +326,7 @@ where
     // Step 8: Let result be a list containing total null values.
     {
         let null_values: Vec<Option<JsValue>> = (0..total).map(|_| None).collect();
-        state.borrow_mut().result = null_values;
+        state.borrow_mut(ec).result = null_values;
     }
 
     // Step 9: For each promise of promises:
@@ -358,7 +361,7 @@ where
                 .first()
                 .cloned()
                 .unwrap_or_else(|| handler_ec.value_undefined());
-            let mut state_ref = captures.state_for_fulfillment.borrow_mut();
+            let mut state_ref = captures.state_for_fulfillment.borrow_mut(handler_ec);
 
             // Step 9.2.1: Set result[promiseIndex] to arg.
             if captures.promise_index < state_ref.result.len() {

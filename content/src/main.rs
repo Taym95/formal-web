@@ -892,7 +892,7 @@ impl ContentProcess {
         let window_target = ec
             .with_object_any(&window)
             .and_then(|data| data.downcast_ref::<crate::html::Window>())
-            .map(|w| w.get_event_target())
+            .map(|w| w.get_event_target(ec))
             .ok_or_else(|| {
                 let msg = "failed to extract EventTarget from Window".to_string();
                 log::error!("{msg}");

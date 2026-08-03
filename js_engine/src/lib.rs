@@ -47,12 +47,18 @@ pub mod jsc;
 #[cfg(feature = "v8")]
 pub mod v8;
 
-pub use engine::{Completion, EcmascriptHost, ExecutionContext, HostHooks, JsEngine};
+pub use engine::{
+    Completion, EcmascriptHost, ExecutionContext, HostHooks, JsEngine, create_engine,
+};
 pub use enums::{
     IntegrityLevel, IteratorKind, Numeric, PreferredType, PromiseRejectionOperation, PromiseState,
     SharedMemoryOrder, TypedArrayElementType,
 };
-pub use gc::{Finalize, GcCell, GcRootHandle, JsTypesGcExt, Trace, gc_cell_new};
+pub use gc::{
+    Finalize, GcCell, GcRootHandle, JsTypesGcExt, Trace, gc_cell_new,
+};
+#[cfg(any(feature = "jsc", feature = "v8"))]
+pub use gc::associate_existing_object;
 #[cfg(feature = "boa")]
 pub use js_engine_macros::gc_struct_boa as gc_struct;
 

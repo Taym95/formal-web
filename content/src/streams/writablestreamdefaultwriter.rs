@@ -32,29 +32,29 @@ pub struct WritableStreamDefaultWriter {
 }
 
 impl WritableStreamDefaultWriter {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(ec: &mut dyn ExecutionContext<Types>) -> Self {
         Self {
-            stream: gc_cell_new(None),
-            ready_promise: gc_cell_new(None),
-            ready_resolvers: gc_cell_new(None),
-            closed_promise: gc_cell_new(None),
-            closed_resolvers: gc_cell_new(None),
+            stream: gc_cell_new(None, ec),
+            ready_promise: gc_cell_new(None, ec),
+            ready_resolvers: gc_cell_new(None, ec),
+            closed_promise: gc_cell_new(None, ec),
+            closed_resolvers: gc_cell_new(None, ec),
         }
     }
-    pub(crate) fn stream_slot_value(&self) -> Option<WritableStream> {
-        self.stream.borrow().clone()
+    pub(crate) fn stream_slot_value(&self, ec: &mut dyn ExecutionContext<Types>) -> Option<WritableStream> {
+        self.stream.borrow(ec).clone()
     }
-    pub(crate) fn set_stream_slot_value(&self, stream: Option<WritableStream>) {
-        *self.stream.borrow_mut() = stream;
+    pub(crate) fn set_stream_slot_value(&self, stream: Option<WritableStream>, ec: &mut dyn ExecutionContext<Types>) {
+        *self.stream.borrow_mut(ec) = stream;
     }
-    pub(crate) fn ready_promise_value(&self) -> Option<JsObject> {
-        self.ready_promise.borrow().clone()
+    pub(crate) fn ready_promise_value(&self, ec: &mut dyn ExecutionContext<Types>) -> Option<JsObject> {
+        self.ready_promise.borrow(ec).clone()
     }
-    pub(crate) fn set_ready_promise_value(&self, promise: Option<JsObject>) {
+    pub(crate) fn set_ready_promise_value(&self, promise: Option<JsObject>, ec: &mut dyn ExecutionContext<Types>) {
         // JSC: protect new value from GC, unprotect old value
         #[cfg(feature = "jsc")]
         {
-            let old = self.ready_promise.borrow().clone();
+            let old = self.ready_promise.borrow(ec).clone();
             if let Some(ref old_obj) = old {
                 unsafe {
                     js_engine::jsc_sys::JSValueUnprotect(old_obj.ctx(), old_obj.as_value_ref());
@@ -66,22 +66,22 @@ impl WritableStreamDefaultWriter {
                 }
             }
         }
-        *self.ready_promise.borrow_mut() = promise;
+        *self.ready_promise.borrow_mut(ec) = promise;
     }
-    pub(crate) fn ready_resolvers_value(&self) -> Option<PromiseResolvers<Types>> {
-        self.ready_resolvers.borrow().clone()
+    pub(crate) fn ready_resolvers_value(&self, ec: &mut dyn ExecutionContext<Types>) -> Option<PromiseResolvers<Types>> {
+        self.ready_resolvers.borrow(ec).clone()
     }
-    pub(crate) fn set_ready_resolvers_value(&self, resolvers: Option<PromiseResolvers<Types>>) {
-        *self.ready_resolvers.borrow_mut() = resolvers;
+    pub(crate) fn set_ready_resolvers_value(&self, resolvers: Option<PromiseResolvers<Types>>, ec: &mut dyn ExecutionContext<Types>) {
+        *self.ready_resolvers.borrow_mut(ec) = resolvers;
     }
-    pub(crate) fn closed_promise_value(&self) -> Option<JsObject> {
-        self.closed_promise.borrow().clone()
+    pub(crate) fn closed_promise_value(&self, ec: &mut dyn ExecutionContext<Types>) -> Option<JsObject> {
+        self.closed_promise.borrow(ec).clone()
     }
-    pub(crate) fn set_closed_promise_value(&self, promise: Option<JsObject>) {
+    pub(crate) fn set_closed_promise_value(&self, promise: Option<JsObject>, ec: &mut dyn ExecutionContext<Types>) {
         // JSC: protect new value from GC, unprotect old value
         #[cfg(feature = "jsc")]
         {
-            let old = self.closed_promise.borrow().clone();
+            let old = self.closed_promise.borrow(ec).clone();
             if let Some(ref old_obj) = old {
                 unsafe {
                     js_engine::jsc_sys::JSValueUnprotect(old_obj.ctx(), old_obj.as_value_ref());
@@ -93,13 +93,13 @@ impl WritableStreamDefaultWriter {
                 }
             }
         }
-        *self.closed_promise.borrow_mut() = promise;
+        *self.closed_promise.borrow_mut(ec) = promise;
     }
-    pub(crate) fn closed_resolvers_value(&self) -> Option<PromiseResolvers<Types>> {
-        self.closed_resolvers.borrow().clone()
+    pub(crate) fn closed_resolvers_value(&self, ec: &mut dyn ExecutionContext<Types>) -> Option<PromiseResolvers<Types>> {
+        self.closed_resolvers.borrow(ec).clone()
     }
-    pub(crate) fn set_closed_resolvers_value(&self, resolvers: Option<PromiseResolvers<Types>>) {
-        *self.closed_resolvers.borrow_mut() = resolvers;
+    pub(crate) fn set_closed_resolvers_value(&self, resolvers: Option<PromiseResolvers<Types>>, ec: &mut dyn ExecutionContext<Types>) {
+        *self.closed_resolvers.borrow_mut(ec) = resolvers;
     }
 
     /// <https://streams.spec.whatwg.org/#set-up-writable-stream-default-writer>
@@ -108,18 +108,18 @@ impl WritableStreamDefaultWriter {
         stream: WritableStream,
         ec: &mut dyn ExecutionContext<Types>,
     ) -> Completion<(), Types> {
-        if stream.is_writable_stream_locked() {
+        if stream.is_writable_stream_locked(ec) {
             return Err(
                 ec.new_type_error("Cannot create a writer for a stream that already has a writer")
             );
         }
 
-        self.set_stream_slot_value(Some(stream.clone()));
-        stream.set_writer_slot(Some(WritableStreamWriter::Default(self.clone())));
+        self.set_stream_slot_value(Some(stream.clone()), ec);
+        stream.set_writer_slot(Some(WritableStreamWriter::Default(self.clone())), ec);
 
         match stream.state() {
             WritableStreamState::Writable => {
-                if !stream.close_queued_or_in_flight() && stream.backpressure() {
+                if !stream.close_queued_or_in_flight(ec) && stream.backpressure() {
                     self.reset_ready_promise(ec)?;
                 } else {
                     self.resolve_ready_promise(ec)?;
@@ -127,7 +127,7 @@ impl WritableStreamDefaultWriter {
                 self.reset_closed_promise(ec)?;
             }
             WritableStreamState::Erroring => {
-                self.reject_ready_promise(stream.stored_error(), ec)?;
+                self.reject_ready_promise(stream.stored_error(ec), ec)?;
                 self.reset_closed_promise(ec)?;
             }
             WritableStreamState::Closed => {
@@ -135,7 +135,7 @@ impl WritableStreamDefaultWriter {
                 self.resolve_closed_promise(ec)?;
             }
             WritableStreamState::Errored => {
-                let stored_error = stream.stored_error();
+                let stored_error = stream.stored_error(ec);
                 self.reject_ready_promise(stored_error.clone(), ec)?;
                 self.reject_closed_promise(stored_error, ec)?;
             }
@@ -150,7 +150,7 @@ impl WritableStreamDefaultWriter {
         ec: &mut dyn ExecutionContext<Types>,
     ) -> Completion<JsObject, Types> {
         let err = ec.new_type_error("WritableStreamDefaultWriter is missing its closed promise");
-        self.closed_promise_value().ok_or(err)
+        self.closed_promise_value(ec).ok_or(err)
     }
 
     /// <https://streams.spec.whatwg.org/#default-writer-desired-size>
@@ -159,7 +159,7 @@ impl WritableStreamDefaultWriter {
         ec: &mut dyn ExecutionContext<Types>,
     ) -> Completion<Option<f64>, Types> {
         let stream = self
-            .stream_slot_value()
+            .stream_slot_value(ec)
             .ok_or_else(|| ec.new_type_error("WritableStreamDefaultWriter has been released"))?;
         self.get_desired_size_from_stream(stream, ec)
     }
@@ -170,7 +170,7 @@ impl WritableStreamDefaultWriter {
         ec: &mut dyn ExecutionContext<Types>,
     ) -> Completion<JsObject, Types> {
         let err = ec.new_type_error("WritableStreamDefaultWriter is missing its ready promise");
-        self.ready_promise_value().ok_or(err)
+        self.ready_promise_value(ec).ok_or(err)
     }
 
     /// <https://streams.spec.whatwg.org/#default-writer-abort>
@@ -179,7 +179,7 @@ impl WritableStreamDefaultWriter {
         reason: JsValue,
         ec: &mut dyn ExecutionContext<Types>,
     ) -> Completion<JsObject, Types> {
-        let Some(stream) = self.stream_slot_value() else {
+        let Some(stream) = self.stream_slot_value(ec) else {
             return rejected_type_error_promise(
                 "Cannot abort using a released WritableStreamDefaultWriter",
                 ec,
@@ -194,14 +194,14 @@ impl WritableStreamDefaultWriter {
         &self,
         ec: &mut dyn ExecutionContext<Types>,
     ) -> Completion<JsObject, Types> {
-        let Some(stream) = self.stream_slot_value() else {
+        let Some(stream) = self.stream_slot_value(ec) else {
             return rejected_type_error_promise(
                 "Cannot close using a released WritableStreamDefaultWriter",
                 ec,
             );
         };
 
-        if stream.close_queued_or_in_flight() {
+        if stream.close_queued_or_in_flight(ec) {
             return rejected_type_error_promise(
                 "Cannot close a WritableStream that is already closing",
                 ec,
@@ -216,7 +216,7 @@ impl WritableStreamDefaultWriter {
         &self,
         ec: &mut dyn ExecutionContext<Types>,
     ) -> Completion<(), Types> {
-        let Some(_) = self.stream_slot_value() else {
+        let Some(_) = self.stream_slot_value(ec) else {
             return Ok(());
         };
 
@@ -229,7 +229,7 @@ impl WritableStreamDefaultWriter {
         chunk: JsValue,
         ec: &mut dyn ExecutionContext<Types>,
     ) -> Completion<JsObject, Types> {
-        let Some(stream) = self.stream_slot_value() else {
+        let Some(stream) = self.stream_slot_value(ec) else {
             return rejected_type_error_promise(
                 "Cannot write using a released WritableStreamDefaultWriter",
                 ec,
@@ -247,8 +247,8 @@ impl WritableStreamDefaultWriter {
         let promise_obj = promise
             .as_object()
             .ok_or_else(|| ec.new_type_error("new_promise_pending did not return an object"))?;
-        self.set_ready_promise_value(Some(promise_obj));
-        self.set_ready_resolvers_value(Some(resolvers));
+        self.set_ready_promise_value(Some(promise_obj), ec);
+        self.set_ready_resolvers_value(Some(resolvers), ec);
         Ok(())
     }
 
@@ -256,16 +256,16 @@ impl WritableStreamDefaultWriter {
         &self,
         ec: &mut dyn ExecutionContext<Types>,
     ) -> Completion<(), Types> {
-        if let Some(resolvers) = self.ready_resolvers_value() {
+        if let Some(resolvers) = self.ready_resolvers_value(ec) {
             let undefined = ec.value_undefined();
             let args = [undefined];
             ec.call(&resolvers.resolve, &args[0], &args)?;
-            self.set_ready_resolvers_value(None);
+            self.set_ready_resolvers_value(None, ec);
             return Ok(());
         }
 
         let promise = resolved_promise(ec.value_undefined(), ec)?;
-        self.set_ready_promise_value(Some(promise));
+        self.set_ready_promise_value(Some(promise), ec);
         Ok(())
     }
 
@@ -274,15 +274,15 @@ impl WritableStreamDefaultWriter {
         error: JsValue,
         ec: &mut dyn ExecutionContext<Types>,
     ) -> Completion<(), Types> {
-        if let Some(resolvers) = self.ready_resolvers_value() {
+        if let Some(resolvers) = self.ready_resolvers_value(ec) {
             let undefined = ec.value_undefined();
             ec.call(&resolvers.reject, &undefined, &[error])?;
-            self.set_ready_resolvers_value(None);
+            self.set_ready_resolvers_value(None, ec);
         } else {
-            self.set_ready_promise_value(Some(rejected_promise(error, ec)?));
+            self.set_ready_promise_value(Some(rejected_promise(error, ec)?), ec);
         }
 
-        if let Some(ready_promise) = self.ready_promise_value() {
+        if let Some(ready_promise) = self.ready_promise_value(ec) {
             mark_promise_as_handled(&ready_promise, ec)?;
         }
         Ok(())
@@ -296,8 +296,8 @@ impl WritableStreamDefaultWriter {
         let promise_obj = promise
             .as_object()
             .ok_or_else(|| ec.new_type_error("new_promise_pending did not return an object"))?;
-        self.set_closed_promise_value(Some(promise_obj));
-        self.set_closed_resolvers_value(Some(resolvers));
+        self.set_closed_promise_value(Some(promise_obj), ec);
+        self.set_closed_resolvers_value(Some(resolvers), ec);
         Ok(())
     }
 
@@ -305,16 +305,16 @@ impl WritableStreamDefaultWriter {
         &self,
         ec: &mut dyn ExecutionContext<Types>,
     ) -> Completion<(), Types> {
-        if let Some(resolvers) = self.closed_resolvers_value() {
+        if let Some(resolvers) = self.closed_resolvers_value(ec) {
             let undefined = ec.value_undefined();
             let args = [undefined];
             ec.call(&resolvers.resolve, &args[0], &args)?;
-            self.set_closed_resolvers_value(None);
+            self.set_closed_resolvers_value(None, ec);
             return Ok(());
         }
 
         let promise = resolved_promise(ec.value_undefined(), ec)?;
-        self.set_closed_promise_value(Some(promise));
+        self.set_closed_promise_value(Some(promise), ec);
         Ok(())
     }
 
@@ -323,15 +323,15 @@ impl WritableStreamDefaultWriter {
         error: JsValue,
         ec: &mut dyn ExecutionContext<Types>,
     ) -> Completion<(), Types> {
-        if let Some(resolvers) = self.closed_resolvers_value() {
+        if let Some(resolvers) = self.closed_resolvers_value(ec) {
             let undefined = ec.value_undefined();
             ec.call(&resolvers.reject, &undefined, &[error])?;
-            self.set_closed_resolvers_value(None);
+            self.set_closed_resolvers_value(None, ec);
         } else {
-            self.set_closed_promise_value(Some(rejected_promise(error, ec)?));
+            self.set_closed_promise_value(Some(rejected_promise(error, ec)?), ec);
         }
 
-        if let Some(closed_promise) = self.closed_promise_value() {
+        if let Some(closed_promise) = self.closed_promise_value(ec) {
             mark_promise_as_handled(&closed_promise, ec)?;
         }
         Ok(())
@@ -363,7 +363,7 @@ impl WritableStreamDefaultWriter {
             WritableStreamState::Closed => Ok(Some(0.0)),
             WritableStreamState::Writable => {
                 let controller = stream
-                    .controller_slot()
+                    .controller_slot(ec)
                     .ok_or_else(|| ec.new_type_error("WritableStream is missing its controller"))?;
                 Ok(Some(writable_stream_default_controller_get_desired_size(
                     controller.as_default_controller(),
@@ -375,14 +375,14 @@ impl WritableStreamDefaultWriter {
 
     fn release(&self, ec: &mut dyn ExecutionContext<Types>) -> Completion<(), Types> {
         let released = ec.new_type_error("WritableStreamDefaultWriter has been released");
-        let stream = self.stream_slot_value().ok_or_else(|| released)?;
-        debug_assert!(stream.writer_slot().is_some());
+        let stream = self.stream_slot_value(ec).ok_or_else(|| released)?;
+        debug_assert!(stream.writer_slot(ec).is_some());
 
         let released_error = type_error_value("Writer was released", ec)?;
         self.ensure_ready_promise_rejected(released_error.clone(), ec)?;
         self.ensure_closed_promise_rejected(released_error, ec)?;
-        stream.set_writer_slot(None);
-        self.set_stream_slot_value(None);
+        stream.set_writer_slot(None, ec);
+        self.set_stream_slot_value(None, ec);
         Ok(())
     }
 
@@ -393,14 +393,14 @@ impl WritableStreamDefaultWriter {
         ec: &mut dyn ExecutionContext<Types>,
     ) -> Completion<JsObject, Types> {
         let no_ctrl = ec.new_type_error("WritableStream is missing its controller");
-        let controller = stream.controller_slot().ok_or_else(|| no_ctrl)?;
+        let controller = stream.controller_slot(ec).ok_or_else(|| no_ctrl)?;
         let chunk_size = writable_stream_default_controller_get_chunk_size(
             controller.as_default_controller(),
             &chunk,
             ec,
         )?;
 
-        if let Some(current_stream) = self.stream_slot_value() {
+        if let Some(current_stream) = self.stream_slot_value(ec) {
             if !current_stream.same_instance(&stream) {
                 return rejected_type_error_promise(
                     "Cannot write using a released WritableStreamDefaultWriter",
@@ -416,7 +416,7 @@ impl WritableStreamDefaultWriter {
 
         match stream.state() {
             WritableStreamState::Errored => {
-                return rejected_promise(stream.stored_error(), ec);
+                return rejected_promise(stream.stored_error(ec), ec);
             }
             WritableStreamState::Closed => {
                 return rejected_type_error_promise(
@@ -425,12 +425,12 @@ impl WritableStreamDefaultWriter {
                 );
             }
             WritableStreamState::Erroring => {
-                return rejected_promise(stream.stored_error(), ec);
+                return rejected_promise(stream.stored_error(ec), ec);
             }
             WritableStreamState::Writable => {}
         }
 
-        if stream.close_queued_or_in_flight() {
+        if stream.close_queued_or_in_flight(ec) {
             return rejected_type_error_promise(
                 "Cannot write to a WritableStream that is closing or closed",
                 ec,
@@ -462,8 +462,8 @@ pub(crate) fn construct_writable_stream_default_writer(
         .ok_or_else(|| {
             ec.new_type_error("WritableStreamDefaultWriter requires a WritableStream")
         })?;
-    let stream = with_writable_stream_ref(&stream_object, ec, |stream| stream.clone())?;
-    let writer = WritableStreamDefaultWriter::new();
+    let stream = with_writable_stream_ref(&stream_object, ec, |stream, _ec| stream.clone())?;
+    let writer = WritableStreamDefaultWriter::new(ec);
     writer.set_up_writable_stream_default_writer(stream, ec)?;
     Ok(writer)
 }
@@ -475,7 +475,7 @@ pub(crate) fn acquire_writable_stream_default_writer(
 ) -> Completion<JsObject, Types> {
     let writer_object = create_writable_stream_default_writer(ec)?;
     let writer =
-        with_writable_stream_default_writer_ref(&writer_object, ec, |writer| writer.clone())?;
+        with_writable_stream_default_writer_ref(&writer_object, ec, |writer, _ec| writer.clone())?;
     writer.set_up_writable_stream_default_writer(stream, ec)?;
     Ok(writer_object)
 }
@@ -483,7 +483,7 @@ pub(crate) fn acquire_writable_stream_default_writer(
 fn create_writable_stream_default_writer(
     ec: &mut dyn ExecutionContext<Types>,
 ) -> Completion<JsObject, Types> {
-    let writer = WritableStreamDefaultWriter::new();
+    let writer = WritableStreamDefaultWriter::new(ec);
     let writer_object =
         create_interface_instance::<Types, WritableStreamDefaultWriter>(writer, ec)?;
     Ok(writer_object)
@@ -492,16 +492,18 @@ fn create_writable_stream_default_writer(
 pub(crate) fn with_writable_stream_default_writer_ref<R>(
     object: &JsObject,
     ec: &mut dyn ExecutionContext<Types>,
-    f: impl FnOnce(&WritableStreamDefaultWriter) -> R,
+    f: impl FnOnce(&WritableStreamDefaultWriter, &mut dyn ExecutionContext<Types>) -> R,
 ) -> Completion<R, Types> {
-    let writer_ref = ec
+    // Clone the handle out of the object registry so `f` can borrow `ec`
+    // mutably; the clone shares all GC-managed state with the registered
+    // platform object.
+    let writer = ec
         .with_object_any(object)
-        .and_then(|a| a.downcast_ref::<WritableStreamDefaultWriter>());
-    let writer = match writer_ref {
-        Some(w) => w,
-        None => return Err(ec.new_type_error("object is not a WritableStreamDefaultWriter")),
+        .and_then(|a| a.downcast_ref::<WritableStreamDefaultWriter>().cloned());
+    let Some(writer) = writer else {
+        return Err(ec.new_type_error("object is not a WritableStreamDefaultWriter"));
     };
-    Ok(f(writer))
+    Ok(f(&writer, ec))
 }
 
 /// <https://streams.spec.whatwg.org/#writable-stream-default-writer-release>

@@ -2107,6 +2107,10 @@ impl ExecutionContext<JscTypes> for JscEngine {
         self
     }
 
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
+
     fn create_builtin_fn(
         &mut self,
         behaviour: Box<

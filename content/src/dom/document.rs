@@ -6,7 +6,8 @@ use url::Url;
 
 use super::{Element, Node};
 use crate::infra::strip_and_collapse_ascii_whitespace;
-use js_engine::gc_struct;
+use crate::js::Types;
+use js_engine::{ExecutionContext, gc_struct};
 
 fn collect_subtree_node_ids(document: &BaseDocument, node_id: usize, node_ids: &mut Vec<usize>) {
     let Some(node) = document.get_node(node_id) else {
@@ -42,9 +43,13 @@ pub struct Document {
 }
 
 impl Document {
-    pub fn new(document: Rc<RefCell<BaseDocument>>, creation_url: Url) -> Self {
+    pub fn new(
+        document: Rc<RefCell<BaseDocument>>,
+        creation_url: Url,
+        ec: &mut dyn ExecutionContext<Types>,
+    ) -> Self {
         Self {
-            node: Node::new(document, 0),
+            node: Node::new(document, 0, ec),
             creation_url,
         }
     }
@@ -178,7 +183,7 @@ impl Document {
     }
 
     /// <https://html.spec.whatwg.org/#document.title>
-    pub(crate) fn set_title(&self, title: &str) {
+    pub(crate) fn set_title(&self, title: &str, ec: &mut dyn ExecutionContext<Types>) {
         let title_node_id = self
             .node
             .document
@@ -186,7 +191,8 @@ impl Document {
             .find_title_node()
             .map(|node| node.id);
         if let Some(title_node_id) = title_node_id {
-            Node::new(Rc::clone(&self.node.document), title_node_id).set_text_content(Some(title));
+            Node::new(Rc::clone(&self.node.document), title_node_id, ec)
+                .set_text_content(Some(title));
         }
     }
 
@@ -207,19 +213,19 @@ impl Document {
     }
 
     /// <https://html.spec.whatwg.org/multipage/dom.html#dom-document-dir>
-    pub(crate) fn dir(&self) -> String {
+    pub(crate) fn dir(&self, ec: &mut dyn ExecutionContext<Types>) -> String {
         self.document_element()
             .and_then(|node_id| {
-                Element::new(Rc::clone(&self.node.document), node_id).get_attribute("dir")
+                Element::new(Rc::clone(&self.node.document), node_id, ec).get_attribute("dir")
             })
             .map(|value| canonical_document_dir(&value).to_string())
             .unwrap_or_default()
     }
 
     /// <https://html.spec.whatwg.org/multipage/dom.html#dom-document-dir>
-    pub(crate) fn set_dir(&self, dir: &str) {
+    pub(crate) fn set_dir(&self, dir: &str, ec: &mut dyn ExecutionContext<Types>) {
         if let Some(node_id) = self.document_element() {
-            Element::new(Rc::clone(&self.node.document), node_id).set_attribute("dir", dir);
+            Element::new(Rc::clone(&self.node.document), node_id, ec).set_attribute("dir", dir);
         }
     }
 }

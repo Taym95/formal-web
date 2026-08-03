@@ -7,7 +7,7 @@ use crate::js::{Types, create_builtin_fn_with_traced_captures};
 use crate::streams::SizeAlgorithm;
 use crate::webidl::bindings::create_interface_instance;
 use crate::webidl::{mark_promise_as_handled, rejected_promise, resolved_promise};
-use js_engine::gc::{GcCell, JsValueCell, gc_cell_new};
+use js_engine::gc::{GcCell, gc_cell_new};
 use js_engine::gc_struct;
 
 use super::readablestream::{
@@ -166,7 +166,7 @@ impl StartAlgorithm {
 /// `EnqueueValueWithSize` computes for it.
 #[gc_struct]
 struct QueueEntry {
-    chunk: JsValueCell,
+    chunk: GcCell<JsValue>,
     #[ignore_trace]
     size: f64,
 }
@@ -215,19 +215,19 @@ pub struct ReadableStreamDefaultController {
 }
 
 impl ReadableStreamDefaultController {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(ec: &mut dyn ExecutionContext<Types>) -> Self {
         Self {
-            stream: gc_cell_new(None),
-            queue: gc_cell_new(VecDeque::new()),
+            stream: gc_cell_new(None, ec),
+            queue: gc_cell_new(VecDeque::new(), ec),
             queue_total_size: Rc::new(Cell::new(0.0)),
             started: Rc::new(Cell::new(false)),
             close_requested: Rc::new(Cell::new(false)),
             pull_again: Rc::new(Cell::new(false)),
             pulling: Rc::new(Cell::new(false)),
-            strategy_size_algorithm: gc_cell_new(None),
+            strategy_size_algorithm: gc_cell_new(None, ec),
             strategy_high_water_mark: Rc::new(Cell::new(0.0)),
-            pull_algorithm: gc_cell_new(None),
-            cancel_algorithm: gc_cell_new(None),
+            pull_algorithm: gc_cell_new(None, ec),
+            cancel_algorithm: gc_cell_new(None, ec),
         }
     }
 
@@ -235,7 +235,7 @@ impl ReadableStreamDefaultController {
         &self,
         ec: &mut dyn ExecutionContext<Types>,
     ) -> Completion<ReadableStream, Types> {
-        self.stream.borrow().clone().ok_or_else(|| {
+        self.stream.borrow(ec).clone().ok_or_else(|| {
             ec.new_type_error("ReadableStreamDefaultController is missing its stream")
         })
     }
@@ -245,7 +245,7 @@ impl ReadableStreamDefaultController {
         ec: &mut dyn ExecutionContext<Types>,
     ) -> Completion<JsObject, Types> {
         self.stream_slot(ec)?
-            .controller_object_slot()
+            .controller_object_slot(ec)
             .ok_or_else(|| {
                 ec.new_type_error(
                     "ReadableStreamDefaultController is missing its JavaScript object",
@@ -253,8 +253,8 @@ impl ReadableStreamDefaultController {
             })
     }
 
-    fn queue_is_empty(&self) -> bool {
-        self.queue.borrow().is_empty()
+    fn queue_is_empty(&self, ec: &mut dyn ExecutionContext<Types>) -> bool {
+        self.queue.borrow(ec).is_empty()
     }
 
     /// <https://streams.spec.whatwg.org/#rs-default-controller-desired-size>
@@ -309,9 +309,9 @@ impl ReadableStreamDefaultController {
         ec: &mut dyn ExecutionContext<Types>,
     ) -> Completion<JsObject, Types> {
         // Step 1: "Perform ! ResetQueue(this)."
-        self.reset_queue();
+        self.reset_queue(ec);
 
-        let cancel_algorithm = self.cancel_algorithm.borrow().clone();
+        let cancel_algorithm = self.cancel_algorithm.borrow(ec).clone();
 
         // Step 2: "Let result be the result of performing this.[[cancelAlgorithm]], passing reason."
         let result = match cancel_algorithm {
@@ -323,7 +323,7 @@ impl ReadableStreamDefaultController {
         };
 
         // Step 3: "Perform ! ReadableStreamDefaultControllerClearAlgorithms(this)."
-        self.clear_algorithms();
+        self.clear_algorithms(ec);
 
         // Step 4: "Return result."
         Ok(result)
@@ -339,15 +339,15 @@ impl ReadableStreamDefaultController {
         let stream = self.stream_slot(ec)?;
 
         // Step 2: "If this.[[queue]] is not empty,"
-        if !self.queue_is_empty() {
+        if !self.queue_is_empty(ec) {
             let (chunk, should_close_stream, _chunk_root) = {
-                let mut queue = self.queue.borrow_mut();
+                let mut queue = self.queue.borrow_mut(ec);
 
                 // Step 2.1: "Let chunk be ! DequeueValue(this)."
                 let entry = queue
                     .pop_front()
                     .expect("queue was checked to be non-empty");
-                let chunk_value = entry.chunk.borrow().clone();
+                let chunk_value = entry.chunk.borrow(ec).clone();
                 // Protect the chunk immediately after extraction so it
                 // survives JSC GC even after the QueueEntry's JsValueCell
                 // is dropped (which calls JSValueUnprotect).
@@ -368,7 +368,7 @@ impl ReadableStreamDefaultController {
 
             if should_close_stream {
                 // Step 2.2.1: "Perform ! ReadableStreamDefaultControllerClearAlgorithms(this)."
-                self.clear_algorithms();
+                self.clear_algorithms(ec);
 
                 // Step 2.2.2: "Perform ! ReadableStreamClose(stream)."
                 readable_stream_close(stream, ec)?;
@@ -427,7 +427,7 @@ impl ReadableStreamDefaultController {
 
         // Step 6: "Let pullPromise be the result of performing controller.[[pullAlgorithm]]."
         let controller_object = self.controller_object(ec)?;
-        let pull_algorithm = self.pull_algorithm.borrow().clone();
+        let pull_algorithm = self.pull_algorithm.borrow(ec).clone();
         let pull_promise: JsObject = match pull_algorithm {
             Some(pull_algorithm) => match pull_algorithm.call(&controller_object, ec) {
                 Ok(promise) => promise,
@@ -505,9 +505,9 @@ impl ReadableStreamDefaultController {
         self.close_requested.set(true);
 
         // Step 4: "If controller.[[queue]] is empty,"
-        if self.queue_is_empty() {
+        if self.queue_is_empty(ec) {
             // Step 4.1: "Perform ! ReadableStreamDefaultControllerClearAlgorithms(controller)."
-            self.clear_algorithms();
+            self.clear_algorithms(ec);
 
             // Step 4.2: "Perform ! ReadableStreamClose(stream)."
             readable_stream_close(stream, ec)?;
@@ -531,15 +531,15 @@ impl ReadableStreamDefaultController {
         let stream = self.stream_slot(ec)?;
 
         // Step 3: "If ! IsReadableStreamLocked(stream) is true and ! ReadableStreamGetNumReadRequests(stream) > 0, perform ! ReadableStreamFulfillReadRequest(stream, chunk, false)."
-        if stream.is_readable_stream_locked()
-            && readable_stream_get_num_read_requests(stream.clone()) > 0
+        if stream.is_readable_stream_locked(ec)
+            && readable_stream_get_num_read_requests(stream.clone(), ec) > 0
         {
             readable_stream_fulfill_read_request(stream, chunk, false, ec)?;
         } else {
             // Step 4.1: "Let result be the result of performing controller.[[strategySizeAlgorithm]], passing in chunk, and interpreting the result as a completion record."
             let size_algorithm =
                 self.strategy_size_algorithm
-                    .borrow()
+                    .borrow(ec)
                     .clone()
                     .ok_or_else(|| {
                         ec.new_type_error(
@@ -572,7 +572,7 @@ impl ReadableStreamDefaultController {
                 return Err(error);
             }
 
-            self.enqueue_value_with_size(chunk, chunk_size);
+            self.enqueue_value_with_size(chunk, chunk_size, ec);
         }
 
         // Step 5: "Perform ! ReadableStreamDefaultControllerCallPullIfNeeded(controller)."
@@ -594,10 +594,10 @@ impl ReadableStreamDefaultController {
         }
 
         // Step 3: "Perform ! ResetQueue(controller)."
-        self.reset_queue();
+        self.reset_queue(ec);
 
         // Step 4: "Perform ! ReadableStreamDefaultControllerClearAlgorithms(controller)."
-        self.clear_algorithms();
+        self.clear_algorithms(ec);
 
         // Step 5: "Perform ! ReadableStreamError(stream, e)."
         readable_stream_error(stream, error, ec)?;
@@ -652,8 +652,8 @@ impl ReadableStreamDefaultController {
         }
 
         // Step 4: "If ! IsReadableStreamLocked(stream) is true and ! ReadableStreamGetNumReadRequests(stream) > 0, return true."
-        if stream.is_readable_stream_locked()
-            && readable_stream_get_num_read_requests(stream.clone()) > 0
+        if stream.is_readable_stream_locked(ec)
+            && readable_stream_get_num_read_requests(stream.clone(), ec) > 0
         {
             return Ok(true);
         }
@@ -674,16 +674,21 @@ impl ReadableStreamDefaultController {
     }
 
     /// <https://streams.spec.whatwg.org/#readable-stream-default-controller-clear-algorithms>
-    fn clear_algorithms(&self) {
-        *self.pull_algorithm.borrow_mut() = None;
-        *self.cancel_algorithm.borrow_mut() = None;
-        *self.strategy_size_algorithm.borrow_mut() = None;
+    fn clear_algorithms(&self, ec: &mut dyn ExecutionContext<Types>) {
+        *self.pull_algorithm.borrow_mut(ec) = None;
+        *self.cancel_algorithm.borrow_mut(ec) = None;
+        *self.strategy_size_algorithm.borrow_mut(ec) = None;
     }
 
     /// <https://streams.spec.whatwg.org/#enqueue-value-with-size>
-    fn enqueue_value_with_size(&self, chunk: JsValue, chunk_size: f64) {
-        self.queue.borrow_mut().push_back(QueueEntry {
-            chunk: JsValueCell::new(chunk),
+    fn enqueue_value_with_size(
+        &self,
+        chunk: JsValue,
+        chunk_size: f64,
+        ec: &mut dyn ExecutionContext<Types>,
+    ) {
+        self.queue.borrow_mut(ec).push_back(QueueEntry {
+            chunk: gc_cell_new(chunk, ec),
             size: chunk_size,
         });
         self.queue_total_size
@@ -691,8 +696,8 @@ impl ReadableStreamDefaultController {
     }
 
     /// <https://streams.spec.whatwg.org/#reset-queue>
-    fn reset_queue(&self) {
-        self.queue.borrow_mut().clear();
+    fn reset_queue(&self, ec: &mut dyn ExecutionContext<Types>) {
+        self.queue.borrow_mut(ec).clear();
         self.queue_total_size.set(0.0);
     }
 }
@@ -710,13 +715,13 @@ pub(crate) fn set_up_readable_stream_default_controller(
     ec: &mut dyn ExecutionContext<Types>,
 ) -> Completion<(), Types> {
     // Step 1: "Assert: stream.[[controller]] is undefined."
-    debug_assert!(stream.controller_slot().is_none());
+    debug_assert!(stream.controller_slot(ec).is_none());
 
     // Step 2: "Set controller.[[stream]] to stream."
-    *controller.stream.borrow_mut() = Some(stream.clone());
+    *controller.stream.borrow_mut(ec) = Some(stream.clone());
 
     // Step 3: "Perform ! ResetQueue(controller)."
-    controller.reset_queue();
+    controller.reset_queue(ec);
 
     // Step 4: "Set controller.[[started]], controller.[[closeRequested]], controller.[[pullAgain]], and controller.[[pulling]] to false."
     controller.started.set(false);
@@ -725,18 +730,18 @@ pub(crate) fn set_up_readable_stream_default_controller(
     controller.pulling.set(false);
 
     // Step 5: "Set controller.[[strategySizeAlgorithm]] to sizeAlgorithm and controller.[[strategyHWM]] to highWaterMark."
-    *controller.strategy_size_algorithm.borrow_mut() = Some(size_algorithm);
+    *controller.strategy_size_algorithm.borrow_mut(ec) = Some(size_algorithm);
     controller.strategy_high_water_mark.set(high_water_mark);
 
     // Step 6: "Set controller.[[pullAlgorithm]] to pullAlgorithm."
-    *controller.pull_algorithm.borrow_mut() = Some(pull_algorithm);
+    *controller.pull_algorithm.borrow_mut(ec) = Some(pull_algorithm);
 
     // Step 7: "Set controller.[[cancelAlgorithm]] to cancelAlgorithm."
-    *controller.cancel_algorithm.borrow_mut() = Some(cancel_algorithm);
+    *controller.cancel_algorithm.borrow_mut(ec) = Some(cancel_algorithm);
 
     // Step 8: "Set stream.[[controller]] to controller."
-    stream.set_controller_slot(Some(ReadableStreamController::Default(controller.clone())));
-    stream.set_controller_object_slot(Some(controller_object.clone()));
+    stream.set_controller_slot(Some(ReadableStreamController::Default(controller.clone())), ec);
+    stream.set_controller_object_slot(Some(controller_object.clone()), ec);
 
     // Step 9: "Let startResult be the result of performing startAlgorithm. (This might throw an exception.)"
     let start_result = start_algorithm.call(&controller_object, ec)?;
@@ -784,7 +789,7 @@ pub(crate) fn set_up_readable_stream_default_controller_from_underlying_source(
     ec: &mut dyn ExecutionContext<Types>,
 ) -> Completion<(), Types> {
     // Step 1: "Let controller be a new ReadableStreamDefaultController."
-    let controller = ReadableStreamDefaultController::new();
+    let controller = ReadableStreamDefaultController::new(ec);
     let controller_object = create_interface_instance::<Types, ReadableStreamDefaultController>(
         controller.clone(),
         ec,
@@ -860,6 +865,7 @@ pub(crate) fn extract_source_method(
     Ok(Some(SourceMethod::new(
         source_object.clone(),
         crate::webidl::Callback::from_object(callback, ec),
+        ec,
     )))
 }
 

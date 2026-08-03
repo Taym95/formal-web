@@ -186,7 +186,7 @@ where
     // Step 2: "Let constructorProto be realm.[[Intrinsics]].[[%Function.prototype%]]."
     // Step 3: "If I inherits from some other interface P, then set constructorProto
     //   to the interface object of P in realm."
-    //   Note: prototype chain wiring is done explicitly in host_hooks.rs via
+    //   Note: prototype chain wiring is done explicitly in build_context.rs via
     //   `wire_registry_prototype`. The constructorProto is not yet wired — the
     //   default %Function.prototype% is used, and subclass constructors inherit
     //   from their parent interface object via a separate call.
@@ -428,7 +428,7 @@ where
     // Step 2: "Let constructorProto be realm.[[Intrinsics]].[[%Function.prototype%]]."
     // Step 3: "If I inherits from some other interface P, then set constructorProto
     //   to the interface object of P in realm."
-    //   Note: prototype chain wiring is done explicitly in host_hooks.rs via
+    //   Note: prototype chain wiring is done explicitly in build_context.rs via
     //   `wire_registry_prototype`. The constructorProto is not yet wired — the
     //   default %Function.prototype% is used, and subclass constructors inherit
     //   from their parent interface object via a separate call.

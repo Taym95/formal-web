@@ -1,4 +1,5 @@
 mod engine;
+pub(crate) mod gc;
 mod types;
 
 pub use engine::{V8Engine, create_builtin_fn_with_captures};
