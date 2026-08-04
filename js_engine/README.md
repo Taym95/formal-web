@@ -104,15 +104,20 @@ WebAssembly support is deferred for V8; use Boa with the `wasm` feature.
 
 ### V8 backend (default — run full suite)
 
-Latest: `executed=79 unexpected=3..4` — unstable across runs.
+Latest: `executed=79 unexpected=1`.
 
-Deterministic failures: `streams/readable-byte-streams/enqueue-with-
-detached-buffer.any.js` FAIL, and the two `garbage-collection.any.js` files
-(`streams/readable-streams/` and its `crashtests/` sibling) TIMEOUT. A
-crash/ERROR flaps to a different streams test each run. The two BYOB
-byte-stream failures documented previously (`patched-global.any.js`,
-`respond-after-enqueue.any.js`) appear and disappear between runs. See the
-session log under "Remaining work" for the crash/hang investigation.
+The two `garbage-collection.any.js` files (`streams/readable-streams/` and
+its `crashtests/` sibling) now PASS — the window-cell sweep hang is fixed
+(associated platforms are traced from the realm host data) and
+`TestUtils.gc()` defers the collection past the current microtask
+checkpoint. `streams/piping/close-propagation-backward.any.js` and the two
+BYOB byte-stream failures documented previously (`patched-global.any.js`,
+`respond-after-enqueue.any.js`) also PASS in this run.
+
+Remaining unexpected: `streams/readable-byte-streams/enqueue-with-
+detached-buffer.any.js` FAIL (`controller.enqueue` after detaching
+`byobRequest.view.buffer` does not throw). The BYOB byte-stream failures
+have historically appeared and disappeared between runs.
 
 ### Boa backend (opt-in)
 
@@ -158,7 +163,7 @@ The V8 backend now integrates with cppgc (the unified heap). The design:
   and traced-value destructors (which drop V8 handles) run on the isolate
   thread.
 
-All existing tests pass (18 js_engine, 93 generic JS). Forced-collection
+All existing tests pass (30 js_engine, 93 generic JS). Forced-collection
 coverage lives in the js_engine test module: `engine.gc()` (a V8 full
 collection plus a cppgc sweep with `NoHeapPointers`) reclaims a
 wrapper↔platform reflector cycle, a two-platform mutual cycle, and a JS
@@ -176,6 +181,21 @@ is finalized at isolate destruction. Remaining:
    `V8Handle::same_identity`, which is exact for clones of one edge but
    under-approximates two independently created edges to the same object
    (use `ec.same_value` for those — `Callback::equals` already does).
+3. **Wrapper data for Boolean/String/BigInt created by scripts.** The
+   `wrapper_primitive` profile slot is extracted at wrap time only for
+   Number wrappers (the native `NumberValue` fast path unboxes
+   `[[NumberData]]`). Wrappers created by evaluating `new Boolean(false)`,
+   `new String(\"x\")`, or `Object(5n)` therefore report `None` from
+   `boolean_wrapper_data`/`string_wrapper_data`/`bigint_wrapper_data`;
+   the `construct` path coerces Boolean/String arguments (BigInt has no
+   [[Construct]]). Extracting the other wrapper slots needs a per-realm
+   captured `%Boolean.prototype.valueOf%`-style intrinsic.
+4. **Scope-macro `&mut PinScope` reborrow.** The `v8_engine_scope_with_*`
+   macros reborrow the callback scope as `&mut` on each nested engine call
+   during a native callback. The references never overlap in use (each is
+   created, used for a bounded sequence of C calls, and dropped) and the
+   underlying memory is C++-owned, but the pattern is not Stacked-Borrows
+   clean; a Miri run would flag it.
 
 ### BYOB byte-stream WPT failures (both backends)
 
@@ -184,92 +204,52 @@ is finalized at isolate destruction. Remaining:
 and V8: the tests read back zeroed bytes instead of the values written via
 `byobRequest.respond()`. Not yet investigated.
 
-### 2026-08-04 — WPT stream GC tests crash, then hang, on the V8 backend
+### 2026-08-04 — WPT stream GC crash/hang on the V8 backend — fixed
 
-**Files changed (permanent fix):**
+**Root cause (two independent bugs):**
 
-- `content/src/webidl/bindings/interface.rs` — the V8 `register_interface_spec`
-  constructor path now wraps the platform object in
-  `js_engine::v8::V8PlatformData::new` instead of passing the raw `Box`
-  (which made `create_object_with_any` fall back to a noop cppgc trace).
-- `content/src/webidl/async_iterable.rs` — `create_default_async_iterator_object`
-  likewise wraps in `V8PlatformData` on `v8_backend`.
+1. Platform objects whose data was stored as a raw `Box` (the Web IDL
+   constructor path before the previous fix, and `associate_existing_object`
+   for the Window) were wrapped in `V8PlatformData::noop`, so their cppgc
+   cells and JS edges were never traced. A full GC swept them (crash: the
+   AbortSignal state cell; hang: the Window's event-listener/timer cells,
+   leaving `dispatch load: listeners=0`).
+2. `TestUtils.gc()` ran the collection synchronously, before the queued
+   microtask reactions that still referenced realm objects (e.g. a stream's
+   start reaction, which sets `started` and performs the first pull); the
+   collection reaped the stream machinery while a read was still pending.
 
-**What was confirmed:**
+**Fixes (in the current tree):**
 
-- At branch HEAD,
-  `streams/readable-streams/garbage-collection.any.js` and
-  `crashtests/garbage-collection.any.js` SIGSEGV the content process
-  (release) / SIGBUS (debug), deterministically. Crash report
-  (`~/Library/Logs/DiagnosticReports/formal-web-content-*.ips`):
-  `Rc<TracedReference>::drop` on a null/freed Rc pointer inside
-  `AbortSignal::begin_abort`, called from testharness's per-test
-  `AbortController.abort("Test cleanup")`.
-- Root cause of the crash: the Web IDL **constructor** path stored the raw
-  platform object, so constructor-created platforms (AbortController,
-  DOMException, Event, streams, …) were wrapped in `V8PlatformData::noop` —
-  their cells and JS edges were **never traced on the cppgc heap**. A full GC
-  swept the AbortSignal state cell while the controller was still alive
-  (cell-address instrumentation showed the aborting signal's cell `0x…a70`
-  RustObj = `0x…a98` HeapCell was the first swept `AbortSignalState`); the
-  controller's Rust-side `Member` then pointed at freed memory → UAF.
-- After the fix the two tests no longer crash; they now TIME OUT.
-  `streams/piping/close-propagation-backward.any.js` went from TIMEOUT to
-  PASS. Full-suite results are unstable across runs
-  (`executed=79 unexpected=3` … `4`):
-  `enqueue-with-detached-buffer.any.js` FAIL and the two
-  `garbage-collection.any.js` files TIMEOUT, with a crash/ERROR flapping to
-  a different streams test each run.
-- The hang was reduced to a minimal reproduction: a testharness page whose
-  only test is `promise_test(async () => { await TestUtils.gc(); await
-  Promise.resolve(42); })` never completes. Inspected live via CDP
-  (`browser_evaluate` against a debug build): the async test body completes
-  in ~2 ms (timestamp probes t0–t3); the harness `result` callback fires but
-  the `completion` callback never does; no `#summary` is produced; manual
-  `done()` does not help.
-- Content logging showed the window `load` event fires after deferred script
-  evaluation, but `dispatch load: listeners=0` — the Window's event-listener
-  list is empty at dispatch time when a `TestUtils.gc()` ran during script
-  evaluation. A control page without a GC dispatches `load` with the
-  listener present.
-- Likely root cause of the hang (strongly supported, not yet fixed): the
-  Window platform is attached to the realm global via
-  `associate_existing_object` (raw `Box` in `RealmHostData.associated_objects`),
-  and the `RealmHostData` holder itself is created with a raw `Box` →
-  `V8PlatformData::noop`. The Window's cells (event-listener list, timer
-  registry, …) are therefore never traced; the first full GC sweeps them and
-  subsequent operations see missing state — the same bug class as the
-  crash, in the `associate_existing_object` path. See
-  `scratchpad/v8-safety-review.md` for a broader static-safety review of the
-  V8 integration (aliasing in `with_object_any_mut_with`, re-entrant
-  `&mut PinScope` in the scope macros, transmute assumptions in
-  `create_builtin_fn_with_captures`; not addressed this session).
+- `content/src/webidl/bindings/interface.rs` and
+  `content/src/webidl/async_iterable.rs` wrap constructor-created platforms
+  in `V8PlatformData::new` (previous session).
+- `js_engine/src/gc.rs` + `js_engine/src/v8/engine.rs`: the generic
+  `associate_existing_object` wraps the platform in `V8PlatformData::new`
+  and stores it on the cppgc heap; `RealmHostData` holds a `Member` edge to
+  each associated platform and its `Trace` visits them, so the Window's
+  cells stay alive for the realm's lifetime.
+- `content/src/testutils/mod.rs`: `TestUtils.gc()` enqueues the collection
+  as a realm job, so it runs at the next microtask checkpoint (browsers
+  defer the spec's "in parallel" steps past the current checkpoint).
 
-**What was ruled out:**
+**Outcome:** `streams/readable-streams/garbage-collection.any.js` and its
+`crashtests/` sibling PASS; default run `executed=79 unexpected=1`.
 
-- Missing microtask checkpoints: disproved. `evaluate_script` and
-  `evaluate_script_to_json` both run a checkpoint after evaluation; a
-  4-microtask `Promise.resolve().then…` chain scheduled from one eval is
-  fully drained by the next; adding an explicit
-  `perform_a_microtask_checkpoint` inside `TestUtils::gc` immediately after
-  resolving did not fix the hang; the TestUtils promise resolves to
-  `Fulfilled` (probed via `promise_state`).
-- testharness watchdog: the `test_state` callback's `{status: 2, message:
-  "Test timed out"}` is the test's *initial* STARTED status (set in
-  `Test.prototype.step`), not an actual timeout.
-- `v8::Weak::is_empty` collection detection: not re-attempted (previous dead
-  end documented above).
+**Dead end (from the investigation):** an explicit
+`perform_a_microtask_checkpoint` inside `TestUtils::gc` does not drain
+queued microtasks when gc is called from within a microtask (V8 skips
+re-entrant checkpoints) — the collection must be deferred to the next
+top-level checkpoint instead.
 
-**Not investigated:**
+**Still open:**
 
-- Wrapping the Window / `RealmHostData` in `V8PlatformData` (with a
-  `RealmHostData::trace` that walks `associated_objects`) — the natural next
-  fix for the hang. Whether `Object::wrap` works on the realm global (which
-  has no internal fields) is unknown.
 - `streams/readable-byte-streams/enqueue-with-detached-buffer.any.js` FAIL
-  and the two BYOB byte-stream failures.
+  (`controller.enqueue` after detaching `byobRequest.view.buffer` does not
+  throw). The BYOB byte-stream failures have historically appeared and
+  disappeared between runs.
 - The pre-existing clippy warning backlog in `content/` from the type
-  unification (e.g. 17× "useless conversion to the same type: V8Object").
+  unification (e.g. "useless conversion to the same type: V8Object").
 
 ### JSC microtask drain during nested C API calls
 

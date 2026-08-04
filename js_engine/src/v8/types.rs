@@ -43,6 +43,7 @@ pub(crate) struct ObjectProfile {
     pub is_date: bool,
     pub is_regexp: bool,
     pub is_error: bool,
+    pub is_constructor: bool,
     pub wrapper_primitive: Option<CachedPrimitive>,
     pub array_buffer_state: Option<V8ArrayBufferState>,
     pub typed_array_element_type: Option<TypedArrayElementType>,
@@ -518,6 +519,12 @@ impl JsTypes for V8Types {
 
     fn object_as_constructor(object: &Self::JsObject) -> Option<Self::Constructor> {
         let profile = object.0.object_profile.as_ref()?;
+        // Arrow, async, generator, and bound functions are callable but have
+        // no [[Construct]]; the profile records this at wrap time (see
+        // `wrap_local_value`), so only true constructors convert.
+        if !profile.is_constructor {
+            return None;
+        }
         Some(V8Constructor(
             object.clone(),
             profile.function_handle.clone()?,

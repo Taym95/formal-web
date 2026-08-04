@@ -444,7 +444,12 @@ pub fn associate_existing_object<D>(
         .as_any_mut()
         .downcast_mut::<crate::v8::V8Engine>()
         .expect("associate_existing_object called with a non-V8 execution context");
-    engine.associate_existing_object(object, Box::new(data));
+    // The concrete type is known here (`D: Trace`), so the platform is
+    // wrapped in `V8PlatformData` with its real trace before the engine
+    // stores it on the cppgc heap: the associated platform's cells and JS
+    // edges (Window event listeners, timers, ...) must be traced while the
+    // realm lives.
+    engine.associate_existing_object(object, Box::new(crate::v8::V8PlatformData::new(data)));
 }
 
 // ============================================================================

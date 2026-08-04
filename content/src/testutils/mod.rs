@@ -19,17 +19,29 @@ impl TestUtils {
         let (promise, resolvers) = ec.new_promise_pending()?;
 
         // Step 2: "Run the following in parallel:"
-        // Note: In a single-threaded content process, garbage collection
-        // runs synchronously.  The spec's "in parallel" is approximated
-        // by triggering GC immediately and resolving.
-        //
-        // Step 2.1: "Run implementation-defined steps to perform a
-        // garbage collection covering at least the entry Realm."
-        ec.gc();
+        // Note: In a single-threaded content process the collection runs on
+        // the main thread, approximating the spec's "in parallel". The
+        // collection is queued as a job so it runs at the next microtask
+        // checkpoint rather than synchronously: browsers defer the
+        // in-parallel steps past the current microtask checkpoint, and a
+        // collection must not reap objects that queued reaction jobs still
+        // reference (e.g. a stream's start reaction, which sets `started`
+        // and performs the first pull).
+        let realm = ec.current_realm();
+        ec.enqueue_job_with_realm(
+            realm,
+            Box::new(move |job_context| {
+                // Step 2.1: "Run implementation-defined steps to perform a
+                // garbage collection covering at least the entry Realm."
+                job_context.gc();
 
-        // Step 2.2: "Resolve p."
-        let undefined = ec.value_undefined();
-        ec.call(&resolvers.resolve, &undefined, &[])?;
+                // Step 2.2: "Resolve p."
+                let undefined = job_context.value_undefined();
+                if let Err(error) = job_context.call(&resolvers.resolve, &undefined, &[]) {
+                    job_context.report_exception(error);
+                }
+            }),
+        );
 
         Ok(promise)
     }
