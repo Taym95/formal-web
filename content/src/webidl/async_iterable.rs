@@ -574,7 +574,14 @@ where
         let boxed = js_engine::boa::TraceableBox::new(iterator);
         ec.create_object_with_any(prototype, Box::new(boxed))
     }
-    #[cfg(not(boa_backend))]
+    // On V8 the iterator is wrapped in a cppgc `V8PlatformData` so its cells
+    // and JS edges are traced from the JS wrapper by the unified heap.
+    #[cfg(v8_backend)]
+    {
+        let boxed = js_engine::v8::V8PlatformData::new(iterator);
+        ec.create_object_with_any(prototype, Box::new(boxed))
+    }
+    #[cfg(all(not(boa_backend), not(v8_backend)))]
     {
         ec.create_object_with_any(prototype, Box::new(iterator))
     }

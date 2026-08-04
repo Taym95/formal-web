@@ -3299,14 +3299,16 @@ mod tests {
 
     use rusty_v8 as v8;
 
+    use crate::gc::{Finalize, GcCell, Trace, gc_cell_new};
+    use crate::v8_gc::Visitor;
     use crate::{EcmascriptHost, ExecutionContext, JsTypes};
 
     use super::super::types::V8Handle;
-    use super::super::{V8AsyncGenerator, V8WeakMap, V8WeakRef, V8WeakSet};
+    use super::super::{V8AsyncGenerator, V8PlatformData, V8WeakMap, V8WeakRef, V8WeakSet};
     use super::{
         CURRENT_CALLBACK_ISOLATE_ID, CURRENT_CALLBACK_SCOPE, V8ArrayBuffer, V8Constructor,
         V8DataView, V8Engine, V8Function, V8Generator, V8Map, V8Object, V8Promise, V8Set,
-        V8SharedArrayBuffer, V8TypedArray, V8Types,
+        V8SharedArrayBuffer, V8TypedArray, V8Types, local_object,
     };
 
     pub(crate) struct DropFlag(pub(crate) Rc<Cell<bool>>);
@@ -3932,5 +3934,281 @@ mod tests {
 
         assert!(host_object_dropped.get());
         assert!(callback_dropped.get());
+    }
+
+    /// A traced platform payload with a finalization probe and the three
+    /// reference kinds production platform objects carry: a reflector edge
+    /// back to the JS wrapper, a peer edge to another wrapper, and a nested
+    /// cell holding JS references.
+    struct TestPlatform {
+        dropped: DropFlag,
+        reflector: Option<V8Object>,
+        peer: Option<V8Object>,
+        cell: Option<GcCell<Option<V8Object>>>,
+    }
+
+    // SAFETY: Every edge the platform holds is visited exactly once: the
+    // reflector, the peer, and the nested cell (whose trace walks the Member
+    // to the heap cell). The finalization probe is not traced.
+    unsafe impl Trace for TestPlatform {
+        unsafe fn trace(&self, visitor: &mut Visitor) {
+            if let Some(reflector) = &self.reflector {
+                // SAFETY: Delegated to the field's own trace implementation.
+                unsafe { Trace::trace(reflector, visitor) }
+            }
+            if let Some(peer) = &self.peer {
+                // SAFETY: Delegated to the field's own trace implementation.
+                unsafe { Trace::trace(peer, visitor) }
+            }
+            if let Some(cell) = &self.cell {
+                // SAFETY: Delegated to the field's own trace implementation.
+                unsafe { Trace::trace(cell, visitor) }
+            }
+        }
+
+        fn store(&mut self, ec: &mut dyn ExecutionContext<V8Types>) {
+            if let Some(reflector) = &mut self.reflector {
+                Trace::store(reflector, ec);
+            }
+            if let Some(peer) = &mut self.peer {
+                Trace::store(peer, ec);
+            }
+            if let Some(cell) = &mut self.cell {
+                Trace::store(cell, ec);
+            }
+        }
+    }
+
+    impl Finalize for TestPlatform {}
+
+    /// Install a guaranteed finalizer on `object`; the returned weak handle
+    /// must stay alive for the finalizer to run.
+    fn install_guaranteed_finalizer(
+        engine: &mut V8Engine,
+        object: &V8Object,
+        flag: Rc<Cell<bool>>,
+    ) -> v8::Weak<v8::Object> {
+        let isolate_id = engine.isolate_id;
+        v8_engine_scope_with_context!(scope, engine, &engine.realm_state.realm.context, {
+            let local = local_object(scope, isolate_id, object)
+                .expect("finalizer installation received a reclaimed or cross-isolate object");
+            v8::Weak::with_guaranteed_finalizer(scope, local, Box::new(move || flag.set(true)))
+        })
+    }
+
+    #[test]
+    fn reflector_cycle_is_collected_by_forced_gc() {
+        let mut engine = V8Engine::new();
+        let platform_dropped = Rc::new(Cell::new(false));
+        let prototype = engine.create_plain_object(None);
+        let platform = V8PlatformData::new(TestPlatform {
+            dropped: DropFlag(Rc::clone(&platform_dropped)),
+            reflector: None,
+            peer: None,
+            cell: None,
+        });
+        let wrapper = engine.create_object_with_any(prototype, Box::new(platform));
+
+        // The platform stores an edge back to its own wrapper: the wrapper
+        // traces the platform (v8::Object::wrap) and the platform traces the
+        // wrapper (reflector edge) — a cross-heap cycle.
+        engine.with_object_any_mut_with(
+            &wrapper,
+            Box::new(|data, ec| {
+                let platform = data
+                    .downcast_mut::<TestPlatform>()
+                    .expect("wrapper carries test platform data");
+                assert!(
+                    !platform.dropped.0.get(),
+                    "the probe must not fire while the platform is alive"
+                );
+                ec.store_js_object(&mut platform.reflector, wrapper.clone());
+            }),
+        );
+
+        let wrapper_collected = Rc::new(Cell::new(false));
+        let wrapper_weak =
+            install_guaranteed_finalizer(&mut engine, &wrapper, Rc::clone(&wrapper_collected));
+
+        drop(wrapper);
+        // One full collection: the unified heap marks the wrapper and its
+        // platform together, so the cycle is reclaimed in a single pass.
+        engine.gc();
+
+        assert!(
+            platform_dropped.get(),
+            "the platform must be collected with its unreachable wrapper"
+        );
+        assert!(
+            wrapper_collected.get(),
+            "the wrapper must be collected with its reflector-holding platform"
+        );
+        drop(wrapper_weak);
+    }
+
+    #[test]
+    fn mutual_platform_object_cycle_is_collected() {
+        let mut engine = V8Engine::new();
+        let a_dropped = Rc::new(Cell::new(false));
+        let b_dropped = Rc::new(Cell::new(false));
+        let prototype = engine.create_plain_object(None);
+        let a = engine.create_object_with_any(
+            prototype.clone(),
+            Box::new(V8PlatformData::new(TestPlatform {
+                dropped: DropFlag(Rc::clone(&a_dropped)),
+                reflector: None,
+                peer: None,
+                cell: None,
+            })),
+        );
+        let b = engine.create_object_with_any(
+            prototype,
+            Box::new(V8PlatformData::new(TestPlatform {
+                dropped: DropFlag(Rc::clone(&b_dropped)),
+                reflector: None,
+                peer: None,
+                cell: None,
+            })),
+        );
+
+        engine.with_object_any_mut_with(
+            &a,
+            Box::new(|data, ec| {
+                let platform = data
+                    .downcast_mut::<TestPlatform>()
+                    .expect("wrapper A carries test platform data");
+                assert!(
+                    !platform.dropped.0.get(),
+                    "the probe must not fire while platform A is alive"
+                );
+                ec.store_js_object(&mut platform.peer, b.clone());
+            }),
+        );
+        engine.with_object_any_mut_with(
+            &b,
+            Box::new(|data, ec| {
+                let platform = data
+                    .downcast_mut::<TestPlatform>()
+                    .expect("wrapper B carries test platform data");
+                assert!(
+                    !platform.dropped.0.get(),
+                    "the probe must not fire while platform B is alive"
+                );
+                ec.store_js_object(&mut platform.peer, a.clone());
+            }),
+        );
+
+        let a_wrapper_collected = Rc::new(Cell::new(false));
+        let b_wrapper_collected = Rc::new(Cell::new(false));
+        let a_weak = install_guaranteed_finalizer(&mut engine, &a, Rc::clone(&a_wrapper_collected));
+        let b_weak = install_guaranteed_finalizer(&mut engine, &b, Rc::clone(&b_wrapper_collected));
+
+        drop(a);
+        drop(b);
+        // One full collection: the two wrappers and their platforms form a
+        // single cross-heap cycle, reclaimed in one pass.
+        engine.gc();
+
+        assert!(
+            a_dropped.get(),
+            "platform A must be collected with the cycle"
+        );
+        assert!(
+            b_dropped.get(),
+            "platform B must be collected with the cycle"
+        );
+        assert!(
+            a_wrapper_collected.get(),
+            "wrapper A must be collected with the cycle"
+        );
+        assert!(
+            b_wrapper_collected.get(),
+            "wrapper B must be collected with the cycle"
+        );
+        drop(a_weak);
+        drop(b_weak);
+    }
+
+    #[test]
+    fn stored_js_reference_dies_with_its_cell() {
+        let mut engine = V8Engine::new();
+
+        // X is a plain object reachable only through the cell edge below.
+        let x = ExecutionContext::evaluate_script(&mut engine, "({ marker: 'payload' })")
+            .expect("the payload object must evaluate");
+        let x_object = V8Types::value_as_object(&x).expect("the payload must be an object");
+        let x_collected = Rc::new(Cell::new(false));
+        let x_weak = install_guaranteed_finalizer(&mut engine, &x_object, Rc::clone(&x_collected));
+
+        // gc_cell_new converts the rooted handle into a cppgc edge.
+        let cell = gc_cell_new(Some(x_object), &mut engine);
+        drop(x);
+
+        // A platform object owns the cell so it is traced while the platform
+        // lives (the production pattern for stream controller state).
+        let platform_dropped = Rc::new(Cell::new(false));
+        let prototype = engine.create_plain_object(None);
+        let owner = engine.create_object_with_any(
+            prototype,
+            Box::new(V8PlatformData::new(TestPlatform {
+                dropped: DropFlag(Rc::clone(&platform_dropped)),
+                reflector: None,
+                peer: None,
+                cell: Some(cell),
+            })),
+        );
+        assert!(
+            engine
+                .with_object_any(&owner)
+                .and_then(|data| data.downcast_ref::<TestPlatform>())
+                .is_some_and(|platform| !platform.dropped.0.get()),
+            "the probe must not fire while the owner is alive"
+        );
+
+        drop(owner);
+        // One full collection: the payload edge dies with the cell, and the
+        // cell dies with its owning platform, all in the same pass.
+        engine.gc();
+
+        assert!(
+            platform_dropped.get(),
+            "the owning platform must be collected"
+        );
+        assert!(
+            x_collected.get(),
+            "the payload referenced only through the cell edge must be collected with it"
+        );
+        drop(x_weak);
+    }
+
+    #[test]
+    fn platform_data_finalized_at_isolate_destruction() {
+        let platform_dropped = Rc::new(Cell::new(false));
+        {
+            let mut engine = V8Engine::new();
+            let prototype = engine.create_plain_object(None);
+            let owner = engine.create_object_with_any(
+                prototype,
+                Box::new(V8PlatformData::new(TestPlatform {
+                    dropped: DropFlag(Rc::clone(&platform_dropped)),
+                    reflector: None,
+                    peer: None,
+                    cell: None,
+                })),
+            );
+            // Keep the wrapper alive: destruction must finalize the platform
+            // data even though no collection ran.
+            assert!(
+                engine
+                    .with_object_any(&owner)
+                    .and_then(|data| data.downcast_ref::<TestPlatform>())
+                    .is_some_and(|platform| !platform.dropped.0.get()),
+                "the platform must be alive before destruction"
+            );
+        }
+        assert!(
+            platform_dropped.get(),
+            "platform data must be finalized when the isolate is destroyed"
+        );
     }
 }

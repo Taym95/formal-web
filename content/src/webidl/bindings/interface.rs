@@ -461,7 +461,7 @@ where
 pub(crate) fn register_interface_spec<Ty, I, E>(engine: &mut E) -> Completion<(), Ty>
 where
     Ty: JsTypes + JsTypesWithRealm,
-    I: WebIdlInterface<Ty> + 'static,
+    I: WebIdlInterface<Ty> + js_engine::gc::Trace + 'static,
     E: JsEngine<Ty> + ExecutionContext<Ty>,
 {
     // <https://webidl.spec.whatwg.org/#create-an-interface-object>
@@ -571,7 +571,16 @@ where
                 //   object as this and values as the argument values."
                 //   Note: handled inside create_platform_object.
                 // Step 1.10: "Let O be object, converted to a JavaScript value."
-                let instance = ec.create_object_with_any(resolved_prototype, Box::new(obj));
+                //   On V8 the platform object is wrapped in a cppgc
+                //   `V8PlatformData` so its cells and JS edges are traced
+                //   from the JS wrapper by the unified heap (mirroring
+                //   `create_interface_instance`). On JSC the raw data is
+                //   stored in the per-object side table.
+                #[cfg(feature = "v8")]
+                let boxed = js_engine::v8::V8PlatformData::new(obj);
+                #[cfg(all(not(feature = "boa"), not(feature = "v8")))]
+                let boxed = obj;
+                let instance = ec.create_object_with_any(resolved_prototype, Box::new(boxed));
 
                 // Step 11: "For every interface ancestor interface in interfaces:"
                 // Only copies own interface's [[Unforgeables]]; ancestor iteration
