@@ -7,7 +7,7 @@ publish = false
 [dependencies]
 anyrender = { version = "0.10", features = ["serde"] }
 ipc = { path = "../ipc" }
-ipc-channel = { git = "https://github.com/gterzian/ipc-channel" }
+ipc-channel = { git = "https://github.com/gterzian/ipc-channel", rev = "169da83" }
 peniko = "0.6.0"
 postcard = { version = "1", features = ["use-std"] }
 serde = { version = "1", features = ["derive"] }

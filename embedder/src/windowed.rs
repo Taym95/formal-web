@@ -22,6 +22,8 @@ use blitz_traits::events::{
     MouseEventButton, MouseEventButtons, PointerCoords, PointerDetails, UiEvent,
 };
 use blitz_traits::shell::{ColorScheme, ShellProvider};
+#[cfg(target_os = "macos")]
+use ipc_channel::platform::deallocate_mach_port;
 use ipc_messages::content::WebviewId;
 #[cfg(target_os = "macos")]
 use keyboard_types::{Key, Modifiers as KeyboardModifiers};
@@ -1558,12 +1560,18 @@ impl ApplicationHandler<FormalWebUserEvent> for WindowedApp {
                             {
                                 state.renderer.unregister_resource(old.resource_id());
                             }
-                            // SAFETY: the port is a send right to the shared
-                            // surface; lookup consumes it.
+                            // The port is a send right to the shared surface;
+                            // `into_name` transfers ownership of it to this
+                            // process. `IOSurfaceLookupFromMachPort` does not
+                            // consume the port (the returned surface is
+                            // retained independently by CoreFoundation), so
+                            // the send right is released right after the
+                            // lookup on both the success and failure paths.
                             let port_name = port.into_name();
-                            let Some(surface_ref) =
-                                objc2_io_surface::IOSurfaceRef::lookup_from_mach_port(port_name)
-                            else {
+                            let surface =
+                                objc2_io_surface::IOSurfaceRef::lookup_from_mach_port(port_name);
+                            deallocate_mach_port(port_name);
+                            let Some(surface_ref) = surface else {
                                 error!(
                                     "[embedder] IOSurfaceLookupFromMachPort failed for webview={:?}",
                                     webview_id

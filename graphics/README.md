@@ -48,6 +48,15 @@ Key properties:
 - The renderer keeps a per-slot staging-buffer pool (one per in-flight
   frame) and a per-webview device; the renderer always produces a frame (sizes
   are clamped to ≥ 1) so the UA's rendering-opportunity cycle never stalls.
+- The FrameNeeded-gated render cycle is modeled and validated by the
+  `RenderingOpportunity` TLA+ spec (`verification/tla_specs/RenderingOpportunity.tla`):
+  the UA traces `NoteRenderingOpportunity`/`FrameNeeded`, content traces
+  `UpdateTheRendering`, and the graphics process traces `GraphicsComputed` when
+  `PixelFrameReady` is actually sent — i.e. after the poll thread's
+  `device.poll(Wait)` confirmed the render completed on the GPU. The model
+  checks that a render starts only when the embedder needs a frame AND a
+  rendering opportunity was noted, and that the pipeline never holds more than
+  `BufferCount` (2) renders in flight (one displayed, one being rendered).
 
 Per-frame copies today: GPU → CPU readback, kernel copy in the IPC transport,
 CPU → GPU upload, and Vello's internal atlas copy.
@@ -259,6 +268,24 @@ because Vello's `register_texture` requires `Rgba8Unorm`.
   before signaling (coarse fence); a true zero-copy path may need a shared
   `MTLSharedEvent` to bound the consumer's blit against the producer's render
   without the CPU-side wait.
+- **Consumer-blit vs. producer-overwrite ordering**: the consumer's blit of a
+  shared buffer and the producer's next render into the same buffer are not
+  synchronized at the GPU level (no shared `MTLSharedEvent`). The submission
+  ordering is what makes this safe in practice: the producer is strictly
+  request-paced — content renders and the producer submits only in response to
+  the embedder's `frame_needed`, which `paint_frame` sends before the blit, and
+  the UA gates update-the-rendering on `frame_needed` — so the producer can
+  never submit a render whose frame the consumer has not requested at a redraw
+  (it never runs more than one frame ahead). The alternation means a given
+  buffer is written every other cycle; the write into buffer B at cycle N+2 is
+  submitted only after the consumer has processed `PixelFrameReady` for B(N) and
+  A(N+1), so the B(N) blit was enqueued a full redraw earlier and the overwrite
+  submission is downstream of a further full redraw plus a content render. The
+  residual (the blit's GPU execution overlapping the overwrite's execution)
+  therefore requires the consumer's single draw call to remain unexecuted for
+  more than a full render cycle — a consumer-side GPU queue stall. The
+  submission ordering is structural; only the GPU execution timing of an
+  already-enqueued blit vs. a much-later-submitted overwrite is unenforced.
 - **Device topology**: the zero-copy path works best with one shared wgpu
   device across webviews (and with the media backend); today the graphics
   process creates a device per webview. Video textures live on the webview's

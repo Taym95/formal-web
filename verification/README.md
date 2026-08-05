@@ -16,6 +16,34 @@ The verification crate owns trace recording, TLA+ validation, and the shutdown w
 | `RenderingOpportunity` | UA `NoteRenderingOpportunity`/`FrameNeeded`, content `UpdateTheRendering`, graphics `GraphicsComputed` (traced when the pixels are actually sent) | FrameNeeded-gated render cycle with double buffering: a render starts only when the embedder needs a frame (paced by vsync) AND a rendering opportunity was noted; the paint consumes the composed frames, and the pipeline never holds more than `BufferCount` (2) renders in flight (one displayed, one being rendered) |
 | `MessagePort*` | (not written yet) | — |
 
+### RenderingOpportunity scope
+
+The model tracks the frame-production cycle at the **top-level traversable** only.
+`FrameNeeded` and `GraphicsComputed` only ever fire for top-levels (the embedder
+sends `frame_needed` for webviews; graphics only computes when the root frame
+arrives), and child navigables' rendering updates
+(`NoteRenderingOpportunity`/`UpdateTheRendering` for child ids) are content that
+is composed into the parent's frame — they change no counter the model's
+invariants constrain.
+
+The verification session (`verify-specs.sh`) navigates only to `about:blank`, so
+no child-navigable events ever enter the trace and the child path is untested.
+Observed when a local page with an `<iframe>` was loaded instead: the trace
+contained child `NoteRenderingOpportunity`/`UpdateTheRendering` entries, which
+the model as written cannot replay — a child's `pending` counter can never rise
+because `FrameNeeded`/`GraphicsComputed` are top-level-only and no model action
+drains a child's batched opportunity (in the code this is the UA's
+`queue_update_the_rendering_for_navigables`, called when the top-level's
+`FrameNeeded` arrives). Child rendering updates are therefore deliberately out
+of the model's scope.
+
+Not investigated: because the UA clears a composed child's pending state at
+`PixelFrameReady`, a child whose `PaintFrame` reaches graphics after the
+parent's composition is stored but not composed until the parent's next frame,
+and its next update depends on a new rendering opportunity being noted. Whether
+child content can consequently lag one frame behind (staleness) has not been
+investigated.
+
 ### Adding a spec
 
 1. Write `{Name}.tla` (the model) and `{Name}Trace.tla` (the trace consumer) plus `{Name}.cfg` / `{Name}Trace.cfg` in `verification/tla_specs/`. Discovery is automatic from the flat `.tla` files.
