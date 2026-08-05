@@ -108,10 +108,8 @@ where
     //   Domain callers (not constructors) always use the standard prototype.
     // Steps 3-8: newTarget handling, MakeBasicObject — handled below.
     // Step 9: "Set instance.[[Prototype]] to prototype."
-    //   The backend wraps the concrete platform data in its GC wrapper (V8
-    //   `V8PlatformData`, Boa `TraceableBox`) so the unified GC traces the
-    //   platform object's cells and JS edges from the JS wrapper; JSC stores
-    //   the raw data in its per-object side table.
+    //   The engine stores the platform data in a GC wrapper so its cells and
+    //   JS edges are traced from the JS wrapper.
     let instance = js_engine::create_platform_object(ec, &prototype, data);
 
     // Steps 10-11: "Let interfaces be the inclusive inherited interfaces..."
@@ -242,11 +240,9 @@ where
                 //   object as this and values as the argument values."
                 //   Note: handled inside create_platform_object.
                 // Step 1.10: "Let O be object, converted to a JavaScript value."
-                //   The backend wraps the concrete platform data in its GC
-                //   wrapper (V8 `V8PlatformData`, Boa `TraceableBox`) so the
-                //   unified GC traces its cells and JS edges from the JS
-                //   wrapper (mirroring `create_interface_instance`); JSC
-                //   stores the raw data in the per-object side table.
+                //   The engine stores the platform data in a GC wrapper so its
+                //   cells and JS edges are traced from the JS wrapper
+                //   (mirroring `create_interface_instance`).
                 let instance = js_engine::create_platform_object(ec, &resolved_prototype, obj);
 
                 <Ty as PostCreateReflector<Ty>>::set_reflector(&instance, ec);

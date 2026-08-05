@@ -565,11 +565,9 @@ where
 {
     let prototype = create_async_iterator_prototype::<T>(ec);
 
-    // The backend wraps the concrete iterator data in its GC wrapper (V8
-    // `V8PlatformData`, Boa `TraceableBox`) so the unified GC traces the
-    // `ongoing_promise` cell and the state's JS references stored inside the
-    // type-erased platform data; JSC stores the raw data in its per-object
-    // side table.
+    // The engine stores the iterator data in a GC wrapper so the
+    // `ongoing_promise` cell and the state's JS references are traced from
+    // the JS wrapper.
     js_engine::create_platform_object(ec, &prototype, iterator)
 }
 
