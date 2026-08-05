@@ -3834,6 +3834,21 @@ impl UserAgentWorker {
             self.queued_rendering_opportunities.remove(traversable_id);
         }
 
+        // Release the graphics-process state for the removed webviews
+        // (compositor, GPU buffers, shared surfaces), symmetric with the
+        // RegisterWebview sent when the child navigable was created.
+        if let Some(graphics_sender) = &self.graphics_extension_sender {
+            for traversable_id in &traversable_ids {
+                if let Err(error) = graphics_sender.send(
+                    ipc_messages::graphics::GraphicsCommand::UnregisterWebview {
+                        webview_id: WebviewId(*traversable_id),
+                    },
+                ) {
+                    error!("failed to unregister webview with graphics process: {error}");
+                }
+            }
+        }
+
         if !removed_document_ids.is_empty() {
             self.state.documents.retain(|document_id, document| {
                 !removed_document_ids.contains(document_id)

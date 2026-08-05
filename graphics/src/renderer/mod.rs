@@ -303,20 +303,30 @@ impl<P> SurfaceBuffers<P> {
     }
 }
 
+/// The maximum surface dimension accepted from content-claimed viewport
+/// dimensions. Content is the least-trusted process and reports the viewport
+/// it renders at; without an upper bound a buggy or compromised content
+/// process could claim an arbitrarily large viewport and drive huge
+/// graphics-process allocations (shared memory, IOSurfaces, intermediate
+/// textures). Far above any real display size (8K is 7680×4320).
+pub(crate) const MAX_SURFACE_DIMENSION: u32 = 8192;
+
 /// The render size for a composed scene: the root frame's viewport, clamped
 /// to at least 1×1 so a frame is always produced (a skipped frame would
-/// leave the UA's rendering cycle open and stall all future renders).
+/// leave the UA's rendering cycle open and stall all future renders), and to
+/// at most [`MAX_SURFACE_DIMENSION`] so content-claimed dimensions cannot
+/// drive unbounded allocations in this process.
 pub(crate) fn render_size(frame_hit_info: &[FrameHitInfo]) -> (u32, u32) {
     let width = frame_hit_info
         .first()
         .map(|h| h.viewport_width)
         .unwrap_or(0)
-        .max(1);
+        .clamp(1, MAX_SURFACE_DIMENSION);
     let height = frame_hit_info
         .first()
         .map(|h| h.viewport_height)
         .unwrap_or(0)
-        .max(1);
+        .clamp(1, MAX_SURFACE_DIMENSION);
     (width, height)
 }
 
