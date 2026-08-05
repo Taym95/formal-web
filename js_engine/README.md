@@ -187,6 +187,15 @@ The V8 backend now integrates with cppgc (the unified heap). The design:
   type-erased cppgc object tracing through the concrete type) and linked to
   their JS wrapper with `v8::Object::wrap`, so the unified heap traces
   wrapper → platform → cells → JS edges and can collect cycles.
+- `gc::create_platform_object` is the single entry point that wraps concrete
+  platform data (`Trace` + `Finalize`) in the backend's GC wrapper
+  (`V8PlatformData` on V8, `TraceableBox` on Boa, raw side-table data on
+  JSC) before `create_object_with_any`; the Web IDL bindings
+  (`create_interface_instance`, constructor closures, async-iterator
+  objects) call it instead of reaching into `js_engine::v8::` or
+  `js_engine::boa::` directly. Passing an unwrapped `Box<dyn Any>` to
+  `create_object_with_any` falls back to no-op tracing — safe only for
+  prototypes and namespace objects with no `GcCell` fields.
 - The isolate's `CppHeap` is created with atomic marking and sweeping
   (`SharedIsolate::new`), so traces run stop-the-world on the isolate thread
   and traced-value destructors (which drop V8 handles) run on the isolate
@@ -255,54 +264,15 @@ is finalized at isolate destruction. Remaining:
 `streams/readable-byte-streams/patched-global.any.js` and
 `streams/readable-byte-streams/respond-after-enqueue.any.js` fail on both Boa
 and V8: the tests read back zeroed bytes instead of the values written via
-`byobRequest.respond()`. Not yet investigated.
+`byobRequest.respond()`. The BYOB failures have historically appeared and
+disappeared between runs; `enqueue-with-detached-buffer.any.js` FAIL
+(`controller.enqueue` after detaching `byobRequest.view.buffer` does not
+throw) is the same class of issue. Not yet investigated.
 
-### 2026-08-04 — WPT stream GC crash/hang on the V8 backend — fixed
+### Pre-existing clippy backlog in `content/`
 
-**Root cause (two independent bugs):**
-
-1. Platform objects whose data was stored as a raw `Box` (the Web IDL
-   constructor path before the previous fix, and `associate_existing_object`
-   for the Window) were wrapped in `V8PlatformData::noop`, so their cppgc
-   cells and JS edges were never traced. A full GC swept them (crash: the
-   AbortSignal state cell; hang: the Window's event-listener/timer cells,
-   leaving `dispatch load: listeners=0`).
-2. `TestUtils.gc()` ran the collection synchronously, before the queued
-   microtask reactions that still referenced realm objects (e.g. a stream's
-   start reaction, which sets `started` and performs the first pull); the
-   collection reaped the stream machinery while a read was still pending.
-
-**Fixes (in the current tree):**
-
-- `content/src/webidl/bindings/interface.rs` and
-  `content/src/webidl/async_iterable.rs` wrap constructor-created platforms
-  in `V8PlatformData::new` (previous session).
-- `js_engine/src/gc.rs` + `js_engine/src/v8/engine.rs`: the generic
-  `associate_existing_object` wraps the platform in `V8PlatformData::new`
-  and stores it on the cppgc heap; `RealmHostData` holds a `Member` edge to
-  each associated platform and its `Trace` visits them, so the Window's
-  cells stay alive for the realm's lifetime.
-- `content/src/testutils/mod.rs`: `TestUtils.gc()` enqueues the collection
-  as a realm job, so it runs at the next microtask checkpoint (browsers
-  defer the spec's "in parallel" steps past the current checkpoint).
-
-**Outcome:** `streams/readable-streams/garbage-collection.any.js` and its
-`crashtests/` sibling PASS; default run `executed=79 unexpected=1`.
-
-**Dead end (from the investigation):** an explicit
-`perform_a_microtask_checkpoint` inside `TestUtils::gc` does not drain
-queued microtasks when gc is called from within a microtask (V8 skips
-re-entrant checkpoints) — the collection must be deferred to the next
-top-level checkpoint instead.
-
-**Still open:**
-
-- `streams/readable-byte-streams/enqueue-with-detached-buffer.any.js` FAIL
-  (`controller.enqueue` after detaching `byobRequest.view.buffer` does not
-  throw). The BYOB byte-stream failures have historically appeared and
-  disappeared between runs.
-- The pre-existing clippy warning backlog in `content/` from the type
-  unification (e.g. "useless conversion to the same type: V8Object").
+The type-unification cleanup left a warning backlog in `content/` (e.g.
+"useless conversion to the same type: V8Object"). Not part of the GC work.
 
 ### JSC microtask drain during nested C API calls
 

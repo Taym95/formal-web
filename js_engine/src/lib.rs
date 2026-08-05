@@ -65,7 +65,9 @@ pub use enums::{
 };
 #[cfg(any(feature = "jsc", feature = "v8"))]
 pub use gc::associate_existing_object;
-pub use gc::{Finalize, GcCell, GcRootHandle, JsTypesGcExt, Trace, gc_cell_new};
+pub use gc::{
+    Finalize, GcCell, GcRootHandle, JsTypesGcExt, Trace, create_platform_object, gc_cell_new,
+};
 #[cfg(feature = "boa")]
 pub use js_engine_macros::gc_struct_boa as gc_struct;
 

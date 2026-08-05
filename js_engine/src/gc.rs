@@ -460,6 +460,95 @@ pub fn associate_existing_object<D>(
     engine.associate_existing_object(object, Box::new(crate::v8::V8PlatformData::new(data)));
 }
 
+/// Create a JS object with the given prototype, wrapping GC-traceable
+/// platform data in the backend's GC wrapper (V8 `V8PlatformData`, Boa
+/// `TraceableBox`) so the engine's GC traces the platform object's cells and
+/// JS edges from the JS wrapper. JSC stores the raw data in its per-object
+/// side table.
+///
+/// The concrete data type `D` is known here (`Trace` + `Finalize`), so the
+/// wrapper carries the real trace/finalize vtables; `create_object_with_any`
+/// alone only receives type-erased `Box<dyn Any>` and falls back to no-op
+/// tracing, which is only safe for prototypes and namespace objects that hold
+/// no `GcCell` fields. Generic over `Ty` so the Web IDL bindings can call it
+/// from generic code.
+#[cfg(feature = "jsc")]
+pub fn create_platform_object<Ty, D>(
+    ec: &mut dyn ExecutionContext<Ty>,
+    prototype: &Ty::JsObject,
+    data: D,
+) -> Ty::JsObject
+where
+    Ty: JsTypes + JsTypesWithRealm,
+    D: 'static + Trace + Finalize,
+{
+    ec.create_object_with_any(prototype.clone(), Box::new(data))
+}
+
+/// Create a JS object with the given prototype, wrapping GC-traceable
+/// platform data in the backend's GC wrapper (V8 `V8PlatformData`, Boa
+/// `TraceableBox`) so the engine's GC traces the platform object's cells and
+/// JS edges from the JS wrapper. JSC stores the raw data in its per-object
+/// side table.
+///
+/// The concrete data type `D` is known here (`Trace` + `Finalize`), so the
+/// wrapper carries the real trace/finalize vtables; `create_object_with_any`
+/// alone only receives type-erased `Box<dyn Any>` and falls back to no-op
+/// tracing, which is only safe for prototypes and namespace objects that hold
+/// no `GcCell` fields. Generic over `Ty` so the Web IDL bindings can call it
+/// from generic code.
+#[cfg(feature = "v8")]
+pub fn create_platform_object<Ty, D>(
+    ec: &mut dyn ExecutionContext<Ty>,
+    prototype: &Ty::JsObject,
+    data: D,
+) -> Ty::JsObject
+where
+    Ty: JsTypes + JsTypesWithRealm,
+    D: 'static + Trace + Finalize,
+{
+    // The concrete type is known here (`D: Trace`), so the platform is
+    // wrapped in `V8PlatformData` with its real trace before the engine
+    // stores it on the cppgc heap: the platform's cells and JS edges must
+    // be traced while the wrapper lives.
+    ec.create_object_with_any(
+        prototype.clone(),
+        Box::new(crate::v8::V8PlatformData::new(data)),
+    )
+}
+
+/// Create a JS object with the given prototype, wrapping GC-traceable
+/// platform data in the backend's GC wrapper (V8 `V8PlatformData`, Boa
+/// `TraceableBox`) so the engine's GC traces the platform object's cells and
+/// JS edges from the JS wrapper. JSC stores the raw data in its per-object
+/// side table.
+///
+/// The concrete data type `D` is known here (`Trace` + `Finalize`), so the
+/// wrapper carries the real trace/finalize vtables; `create_object_with_any`
+/// alone only receives type-erased `Box<dyn Any>` and falls back to no-op
+/// tracing, which is only safe for prototypes and namespace objects that hold
+/// no `GcCell` fields. Generic over `Ty` so the Web IDL bindings can call it
+/// from generic code.
+#[cfg(feature = "boa")]
+pub fn create_platform_object<Ty, D>(
+    ec: &mut dyn ExecutionContext<Ty>,
+    prototype: &Ty::JsObject,
+    data: D,
+) -> Ty::JsObject
+where
+    Ty: JsTypes + JsTypesWithRealm,
+    D: 'static + Trace + Finalize,
+{
+    // The concrete type is known here (`D: Trace`), so the data is wrapped
+    // in a `TraceableBox` with its real trace/finalize vtables before the
+    // engine stores it: the platform's `GcCell` fields and JS references
+    // must be visible to the Boa GC while the wrapper lives.
+    ec.create_object_with_any(
+        prototype.clone(),
+        Box::new(crate::boa::TraceableBox::new(data)),
+    )
+}
+
 // ============================================================================
 // SECTION IV: GC-TRAIT MACRO
 // ============================================================================

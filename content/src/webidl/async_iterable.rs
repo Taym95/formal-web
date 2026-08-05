@@ -565,26 +565,12 @@ where
 {
     let prototype = create_async_iterator_prototype::<T>(ec);
 
-    // Wrap in TraceableBox on the Boa backend so the GC can trace through
-    // the GcCell<Option<JsObject>> (ongoing_promise) and the state's reader
-    // field stored inside the type-erased Box<dyn Any>.  Without this, the
-    // Boa GC cannot see those references and may collect them.
-    #[cfg(boa_backend)]
-    {
-        let boxed = js_engine::boa::TraceableBox::new(iterator);
-        ec.create_object_with_any(prototype, Box::new(boxed))
-    }
-    // On V8 the iterator is wrapped in a cppgc `V8PlatformData` so its cells
-    // and JS edges are traced from the JS wrapper by the unified heap.
-    #[cfg(v8_backend)]
-    {
-        let boxed = js_engine::v8::V8PlatformData::new(iterator);
-        ec.create_object_with_any(prototype, Box::new(boxed))
-    }
-    #[cfg(all(not(boa_backend), not(v8_backend)))]
-    {
-        ec.create_object_with_any(prototype, Box::new(iterator))
-    }
+    // The backend wraps the concrete iterator data in its GC wrapper (V8
+    // `V8PlatformData`, Boa `TraceableBox`) so the unified GC traces the
+    // `ongoing_promise` cell and the state's JS references stored inside the
+    // type-erased platform data; JSC stores the raw data in its per-object
+    // side table.
+    js_engine::create_platform_object(ec, &prototype, iterator)
 }
 
 fn default_async_iterator_from_this<T>(
