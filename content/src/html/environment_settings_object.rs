@@ -101,7 +101,7 @@ impl EnvironmentSettingsObject {
         // Set up timer host and navigation info on the GlobalScope through
         // the EC trait's realm_global_object + with_object_any.
         if let (Some(event_sender), Some(document_id)) = (&event_sender, document_id) {
-            with_global_scope(&mut engine, |global_scope| {
+            with_global_scope(&mut engine, |global_scope, _ec| {
                 global_scope.set_timer_host(document_id, event_sender.clone());
                 Ok(())
             })
@@ -113,7 +113,7 @@ impl EnvironmentSettingsObject {
         }
         if let Some(navigable_id) = source_navigable_id {
             if let Some(event_sender) = &event_sender {
-                with_global_scope(&mut engine, |global_scope| {
+                with_global_scope(&mut engine, |global_scope, _ec| {
                     global_scope.set_navigation_info(navigable_id, event_sender.clone());
                     global_scope.set_creation_url(creation_url.clone());
                     Ok(())
@@ -138,8 +138,8 @@ impl EnvironmentSettingsObject {
                     .unwrap_or_else(|_| "unknown error".to_string())
             })?;
 
-        with_global_scope(&mut engine, |global_scope| {
-            global_scope.store_document_object(document_object);
+        with_global_scope(&mut engine, |global_scope, ec| {
+            global_scope.store_document_object(document_object, ec);
             Ok(())
         })
         .map_err(|error| {
@@ -220,8 +220,8 @@ impl EnvironmentSettingsObject {
     }
 
     pub fn clear_all_window_timers(&mut self) -> Result<(), String> {
-        with_global_scope(&mut self.realm_execution_context, |global_scope| {
-            global_scope.clear_all_timers();
+        with_global_scope(&mut self.realm_execution_context, |global_scope, ec| {
+            global_scope.clear_all_timers(ec);
             Ok(())
         })
         .map_err(|error| self.error_to_string(error))
@@ -294,13 +294,13 @@ impl EnvironmentSettingsObject {
         ));
 
         let previous_nesting_level =
-            with_global_scope(&mut self.realm_execution_context, |global_scope| {
+            with_global_scope(&mut self.realm_execution_context, |global_scope, _ec| {
                 Ok(global_scope.set_current_timer_nesting_level(Some(nesting_level)))
             })
             .map_err(|error| self.error_to_string(error))?;
 
-        let timer = with_global_scope(&mut self.realm_execution_context, |global_scope| {
-            Ok(global_scope.window_timer(timer_id, timer_key))
+        let timer = with_global_scope(&mut self.realm_execution_context, |global_scope, ec| {
+            Ok(global_scope.window_timer(timer_id, timer_key, ec))
         })
         .map_err(|error| self.error_to_string(error))?;
 
@@ -310,7 +310,7 @@ impl EnvironmentSettingsObject {
                 timer_id, timer_key
             ));
             if let Err(error) =
-                with_global_scope(&mut self.realm_execution_context, |global_scope| {
+                with_global_scope(&mut self.realm_execution_context, |global_scope, _ec| {
                     global_scope.set_current_timer_nesting_level(previous_nesting_level);
                     Ok(())
                 })
@@ -359,21 +359,27 @@ impl EnvironmentSettingsObject {
             }
         }
 
-        if let Err(error) = with_global_scope(&mut self.realm_execution_context, |global_scope| {
-            if let Err(error) = global_scope.complete_window_timer(timer_id, timer_key) {
-                error!("failed to complete window timer (id={timer_id} key={timer_key}): {error}");
-            }
-            Ok(())
-        }) {
+        if let Err(error) =
+            with_global_scope(&mut self.realm_execution_context, |global_scope, ec| {
+                if let Err(error) = global_scope.complete_window_timer(timer_id, timer_key, ec) {
+                    error!(
+                        "failed to complete window timer (id={timer_id} key={timer_key}): {error}"
+                    );
+                }
+                Ok(())
+            })
+        {
             error!(
                 "failed to access global scope for timer completion: {}",
                 self.error_to_string(error)
             );
         }
-        if let Err(error) = with_global_scope(&mut self.realm_execution_context, |global_scope| {
-            global_scope.set_current_timer_nesting_level(previous_nesting_level);
-            Ok(())
-        }) {
+        if let Err(error) =
+            with_global_scope(&mut self.realm_execution_context, |global_scope, _ec| {
+                global_scope.set_current_timer_nesting_level(previous_nesting_level);
+                Ok(())
+            })
+        {
             error!(
                 "failed to access global scope for timer nesting level: {}",
                 self.error_to_string(error)

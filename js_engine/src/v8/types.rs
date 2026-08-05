@@ -1,4 +1,3 @@
-use std::borrow::Borrow;
 use std::cell::Cell;
 use std::ffi::c_void;
 use std::fmt;
@@ -19,20 +18,21 @@ pub(crate) enum CachedPrimitive {
     Number(f64),
     String(Arc<[u16]>),
     BigInt(Arc<str>),
+    Symbol,
     Other,
 }
 
 #[derive(Clone, Debug)]
 pub(crate) struct ObjectProfile {
-    pub object_handle: v8::Global<v8::Object>,
-    pub array_buffer_handle: Option<v8::Global<v8::ArrayBuffer>>,
-    pub shared_array_buffer_handle: Option<v8::Global<v8::SharedArrayBuffer>>,
-    pub typed_array_handle: Option<v8::Global<v8::TypedArray>>,
-    pub data_view_handle: Option<v8::Global<v8::DataView>>,
-    pub promise_handle: Option<v8::Global<v8::Promise>>,
-    pub function_handle: Option<v8::Global<v8::Function>>,
-    pub map_handle: Option<v8::Global<v8::Map>>,
-    pub set_handle: Option<v8::Global<v8::Set>>,
+    pub object_handle: V8Handle<v8::Object>,
+    pub array_buffer_handle: Option<V8Handle<v8::ArrayBuffer>>,
+    pub shared_array_buffer_handle: Option<V8Handle<v8::SharedArrayBuffer>>,
+    pub typed_array_handle: Option<V8Handle<v8::TypedArray>>,
+    pub data_view_handle: Option<V8Handle<v8::DataView>>,
+    pub promise_handle: Option<V8Handle<v8::Promise>>,
+    pub function_handle: Option<V8Handle<v8::Function>>,
+    pub map_handle: Option<V8Handle<v8::Map>>,
+    pub set_handle: Option<V8Handle<v8::Set>>,
     pub is_weak_map: bool,
     pub is_weak_set: bool,
     pub is_generator: bool,
@@ -43,6 +43,7 @@ pub(crate) struct ObjectProfile {
     pub is_date: bool,
     pub is_regexp: bool,
     pub is_error: bool,
+    pub is_constructor: bool,
     pub wrapper_primitive: Option<CachedPrimitive>,
     pub array_buffer_state: Option<V8ArrayBufferState>,
     pub typed_array_element_type: Option<TypedArrayElementType>,
@@ -66,10 +67,87 @@ impl std::fmt::Debug for V8ArrayBufferState {
     }
 }
 
+/// A JS-object handle with two representations.
+///
+/// - [`V8Handle::Root`] — a strong `v8::Global` root. Values created from
+///   V8 locals and held on the Rust stack use this: a bare cppgc edge would
+///   not keep the referent alive while Rust holds it.
+/// - [`V8Handle::Edge`] — a `TracedReference` edge. Values stored inside
+///   traced storage (cells, platform objects) use this: the referent stays
+///   alive only while an owning cppgc object traces the edge, so cycles
+///   spanning the JS heap and the cppgc heap are collectable.
+///
+/// Conversion happens at storage boundaries ([`V8Handle::store_edge`]);
+/// clones share a single edge through the `Rc`.
+pub(crate) enum V8Handle<T> {
+    Root(v8::Global<T>),
+    Edge(std::rc::Rc<v8::TracedReference<T>>),
+}
+
+impl<T> Clone for V8Handle<T> {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Root(global) => Self::Root(global.clone()),
+            Self::Edge(edge) => Self::Edge(std::rc::Rc::clone(edge)),
+        }
+    }
+}
+
+impl<T> V8Handle<T> {
+    /// Materialize a `Local` for this handle in the given scope. `None` when
+    /// the referent has been reclaimed (a stale edge) or the handle is
+    /// empty.
+    pub(crate) fn to_local<'s>(
+        &self,
+        scope: &mut v8::PinScope<'s, '_, ()>,
+    ) -> Option<v8::Local<'s, T>> {
+        match self {
+            Self::Root(global) => Some(v8::Local::new(scope, global)),
+            Self::Edge(edge) => edge.get(scope),
+        }
+    }
+
+    /// Convert a rooted handle into a cppgc edge. Idempotent for edges.
+    pub(crate) fn store_edge(&mut self, scope: &mut v8::PinScope<'_, '_, ()>) {
+        if let Self::Root(global) = self {
+            let local = v8::Local::new(scope, &*global);
+            *self = Self::Edge(std::rc::Rc::new(v8::TracedReference::new(scope, local)));
+        }
+    }
+
+    /// Scope-free identity comparison. Root handles compare by object
+    /// identity (V8 keeps the handle cell updated); edges compare by shared
+    /// storage cell, which is exact for clones of one edge but under-approximates
+    /// two independently-created edges to the same object (use the engine's
+    /// `same_value` for those).
+    pub(crate) fn same_identity(&self, other: &Self) -> bool
+    where
+        T: PartialEq,
+    {
+        match (self, other) {
+            (Self::Root(left), Self::Root(right)) => left == right,
+            (Self::Edge(left), Self::Edge(right)) => std::rc::Rc::ptr_eq(left, right),
+            _ => false,
+        }
+    }
+}
+
+impl<T: std::fmt::Debug> std::fmt::Debug for V8Handle<T> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Root(handle) => formatter
+                .debug_tuple("V8Handle::Root")
+                .field(handle)
+                .finish(),
+            Self::Edge(_) => formatter.write_str("V8Handle::Edge"),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct V8Value {
     pub(crate) isolate_id: u64,
-    pub(crate) handle: v8::Global<v8::Value>,
+    pub(crate) handle: V8Handle<v8::Value>,
     pub(crate) primitive: CachedPrimitive,
     pub(crate) object_profile: Option<Box<ObjectProfile>>,
     pub(crate) host_data: Option<NonNull<c_void>>,
@@ -100,6 +178,7 @@ impl V8Value {
             CachedPrimitive::Number(number) => number.to_string(),
             CachedPrimitive::String(utf16) => String::from_utf16_lossy(utf16),
             CachedPrimitive::BigInt(canonical) => canonical.to_string(),
+            CachedPrimitive::Symbol => String::from("[symbol]"),
             CachedPrimitive::Other if self.object_profile.is_some() => String::from("[object]"),
             CachedPrimitive::Other => String::from("[value]"),
         }
@@ -113,7 +192,7 @@ impl fmt::Display for V8Value {
 }
 
 #[derive(Clone, Debug)]
-pub struct V8Object(pub(crate) V8Value, pub(crate) v8::Global<v8::Object>);
+pub struct V8Object(pub(crate) V8Value, pub(crate) V8Handle<v8::Object>);
 
 impl V8Object {
     pub(crate) fn from_value(value: V8Value) -> Option<Self> {
@@ -130,14 +209,16 @@ impl From<V8Object> for V8Value {
 
 impl PartialEq for V8Object {
     fn eq(&self, other: &Self) -> bool {
-        self.0.isolate_id == other.0.isolate_id && self.0.handle == other.0.handle
+        self.0.isolate_id == other.0.isolate_id
+            && self.0.handle.same_identity(&other.0.handle)
+            && self.1.same_identity(&other.1)
     }
 }
 
 macro_rules! typed_v8_object {
     ($name:ident, $handle:ty) => {
         #[derive(Clone, Debug)]
-        pub struct $name(pub(crate) V8Object, pub(crate) v8::Global<$handle>);
+        pub struct $name(pub(crate) V8Object, pub(crate) V8Handle<$handle>);
 
         impl From<$name> for V8Object {
             fn from(value: $name) -> Self {
@@ -225,7 +306,7 @@ pub struct V8Symbol(pub(crate) V8Value);
 
 impl PartialEq for V8Symbol {
     fn eq(&self, other: &Self) -> bool {
-        self.0.isolate_id == other.0.isolate_id && self.0.handle == other.0.handle
+        self.0.isolate_id == other.0.isolate_id && self.0.handle.same_identity(&other.0.handle)
     }
 }
 
@@ -362,9 +443,7 @@ impl JsTypes for V8Types {
     }
 
     fn value_as_symbol(value: &Self::JsValue) -> Option<Self::JsSymbol> {
-        <v8::Global<v8::Value> as Borrow<v8::Value>>::borrow(&value.handle)
-            .is_symbol()
-            .then(|| V8Symbol(value.clone()))
+        matches!(value.primitive, CachedPrimitive::Symbol).then(|| V8Symbol(value.clone()))
     }
 
     fn value_as_number(value: &Self::JsValue) -> Option<f64> {
@@ -440,6 +519,12 @@ impl JsTypes for V8Types {
 
     fn object_as_constructor(object: &Self::JsObject) -> Option<Self::Constructor> {
         let profile = object.0.object_profile.as_ref()?;
+        // Arrow, async, generator, and bound functions are callable but have
+        // no [[Construct]]; the profile records this at wrap time (see
+        // `wrap_local_value`), so only true constructors convert.
+        if !profile.is_constructor {
+            return None;
+        }
         Some(V8Constructor(
             object.clone(),
             profile.function_handle.clone()?,

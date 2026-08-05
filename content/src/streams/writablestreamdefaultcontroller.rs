@@ -180,25 +180,25 @@ pub struct WritableStreamDefaultController {
 }
 
 impl WritableStreamDefaultController {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(ec: &mut dyn ExecutionContext<Types>) -> Self {
         Self {
-            stream: gc_cell_new(None),
-            abort_signal: gc_cell_new(None),
-            queue: gc_cell_new(Vec::new()),
+            stream: gc_cell_new(None, ec),
+            abort_signal: gc_cell_new(None, ec),
+            queue: gc_cell_new(Vec::new(), ec),
             queue_total_size: Rc::new(Cell::new(0.0)),
             started: Rc::new(Cell::new(false)),
-            strategy_size_algorithm: gc_cell_new(None),
+            strategy_size_algorithm: gc_cell_new(None, ec),
             strategy_high_water_mark: Rc::new(Cell::new(1.0)),
-            write_algorithm: gc_cell_new(None),
-            close_algorithm: gc_cell_new(None),
-            abort_algorithm: gc_cell_new(None),
+            write_algorithm: gc_cell_new(None, ec),
+            close_algorithm: gc_cell_new(None, ec),
+            abort_algorithm: gc_cell_new(None, ec),
         }
     }
     fn stream_slot(
         &self,
         ec: &mut dyn ExecutionContext<Types>,
     ) -> Completion<WritableStream, Types> {
-        self.stream.borrow().clone().ok_or_else(|| {
+        self.stream.borrow(ec).clone().ok_or_else(|| {
             ec.new_type_error("WritableStreamDefaultController is not attached to a stream")
         })
     }
@@ -208,7 +208,7 @@ impl WritableStreamDefaultController {
         ec: &mut dyn ExecutionContext<Types>,
     ) -> Completion<JsObject, Types> {
         self.stream_slot(ec)?
-            .controller_object_slot()
+            .controller_object_slot(ec)
             .ok_or_else(|| {
                 ec.new_type_error(
                     "WritableStreamDefaultController is missing its JavaScript object",
@@ -216,19 +216,27 @@ impl WritableStreamDefaultController {
             })
     }
 
-    pub(crate) fn set_stream_slot(&self, stream: Option<WritableStream>) {
-        *self.stream.borrow_mut() = stream;
+    pub(crate) fn set_stream_slot(
+        &self,
+        stream: Option<WritableStream>,
+        ec: &mut dyn ExecutionContext<Types>,
+    ) {
+        *self.stream.borrow_mut(ec) = stream;
     }
 
-    pub(crate) fn set_abort_signal_slot(&self, signal: AbortSignal) {
-        *self.abort_signal.borrow_mut() = Some(signal);
+    pub(crate) fn set_abort_signal_slot(
+        &self,
+        signal: AbortSignal,
+        ec: &mut dyn ExecutionContext<Types>,
+    ) {
+        *self.abort_signal.borrow_mut(ec) = Some(signal);
     }
 
     pub(crate) fn signal(
         &self,
         ec: &mut dyn ExecutionContext<Types>,
     ) -> Completion<AbortSignal, Types> {
-        self.abort_signal.borrow().clone().ok_or_else(|| {
+        self.abort_signal.borrow(ec).clone().ok_or_else(|| {
             ec.new_type_error("WritableStreamDefaultController is missing its abort signal")
         })
     }
@@ -247,7 +255,7 @@ impl WritableStreamDefaultController {
         ec: &mut dyn ExecutionContext<Types>,
     ) -> Completion<JsObject, Types> {
         self.signal(ec)?
-            .object()
+            .object(ec)
             .ok_or_else(|| ec.new_type_error("AbortSignal is missing its JavaScript object"))
     }
 
@@ -272,13 +280,13 @@ impl WritableStreamDefaultController {
     ) -> Completion<JsObject, Types> {
         let algorithm = self.abort_algorithm(ec)?;
         let result = algorithm.call(reason, ec)?;
-        self.clear_algorithms();
+        self.clear_algorithms(ec);
         Ok(result)
     }
 
     /// <https://streams.spec.whatwg.org/#ws-default-controller-private-error>
-    pub(crate) fn error_steps(&self) {
-        self.reset_queue();
+    pub(crate) fn error_steps(&self, ec: &mut dyn ExecutionContext<crate::js::Types>) {
+        self.reset_queue(ec);
     }
 
     pub(crate) fn signal_abort(
@@ -294,7 +302,7 @@ impl WritableStreamDefaultController {
         &self,
         ec: &mut dyn ExecutionContext<Types>,
     ) -> Completion<WriteAlgorithm, Types> {
-        self.write_algorithm.borrow().clone().ok_or_else(|| {
+        self.write_algorithm.borrow(ec).clone().ok_or_else(|| {
             ec.new_type_error("WritableStreamDefaultController is missing its write algorithm")
         })
     }
@@ -303,7 +311,7 @@ impl WritableStreamDefaultController {
         &self,
         ec: &mut dyn ExecutionContext<Types>,
     ) -> Completion<CloseAlgorithm, Types> {
-        self.close_algorithm.borrow().clone().ok_or_else(|| {
+        self.close_algorithm.borrow(ec).clone().ok_or_else(|| {
             ec.new_type_error("WritableStreamDefaultController is missing its close algorithm")
         })
     }
@@ -312,7 +320,7 @@ impl WritableStreamDefaultController {
         &self,
         ec: &mut dyn ExecutionContext<Types>,
     ) -> Completion<AbortAlgorithm, Types> {
-        self.abort_algorithm.borrow().clone().ok_or_else(|| {
+        self.abort_algorithm.borrow(ec).clone().ok_or_else(|| {
             ec.new_type_error("WritableStreamDefaultController is missing its abort algorithm")
         })
     }
@@ -330,7 +338,7 @@ impl WritableStreamDefaultController {
         chunk: &JsValue,
         ec: &mut dyn ExecutionContext<Types>,
     ) -> Completion<f64, Types> {
-        let Some(strategy_size_algorithm) = self.strategy_size_algorithm.borrow().clone() else {
+        let Some(strategy_size_algorithm) = self.strategy_size_algorithm.borrow(ec).clone() else {
             debug_assert_ne!(self.stream_slot(ec)?.state(), WritableStreamState::Writable,);
             return Ok(1.0);
         };
@@ -344,11 +352,11 @@ impl WritableStreamDefaultController {
         }
     }
 
-    fn clear_algorithms(&self) {
-        *self.write_algorithm.borrow_mut() = None;
-        *self.close_algorithm.borrow_mut() = None;
-        *self.abort_algorithm.borrow_mut() = None;
-        *self.strategy_size_algorithm.borrow_mut() = None;
+    fn clear_algorithms(&self, ec: &mut dyn ExecutionContext<Types>) {
+        *self.write_algorithm.borrow_mut(ec) = None;
+        *self.close_algorithm.borrow_mut(ec) = None;
+        *self.abort_algorithm.borrow_mut(ec) = None;
+        *self.strategy_size_algorithm.borrow_mut(ec) = None;
     }
 
     fn error_controller(
@@ -359,7 +367,7 @@ impl WritableStreamDefaultController {
         let stream = self.stream_slot(ec)?;
         debug_assert_eq!(stream.state(), WritableStreamState::Writable);
 
-        self.clear_algorithms();
+        self.clear_algorithms(ec);
         stream.start_erroring(error, ec)
     }
 
@@ -393,7 +401,8 @@ impl WritableStreamDefaultController {
             return Ok(());
         }
 
-        if !stream.close_queued_or_in_flight() && stream.state() == WritableStreamState::Writable {
+        if !stream.close_queued_or_in_flight(ec) && stream.state() == WritableStreamState::Writable
+        {
             let backpressure = self.get_backpressure(ec)?;
             stream.update_backpressure(backpressure, ec)?;
         }
@@ -410,7 +419,7 @@ impl WritableStreamDefaultController {
             return Ok(());
         }
 
-        if stream.in_flight_write_request_slot().is_some() {
+        if stream.in_flight_write_request_slot(ec).is_some() {
             return Ok(());
         }
 
@@ -425,7 +434,7 @@ impl WritableStreamDefaultController {
             return Ok(());
         }
 
-        if self.queue.borrow().is_empty() {
+        if self.queue.borrow(ec).is_empty() {
             return Ok(());
         }
 
@@ -445,7 +454,7 @@ impl WritableStreamDefaultController {
         let _ = self.dequeue_value(ec)?;
 
         // Step 3: "Assert: controller.[[queue]] is empty."
-        debug_assert!(self.queue.borrow().is_empty());
+        debug_assert!(self.queue.borrow(ec).is_empty());
 
         // Step 4: "Let sinkClosePromise be the result of performing controller.[[closeAlgorithm]]."
         let algorithm = self.close_algorithm(ec)?;
@@ -460,7 +469,7 @@ impl WritableStreamDefaultController {
         };
 
         // Step 5: "Perform ! WritableStreamDefaultControllerClearAlgorithms(controller)."
-        self.clear_algorithms();
+        self.clear_algorithms(ec);
         let name_key = ec.property_key_from_str("");
         let on_fulfilled = create_builtin_fn_with_traced_captures(
             ec,
@@ -541,7 +550,7 @@ impl WritableStreamDefaultController {
             return Err(ec.new_range_error("queue size must be a non-negative number"));
         }
 
-        self.queue.borrow_mut().push(QueueEntry {
+        self.queue.borrow_mut(ec).push(QueueEntry {
             value,
             size: chunk_size,
         });
@@ -550,8 +559,8 @@ impl WritableStreamDefaultController {
         Ok(())
     }
 
-    fn reset_queue(&self) {
-        self.queue.borrow_mut().clear();
+    fn reset_queue(&self, ec: &mut dyn ExecutionContext<Types>) {
+        self.queue.borrow_mut(ec).clear();
         self.queue_total_size.set(0.0);
     }
 
@@ -560,7 +569,7 @@ impl WritableStreamDefaultController {
         ec: &mut dyn ExecutionContext<Types>,
     ) -> Completion<QueueEntryValue, Types> {
         self.queue
-            .borrow()
+            .borrow(ec)
             .first()
             .map(|entry| entry.value.clone())
             .ok_or_else(|| ec.new_type_error("WritableStreamDefaultController queue is empty"))
@@ -568,9 +577,9 @@ impl WritableStreamDefaultController {
 
     fn dequeue_value(
         &self,
-        _ec: &mut dyn ExecutionContext<Types>,
+        ec: &mut dyn ExecutionContext<Types>,
     ) -> Completion<QueueEntryValue, Types> {
-        let mut queue = self.queue.borrow_mut();
+        let mut queue = self.queue.borrow_mut(ec);
         let entry = queue.remove(0);
         drop(queue);
         let value = entry.value.clone();
@@ -588,7 +597,7 @@ impl WritableStreamDefaultController {
 pub(crate) fn create_writable_stream_default_controller(
     ec: &mut dyn ExecutionContext<Types>,
 ) -> Completion<(WritableStreamDefaultController, JsObject), Types> {
-    let controller = WritableStreamDefaultController::new();
+    let controller = WritableStreamDefaultController::new(ec);
     let controller_object = create_interface_instance::<Types, WritableStreamDefaultController>(
         controller.clone(),
         ec,
@@ -600,16 +609,18 @@ pub(crate) fn create_writable_stream_default_controller(
 pub(crate) fn with_writable_stream_default_controller_ref<R>(
     object: &JsObject,
     ec: &mut dyn ExecutionContext<Types>,
-    f: impl FnOnce(&WritableStreamDefaultController) -> R,
+    f: impl FnOnce(&WritableStreamDefaultController, &mut dyn ExecutionContext<Types>) -> R,
 ) -> Completion<R, Types> {
-    let ctrl_ref = ec
+    // Clone the handle out of the object registry so `f` can borrow `ec`
+    // mutably; the clone shares all GC-managed state with the registered
+    // platform object.
+    let controller = ec
         .with_object_any(object)
-        .and_then(|a| a.downcast_ref::<WritableStreamDefaultController>());
-    let controller = match ctrl_ref {
-        Some(c) => c,
-        None => return Err(ec.new_type_error("object is not a WritableStreamDefaultController")),
+        .and_then(|a| a.downcast_ref::<WritableStreamDefaultController>().cloned());
+    let Some(controller) = controller else {
+        return Err(ec.new_type_error("object is not a WritableStreamDefaultController"));
     };
-    Ok(f(controller))
+    Ok(f(&controller, ec))
 }
 
 /// <https://streams.spec.whatwg.org/#set-up-writable-stream-default-controller>
@@ -628,38 +639,41 @@ pub(crate) fn set_up_writable_stream_default_controller(
     // Step 1: "Assert: stream implements WritableStream."
     // Step 2: "Assert: stream.[[controller]] is undefined."
     // Step 3: "Set controller.[[stream]] to stream."
-    controller.set_stream_slot(Some(stream.clone()));
+    controller.set_stream_slot(Some(stream.clone()), ec);
 
     // Step 4: "Set stream.[[controller]] to controller."
-    stream.set_controller_slot(Some(WritableStreamController::Default(controller.clone())));
-    stream.set_controller_object_slot(Some(controller_object.clone()));
+    stream.set_controller_slot(
+        Some(WritableStreamController::Default(controller.clone())),
+        ec,
+    );
+    stream.set_controller_object_slot(Some(controller_object.clone()), ec);
 
     // Step 5: "Perform ! ResetQueue(controller)."
-    reset_controller_queue(&controller);
+    reset_controller_queue(&controller, ec);
 
     // Step 6: "Set controller.[[abortController]] to a new AbortController."
     // The content process stores the exposed [AbortSignal](https://dom.spec.whatwg.org/#interface-AbortSignal) [platform object](https://webidl.spec.whatwg.org/#dfn-platform-object) directly because the controller getter
     // only needs the signal object.
     let signal = create_abort_signal(AbortSignal::new(ec), ec)?;
-    controller.set_abort_signal_slot(signal);
+    controller.set_abort_signal_slot(signal, ec);
 
     // Step 7: "Set controller.[[started]] to false."
     controller.set_started(false);
 
     // Step 8: "Set controller.[[strategySizeAlgorithm]] to sizeAlgorithm."
-    *controller.strategy_size_algorithm.borrow_mut() = Some(size_algorithm);
+    *controller.strategy_size_algorithm.borrow_mut(ec) = Some(size_algorithm);
 
     // Step 9: "Set controller.[[strategyHWM]] to highWaterMark."
     controller.strategy_high_water_mark.set(high_water_mark);
 
     // Step 10: "Set controller.[[writeAlgorithm]] to writeAlgorithm."
-    *controller.write_algorithm.borrow_mut() = Some(write_algorithm);
+    *controller.write_algorithm.borrow_mut(ec) = Some(write_algorithm);
 
     // Step 11: "Set controller.[[closeAlgorithm]] to closeAlgorithm."
-    *controller.close_algorithm.borrow_mut() = Some(close_algorithm);
+    *controller.close_algorithm.borrow_mut(ec) = Some(close_algorithm);
 
     // Step 12: "Set controller.[[abortAlgorithm]] to abortAlgorithm."
-    *controller.abort_algorithm.borrow_mut() = Some(abort_algorithm);
+    *controller.abort_algorithm.borrow_mut(ec) = Some(abort_algorithm);
 
     // Step 13: "Let backpressure be ! WritableStreamDefaultControllerGetBackpressure(controller)."
     let backpressure = controller.get_backpressure(ec)?;
@@ -746,6 +760,7 @@ pub(crate) fn set_up_writable_stream_default_controller_from_underlying_sink(
             start_algorithm = StartAlgorithm::JavaScript(SourceMethod::new(
                 underlying_sink.clone(),
                 crate::webidl::Callback::from_object(start, ec),
+                ec,
             ));
         }
 
@@ -754,6 +769,7 @@ pub(crate) fn set_up_writable_stream_default_controller_from_underlying_sink(
             write_algorithm = WriteAlgorithm::JavaScript(SourceMethod::new(
                 underlying_sink.clone(),
                 crate::webidl::Callback::from_object(write, ec),
+                ec,
             ));
         }
 
@@ -762,6 +778,7 @@ pub(crate) fn set_up_writable_stream_default_controller_from_underlying_sink(
             close_algorithm = CloseAlgorithm::JavaScript(SourceMethod::new(
                 underlying_sink.clone(),
                 crate::webidl::Callback::from_object(close, ec),
+                ec,
             ));
         }
 
@@ -770,6 +787,7 @@ pub(crate) fn set_up_writable_stream_default_controller_from_underlying_sink(
             abort_algorithm = AbortAlgorithm::JavaScript(SourceMethod::new(
                 underlying_sink,
                 crate::webidl::Callback::from_object(abort, ec),
+                ec,
             ));
         }
     }
@@ -859,8 +877,11 @@ fn get_callable_method(
     Ok(Some(method.clone()))
 }
 
-fn reset_controller_queue(controller: &WritableStreamDefaultController) {
-    controller.reset_queue();
+fn reset_controller_queue(
+    controller: &WritableStreamDefaultController,
+    ec: &mut dyn ExecutionContext<crate::js::Types>,
+) {
+    controller.reset_queue(ec);
 }
 
 fn process_close_on_fulfilled(
@@ -899,7 +920,7 @@ fn process_write_on_fulfilled(
     stream.finish_in_flight_write(ec)?;
     let state = stream.state();
     debug_assert!(state == WritableStreamState::Writable || state == WritableStreamState::Erroring);
-    if !stream.close_queued_or_in_flight() && state == WritableStreamState::Writable {
+    if !stream.close_queued_or_in_flight(ec) && state == WritableStreamState::Writable {
         let backpressure = controller.get_backpressure(ec)?;
         stream.update_backpressure(backpressure, ec)?;
     }
@@ -915,7 +936,7 @@ fn process_write_on_rejected(
 ) -> Completion<JsValue, Types> {
     let (controller, stream) = captures;
     if stream.state() == WritableStreamState::Writable {
-        controller.clear_algorithms();
+        controller.clear_algorithms(ec);
     }
     stream.finish_in_flight_write_with_error(
         args.first().cloned().unwrap_or(ec.value_undefined()),

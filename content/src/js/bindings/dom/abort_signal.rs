@@ -139,9 +139,9 @@ pub(crate) fn abort_static(
     ec: &mut dyn ExecutionContext<Types>,
 ) -> Completion<JsValue, Types> {
     let reason = abort_reason_from_argument(args.get(0), ec)?;
-    let signal = create_abort_signal(AbortSignal::aborted_with_reason(reason), ec)?;
+    let signal = create_abort_signal(AbortSignal::aborted_with_reason(reason, ec), ec)?;
     Ok(<Types as JsTypes>::value_from_object(
-        signal.object().ok_or_else(|| ec.value_undefined())?,
+        signal.object(ec).ok_or_else(|| ec.value_undefined())?,
     ))
 }
 
@@ -186,7 +186,7 @@ pub(crate) fn timeout_static(
     set_result?;
 
     Ok(<Types as JsTypes>::value_from_object(
-        signal.object().ok_or_else(|| ec.value_undefined())?,
+        signal.object(ec).ok_or_else(|| ec.value_undefined())?,
     ))
 }
 
@@ -211,9 +211,9 @@ pub(crate) fn any_static(
     let value_undefined = ec.value_undefined();
     let signals = sequence_abort_signals(args.get(0).unwrap_or(&value_undefined), ec)?;
     let result_signal = create_abort_signal(AbortSignal::new(ec), ec)?;
-    initialize_dependent_abort_signal(&result_signal, &signals);
+    initialize_dependent_abort_signal(&result_signal, &signals, ec);
     Ok(<Types as JsTypes>::value_from_object(
-        result_signal.object().ok_or(value_undefined)?,
+        result_signal.object(ec).ok_or(value_undefined)?,
     ))
 }
 
@@ -224,12 +224,16 @@ fn get_aborted(
 ) -> Completion<JsValue, Types> {
     let obj = <Types as JsTypes>::value_as_object(this)
         .ok_or_else(|| ec.new_type_error("AbortSignal receiver is not an object"))?;
-    if let Some(data) = ec.with_object_any(&obj) {
-        if let Some(signal) = data.downcast_ref::<AbortSignal>() {
-            return Ok(ec.value_from_bool(signal.aborted_value()));
-        }
-    }
-    Err(ec.new_type_error("object is not an AbortSignal"))
+    // Clone the handle out of the object registry so its methods can borrow
+    // `ec` mutably; the clone shares all GC-managed state.
+    let signal = ec
+        .with_object_any(&obj)
+        .and_then(|data| data.downcast_ref::<AbortSignal>().cloned());
+    let Some(signal) = signal else {
+        return Err(ec.new_type_error("object is not an AbortSignal"));
+    };
+    let aborted = signal.aborted_value(ec);
+    Ok(ec.value_from_bool(aborted))
 }
 
 fn get_reason(
@@ -239,12 +243,15 @@ fn get_reason(
 ) -> Completion<JsValue, Types> {
     let obj = <Types as JsTypes>::value_as_object(this)
         .ok_or_else(|| ec.new_type_error("AbortSignal receiver is not an object"))?;
-    if let Some(data) = ec.with_object_any(&obj) {
-        if let Some(signal) = data.downcast_ref::<AbortSignal>() {
-            return Ok(signal.reason_value());
-        }
-    }
-    Err(ec.new_type_error("object is not an AbortSignal"))
+    // Clone the handle out of the object registry so its methods can borrow
+    // `ec` mutably; the clone shares all GC-managed state.
+    let signal = ec
+        .with_object_any(&obj)
+        .and_then(|data| data.downcast_ref::<AbortSignal>().cloned());
+    let Some(signal) = signal else {
+        return Err(ec.new_type_error("object is not an AbortSignal"));
+    };
+    Ok(signal.reason_value(ec))
 }
 
 fn throw_if_aborted(
@@ -254,15 +261,18 @@ fn throw_if_aborted(
 ) -> Completion<JsValue, Types> {
     let obj = <Types as JsTypes>::value_as_object(this)
         .ok_or_else(|| ec.new_type_error("AbortSignal receiver is not an object"))?;
-    if let Some(data) = ec.with_object_any(&obj) {
-        if let Some(signal) = data.downcast_ref::<AbortSignal>() {
-            if !signal.aborted_value() {
-                return Ok(ec.value_undefined());
-            }
-            return Err(signal.reason_value());
-        }
+    // Clone the handle out of the object registry so its methods can borrow
+    // `ec` mutably; the clone shares all GC-managed state.
+    let signal = ec
+        .with_object_any(&obj)
+        .and_then(|data| data.downcast_ref::<AbortSignal>().cloned());
+    let Some(signal) = signal else {
+        return Err(ec.new_type_error("object is not an AbortSignal"));
+    };
+    if !signal.aborted_value(ec) {
+        return Ok(ec.value_undefined());
     }
-    Err(ec.new_type_error("object is not an AbortSignal"))
+    Err(signal.reason_value(ec))
 }
 
 fn get_onabort(
@@ -272,15 +282,18 @@ fn get_onabort(
 ) -> Completion<JsValue, Types> {
     let obj = <Types as JsTypes>::value_as_object(this)
         .ok_or_else(|| ec.new_type_error("AbortSignal receiver is not an object"))?;
-    if let Some(data) = ec.with_object_any(&obj) {
-        if let Some(signal) = data.downcast_ref::<AbortSignal>() {
-            let callback = signal.onabort_value();
-            return Ok(callback
-                .map(|c| c.to_js_value())
-                .unwrap_or_else(|| ec.value_null()));
-        }
-    }
-    Err(ec.new_type_error("object is not an AbortSignal"))
+    // Clone the handle out of the object registry so its methods can borrow
+    // `ec` mutably; the clone shares all GC-managed state.
+    let signal = ec
+        .with_object_any(&obj)
+        .and_then(|data| data.downcast_ref::<AbortSignal>().cloned());
+    let Some(signal) = signal else {
+        return Err(ec.new_type_error("object is not an AbortSignal"));
+    };
+    let callback = signal.onabort_value(ec);
+    Ok(callback
+        .map(|c| c.to_js_value())
+        .unwrap_or_else(|| ec.value_null()))
 }
 
 fn set_onabort(
@@ -296,17 +309,18 @@ fn set_onabort(
         callback_function_value,
     )?;
 
-    let previous =
-        try_with_abort_signal_mut(this, ec, |signal| signal.replace_onabort(callback.clone()))?;
+    let previous = try_with_abort_signal_mut(this, ec, |signal, ec| {
+        signal.replace_onabort(callback.clone(), ec)
+    })?;
 
     if let Some(previous) = previous {
-        try_with_event_target_mut(this, ec, |target| {
-            target.remove_event_listener_entry("abort", &previous, false);
+        try_with_event_target_mut(this, ec, |target, ec| {
+            target.remove_event_listener_entry("abort", &previous, false, ec);
         })?;
     }
 
     if let Some(callback) = callback {
-        try_with_event_target_mut(this, ec, |target| {
+        try_with_event_target_mut(this, ec, |target, ec| {
             target.add_event_listener(
                 target.clone(),
                 String::from("abort"),
@@ -315,6 +329,7 @@ fn set_onabort(
                 false,
                 Some(false),
                 None,
+                ec,
             );
         })?;
     }
@@ -339,7 +354,7 @@ fn sequence_abort_signals(
         let signal_value = ExecutionContext::get(ec, object.clone(), index_key)?;
         let signal_object = <Types as JsTypes>::value_as_object(&signal_value)
             .ok_or_else(|| ec.new_type_error("AbortSignal.any() requires AbortSignal objects"))?;
-        let signal = try_with_abort_signal_ref(&signal_object, ec, |signal| signal.clone())?;
+        let signal = try_with_abort_signal_ref(&signal_object, ec, |signal, _ec| signal.clone())?;
         signals.push(signal);
     }
 

@@ -16,42 +16,54 @@ use js_engine::{Completion, ExecutionContext, JsTypes};
 pub(crate) fn try_with_abort_signal_mut<R>(
     this: &<Types as JsTypes>::JsValue,
     ec: &mut dyn ExecutionContext<Types>,
-    f: impl FnOnce(&mut AbortSignal) -> R,
+    f: impl FnOnce(&mut AbortSignal, &mut dyn ExecutionContext<Types>) -> R,
 ) -> Completion<R, Types> {
     let obj = <Types as JsTypes>::value_as_object(this)
         .ok_or_else(|| ec.new_type_error("abort signal receiver is not an object"))?;
-    if let Some(data) = ec.with_object_any_mut(&obj) {
-        if let Some(signal) = data.downcast_mut::<AbortSignal>() {
-            return Ok(f(signal));
-        }
-    }
-    Err(ec.new_type_error("receiver is not an AbortSignal"))
+    let mut result = Err(ec.new_type_error("receiver is not an AbortSignal"));
+    ec.with_object_any_mut_with(
+        &obj,
+        Box::new(|data, ec| {
+            if let Some(signal) = data.downcast_mut::<AbortSignal>() {
+                result = Ok(f(signal, ec));
+            }
+        }),
+    );
+    result
 }
 
 pub(crate) fn try_with_abort_signal_ref<R>(
     object: &<Types as JsTypes>::JsObject,
     ec: &mut dyn ExecutionContext<Types>,
-    f: impl FnOnce(&AbortSignal) -> R,
+    f: impl FnOnce(&AbortSignal, &mut dyn ExecutionContext<Types>) -> R,
 ) -> Completion<R, Types> {
-    if let Some(data) = ec.with_object_any(object) {
-        if let Some(signal) = data.downcast_ref::<AbortSignal>() {
-            return Ok(f(signal));
-        }
-    }
-    Err(ec.new_type_error("object is not an AbortSignal"))
+    // Clone the handle out of the object registry so `f` can borrow `ec`
+    // mutably; the clone shares all GC-managed state with the registered
+    // platform object.
+    let signal = ec
+        .with_object_any(object)
+        .and_then(|data| data.downcast_ref::<AbortSignal>().cloned());
+    let Some(signal) = signal else {
+        return Err(ec.new_type_error("object is not an AbortSignal"));
+    };
+    Ok(f(&signal, ec))
 }
 
 pub(crate) fn try_with_abort_controller_ref<R>(
     object: &<Types as JsTypes>::JsObject,
     ec: &mut dyn ExecutionContext<Types>,
-    f: impl FnOnce(&AbortController) -> R,
+    f: impl FnOnce(&AbortController, &mut dyn ExecutionContext<Types>) -> R,
 ) -> Completion<R, Types> {
-    if let Some(data) = ec.with_object_any(object) {
-        if let Some(controller) = data.downcast_ref::<AbortController>() {
-            return Ok(f(controller));
-        }
-    }
-    Err(ec.new_type_error("object is not an AbortController"))
+    // Clone the handle out of the object registry so `f` can borrow `ec`
+    // mutably; the clone shares all GC-managed state with the registered
+    // platform object.
+    let controller = ec
+        .with_object_any(object)
+        .and_then(|data| data.downcast_ref::<AbortController>().cloned());
+    let Some(controller) = controller else {
+        return Err(ec.new_type_error("object is not an AbortController"));
+    };
+    Ok(f(&controller, ec))
 }
 
 pub(crate) fn try_set_event_target_reflector(
@@ -59,45 +71,78 @@ pub(crate) fn try_set_event_target_reflector(
     ec: &mut dyn ExecutionContext<Types>,
 ) {
     if let Some(obj) = <Types as JsTypes>::value_as_object(value) {
-        let obj_clone = obj.clone();
-        if let Some(data) = ec.with_object_any_mut(&obj) {
-            // Walk all known platform object types that embed an EventTarget.
-            if let Some(window) = data.downcast_mut::<Window>() {
-                window.event_target.reflector = Some(obj_clone);
-            } else if let Some(document) = data.downcast_mut::<Document>() {
-                document.node.event_target.reflector = Some(obj_clone);
-            } else if let Some(element) = data.downcast_mut::<Element>() {
-                element.node.event_target.reflector = Some(obj_clone);
-            } else if let Some(html_element) = data.downcast_mut::<HTMLElement>() {
-                html_element.element.node.event_target.reflector = Some(obj_clone);
-            } else if let Some(anchor) = data.downcast_mut::<HTMLAnchorElement>() {
-                anchor.html_element.element.node.event_target.reflector = Some(obj_clone);
-            } else if let Some(iframe) = data.downcast_mut::<HTMLIFrameElement>() {
-                iframe.html_element.element.node.event_target.reflector = Some(obj_clone);
-            } else if let Some(media) = data.downcast_mut::<HTMLMediaElement>() {
-                media.html_element.element.node.event_target.reflector = Some(obj_clone);
-            } else if let Some(input) = data.downcast_mut::<HTMLInputElement>() {
-                input.html_element.element.node.event_target.reflector = Some(obj_clone);
-            } else if let Some(video) = data.downcast_mut::<HTMLVideoElement>() {
-                video
-                    .media_element
-                    .html_element
-                    .element
-                    .node
-                    .event_target
-                    .reflector = Some(obj_clone);
-            } else if let Some(node) = data.downcast_mut::<Node>() {
-                node.event_target.reflector = Some(obj_clone);
-            } else if let Some(target) = data.downcast_mut::<EventTarget>() {
-                target.reflector = Some(obj_clone);
-            } else if let Some(signal) = data.downcast_mut::<AbortSignal>() {
-                signal.with_event_target_mut(|et| et.reflector = Some(obj_clone));
-            } else if let Some(event) = data.downcast_mut::<Event>() {
-                event.reflector = Some(obj_clone);
-            } else if let Some(ui_event) = data.downcast_mut::<UIEvent>() {
-                ui_event.event.reflector = Some(obj_clone);
-            }
-        }
+        let reflector = obj.clone();
+        // Walk all known platform object types that embed an EventTarget.
+        // The reflector slot is written through `store_js_object` so the V8
+        // backend converts the stored handle into a cppgc edge (the cycle
+        // between the wrapper and its platform object becomes collectable).
+        ec.with_object_any_mut_with(
+            &obj,
+            Box::new(move |data, ec| {
+                if let Some(window) = data.downcast_mut::<Window>() {
+                    ec.store_js_object(&mut window.event_target.reflector, reflector);
+                } else if let Some(document) = data.downcast_mut::<Document>() {
+                    ec.store_js_object(&mut document.node.event_target.reflector, reflector);
+                } else if let Some(element) = data.downcast_mut::<Element>() {
+                    ec.store_js_object(&mut element.node.event_target.reflector, reflector);
+                } else if let Some(html_element) = data.downcast_mut::<HTMLElement>() {
+                    ec.store_js_object(
+                        &mut html_element.element.node.event_target.reflector,
+                        reflector,
+                    );
+                } else if let Some(anchor) = data.downcast_mut::<HTMLAnchorElement>() {
+                    ec.store_js_object(
+                        &mut anchor.html_element.element.node.event_target.reflector,
+                        reflector,
+                    );
+                } else if let Some(iframe) = data.downcast_mut::<HTMLIFrameElement>() {
+                    ec.store_js_object(
+                        &mut iframe.html_element.element.node.event_target.reflector,
+                        reflector,
+                    );
+                } else if let Some(media) = data.downcast_mut::<HTMLMediaElement>() {
+                    ec.store_js_object(
+                        &mut media.html_element.element.node.event_target.reflector,
+                        reflector,
+                    );
+                } else if let Some(input) = data.downcast_mut::<HTMLInputElement>() {
+                    ec.store_js_object(
+                        &mut input.html_element.element.node.event_target.reflector,
+                        reflector,
+                    );
+                } else if let Some(video) = data.downcast_mut::<HTMLVideoElement>() {
+                    ec.store_js_object(
+                        &mut video
+                            .media_element
+                            .html_element
+                            .element
+                            .node
+                            .event_target
+                            .reflector,
+                        reflector,
+                    );
+                } else if let Some(node) = data.downcast_mut::<Node>() {
+                    ec.store_js_object(&mut node.event_target.reflector, reflector);
+                } else if let Some(target) = data.downcast_mut::<EventTarget>() {
+                    ec.store_js_object(&mut target.reflector, reflector);
+                } else if let Some(signal) = data.downcast_mut::<AbortSignal>() {
+                    // AbortSignal exposes its EventTarget through a shared
+                    // cell, so its setter borrows the cell (the clone shares
+                    // the same cell).
+                    let signal = signal.clone();
+                    signal.with_event_target_mut(
+                        move |event_target, ec| {
+                            ec.store_js_object(&mut event_target.reflector, reflector)
+                        },
+                        ec,
+                    );
+                } else if let Some(event) = data.downcast_mut::<Event>() {
+                    ec.store_js_object(&mut event.reflector, reflector);
+                } else if let Some(ui_event) = data.downcast_mut::<UIEvent>() {
+                    ec.store_js_object(&mut ui_event.event.reflector, reflector);
+                }
+            }),
+        );
     }
 }
 
@@ -127,69 +172,69 @@ pub(crate) fn event_target_from_js_object(
 pub(crate) fn try_with_event_target_mut<R>(
     this: &<Types as JsTypes>::JsValue,
     ec: &mut dyn ExecutionContext<Types>,
-    f: impl FnOnce(&mut EventTarget) -> R,
+    f: impl FnOnce(&mut EventTarget, &mut dyn ExecutionContext<Types>) -> R,
 ) -> Completion<R, Types> {
     let obj = <Types as JsTypes>::value_as_object(this)
         .ok_or_else(|| ec.new_type_error("event target receiver is not an object"))?;
 
-    if let Some(data) = ec.with_object_any_mut(&obj) {
-        if let Some(window) = data.downcast_mut::<Window>() {
-            return Ok(f(&mut window.event_target));
-        }
-        if let Some(document) = data.downcast_mut::<Document>() {
-            return Ok(f(&mut document.node.event_target));
-        }
-        if let Some(element) = data.downcast_mut::<Element>() {
-            return Ok(f(&mut element.node.event_target));
-        }
-        if let Some(html_element) = data.downcast_mut::<HTMLElement>() {
-            return Ok(f(&mut html_element.element.node.event_target));
-        }
-        if let Some(anchor) = data.downcast_mut::<HTMLAnchorElement>() {
-            return Ok(f(&mut anchor.html_element.element.node.event_target));
-        }
-        if let Some(iframe) = data.downcast_mut::<HTMLIFrameElement>() {
-            return Ok(f(&mut iframe.html_element.element.node.event_target));
-        }
-        if let Some(media) = data.downcast_mut::<HTMLMediaElement>() {
-            return Ok(f(&mut media.html_element.element.node.event_target));
-        }
-        if let Some(input) = data.downcast_mut::<HTMLInputElement>() {
-            return Ok(f(&mut input.html_element.element.node.event_target));
-        }
-        if let Some(video) = data.downcast_mut::<HTMLVideoElement>() {
-            return Ok(f(&mut video
-                .media_element
-                .html_element
-                .element
-                .node
-                .event_target));
-        }
-        if let Some(node) = data.downcast_mut::<Node>() {
-            return Ok(f(&mut node.event_target));
-        }
-        if let Some(target) = data.downcast_mut::<EventTarget>() {
-            return Ok(f(target));
-        }
-    }
-    // `data` borrow dropped; use immutable downcast for AbortSignal.
-    if let Some(data) = ec.with_object_any(&obj) {
-        if let Some(signal) = data.downcast_ref::<AbortSignal>() {
-            return Ok(signal.with_event_target_mut(f));
-        }
-    }
-    Err(ec.new_type_error("receiver is not an EventTarget"))
+    // `with_object_any_mut_with` passes both the registry data and the
+    // execution context to the closure, so the platform object can be
+    // mutated in place while `f` uses `ec`. The AbortSignal path (which
+    // exposes its EventTarget through the shared cell) is handled in the
+    // same closure so `f` runs exactly once.
+    let mut result = Err(ec.new_type_error("receiver is not an EventTarget"));
+    ec.with_object_any_mut_with(
+        &obj,
+        Box::new(|data, ec| {
+            // Walk all known platform object types that embed an EventTarget.
+            if let Some(window) = data.downcast_mut::<Window>() {
+                result = Ok(f(&mut window.event_target, ec));
+            } else if let Some(document) = data.downcast_mut::<Document>() {
+                result = Ok(f(&mut document.node.event_target, ec));
+            } else if let Some(element) = data.downcast_mut::<Element>() {
+                result = Ok(f(&mut element.node.event_target, ec));
+            } else if let Some(html_element) = data.downcast_mut::<HTMLElement>() {
+                result = Ok(f(&mut html_element.element.node.event_target, ec));
+            } else if let Some(anchor) = data.downcast_mut::<HTMLAnchorElement>() {
+                result = Ok(f(&mut anchor.html_element.element.node.event_target, ec));
+            } else if let Some(iframe) = data.downcast_mut::<HTMLIFrameElement>() {
+                result = Ok(f(&mut iframe.html_element.element.node.event_target, ec));
+            } else if let Some(media) = data.downcast_mut::<HTMLMediaElement>() {
+                result = Ok(f(&mut media.html_element.element.node.event_target, ec));
+            } else if let Some(input) = data.downcast_mut::<HTMLInputElement>() {
+                result = Ok(f(&mut input.html_element.element.node.event_target, ec));
+            } else if let Some(video) = data.downcast_mut::<HTMLVideoElement>() {
+                result = Ok(f(
+                    &mut video.media_element.html_element.element.node.event_target,
+                    ec,
+                ));
+            } else if let Some(node) = data.downcast_mut::<Node>() {
+                result = Ok(f(&mut node.event_target, ec));
+            } else if let Some(target) = data.downcast_mut::<EventTarget>() {
+                result = Ok(f(target, ec));
+            } else if let Some(signal) = data.downcast_mut::<AbortSignal>() {
+                // The closure receives the execution context that
+                // `with_event_target_mut` passes alongside the borrowed
+                // event target.
+                result =
+                    Ok(signal.with_event_target_mut(|event_target, ec| f(event_target, ec), ec));
+            }
+        }),
+    );
+    result
 }
 
 pub(crate) fn with_abort_signal_ref<R>(
     object: &<Types as JsTypes>::JsObject,
     ec: &mut dyn ExecutionContext<Types>,
-    f: impl FnOnce(&AbortSignal) -> R,
+    f: impl FnOnce(&AbortSignal, &mut dyn ExecutionContext<Types>) -> R,
 ) -> Completion<R, Types> {
-    let type_error = ec.new_type_error("object is not an AbortSignal");
+    // Clone the handle out of the object registry so `f` can borrow `ec`
+    // mutably; the clone shares all GC-managed state with the registered
+    // platform object.
     let signal = ec
         .with_object_any(object)
-        .and_then(|data| data.downcast_ref::<AbortSignal>())
-        .ok_or(type_error)?;
-    Ok(f(signal))
+        .and_then(|data| data.downcast_ref::<AbortSignal>().cloned())
+        .ok_or_else(|| ec.new_type_error("object is not an AbortSignal"))?;
+    Ok(f(&signal, ec))
 }

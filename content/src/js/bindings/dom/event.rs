@@ -4,22 +4,26 @@ type JsValue = <crate::js::Types as JsTypes>::JsValue;
 fn with_event_ref<R>(
     this: &JsValue,
     ec: &mut dyn ExecutionContext<crate::js::Types>,
-    f: impl FnOnce(&Event) -> R,
+    f: impl FnOnce(&Event, &mut dyn ExecutionContext<crate::js::Types>) -> R,
 ) -> Completion<R, crate::js::Types> {
     let obj = crate::js::Types::value_as_object(this)
         .ok_or_else(|| ec.new_type_error("Event receiver is not an object"))?;
-    if let Some(data) = ec.with_object_any(&obj) {
-        if let Some(event) = data.downcast_ref::<Event>() {
-            return Ok(f(event));
-        }
-        // Handle Event subclasses that embed Event as a field.
-        // Note: this mirrors the hierarchy-walking pattern used in
-        // try_with_element_ref for Element/HTMLElement/etc.
-        if let Some(ui_event) = data.downcast_ref::<UIEvent>() {
-            return Ok(f(&ui_event.event));
-        }
-    }
-    Err(ec.new_type_error("receiver is not an Event"))
+    // Clone the handle out of the object registry so `f` can borrow `ec`
+    // mutably while the platform object is accessed. The clone shares all
+    // GC-managed state with the registered platform object.
+    let event = ec.with_object_any(&obj).and_then(|data| {
+        data.downcast_ref::<Event>().cloned().or_else(|| {
+            // Handle Event subclasses that embed Event as a field.
+            // Note: this mirrors the hierarchy-walking pattern used in
+            // try_with_element_ref for Element/HTMLElement/etc.
+            data.downcast_ref::<UIEvent>()
+                .map(|ui_event| ui_event.event.clone())
+        })
+    });
+    let Some(event) = event else {
+        return Err(ec.new_type_error("receiver is not an Event"));
+    };
+    Ok(f(&event, ec))
 }
 
 use crate::webidl::bindings::{AttributeDef, InterfaceDefinition, OperationDef, WebIdlInterface};
@@ -44,6 +48,7 @@ impl WebIdlInterface<crate::js::Types> for Event {
             init_flag(&init, "composed", ec)?,
             false,
             0.0,
+            ec,
         ))
     }
 
@@ -229,7 +234,7 @@ fn get_type(
     _: &[JsValue],
     ec: &mut dyn ExecutionContext<crate::js::Types>,
 ) -> Completion<JsValue, crate::js::Types> {
-    let type_value = with_event_ref(this, ec, |event| event.type_value().to_string())?;
+    let type_value = with_event_ref(this, ec, |event, _ec| event.type_value().to_string())?;
     Ok(ec.value_from_string(ec.js_string_from_str(&type_value)))
 }
 
@@ -238,7 +243,7 @@ fn get_target(
     _: &[JsValue],
     ec: &mut dyn ExecutionContext<crate::js::Types>,
 ) -> Completion<JsValue, crate::js::Types> {
-    let target = with_event_ref(this, ec, |event| event.target_value())?;
+    let target = with_event_ref(this, ec, |event, ec| event.target_value(ec))?;
     Ok(target
         .and_then(|et| et.reflector.clone())
         .map(crate::js::Types::value_from_object)
@@ -250,7 +255,7 @@ fn get_current_target(
     _: &[JsValue],
     ec: &mut dyn ExecutionContext<crate::js::Types>,
 ) -> Completion<JsValue, crate::js::Types> {
-    let target = with_event_ref(this, ec, |event| event.current_target_value())?;
+    let target = with_event_ref(this, ec, |event, ec| event.current_target_value(ec))?;
     Ok(target
         .and_then(|et| et.reflector.clone())
         .map(crate::js::Types::value_from_object)
@@ -262,7 +267,7 @@ fn get_event_phase(
     _: &[JsValue],
     ec: &mut dyn ExecutionContext<crate::js::Types>,
 ) -> Completion<JsValue, crate::js::Types> {
-    let val = with_event_ref(this, ec, |event| event.event_phase_value())?;
+    let val = with_event_ref(this, ec, |event, ec| event.event_phase_value(ec))?;
     Ok(ec.value_from_number(val as f64))
 }
 
@@ -271,7 +276,7 @@ fn get_bubbles(
     _: &[JsValue],
     ec: &mut dyn ExecutionContext<crate::js::Types>,
 ) -> Completion<JsValue, crate::js::Types> {
-    let val = with_event_ref(this, ec, |event| event.bubbles_value())?;
+    let val = with_event_ref(this, ec, |event, ec| event.bubbles_value(ec))?;
     Ok(ec.value_from_bool(val))
 }
 
@@ -280,7 +285,7 @@ fn get_cancelable(
     _: &[JsValue],
     ec: &mut dyn ExecutionContext<crate::js::Types>,
 ) -> Completion<JsValue, crate::js::Types> {
-    let val = with_event_ref(this, ec, |event| event.cancelable_value())?;
+    let val = with_event_ref(this, ec, |event, ec| event.cancelable_value(ec))?;
     Ok(ec.value_from_bool(val))
 }
 
@@ -289,7 +294,7 @@ fn get_default_prevented(
     _: &[JsValue],
     ec: &mut dyn ExecutionContext<crate::js::Types>,
 ) -> Completion<JsValue, crate::js::Types> {
-    let val = with_event_ref(this, ec, |event| event.default_prevented())?;
+    let val = with_event_ref(this, ec, |event, ec| event.default_prevented(ec))?;
     Ok(ec.value_from_bool(val))
 }
 
@@ -298,7 +303,7 @@ fn get_cancel_bubble(
     _: &[JsValue],
     ec: &mut dyn ExecutionContext<crate::js::Types>,
 ) -> Completion<JsValue, crate::js::Types> {
-    let val = with_event_ref(this, ec, |event| event.cancel_bubble())?;
+    let val = with_event_ref(this, ec, |event, ec| event.cancel_bubble(ec))?;
     Ok(ec.value_from_bool(val))
 }
 
@@ -307,20 +312,23 @@ fn get_cancel_bubble(
 fn with_event_mut<R>(
     this: &JsValue,
     ec: &mut dyn ExecutionContext<crate::js::Types>,
-    f: impl FnOnce(&mut Event) -> R,
+    f: impl FnOnce(&mut Event, &mut dyn ExecutionContext<crate::js::Types>) -> R,
 ) -> Completion<R, crate::js::Types> {
     let obj = crate::js::Types::value_as_object(this)
         .ok_or_else(|| ec.new_type_error("Event receiver is not an object"))?;
-    let result = ec.with_object_any_mut(&obj).and_then(|data| {
-        if let Some(event) = data.downcast_mut::<Event>() {
-            return Some(f(event));
-        }
-        if let Some(ui_event) = data.downcast_mut::<UIEvent>() {
-            return Some(f(&mut ui_event.event));
-        }
-        None
+    // Clone the handle out of the object registry so `f` can borrow `ec`
+    // mutably while the platform object is accessed. The clone shares all
+    // GC-managed state with the registered platform object.
+    let event = ec.with_object_any(&obj).and_then(|data| {
+        data.downcast_ref::<Event>().cloned().or_else(|| {
+            data.downcast_ref::<UIEvent>()
+                .map(|ui_event| ui_event.event.clone())
+        })
     });
-    result.ok_or_else(|| ec.new_type_error("receiver is not an Event"))
+    let Some(mut event) = event else {
+        return Err(ec.new_type_error("receiver is not an Event"));
+    };
+    Ok(f(&mut event, ec))
 }
 
 fn set_cancel_bubble(
@@ -330,7 +338,7 @@ fn set_cancel_bubble(
 ) -> Completion<JsValue, crate::js::Types> {
     let undef = ec.value_undefined();
     let value = args.first().map_or(false, |v| ec.to_boolean(v));
-    with_event_mut(this, ec, |event| event.set_cancel_bubble(value))?;
+    with_event_mut(this, ec, |event, ec| event.set_cancel_bubble(value, ec))?;
     Ok(undef)
 }
 
@@ -339,7 +347,7 @@ fn get_is_trusted(
     _: &[JsValue],
     ec: &mut dyn ExecutionContext<crate::js::Types>,
 ) -> Completion<JsValue, crate::js::Types> {
-    let val = with_event_ref(this, ec, |event| event.is_trusted())?;
+    let val = with_event_ref(this, ec, |event, ec| event.is_trusted(ec))?;
     Ok(ec.value_from_bool(val))
 }
 
@@ -348,7 +356,7 @@ fn get_time_stamp(
     _: &[JsValue],
     ec: &mut dyn ExecutionContext<crate::js::Types>,
 ) -> Completion<JsValue, crate::js::Types> {
-    let val = with_event_ref(this, ec, |event| event.time_stamp_value())?;
+    let val = with_event_ref(this, ec, |event, ec| event.time_stamp_value(ec))?;
     Ok(ec.value_from_number(val))
 }
 
@@ -358,7 +366,7 @@ fn stop_propagation(
     ec: &mut dyn ExecutionContext<crate::js::Types>,
 ) -> Completion<JsValue, crate::js::Types> {
     let undef = ec.value_undefined();
-    with_event_mut(this, ec, |event| event.stop_propagation())?;
+    with_event_mut(this, ec, |event, ec| event.stop_propagation(ec))?;
     Ok(undef)
 }
 
@@ -368,7 +376,7 @@ fn stop_immediate_propagation(
     ec: &mut dyn ExecutionContext<crate::js::Types>,
 ) -> Completion<JsValue, crate::js::Types> {
     let undef = ec.value_undefined();
-    with_event_mut(this, ec, |event| event.stop_immediate_propagation())?;
+    with_event_mut(this, ec, |event, ec| event.stop_immediate_propagation(ec))?;
     Ok(undef)
 }
 
@@ -378,6 +386,6 @@ fn prevent_default(
     ec: &mut dyn ExecutionContext<crate::js::Types>,
 ) -> Completion<JsValue, crate::js::Types> {
     let undef = ec.value_undefined();
-    with_event_mut(this, ec, |event| event.prevent_default())?;
+    with_event_mut(this, ec, |event, ec| event.prevent_default(ec))?;
     Ok(undef)
 }

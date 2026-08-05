@@ -194,13 +194,13 @@ fn set_onload(
     };
 
     if let Some(previous) = previous {
-        try_with_event_target_mut(this, ec, |target| {
-            target.remove_event_listener_entry("load", &previous, false);
+        try_with_event_target_mut(this, ec, |target, ec| {
+            target.remove_event_listener_entry("load", &previous, false, ec);
         })?;
     }
 
     if let Some(callback) = callback {
-        try_with_event_target_mut(this, ec, |target| {
+        try_with_event_target_mut(this, ec, |target, ec| {
             target.add_event_listener(
                 target.clone(),
                 String::from("load"),
@@ -209,6 +209,7 @@ fn set_onload(
                 false,
                 Some(false),
                 None,
+                ec,
             );
         })?;
     }
@@ -249,13 +250,13 @@ fn set_onerror(
     };
 
     if let Some(previous) = previous {
-        try_with_event_target_mut(this, ec, |target| {
-            target.remove_event_listener_entry("error", &previous, false);
+        try_with_event_target_mut(this, ec, |target, ec| {
+            target.remove_event_listener_entry("error", &previous, false, ec);
         })?;
     }
 
     if let Some(callback) = callback {
-        try_with_event_target_mut(this, ec, |target| {
+        try_with_event_target_mut(this, ec, |target, ec| {
             target.add_event_listener(
                 target.clone(),
                 String::from("error"),
@@ -264,6 +265,7 @@ fn set_onerror(
                 false,
                 Some(false),
                 None,
+                ec,
             );
         })?;
     }

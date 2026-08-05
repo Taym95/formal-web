@@ -1,6 +1,6 @@
 use std::any::{Any, TypeId};
 use std::cell::{Cell, RefCell, RefMut};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::convert::TryFrom;
 use std::ffi::c_void;
 use std::mem::replace;
@@ -17,13 +17,16 @@ use crate::enums::{
     IntegrityLevel, IteratorKind, PromiseState, SharedMemoryOrder, TypedArrayElementType,
 };
 use crate::gc::{JsTypesGcExt, Trace};
-use crate::records::{IteratorRecord, PromiseCapability, PromiseResolvers, RealmIntrinsics};
+use crate::records::{
+    IteratorRecord, ModuleRequest, PromiseCapability, PromiseResolvers, RealmIntrinsics,
+};
 use crate::{
     Completion, EcmascriptHost, ExecutionContext, HostHooks, JsEngine, JsTypes, JsTypesWithRealm,
     Numeric, PreferredType, PropertyDescriptor,
 };
 
-use super::types::{CachedPrimitive, ObjectProfile, V8ArrayBufferState};
+use super::gc::V8PlatformData;
+use super::types::{CachedPrimitive, ObjectProfile, V8ArrayBufferState, V8Handle};
 use super::{
     V8ArrayBuffer, V8BigInt, V8Constructor, V8DataView, V8Function, V8Generator, V8Map, V8Object,
     V8Promise, V8PropertyKey, V8Realm, V8Set, V8SharedArrayBuffer, V8String, V8Symbol,
@@ -33,6 +36,10 @@ use super::{
 const HOST_OBJECT_TAG: u16 = 1;
 static HOST_OBJECT_MARKER: u8 = 0;
 static NEXT_ISOLATE_ID: AtomicU64 = AtomicU64::new(1);
+
+/// The registry of native-function weak handles is compacted opportunistically
+/// once it reaches this many entries (see `make_builtin_function`).
+const CALLBACK_HANDLE_COMPACTION_THRESHOLD: usize = 64;
 
 type StoredBehaviour = Box<
     dyn Fn(&[V8Value], V8Value, &mut dyn ExecutionContext<V8Types>) -> Completion<V8Value, V8Types>,
@@ -50,28 +57,104 @@ enum QueuedJob {
     WithRealm(Rc<V8RealmState>, RealmJob),
 }
 
+/// The ECMA-262 wrapper-object kinds whose constructor the engine may be
+/// asked to invoke with a primitive argument.
+enum WrapperKind {
+    Boolean,
+    Number,
+    String,
+}
+
 struct CallbackRecord {
     isolate_id: u64,
     creation_realm: RcWeak<V8RealmState>,
     behaviour: StoredBehaviour,
 }
 
-struct HostObjectRecord {
-    data: Box<dyn Any>,
+/// A registered native-function weak handle paired with the callback record
+/// it keeps alive.
+///
+/// `weak` must be retained for the function's lifetime: dropping a
+/// `v8::Weak` cancels its guaranteed finalizer, which would leak the record.
+/// `record` is the shared ownership slot: the guaranteed finalizer and the
+/// compaction pass each take the boxed record when the function dies, so the
+/// record is freed exactly once by whichever owner gets there first (and at
+/// isolate teardown by the slot itself when both owners drop).
+struct CallbackHandle {
+    weak: v8::Weak<v8::Function>,
+    record: Rc<RefCell<Option<Box<CallbackRecord>>>>,
+}
+
+/// A platform object associated with an existing JS object (the realm
+/// global), kept alive and traced through a cppgc [`Member`] edge so its
+/// cells and JS edges participate in unified-heap collection. The raw
+/// pointer mirrors the `host_data` internal-field pointer of
+/// [`V8Engine::create_object_with_any`]: cppgc is non-moving and the Member
+/// keeps the platform alive for as long as this record is traced.
+struct AssociatedPlatform {
+    object: V8Object,
+    member: v8::cppgc::Member<V8PlatformData>,
+    platform_pointer: *mut V8PlatformData,
 }
 
 #[derive(Default)]
 struct RealmHostData {
     values: HashMap<TypeId, Box<dyn Any>>,
-    associated_objects: Vec<(V8Object, Box<dyn Any>)>,
+    associated_objects: Vec<AssociatedPlatform>,
+}
+
+// SAFETY: The trace visits every cppgc edge the host data holds: each
+// associated platform (whose trace walks its cells and JS edges) and each
+// associated JS object handle (edges only; rooted handles have nothing to
+// visit). Host `values` hold strong roots (`store_host_any` never converts
+// them), so they are over-retained rather than traced.
+unsafe impl Trace for RealmHostData {
+    unsafe fn trace(&self, visitor: &mut crate::v8_gc::Visitor) {
+        for associated in &self.associated_objects {
+            // SAFETY: Delegated to the cppgc Member trace, which visits the
+            // platform object and through it the platform's cells.
+            visitor.trace(&associated.member);
+            // SAFETY: Delegated to the object handle's own trace.
+            unsafe { Trace::trace(&associated.object, visitor) }
+        }
+    }
+
+    fn store(&mut self, _ec: &mut dyn ExecutionContext<V8Types>) {
+        // The associated objects are the realm global (context-rooted); the
+        // platform Members are traced by this type, so no root-to-edge
+        // conversion is needed here.
+    }
 }
 
 #[derive(Clone)]
 struct V8RealmState {
     realm: V8Realm,
     realm_global: RefCell<V8Object>,
-    intrinsics: Option<RealmIntrinsics<V8Types>>,
-    host_data_holder: Option<V8Object>,
+    // RefCell so realm initialization can populate the fields through a
+    // shared `Rc` (the engine's current realm and the realm being
+    // initialized may both hold strong references while intrinsics load).
+    intrinsics: RefCell<Option<RealmIntrinsics<V8Types>>>,
+    host_data_holder: RefCell<Option<V8Object>>,
+    // Realm-bound builtin functions captured at realm creation, when the
+    // global is pristine. The generic abstract operations that need JS
+    // (`Object.getPrototypeOf`, `Reflect.ownKeys`, `Object.defineProperty`,
+    // ...) invoke these captured functions so page code overwriting the
+    // realm's globals cannot change their ECMA-262 semantics.
+    captured: RefCell<Option<CapturedIntrinsics>>,
+}
+
+/// Realm-bound builtin functions captured at realm creation, used by the
+/// generic abstract operations instead of the realm's (possibly patched)
+/// globals.
+#[derive(Clone)]
+struct CapturedIntrinsics {
+    get_prototype_of: V8Function,
+    own_keys: V8Function,
+    set_prototype_of: V8Function,
+    is_extensible: V8Function,
+    is_sealed: V8Function,
+    is_frozen: V8Function,
+    define_property: V8Function,
 }
 
 type StoredCallbackScope = v8::PinScope<'static, 'static>;
@@ -86,8 +169,7 @@ struct SharedIsolate {
     isolate_id: u64,
     realm_states: RefCell<Vec<RcWeak<V8RealmState>>>,
     queued_jobs: RefCell<VecDeque<QueuedJob>>,
-    host_object_handles: RefCell<Vec<v8::Weak<v8::Object>>>,
-    callback_handles: RefCell<Vec<v8::Weak<v8::Function>>>,
+    callback_handles: RefCell<Vec<CallbackHandle>>,
     isolate: RefCell<v8::OwnedIsolate>,
     microtask_queue: v8::UniqueRef<v8::MicrotaskQueue>,
 }
@@ -95,14 +177,29 @@ struct SharedIsolate {
 impl SharedIsolate {
     fn new() -> Rc<Self> {
         initialize_v8();
-        let mut isolate = v8::Isolate::new(v8::CreateParams::default());
+        // The cppgc heap is created with atomic marking and sweeping: the
+        // trace callbacks run stop-the-world on the isolate thread (so Rust
+        // never mutates a cell concurrently with the marker) and the
+        // destructors of the traced values (which drop V8 handles) also run
+        // on the isolate thread.
+        let platform = V8_PLATFORM
+            .get()
+            .expect("V8 platform must be initialized before the isolate")
+            .clone();
+        let heap = v8::cppgc::Heap::create(
+            platform,
+            v8::cppgc::HeapCreateParams {
+                marking_support: v8::cppgc::MarkingType::Atomic,
+                sweeping_support: v8::cppgc::SweepingType::Atomic,
+            },
+        );
+        let mut isolate = v8::Isolate::new(v8::CreateParams::default().cpp_heap(heap));
         isolate.set_microtasks_policy(v8::MicrotasksPolicy::Explicit);
         let microtask_queue = v8::MicrotaskQueue::new(&mut isolate, v8::MicrotasksPolicy::Explicit);
         Rc::new(Self {
             isolate_id: NEXT_ISOLATE_ID.fetch_add(1, Ordering::Relaxed),
             realm_states: RefCell::new(Vec::new()),
             queued_jobs: RefCell::new(VecDeque::new()),
-            host_object_handles: RefCell::new(Vec::new()),
             callback_handles: RefCell::new(Vec::new()),
             isolate: RefCell::new(isolate),
             microtask_queue,
@@ -115,6 +212,40 @@ impl SharedIsolate {
             "V8 engine and shared isolate identities differ"
         );
         self.isolate.borrow_mut()
+    }
+}
+
+impl V8Engine {
+    /// Run a closure with the isolate borrowed mutably, mirroring the scope
+    /// macros: inside a native callback the isolate is reborrowed from the
+    /// pinned callback scope, otherwise the shared isolate RefCell is used.
+    pub(crate) fn with_isolate_mut<R>(&self, f: impl FnOnce(&mut v8::Isolate) -> R) -> R {
+        let callback_scope_pointer = CURRENT_CALLBACK_SCOPE.get();
+        if callback_scope_pointer.is_null() {
+            let mut isolate_for_operation = self.shared_isolate.borrow(self.isolate_id);
+            f(&mut isolate_for_operation)
+        } else {
+            assert_eq!(
+                CURRENT_CALLBACK_ISOLATE_ID.get(),
+                self.isolate_id,
+                "reentrant V8 scope belongs to another isolate"
+            );
+            // SAFETY: The pointer and lifetime invariants are established by
+            // `CurrentCallbackScopeGuard` and checked above.
+            let callback_scope = unsafe { &mut *callback_scope_pointer };
+            let isolate = &mut ***callback_scope;
+            f(isolate)
+        }
+    }
+
+    /// Run a closure with the isolate's cppgc heap.
+    pub(crate) fn with_cpp_heap<R>(&self, f: impl FnOnce(&v8::cppgc::Heap) -> R) -> R {
+        self.with_isolate_mut(|isolate| {
+            let heap = isolate
+                .get_cpp_heap()
+                .expect("V8 isolate has no cppgc heap");
+            f(heap)
+        })
     }
 }
 
@@ -140,28 +271,6 @@ macro_rules! v8_engine_scope_with_context {
             let callback_scope = unsafe { &mut *callback_scope_pointer };
             let local_context = v8::Local::new(callback_scope, $context);
             let $scope = &mut v8::ContextScope::new(callback_scope, local_context);
-            $body
-        }
-    }};
-}
-
-macro_rules! v8_engine_scope {
-    ($scope:ident, $engine:expr, $body:block) => {{
-        let callback_scope_pointer = CURRENT_CALLBACK_SCOPE.get();
-        if callback_scope_pointer.is_null() {
-            let shared_isolate_for_scope = Rc::clone(&$engine.shared_isolate);
-            let mut isolate_for_scope = shared_isolate_for_scope.borrow($engine.isolate_id);
-            v8::scope!(let $scope, &mut *isolate_for_scope);
-            $body
-        } else {
-            assert_eq!(
-                CURRENT_CALLBACK_ISOLATE_ID.get(),
-                $engine.isolate_id,
-                "reentrant V8 scope belongs to another isolate"
-            );
-            // SAFETY: The pointer and lifetime invariants are established by
-            // `CurrentCallbackScopeGuard` and checked above.
-            let $scope = unsafe { &mut *callback_scope_pointer };
             $body
         }
     }};
@@ -211,8 +320,37 @@ macro_rules! v8_shared_isolate {
     }};
 }
 
+impl V8Engine {
+    /// Run a closure with a scope over the realm context, for operations that
+    /// need V8 locals (edge conversion, handle materialization).
+    pub(crate) fn with_value_scope<R>(
+        &mut self,
+        f: impl FnOnce(&mut v8::PinScope<'_, '_>) -> R,
+    ) -> R {
+        v8_engine_scope_with_context!(scope, self, &self.realm_state.realm.context, { f(scope) })
+    }
+}
+
 struct CurrentEngineGuard {
     previous: *mut V8Engine,
+}
+
+/// Removes a platform address from the engine's `mutably_borrowed_platforms`
+/// set when dropped, including on panic during the operation.
+struct PlatformBorrowGuard {
+    set: *mut RefCell<HashSet<usize>>,
+    address: usize,
+}
+
+impl Drop for PlatformBorrowGuard {
+    fn drop(&mut self) {
+        // SAFETY: The guard is created and dropped inside
+        // `with_object_any_mut_with`, which owns `&mut self` for the whole
+        // guard lifetime, so the engine outlives the guard.
+        unsafe {
+            (*self.set).borrow_mut().remove(&self.address);
+        }
+    }
 }
 
 struct CurrentCallbackScopeGuard {
@@ -258,13 +396,31 @@ pub struct V8Engine {
     realm_state: Rc<V8RealmState>,
     host_hooks: HostHooks<V8Types>,
     shared_isolate: Rc<SharedIsolate>,
+    // Addresses of `V8PlatformData` instances currently handed out as
+    // `&mut dyn Any` through `with_object_any_mut_with`. `with_object_any`
+    // and `with_object_any_mut` panic on a re-entrant access to a platform
+    // that is already mutably borrowed, turning a would-be aliasing
+    // violation (two live references to the same platform data) into a loud
+    // bug report.
+    mutably_borrowed_platforms: RefCell<HashSet<usize>>,
+    // Strong references to realm states created through `create_realm`: the
+    // shared-isolate registry holds weak refs (pruned when the last owner
+    // drops), and the engine keeps the created realms alive so
+    // `realm_intrinsics`/`set_realm_global_object` can find them.
+    created_realm_states: RefCell<Vec<Rc<V8RealmState>>>,
 }
+
+static V8_PLATFORM: std::sync::OnceLock<v8::SharedRef<v8::Platform>> = std::sync::OnceLock::new();
 
 fn initialize_v8() {
     static INITIALIZE: Once = Once::new();
     INITIALIZE.call_once(|| {
         v8::V8::set_flags_from_string("--expose-gc");
-        v8::V8::initialize_platform(v8::new_default_platform(0, false).make_shared());
+        let platform = v8::new_default_platform(0, false).make_shared();
+        v8::V8::initialize_platform(platform.clone());
+        // cppgc needs the platform page allocator before any heap is created.
+        v8::cppgc::initialize_process(platform.clone());
+        let _ = V8_PLATFORM.set(platform);
         v8::V8::initialize();
     });
 }
@@ -290,11 +446,16 @@ fn host_data_pointer<'scope>(
 
     // SAFETY: Field 1 is read only after field 0 proves that this object was
     // created by `create_object_with_any`. That constructor stores an aligned
-    // `HostObjectRecord` pointer in field 1 with this exact tag. The weak
-    // handle keeps the record alive for at least as long as the JS object.
+    // `V8PlatformData` pointer in field 1 with this exact tag. The cppgc
+    // platform object is traced from the JS wrapper, so it stays alive for at
+    // least as long as the JS object.
     let pointer = unsafe { object.get_aligned_pointer_from_internal_field(1, HOST_OBJECT_TAG) }
         as *mut c_void;
     NonNull::new(pointer)
+}
+
+fn root_handle<T>(scope: &mut v8::PinScope<'_, '_>, handle: v8::Local<'_, T>) -> V8Handle<T> {
+    V8Handle::Root(v8::Global::new(scope, handle))
 }
 
 fn wrap_local_value(
@@ -319,6 +480,8 @@ fn wrap_local_value(
             .map(|string| string.to_rust_string_lossy(scope))
             .unwrap_or_default();
         CachedPrimitive::BigInt(Arc::from(canonical))
+    } else if value.is_symbol() {
+        CachedPrimitive::Symbol
     } else {
         CachedPrimitive::Other
     };
@@ -329,28 +492,28 @@ fn wrap_local_value(
         host_data = host_data_pointer(scope, object);
         let array_buffer_handle = v8::Local::<v8::ArrayBuffer>::try_from(value)
             .ok()
-            .map(|handle| v8::Global::new(scope, handle));
+            .map(|handle| root_handle(scope, handle));
         let shared_array_buffer_handle = v8::Local::<v8::SharedArrayBuffer>::try_from(value)
             .ok()
-            .map(|handle| v8::Global::new(scope, handle));
+            .map(|handle| root_handle(scope, handle));
         let typed_array_handle = v8::Local::<v8::TypedArray>::try_from(value)
             .ok()
-            .map(|handle| v8::Global::new(scope, handle));
+            .map(|handle| root_handle(scope, handle));
         let data_view_handle = v8::Local::<v8::DataView>::try_from(value)
             .ok()
-            .map(|handle| v8::Global::new(scope, handle));
+            .map(|handle| root_handle(scope, handle));
         let promise_handle = v8::Local::<v8::Promise>::try_from(value)
             .ok()
-            .map(|handle| v8::Global::new(scope, handle));
+            .map(|handle| root_handle(scope, handle));
         let function_handle = v8::Local::<v8::Function>::try_from(value)
             .ok()
-            .map(|handle| v8::Global::new(scope, handle));
+            .map(|handle| root_handle(scope, handle));
         let map_handle = v8::Local::<v8::Map>::try_from(value)
             .ok()
-            .map(|handle| v8::Global::new(scope, handle));
+            .map(|handle| root_handle(scope, handle));
         let set_handle = v8::Local::<v8::Set>::try_from(value)
             .ok()
-            .map(|handle| v8::Global::new(scope, handle));
+            .map(|handle| root_handle(scope, handle));
         let array_buffer_state = if value.is_array_buffer() {
             let array_buffer = v8::Local::<v8::ArrayBuffer>::try_from(value)
                 .expect("V8 ArrayBuffer type check failed");
@@ -390,8 +553,38 @@ fn wrap_local_value(
         } else {
             None
         };
+        // ECMA-262 IsConstructor (§7.2.4): callable functions without
+        // [[Construct]] have no `prototype` own property (arrows, async
+        // functions, methods, bound functions). Generator functions are the
+        // exception — V8 gives them a `prototype` property even though they
+        // are not constructible — so the generator/async function kinds are
+        // excluded explicitly. `make_builtin_function` overwrites the cached
+        // bit for native functions, where the constructor behavior is known
+        // exactly.
+        let is_constructor = if value.is_function()
+            && !value.is_generator_function()
+            && !value.is_async_function()
+        {
+            let prototype_name = v8::String::new(scope, "prototype")
+                .expect("static V8 property name allocation failed");
+            object
+                .has_own_property(scope, prototype_name.into())
+                .unwrap_or(false)
+        } else {
+            false
+        };
+        // Wrapper objects created by JavaScript (`new Number(42)`) unbox
+        // through the native NumberValue fast path; the profile caches the
+        // wrapped [[NumberData]]. Boolean, String, and BigInt wrappers have
+        // no native unboxing API, so their data is only available through the
+        // `construct` path (see `ExecutionContext::construct`).
+        let wrapper_primitive = if value.is_number_object() {
+            value.number_value(scope).map(CachedPrimitive::Number)
+        } else {
+            None
+        };
         Some(Box::new(ObjectProfile {
-            object_handle: v8::Global::new(scope, object),
+            object_handle: root_handle(scope, object),
             array_buffer_handle,
             shared_array_buffer_handle,
             typed_array_handle,
@@ -410,7 +603,8 @@ fn wrap_local_value(
             is_date: value.is_date(),
             is_regexp: value.is_reg_exp(),
             is_error: value.is_native_error(),
-            wrapper_primitive: None,
+            is_constructor,
+            wrapper_primitive,
             array_buffer_state,
             typed_array_element_type,
         }))
@@ -420,7 +614,7 @@ fn wrap_local_value(
 
     V8Value {
         isolate_id,
-        handle: v8::Global::new(scope, value),
+        handle: root_handle(scope, value),
         primitive,
         object_profile,
         host_data,
@@ -442,7 +636,12 @@ fn local_value<'scope>(
         let exception = v8::Exception::type_error(scope, message);
         return Err(wrap_local_value(scope, isolate_id, exception));
     }
-    Ok(v8::Local::new(scope, &value.handle))
+    value.handle.to_local(scope).ok_or_else(|| {
+        let message = v8::String::new(scope, "value has been reclaimed by the garbage collector")
+            .expect("static V8 error string allocation failed");
+        let exception = v8::Exception::type_error(scope, message);
+        wrap_local_value(scope, isolate_id, exception)
+    })
 }
 
 fn local_object<'scope>(
@@ -456,14 +655,19 @@ fn local_object<'scope>(
         let exception = v8::Exception::type_error(scope, message);
         return Err(wrap_local_value(scope, isolate_id, exception));
     }
-    Ok(v8::Local::new(scope, &object.1))
+    object.1.to_local(scope).ok_or_else(|| {
+        let message = v8::String::new(scope, "value has been reclaimed by the garbage collector")
+            .expect("static V8 error string allocation failed");
+        let exception = v8::Exception::type_error(scope, message);
+        wrap_local_value(scope, isolate_id, exception)
+    })
 }
 
 fn local_typed_object<'scope, T>(
     scope: &mut v8::PinScope<'scope, '_>,
     isolate_id: u64,
     object: &V8Object,
-    handle: &v8::Global<T>,
+    handle: &V8Handle<T>,
 ) -> Result<v8::Local<'scope, T>, V8Value> {
     if object.0.isolate_id != isolate_id {
         let message = v8::String::new(scope, "value belongs to a different V8 isolate")
@@ -471,7 +675,12 @@ fn local_typed_object<'scope, T>(
         let exception = v8::Exception::type_error(scope, message);
         return Err(wrap_local_value(scope, isolate_id, exception));
     }
-    Ok(v8::Local::new(scope, handle))
+    handle.to_local(scope).ok_or_else(|| {
+        let message = v8::String::new(scope, "value has been reclaimed by the garbage collector")
+            .expect("static V8 error string allocation failed");
+        let exception = v8::Exception::type_error(scope, message);
+        wrap_local_value(scope, isolate_id, exception)
+    })
 }
 
 fn local_property_key<'scope>(
@@ -568,13 +777,15 @@ fn native_callback(
         return;
     }
 
-    // SAFETY: Callback records are allocated by `make_builtin_function` and
-    // released only by the function's guaranteed weak finalizer. V8 invokes
-    // this callback while the function is strongly reachable. CURRENT_ENGINE
-    // is installed around every operation that can execute JavaScript and is
-    // restricted to the isolate thread. The isolate id check below prevents a
-    // record from being used by another isolate. `catch_unwind` prevents Rust
-    // unwinding from crossing V8's callback boundary.
+    // SAFETY: Callback records are created by `make_builtin_function` and
+    // released once the function dies (by the guaranteed weak finalizer, by
+    // the registry compaction, or at isolate teardown); V8 invokes this
+    // callback only while the function is strongly reachable, so the record
+    // is still in its slot. CURRENT_ENGINE is installed around every
+    // operation that can execute JavaScript and is restricted to the isolate
+    // thread. The isolate id check below prevents a record from being used
+    // by another isolate. `catch_unwind` prevents Rust unwinding from
+    // crossing V8's callback boundary.
     let (result, callback_isolate_id) = unsafe {
         let record = &*record_pointer;
         let engine = &mut *engine_pointer;
@@ -588,8 +799,15 @@ fn native_callback(
                 let callback_arguments: Vec<_> = (0..arguments.length())
                     .map(|index| wrap_local_value(scope, record.isolate_id, arguments.get(index)))
                     .collect();
-                let this_value =
-                    wrap_local_value(scope, record.isolate_id, arguments.this().into());
+                // For construct calls, V8's `this` is the newly created
+                // receiver; the Web IDL constructor logic expects `this` to be
+                // `new.target` (matching Boa's [[Construct]] convention), so
+                // pass `new_target` instead.
+                let this_value = if arguments.is_construct_call() {
+                    wrap_local_value(scope, record.isolate_id, arguments.new_target())
+                } else {
+                    wrap_local_value(scope, record.isolate_id, arguments.this().into())
+                };
                 match catch_unwind(AssertUnwindSafe(|| {
                     (record.behaviour)(&callback_arguments, this_value, engine)
                 })) {
@@ -609,13 +827,19 @@ fn native_callback(
         Ok(value) => match local_value(scope, callback_isolate_id, &value) {
             Ok(value) => return_value.set(value),
             Err(exception) => {
-                let exception = v8::Local::new(scope, &exception.handle);
+                let exception = exception
+                    .handle
+                    .to_local(scope)
+                    .expect("callback exception handle must be valid");
                 scope.throw_exception(exception);
             }
         },
         Err(exception) => {
             if exception.isolate_id == callback_isolate_id {
-                let exception = v8::Local::new(scope, &exception.handle);
+                let exception = exception
+                    .handle
+                    .to_local(scope)
+                    .expect("callback exception handle must be valid");
                 scope.throw_exception(exception);
             } else {
                 let message = v8::String::new(scope, "callback returned a cross-isolate exception")
@@ -627,21 +851,125 @@ fn native_callback(
     }
 }
 
-fn reject_module_import<'scope>(
+fn resolve_module_import<'scope>(
     context: v8::Local<'scope, v8::Context>,
-    _specifier: v8::Local<'scope, v8::String>,
-    _import_attributes: v8::Local<'scope, v8::FixedArray>,
+    specifier: v8::Local<'scope, v8::String>,
+    import_attributes: v8::Local<'scope, v8::FixedArray>,
     _referrer: v8::Local<'scope, v8::Module>,
 ) -> Option<v8::Local<'scope, v8::Module>> {
     // SAFETY: V8 invokes module-resolution callbacks with the entered context
     // and no Rust handle scope. rusty_v8 requires CallbackScope only at this
     // callback boundary; the scope is pinned for its full use below.
     v8::callback_scope!(unsafe scope, context);
-    let message = v8::String::new(scope, "module imports are not enabled for the V8 backend")
+
+    let engine_pointer = CURRENT_ENGINE.get();
+    if engine_pointer.is_null() {
+        let message = v8::String::new(scope, "module resolution entered without an active engine")
+            .expect("static module error allocation failed");
+        let exception = v8::Exception::type_error(scope, message);
+        scope.throw_exception(exception);
+        return None;
+    }
+
+    // SAFETY: CURRENT_ENGINE is installed around every operation that can
+    // execute JavaScript and is restricted to the isolate thread. The module
+    // resolver runs synchronously inside `evaluate_module`, which already
+    // holds the isolate scope; the callback-scope guard lets engine methods
+    // below reborrow the pinned callback scope instead of the (already
+    // borrowed) shared isolate.
+    unsafe {
+        let engine = &mut *engine_pointer;
+        if engine.host_hooks.load_imported_module.is_none() {
+            let message =
+                v8::String::new(scope, "module imports are not enabled for the V8 backend")
+                    .expect("static module error allocation failed");
+            let exception = v8::Exception::type_error(scope, message);
+            scope.throw_exception(exception);
+            return None;
+        }
+
+        let _current_callback_scope = CurrentCallbackScopeGuard::enter(scope, engine.isolate_id);
+
+        let specifier_string = V8String {
+            value: None,
+            utf16: cache_string(scope, &specifier),
+        };
+        let mut attributes = Vec::new();
+        for index in 0..import_attributes.length() / 2 {
+            if let (Some(key), Some(value)) = (
+                import_attributes.get(scope, index * 2),
+                import_attributes.get(scope, index * 2 + 1),
+            ) && let Ok(key) = v8::Local::<v8::String>::try_from(key)
+                && let Ok(value) = v8::Local::<v8::Value>::try_from(value)
+            {
+                attributes.push((
+                    V8String {
+                        value: None,
+                        utf16: cache_string(scope, &key),
+                    },
+                    wrap_local_value(scope, engine.isolate_id, value),
+                ));
+            }
+        }
+        let module_request = ModuleRequest {
+            specifier: specifier_string,
+            attributes,
+        };
+        let realm = engine.realm_state.realm.clone();
+        let constructor = engine.realm_intrinsics(&realm).promise;
+        let capability = match catch_unwind(AssertUnwindSafe(|| {
+            engine.new_promise_capability(constructor)
+        })) {
+            Ok(Ok(capability)) => capability,
+            Ok(Err(error)) => {
+                error!(
+                    "module resolver failed to create the load capability: {}",
+                    error.display()
+                );
+                let message = v8::String::new(scope, "module load capability creation failed")
+                    .expect("static module error allocation failed");
+                let exception = v8::Exception::type_error(scope, message);
+                scope.throw_exception(exception);
+                return None;
+            }
+            Err(_panic) => {
+                let message = v8::String::new(scope, "module load capability creation panicked")
+                    .expect("static module error allocation failed");
+                let exception = v8::Exception::type_error(scope, message);
+                scope.throw_exception(exception);
+                return None;
+            }
+        };
+        if let Some(hook) = &engine.host_hooks.load_imported_module {
+            // The hook is embedder-supplied Rust code invoked from inside a
+            // callback V8's module resolver calls synchronously; like the
+            // capability creation above and `native_callback`, it must not
+            // unwind across the V8 C++ boundary, so a panic is converted into
+            // a thrown TypeError.
+            let result = catch_unwind(AssertUnwindSafe(|| {
+                hook(module_request, capability);
+            }));
+            if result.is_err() {
+                error!("load_imported_module hook panicked during module resolution");
+                let message = v8::String::new(scope, "module import hook panicked")
+                    .expect("static module error allocation failed");
+                let exception = v8::Exception::type_error(scope, message);
+                scope.throw_exception(exception);
+                return None;
+            }
+        }
+        // V8's module resolver is synchronous, while host module loading
+        // resolves its promise capability asynchronously, so no Module can be
+        // produced here; instantiation fails after the hook has been invoked.
+        let message = v8::String::new(
+            scope,
+            "host module loading is asynchronous; the V8 backend cannot instantiate imported modules",
+        )
         .expect("static module error allocation failed");
-    let exception = v8::Exception::type_error(scope, message);
-    scope.throw_exception(exception);
-    None
+        let exception = v8::Exception::type_error(scope, message);
+        scope.throw_exception(exception);
+        None
+    }
 }
 
 impl V8Engine {
@@ -679,38 +1007,82 @@ impl V8Engine {
         let realm_state = Rc::new(V8RealmState {
             realm,
             realm_global: RefCell::new(realm_global),
-            intrinsics: None,
-            host_data_holder: None,
+            intrinsics: RefCell::new(None),
+            host_data_holder: RefCell::new(None),
+            captured: RefCell::new(None),
         });
         let mut engine = Self {
             isolate_id,
             realm_state,
             host_hooks: HostHooks::empty(),
             shared_isolate,
+            mutably_borrowed_platforms: RefCell::new(HashSet::new()),
+            created_realm_states: RefCell::new(Vec::new()),
         };
-        let intrinsics = engine.load_intrinsics();
-        Rc::get_mut(&mut engine.realm_state)
-            .expect("new V8 realm state must not be shared while initializing intrinsics")
-            .intrinsics = Some(intrinsics.clone());
-        let host_data_holder = engine.create_object_with_any(
-            intrinsics.object_prototype,
-            Box::new(RealmHostData::default()),
-        );
-        Rc::get_mut(&mut engine.realm_state)
-            .expect("new V8 realm state must not be shared while initializing host data")
-            .host_data_holder = Some(host_data_holder);
-        engine
-            .shared_isolate
-            .realm_states
-            .borrow_mut()
-            .push(Rc::downgrade(&engine.realm_state));
+        engine.initialize_realm_state(Rc::clone(&engine.realm_state));
         engine
     }
 
+    /// Load the intrinsics, create the host-data holder, and register the
+    /// realm state with the shared isolate. The engine's current realm is
+    /// temporarily switched to `realm_state` so intrinsics are sourced from
+    /// the realm being initialized.
+    fn initialize_realm_state(&mut self, realm_state: Rc<V8RealmState>) {
+        let previous_realm = replace(&mut self.realm_state, Rc::clone(&realm_state));
+        let intrinsics = self.load_intrinsics();
+        realm_state.intrinsics.replace(Some(intrinsics.clone()));
+        let captured = CapturedIntrinsics {
+            get_prototype_of: self.intrinsic_function("Object.getPrototypeOf"),
+            own_keys: self.intrinsic_function("Reflect.ownKeys"),
+            set_prototype_of: self.intrinsic_function("Reflect.setPrototypeOf"),
+            is_extensible: self.intrinsic_function("Object.isExtensible"),
+            is_sealed: self.intrinsic_function("Object.isSealed"),
+            is_frozen: self.intrinsic_function("Object.isFrozen"),
+            define_property: self.intrinsic_function("Object.defineProperty"),
+        };
+        realm_state.captured.replace(Some(captured));
+        let host_data_holder = self.create_object_with_any(
+            intrinsics.object_prototype,
+            // The holder traces the associated platform objects (and through
+            // them their cells and JS edges) while the realm lives.
+            Box::new(V8PlatformData::new(RealmHostData::default())),
+        );
+        realm_state.host_data_holder.replace(Some(host_data_holder));
+        self.realm_state = previous_realm;
+        self.shared_isolate
+            .realm_states
+            .borrow_mut()
+            .push(Rc::downgrade(&realm_state));
+    }
+
     pub fn associate_existing_object(&mut self, object: &V8Object, data: Box<dyn Any>) {
+        // The platform lives on the cppgc heap, traced from the realm host
+        // data: `associate_existing_object` is used for the realm global
+        // (whose JS wrapper cannot carry an `Object::wrap` platform link), so
+        // the cppgc Member here is the platform's tracing owner.
+        let platform = match V8PlatformData::try_recover(data) {
+            Ok(platform) => platform,
+            Err(raw) => V8PlatformData::noop(raw),
+        };
+        let (member, platform_pointer) = self.with_cpp_heap(|heap| {
+            // SAFETY: The returned `UnsafePtr` is immediately moved into the
+            // `Member` edge below and into the raw access pointer — the
+            // required destination for a stack-created pointer. cppgc is
+            // non-moving, so the raw pointer stays valid while the Member
+            // keeps the platform alive.
+            let pointer = unsafe { v8::cppgc::make_garbage_collected(heap, platform) };
+            let member = v8::cppgc::Member::new(&pointer);
+            let platform_pointer =
+                unsafe { pointer.as_ref() } as *const V8PlatformData as *mut V8PlatformData;
+            (member, platform_pointer)
+        });
         self.realm_host_data_mut()
             .associated_objects
-            .push((object.clone(), data));
+            .push(AssociatedPlatform {
+                object: object.clone(),
+                member,
+                platform_pointer,
+            });
     }
 
     pub fn new_child_realm(&self) -> Self {
@@ -721,9 +1093,11 @@ impl V8Engine {
         let holder = self
             .realm_state
             .host_data_holder
+            .borrow()
             .as_ref()
-            .expect("V8 realm host data is not initialized");
-        self.with_object_any(holder)
+            .expect("V8 realm host data is not initialized")
+            .clone();
+        self.with_object_any(&holder)
             .and_then(|data| data.downcast_ref::<RealmHostData>())
             .expect("V8 realm host-data holder contains an unexpected value")
     }
@@ -732,6 +1106,7 @@ impl V8Engine {
         let holder = self
             .realm_state
             .host_data_holder
+            .borrow()
             .as_ref()
             .expect("V8 realm host data is not initialized")
             .clone();
@@ -837,6 +1212,26 @@ impl V8Engine {
             .unwrap_or_else(|| panic!("V8 intrinsic `{source}` is not a constructor"))
     }
 
+    fn intrinsic_function(&mut self, source: &str) -> V8Function {
+        let object = self.intrinsic_object(source);
+        V8Types::object_as_function(&object)
+            .unwrap_or_else(|| panic!("V8 intrinsic `{source}` is not a function"))
+    }
+
+    /// Clone one of the realm-bound captured builtins used by the generic
+    /// abstract operations.
+    fn captured_intrinsic(
+        &self,
+        select: impl FnOnce(&CapturedIntrinsics) -> V8Function,
+    ) -> V8Function {
+        self.realm_state
+            .captured
+            .borrow()
+            .as_ref()
+            .map(select)
+            .expect("V8 captured intrinsics are not initialized")
+    }
+
     fn load_intrinsics(&mut self) -> RealmIntrinsics<V8Types> {
         RealmIntrinsics {
             array_buffer: self.intrinsic_constructor("ArrayBuffer"),
@@ -879,7 +1274,7 @@ impl V8Engine {
             object_prototype: self.intrinsic_object("Object.prototype"),
             function_prototype: self.intrinsic_object("Function.prototype"),
             async_iterator_prototype: self.intrinsic_object(
-                "Object.getPrototypeOf(Object.getPrototypeOf(async function*(){}()))",
+                "Object.getPrototypeOf(Object.getPrototypeOf(async function* () {}).prototype)",
             ),
         }
     }
@@ -896,12 +1291,24 @@ impl V8Engine {
             creation_realm: Rc::downgrade(&self.realm_state),
             behaviour,
         });
-        let record_pointer = Box::into_raw(record);
+        // The record lives in a shared slot owned by both the guaranteed
+        // finalizer and the callback-handle registry entry; whichever drops
+        // the function first frees it. The raw pointer handed to V8's
+        // `External` data is derived from the box inside the slot and stays
+        // valid while the function is alive (the slot is only taken once the
+        // function has been collected, at which point V8 can no longer invoke
+        // the callback).
+        let record_slot = Rc::new(RefCell::new(Some(record)));
+        let record_pointer = record_slot
+            .borrow()
+            .as_ref()
+            .expect("callback record slot is empty before the function exists")
+            .as_ref() as *const CallbackRecord;
         let isolate_id = self.isolate_id;
         let function_name = self.property_key_to_rust_string(&name);
 
         v8_engine_scope_with_context!(scope, self, &self.realm_state.realm.context, {
-            let external = v8::External::new(scope, record_pointer.cast());
+            let external = v8::External::new(scope, record_pointer.cast_mut().cast());
             let constructor_behavior = if is_constructor {
                 v8::ConstructorBehavior::Allow
             } else {
@@ -916,27 +1323,51 @@ impl V8Engine {
             if let Some(name) = v8::String::new(scope, &function_name) {
                 function.set_name(name);
             }
-            let function_value = wrap_local_value(scope, isolate_id, function.into());
+            let mut function_value = wrap_local_value(scope, isolate_id, function.into());
+            // The profile's constructor bit is computed from the `prototype`
+            // property heuristic at wrap time; for native functions the
+            // constructor behavior is known exactly, so it overwrites the
+            // heuristic.
+            if let Some(profile) = function_value.object_profile.as_mut() {
+                profile.is_constructor = is_constructor;
+            }
 
-            // The weak handle is retained by the engine. The finalizer owns the
-            // callback record and is guaranteed to release it before isolate
+            // The weak handle is retained by the engine; the finalizer owns a
+            // share of the callback record and releases it before isolate
             // destruction, even if no collection happens first.
+            let finalizer_slot = Rc::clone(&record_slot);
             let callback_handle = v8::Weak::with_guaranteed_finalizer(
                 scope,
                 function,
                 Box::new(move || {
-                    // SAFETY: `record_pointer` came from one Box::into_raw above
-                    // and this guaranteed finalizer is its sole owner. The weak
-                    // handle invokes this closure at most once.
-                    unsafe {
-                        drop(Box::from_raw(record_pointer));
+                    if let Some(record) = finalizer_slot.borrow_mut().take() {
+                        drop(record);
                     }
                 }),
             );
-            self.shared_isolate
-                .callback_handles
-                .borrow_mut()
-                .push(callback_handle);
+            let mut callback_handles = self.shared_isolate.callback_handles.borrow_mut();
+            // Opportunistic compaction: stale entries (functions already
+            // collected) are removed so the registry does not grow for the
+            // lifetime of the isolate. The record is taken from the slot
+            // first — the guaranteed finalizer may not have run yet, and
+            // dropping the weak handle below would cancel it, so the slot
+            // hand-off is what prevents a leaked or double-freed record.
+            if callback_handles.len() >= CALLBACK_HANDLE_COMPACTION_THRESHOLD {
+                callback_handles.retain(|handle| {
+                    if handle.weak.is_empty() {
+                        if let Some(record) = handle.record.borrow_mut().take() {
+                            drop(record);
+                        }
+                        false
+                    } else {
+                        true
+                    }
+                });
+            }
+            callback_handles.push(CallbackHandle {
+                weak: callback_handle,
+                record: record_slot,
+            });
             let object = object_from_wrapped_value(function_value);
             V8Types::object_as_function(&object)
                 .expect("V8 native function wrapper is not a function")
@@ -953,20 +1384,45 @@ impl Default for V8Engine {
 impl JsEngine<V8Types> for V8Engine {
     fn create_realm(&mut self) -> V8Realm {
         let isolate_id = self.isolate_id;
-        v8_engine_scope!(scope, self, {
-            let microtask_queue = from_ref(&*self.shared_isolate.microtask_queue).cast_mut();
-            let context = v8::Context::new(
-                scope,
-                v8::ContextOptions {
-                    microtask_queue: Some(microtask_queue),
-                    ..v8::ContextOptions::default()
-                },
-            );
-            V8Realm {
-                isolate_id,
-                context: v8::Global::new(scope, context),
-            }
-        })
+        let (context_handle, realm_global) =
+            v8_engine_scope_with_context!(scope, self, &self.realm_state.realm.context, {
+                let microtask_queue = from_ref(&*self.shared_isolate.microtask_queue).cast_mut();
+                let context = v8::Context::new(
+                    scope,
+                    v8::ContextOptions {
+                        microtask_queue: Some(microtask_queue),
+                        ..v8::ContextOptions::default()
+                    },
+                );
+                let context_handle = v8::Global::new(scope, context);
+                let context_scope = &mut v8::ContextScope::new(scope, context);
+                let global = context.global(context_scope);
+                let realm_global = object_from_wrapped_value(wrap_local_value(
+                    context_scope,
+                    isolate_id,
+                    global.into(),
+                ));
+                (context_handle, realm_global)
+            });
+        let realm = V8Realm {
+            isolate_id,
+            context: context_handle,
+        };
+        let realm_state = Rc::new(V8RealmState {
+            realm: realm.clone(),
+            realm_global: RefCell::new(realm_global),
+            intrinsics: RefCell::new(None),
+            host_data_holder: RefCell::new(None),
+            captured: RefCell::new(None),
+        });
+        // A realm created through the generic API gets its own realm state,
+        // intrinsics, and host-data holder, so `realm_intrinsics` and the
+        // host-data methods source from the new realm rather than falling
+        // back to the caller's current realm. The engine retains a strong
+        // reference so the state survives while the realm handle is usable.
+        self.initialize_realm_state(Rc::clone(&realm_state));
+        self.created_realm_states.borrow_mut().push(realm_state);
+        realm
     }
 
     fn set_realm_global_object(
@@ -978,8 +1434,12 @@ impl JsEngine<V8Types> for V8Engine {
         if realm.isolate_id != self.isolate_id || global.0.isolate_id != self.isolate_id {
             return;
         }
-        if realm.context == self.realm_state.realm.context {
-            self.realm_state.realm_global.replace(global);
+        // V8 context globals are fixed at `Context::new`, so the installed
+        // object cannot replace the context's global proxy; it is recorded in
+        // the realm state so `realm_global_object` reports it while the realm
+        // is current.
+        if let Some(state) = self.state_for_realm(realm) {
+            state.realm_global.replace(global);
         }
     }
 
@@ -1033,11 +1493,28 @@ impl JsEngine<V8Types> for V8Engine {
                     "module source allocation failed",
                 ));
             };
-            let mut source = v8::script_compiler::Source::new(source_string, None);
+            // V8 requires the ScriptOrigin of a compiled module to carry the
+            // module flag.
+            let resource_name = v8::String::new(try_catch, "module")
+                .expect("static module resource name allocation failed");
+            let origin = v8::ScriptOrigin::new(
+                try_catch,
+                resource_name.into(),
+                0,
+                0,
+                false,
+                -1,
+                None,
+                false,
+                false,
+                true,
+                None,
+            );
+            let mut source = v8::script_compiler::Source::new(source_string, Some(&origin));
             let Some(module) = v8::script_compiler::compile_module(try_catch, &mut source) else {
                 return Err(caught!(try_catch, isolate_id, "module compilation failed"));
             };
-            if module.instantiate_module(try_catch, reject_module_import) != Some(true) {
+            if module.instantiate_module(try_catch, resolve_module_import) != Some(true) {
                 return Err(caught!(
                     try_catch,
                     isolate_id,
@@ -1095,16 +1572,31 @@ impl JsEngine<V8Types> for V8Engine {
 
     fn allocate_shared_array_buffer(
         &mut self,
-        _constructor: V8Constructor,
+        constructor: V8Constructor,
         byte_length: u64,
     ) -> Completion<V8SharedArrayBuffer, V8Types> {
-        let byte_length = self.value_from_number(byte_length as f64);
-        let value =
-            self.call_js_helper("length => new SharedArrayBuffer(length)", &[byte_length])?;
-        let object = V8Types::value_as_object(&value)
-            .ok_or_else(|| self.new_type_error("SharedArrayBuffer allocation failed"))?;
-        V8Types::object_as_shared_array_buffer(&object)
-            .ok_or_else(|| self.new_type_error("SharedArrayBuffer allocation failed"))
+        // AllocateSharedArrayBuffer (§25.2.1.1) constructs through the
+        // supplied constructor, so subclass and cross-realm constructors are
+        // honored.
+        let length = self.value_from_number(byte_length as f64);
+        let isolate_id = self.isolate_id;
+        v8_engine_scope_with_context!(scope, self, &self.realm_state.realm.context, {
+            v8::tc_scope!(let try_catch, scope);
+            let constructor =
+                local_typed_object(try_catch, isolate_id, &constructor.0, &constructor.1)?;
+            let length = local_value(try_catch, isolate_id, &length)?;
+            let Some(object) = constructor.new_instance(try_catch, &[length]) else {
+                return Err(caught!(
+                    try_catch,
+                    isolate_id,
+                    "SharedArrayBuffer allocation failed"
+                ));
+            };
+            let object =
+                object_from_wrapped_value(wrap_local_value(try_catch, isolate_id, object.into()));
+            V8Types::object_as_shared_array_buffer(&object)
+                .ok_or_else(|| self.new_type_error("SharedArrayBuffer allocation failed"))
+        })
     }
 
     fn set_host_hooks(&mut self, hooks: HostHooks<V8Types>) {
@@ -1128,15 +1620,6 @@ impl JsTypesGcExt for V8Types {
     }
 }
 
-// SAFETY: Each V8 wrapper owns a `v8::Global` handle, so its JavaScript value
-// remains rooted independently of Rust-side tracing. The marker implementation
-// therefore cannot hide an unrooted V8 reference from the collector.
-unsafe impl Trace for V8Value {}
-unsafe impl Trace for V8Object {}
-unsafe impl Trace for V8String {}
-unsafe impl Trace for V8Symbol {}
-unsafe impl Trace for V8BigInt {}
-
 pub fn create_builtin_fn_with_captures<T, C>(
     execution_context: &mut dyn ExecutionContext<T>,
     captures: C,
@@ -1154,14 +1637,31 @@ where
         .downcast_mut::<V8Engine>()
         .expect("create_builtin_fn_with_captures called with a non-V8 engine");
 
+    // The generic parameter T is the active backend's JsTypes; in a
+    // V8-selected build it is always V8Types. The layout assertions below
+    // turn a mismatched instantiation (e.g. a mock type with a different
+    // PropertyKey/Function layout) into an immediate panic instead of the
+    // byte copies silently corrupting the stack.
+    assert_eq!(
+        std::mem::size_of::<T::PropertyKey>(),
+        std::mem::size_of::<V8PropertyKey>(),
+        "create_builtin_fn_with_captures instantiated with a non-V8 PropertyKey layout"
+    );
+    assert_eq!(
+        std::mem::size_of::<T::Function>(),
+        std::mem::size_of::<V8Function>(),
+        "create_builtin_fn_with_captures instantiated with a non-V8 Function layout"
+    );
+
     // SAFETY: This function is exported only by the V8-selected content
-    // build, where T is V8Types. Function pointers have identical pointer
-    // representation; the callback trampoline validates the active isolate
-    // before invoking the converted behaviour.
+    // build, where T is V8Types (asserted above). Function pointers have
+    // identical pointer representation; the callback trampoline validates
+    // the active isolate before invoking the converted behaviour.
     let behaviour: CaptureBehaviour<V8Types, C> = unsafe { std::mem::transmute_copy(&behaviour) };
 
-    // SAFETY: In a V8-selected build T::PropertyKey is V8PropertyKey. Moving
-    // through MaybeUninit preserves ownership without creating a second drop.
+    // SAFETY: In a V8-selected build T::PropertyKey is V8PropertyKey
+    // (asserted above). Moving through MaybeUninit preserves ownership
+    // without creating a second drop.
     let name: V8PropertyKey = unsafe {
         let mut destination = std::mem::MaybeUninit::<V8PropertyKey>::uninit();
         std::ptr::copy_nonoverlapping(
@@ -1181,8 +1681,9 @@ where
     );
     let result = engine.make_builtin_function(stored, length, name, is_constructor);
 
-    // SAFETY: In a V8-selected build T::Function is V8Function. The result is
-    // moved into its associated-type spelling without duplicating ownership.
+    // SAFETY: In a V8-selected build T::Function is V8Function (asserted
+    // above). The result is moved into its associated-type spelling without
+    // duplicating ownership.
     unsafe {
         let mut destination = std::mem::MaybeUninit::<T::Function>::uninit();
         std::ptr::copy_nonoverlapping(
@@ -1296,6 +1797,11 @@ impl EcmascriptHost<V8Types> for V8Engine {
         v8_shared_isolate!(isolate, shared_isolate, self.isolate_id, {
             isolate.request_garbage_collection_for_testing(v8::GarbageCollectionType::Full);
         });
+        // Sweep the cppgc heap as well: platform objects and cells are
+        // cppgc-managed, and the isolate test hook collects the JS heap only.
+        self.with_cpp_heap(|heap| unsafe {
+            heap.collect_garbage_for_testing(v8::cppgc::EmbedderStackState::NoHeapPointers);
+        });
     }
 
     fn value_undefined(&mut self) -> V8Value {
@@ -1356,6 +1862,10 @@ impl ExecutionContext<V8Types> for V8Engine {
         self
     }
 
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     fn to_primitive(
         &mut self,
         input: V8Value,
@@ -1383,14 +1893,20 @@ impl ExecutionContext<V8Types> for V8Engine {
             CachedPrimitive::Number(number) => *number != 0.0 && !number.is_nan(),
             CachedPrimitive::String(string) => !string.is_empty(),
             CachedPrimitive::BigInt(canonical) => canonical.as_ref() != "0",
-            CachedPrimitive::Other => true,
+            CachedPrimitive::Symbol | CachedPrimitive::Other => true,
         }
     }
 
     fn to_number(&mut self, value: V8Value) -> Completion<f64, V8Types> {
-        let result = self.call_js_helper("value => Number(value)", &[value])?;
-        V8Types::value_as_number(&result)
-            .ok_or_else(|| self.new_type_error("ToNumber did not produce a number"))
+        let isolate_id = self.isolate_id;
+        v8_engine_scope_with_context!(scope, self, &self.realm_state.realm.context, {
+            v8::tc_scope!(let try_catch, scope);
+            let local = local_value(try_catch, isolate_id, &value)?;
+            let Some(number) = local.to_number(try_catch) else {
+                return Err(caught!(try_catch, isolate_id, "ToNumber failed"));
+            };
+            Ok(number.value())
+        })
     }
 
     fn to_numeric(&mut self, value: V8Value) -> Completion<Numeric<V8Types>, V8Types> {
@@ -1458,12 +1974,19 @@ impl ExecutionContext<V8Types> for V8Engine {
     }
 
     fn to_object(&mut self, value: V8Value) -> Completion<V8Object, V8Types> {
-        let result = self.call_js_helper(
-            "value => { if (value == null) throw new TypeError('cannot convert null or undefined to object'); return Object(value); }",
-            &[value],
-        )?;
-        V8Types::value_as_object(&result)
-            .ok_or_else(|| self.new_type_error("ToObject did not produce an object"))
+        let isolate_id = self.isolate_id;
+        v8_engine_scope_with_context!(scope, self, &self.realm_state.realm.context, {
+            v8::tc_scope!(let try_catch, scope);
+            let local = local_value(try_catch, isolate_id, &value)?;
+            let Some(object) = local.to_object(try_catch) else {
+                return Err(caught!(try_catch, isolate_id, "ToObject failed"));
+            };
+            Ok(object_from_wrapped_value(wrap_local_value(
+                try_catch,
+                isolate_id,
+                object.into(),
+            )))
+        })
     }
 
     fn to_property_key(&mut self, value: V8Value) -> Completion<V8PropertyKey, V8Types> {
@@ -1518,21 +2041,32 @@ impl ExecutionContext<V8Types> for V8Engine {
     }
 
     fn is_array(&mut self, value: &V8Value) -> Completion<bool, V8Types> {
-        let result =
-            self.call_js_helper("value => Array.isArray(value)", std::slice::from_ref(value))?;
-        Ok(V8Types::value_as_bool(&result).unwrap_or(false))
+        if value.isolate_id != self.isolate_id {
+            return Err(self.new_type_error("value belongs to a different V8 isolate"));
+        }
+        let isolate_id = self.isolate_id;
+        v8_engine_scope_with_context!(scope, self, &self.realm_state.realm.context, {
+            let local = local_value(scope, isolate_id, value)?;
+            // The native `IsArray` check models ECMA-262 §7.2.2 directly;
+            // it does not consult the realm's (possibly patched) Array.isArray.
+            Ok(local.is_array())
+        })
     }
 
     fn is_constructor(&self, value: &V8Value) -> bool {
         value
             .object_profile
             .as_ref()
-            .is_some_and(|profile| profile.function_handle.is_some())
+            .is_some_and(|profile| profile.is_constructor)
     }
 
     fn is_extensible(&mut self, object: &V8Object) -> Completion<bool, V8Types> {
-        let result = self.call_js_helper(
-            "value => Object.isExtensible(value)",
+        let function = self.captured_intrinsic(|captured| captured.is_extensible.clone());
+        let undefined = self.value_undefined();
+        let result = EcmascriptHost::call(
+            self,
+            &function.0,
+            &undefined,
             std::slice::from_ref(&object.0),
         )?;
         Ok(V8Types::value_as_bool(&result).unwrap_or(false))
@@ -1562,7 +2096,26 @@ impl ExecutionContext<V8Types> for V8Engine {
             }
             (CachedPrimitive::String(left), CachedPrimitive::String(right)) => left == right,
             (CachedPrimitive::BigInt(left), CachedPrimitive::BigInt(right)) => left == right,
-            (CachedPrimitive::Other, CachedPrimitive::Other) => left.handle == right.handle,
+            (
+                CachedPrimitive::Other | CachedPrimitive::Symbol,
+                CachedPrimitive::Other | CachedPrimitive::Symbol,
+            ) => {
+                // Root handles compare scope-free; edges (or mixed modes)
+                // compare through locals in a scope.
+                if left.handle.same_identity(&right.handle) {
+                    return true;
+                }
+                let isolate_id = self.isolate_id;
+                v8_engine_scope_with_context!(scope, self, &self.realm_state.realm.context, {
+                    match (
+                        local_value(scope, isolate_id, left),
+                        local_value(scope, isolate_id, right),
+                    ) {
+                        (Ok(left_local), Ok(right_local)) => left_local.same_value(right_local),
+                        _ => false,
+                    }
+                })
+            }
             _ => false,
         }
     }
@@ -1735,59 +2288,53 @@ impl ExecutionContext<V8Types> for V8Engine {
         property_key: V8PropertyKey,
         descriptor: PropertyDescriptor<V8Types>,
     ) -> Completion<(), V8Types> {
-        let _current_engine = CurrentEngineGuard::enter(self);
-        let isolate_id = self.isolate_id;
-        v8_engine_scope_with_context!(scope, self, &self.realm_state.realm.context, {
-            v8::tc_scope!(let try_catch, scope);
-            let object = local_object(try_catch, isolate_id, &object)?;
-            let key = local_name(try_catch, isolate_id, &property_key)?;
-
-            let undefined = v8::undefined(try_catch).into();
-            let mut v8_descriptor = if descriptor.get.is_some() || descriptor.set.is_some() {
-                let getter = match &descriptor.get {
-                    Some(getter) => {
-                        local_typed_object(try_catch, isolate_id, &getter.0, &getter.1)?.into()
-                    }
-                    None => undefined,
-                };
-                let setter = match &descriptor.set {
-                    Some(setter) => {
-                        local_typed_object(try_catch, isolate_id, &setter.0, &setter.1)?.into()
-                    }
-                    None => undefined,
-                };
-                v8::PropertyDescriptor::new_from_get_set(getter, setter)
-            } else {
-                let value = match &descriptor.value {
-                    Some(value) => local_value(try_catch, isolate_id, value)?,
-                    None => undefined,
-                };
-                v8::PropertyDescriptor::new_from_value_writable(
-                    value,
-                    descriptor.writable.unwrap_or(false),
-                )
-            };
-            if let Some(enumerable) = descriptor.enumerable {
-                v8_descriptor.set_enumerable(enumerable);
-            }
-            if let Some(configurable) = descriptor.configurable {
-                v8_descriptor.set_configurable(configurable);
-            }
-            match object.define_property(try_catch, key, &v8_descriptor) {
-                Some(true) => Ok(()),
-                Some(false) => Err(caught_exception(
-                    try_catch,
-                    isolate_id,
-                    None,
-                    "DefinePropertyOrThrow was rejected",
-                )),
-                None => Err(caught!(
-                    try_catch,
-                    isolate_id,
-                    "DefinePropertyOrThrow failed"
-                )),
-            }
-        })
+        // Build a JS descriptor object containing only the fields the caller
+        // supplied. ECMA-262 DefinePropertyOrThrow treats absent descriptor
+        // fields as "leave the existing attribute unchanged", so a
+        // `value: None`/`writable: None`/missing accessor must not become
+        // `undefined`/`false` in the descriptor. The definition itself runs
+        // through the private helper context, whose pristine
+        // `Object.defineProperty` cannot be patched by page code.
+        let descriptor_object = self.create_plain_object(None);
+        if let Some(enumerable) = descriptor.enumerable {
+            let key = self.property_key_from_str("enumerable");
+            let value = self.value_from_bool(enumerable);
+            self.create_data_property(descriptor_object.clone(), key, value)?;
+        }
+        if let Some(configurable) = descriptor.configurable {
+            let key = self.property_key_from_str("configurable");
+            let value = self.value_from_bool(configurable);
+            self.create_data_property(descriptor_object.clone(), key, value)?;
+        }
+        if let Some(value) = &descriptor.value {
+            let key = self.property_key_from_str("value");
+            self.create_data_property(descriptor_object.clone(), key, value.clone())?;
+        }
+        if let Some(writable) = descriptor.writable {
+            let key = self.property_key_from_str("writable");
+            let value = self.value_from_bool(writable);
+            self.create_data_property(descriptor_object.clone(), key, value)?;
+        }
+        if let Some(getter) = &descriptor.get {
+            let key = self.property_key_from_str("get");
+            let value = V8Types::value_from_object(getter.0.clone());
+            self.create_data_property(descriptor_object.clone(), key, value)?;
+        }
+        if let Some(setter) = &descriptor.set {
+            let key = self.property_key_from_str("set");
+            let value = V8Types::value_from_object(setter.0.clone());
+            self.create_data_property(descriptor_object.clone(), key, value)?;
+        }
+        let key = self.value_from_property_key(property_key);
+        let function = self.captured_intrinsic(|captured| captured.define_property.clone());
+        let undefined = self.value_undefined();
+        EcmascriptHost::call(
+            self,
+            &function.0,
+            &undefined,
+            &[object.0, key, descriptor_object.0],
+        )?;
+        Ok(())
     }
 
     fn delete_property_or_throw(
@@ -1819,8 +2366,9 @@ impl ExecutionContext<V8Types> for V8Engine {
     }
 
     fn get_prototype_of(&mut self, object: V8Object) -> Completion<Option<V8Object>, V8Types> {
-        let prototype =
-            self.call_js_helper("object => Object.getPrototypeOf(object)", &[object.0])?;
+        let function = self.captured_intrinsic(|captured| captured.get_prototype_of.clone());
+        let undefined = self.value_undefined();
+        let prototype = EcmascriptHost::call(self, &function.0, &undefined, &[object.0])?;
         if V8Types::value_is_null(&prototype) {
             Ok(None)
         } else {
@@ -1835,11 +2383,10 @@ impl ExecutionContext<V8Types> for V8Engine {
         object: V8Object,
         prototype: Option<V8Object>,
     ) -> Completion<bool, V8Types> {
+        let function = self.captured_intrinsic(|captured| captured.set_prototype_of.clone());
+        let undefined = self.value_undefined();
         let prototype = prototype.map_or_else(|| self.value_null(), |prototype| prototype.0);
-        let result = self.call_js_helper(
-            "(object, prototype) => Reflect.setPrototypeOf(object, prototype)",
-            &[object.0, prototype],
-        )?;
+        let result = EcmascriptHost::call(self, &function.0, &undefined, &[object.0, prototype])?;
         V8Types::value_as_bool(&result)
             .ok_or_else(|| self.new_type_error("SetPrototypeOf did not return a boolean"))
     }
@@ -1894,7 +2441,9 @@ impl ExecutionContext<V8Types> for V8Engine {
     }
 
     fn own_property_keys(&mut self, object: V8Object) -> Completion<Vec<V8PropertyKey>, V8Types> {
-        let array = self.call_js_helper("object => Reflect.ownKeys(object)", &[object.0])?;
+        let function = self.captured_intrinsic(|captured| captured.own_keys.clone());
+        let undefined = self.value_undefined();
+        let array = EcmascriptHost::call(self, &function.0, &undefined, &[object.0])?;
         let array = V8Types::value_as_object(&array)
             .ok_or_else(|| self.new_type_error("Reflect.ownKeys did not return an array"))?;
         let length_value =
@@ -1961,20 +2510,50 @@ impl ExecutionContext<V8Types> for V8Engine {
                 .ok_or_else(|| self.new_type_error("constructor did not return an object"));
         }
 
-        let wrapper_primitive = self.realm_state.intrinsics.as_ref().and_then(|intrinsics| {
-            let argument = arguments.first().map(|value| value.primitive.clone());
-            if function.0 == intrinsics.boolean.0 {
-                Some(argument.unwrap_or(CachedPrimitive::Boolean(false)))
-            } else if function.0 == intrinsics.number.0 {
-                Some(argument.unwrap_or(CachedPrimitive::Number(0.0)))
-            } else if function.0 == intrinsics.string.0 {
-                Some(argument.unwrap_or_else(|| CachedPrimitive::String(Arc::from([]))))
-            } else if function.0 == intrinsics.bigint.0 {
-                argument
-            } else {
-                None
-            }
-        });
+        let wrapper_kind = self
+            .realm_state
+            .intrinsics
+            .borrow()
+            .as_ref()
+            .and_then(|intrinsics| {
+                if function.0 == intrinsics.boolean.0 {
+                    Some(WrapperKind::Boolean)
+                } else if function.0 == intrinsics.number.0 {
+                    Some(WrapperKind::Number)
+                } else if function.0 == intrinsics.string.0 {
+                    Some(WrapperKind::String)
+                } else {
+                    None
+                }
+            });
+        // The wrapper's [[BooleanData]] has no native unboxing API, so the
+        // cached primitive is derived from the coerced argument; Number and
+        // String wrapper data are also extracted from the wrapper itself at
+        // wrap time, so these entries only supplement that path. (BigInt has
+        // no [[Construct]], so `new BigInt(...)` always throws and no cache
+        // entry is needed.)
+        let wrapper_primitive = match wrapper_kind {
+            Some(kind) => match arguments.first().cloned() {
+                Some(argument) => match kind {
+                    WrapperKind::Boolean => {
+                        Some(CachedPrimitive::Boolean(self.to_boolean(&argument)))
+                    }
+                    WrapperKind::Number => {
+                        self.to_number(argument).ok().map(CachedPrimitive::Number)
+                    }
+                    WrapperKind::String => self
+                        .to_js_string(argument)
+                        .ok()
+                        .map(|string| CachedPrimitive::String(string.utf16)),
+                },
+                None => match kind {
+                    WrapperKind::Boolean => Some(CachedPrimitive::Boolean(false)),
+                    WrapperKind::Number => Some(CachedPrimitive::Number(f64::NAN)),
+                    WrapperKind::String => Some(CachedPrimitive::String(Arc::from([]))),
+                },
+            },
+            None => None,
+        };
         let _current_engine = CurrentEngineGuard::enter(self);
         let isolate_id = self.isolate_id;
         v8_engine_scope_with_context!(scope, self, &self.realm_state.realm.context, {
@@ -2023,11 +2602,12 @@ impl ExecutionContext<V8Types> for V8Engine {
         object: V8Object,
         level: IntegrityLevel,
     ) -> Completion<bool, V8Types> {
-        let source = match level {
-            IntegrityLevel::Sealed => "object => Object.isSealed(object)",
-            IntegrityLevel::Frozen => "object => Object.isFrozen(object)",
-        };
-        let result = self.call_js_helper(source, &[object.0])?;
+        let function = self.captured_intrinsic(|captured| match level {
+            IntegrityLevel::Sealed => captured.is_sealed.clone(),
+            IntegrityLevel::Frozen => captured.is_frozen.clone(),
+        });
+        let undefined = self.value_undefined();
+        let result = EcmascriptHost::call(self, &function.0, &undefined, &[object.0])?;
         Ok(V8Types::value_as_bool(&result).unwrap_or(false))
     }
 
@@ -2155,6 +2735,7 @@ impl ExecutionContext<V8Types> for V8Engine {
         self.state_for_realm(realm)
             .unwrap_or_else(|| Rc::clone(&self.realm_state))
             .intrinsics
+            .borrow()
             .as_ref()
             .expect("V8 intrinsics are not initialized")
             .clone()
@@ -2213,29 +2794,42 @@ impl ExecutionContext<V8Types> for V8Engine {
 
     fn allocate_array_buffer(
         &mut self,
-        _constructor: V8Constructor,
+        constructor: V8Constructor,
         byte_length: u64,
         max_byte_length: Option<u64>,
     ) -> Completion<V8ArrayBuffer, V8Types> {
-        if let Some(max_byte_length) = max_byte_length {
-            let byte_length = self.value_from_number(byte_length as f64);
-            let max_byte_length = self.value_from_number(max_byte_length as f64);
-            let value = self.call_js_helper(
-                "(length, maxByteLength) => new ArrayBuffer(length, { maxByteLength })",
-                &[byte_length, max_byte_length],
-            )?;
-            let object = V8Types::value_as_object(&value)
-                .ok_or_else(|| self.new_type_error("ArrayBuffer allocation failed"))?;
-            return V8Types::object_as_array_buffer(&object)
-                .ok_or_else(|| self.new_type_error("ArrayBuffer allocation failed"));
-        }
+        // AllocateArrayBuffer (§25.1.2.1) constructs through the supplied
+        // constructor (OrdinaryCreateFromConstructor), so subclass and
+        // cross-realm constructors are honored; the V8 [[Construct]] call
+        // performs the CreateByteDataBlock and slot initialization.
+        let length = self.value_from_number(byte_length as f64);
+        let arguments = if let Some(max_byte_length) = max_byte_length {
+            let options = self.create_plain_object(None);
+            let key = self.property_key_from_str("maxByteLength");
+            let value = self.value_from_number(max_byte_length as f64);
+            self.create_data_property(options.clone(), key, value)?;
+            vec![length, V8Types::value_from_object(options)]
+        } else {
+            vec![length]
+        };
         let isolate_id = self.isolate_id;
-        let byte_length = usize::try_from(byte_length)
-            .map_err(|_| self.new_range_error("ArrayBuffer length is too large"))?;
         v8_engine_scope_with_context!(scope, self, &self.realm_state.realm.context, {
-            let array_buffer = v8::ArrayBuffer::new(scope, byte_length);
+            v8::tc_scope!(let try_catch, scope);
+            let constructor =
+                local_typed_object(try_catch, isolate_id, &constructor.0, &constructor.1)?;
+            let local_arguments: Result<Vec<_>, _> = arguments
+                .iter()
+                .map(|argument| local_value(try_catch, isolate_id, argument))
+                .collect();
+            let Some(object) = constructor.new_instance(try_catch, &local_arguments?) else {
+                return Err(caught!(
+                    try_catch,
+                    isolate_id,
+                    "ArrayBuffer allocation failed"
+                ));
+            };
             let object =
-                object_from_wrapped_value(wrap_local_value(scope, isolate_id, array_buffer.into()));
+                object_from_wrapped_value(wrap_local_value(try_catch, isolate_id, object.into()));
             V8Types::object_as_array_buffer(&object)
                 .ok_or_else(|| self.new_type_error("ArrayBuffer allocation failed"))
         })
@@ -2908,6 +3502,24 @@ impl ExecutionContext<V8Types> for V8Engine {
         prototype: V8Object,
         data: Box<dyn Any + 'static>,
     ) -> V8Object {
+        // The platform object lives on the cppgc heap, wrapped in a
+        // type-erased [`V8PlatformData`] that traces through the concrete
+        // type. `create_interface_instance` wraps the platform object in
+        // advance; other callers (prototypes, namespace objects) have no
+        // edges and get a no-op trace.
+        let platform = match V8PlatformData::try_recover(data) {
+            Ok(platform) => platform,
+            Err(raw) => V8PlatformData::noop(raw),
+        };
+        let platform_ptr = self.with_cpp_heap(|heap| {
+            // SAFETY: The returned `UnsafePtr` is immediately stored into the
+            // JS wrapper's cpp heap wrappable slot by `wrap` below — the
+            // required destination for a stack-created pointer.
+            unsafe { v8::cppgc::make_garbage_collected(heap, platform) }
+        });
+        // cppgc is non-moving; the platform data address is stable for the
+        // lifetime of the wrapper, so it can be cached in the internal field.
+        let platform_data_pointer = unsafe { platform_ptr.as_ref() } as *const V8PlatformData;
         let isolate_id = self.isolate_id;
         v8_engine_scope_with_context!(scope, self, &self.realm_state.realm.context, {
             let object_template = v8::ObjectTemplate::new(scope);
@@ -2921,68 +3533,78 @@ impl ExecutionContext<V8Types> for V8Engine {
                 .set_prototype(scope, prototype)
                 .expect("V8 failed to set a platform-object prototype");
 
-            let record = Box::new(HostObjectRecord { data });
-            let record_pointer = Box::into_raw(record);
             let marker = v8::External::new(
                 scope,
                 std::ptr::addr_of!(HOST_OBJECT_MARKER).cast_mut().cast(),
             );
             assert!(object.set_internal_field(0, marker.into()));
-            object.set_aligned_pointer_in_internal_field(1, record_pointer.cast(), HOST_OBJECT_TAG);
-
-            let value =
-                object_from_wrapped_value(wrap_local_value(scope, isolate_id, object.into()));
-            let weak = v8::Weak::with_guaranteed_finalizer(
-                scope,
-                object,
-                Box::new(move || {
-                    // SAFETY: `record_pointer` is created by the single
-                    // Box::into_raw above. This guaranteed finalizer is its sole
-                    // owner and V8 invokes it at most once after the JS object can
-                    // no longer expose its internal field.
-                    unsafe {
-                        drop(Box::from_raw(record_pointer));
-                    }
-                }),
+            object.set_aligned_pointer_in_internal_field(
+                1,
+                platform_data_pointer.cast(),
+                HOST_OBJECT_TAG,
             );
-            self.shared_isolate
-                .host_object_handles
-                .borrow_mut()
-                .push(weak);
-            value
+
+            // Register the cppgc platform object with the wrapper so the
+            // unified heap traces it (and through it its cells and JS edges)
+            // while the wrapper is alive.
+            let isolate = &mut ****scope;
+            // SAFETY: `wrap` stores the wrappable pointer in the wrapper's cpp
+            // heap slot; the tag is unique within this embedder. The isolate
+            // is reborrowed from the active scope, matching the scope-macro
+            // reborrow pattern.
+            unsafe {
+                v8::Object::wrap::<HOST_OBJECT_TAG, V8PlatformData>(isolate, object, &platform_ptr)
+            }
+
+            object_from_wrapped_value(wrap_local_value(scope, isolate_id, object.into()))
         })
     }
 
     fn with_object_any(&self, object: &V8Object) -> Option<&dyn Any> {
-        if let Some(pointer) = object.0.host_data {
-            // SAFETY: `host_data_pointer` validates the marker and tag before
-            // placing this pointer in a V8Value. A Global handle in `object`
-            // keeps the JS object reachable, so its guaranteed finalizer cannot
-            // release the record during this borrow.
-            let record = unsafe { &*pointer.cast::<HostObjectRecord>().as_ptr() };
-            return Some(record.data.as_ref());
-        }
-        self.realm_host_data()
-            .associated_objects
-            .iter()
-            .find(|(candidate, _)| candidate == object)
-            .map(|(_, data)| data.as_ref())
+        let platform_address: Option<usize> = if let Some(pointer) = object.0.host_data {
+            Some(pointer.as_ptr() as usize)
+        } else {
+            self.realm_host_data()
+                .associated_objects
+                .iter()
+                .find(|associated| &associated.object == object)
+                .map(|associated| associated.platform_pointer as usize)
+        };
+        let address = platform_address?;
+        assert!(
+            !self.mutably_borrowed_platforms.borrow().contains(&address),
+            "re-entrant immutable platform access during a mutable platform borrow"
+        );
+        // SAFETY: `host_data_pointer` validates the marker and tag before
+        // placing this pointer in a V8Value; the associated records keep
+        // their platform alive through a traced cppgc Member. cppgc is
+        // non-moving, so the address is stable while the owner lives.
+        let platform = unsafe { &*(address as *const V8PlatformData) };
+        Some(platform.as_any())
     }
 
     fn with_object_any_mut(&mut self, object: &V8Object) -> Option<&mut dyn Any> {
-        if let Some(pointer) = object.0.host_data {
-            // SAFETY: The marker, reachability, and finalization invariants are
-            // the same as in `with_object_any`. The `&mut self` receiver makes
-            // this the exclusive host-data access path for the duration of the
-            // returned borrow.
-            let record = unsafe { &mut *pointer.cast::<HostObjectRecord>().as_ptr() };
-            return Some(record.data.as_mut());
-        }
-        self.realm_host_data_mut()
-            .associated_objects
-            .iter_mut()
-            .find(|(candidate, _)| candidate == object)
-            .map(|(_, data)| data.as_mut())
+        let platform_address: Option<usize> = if let Some(pointer) = object.0.host_data {
+            Some(pointer.as_ptr() as usize)
+        } else {
+            self.realm_host_data_mut()
+                .associated_objects
+                .iter_mut()
+                .find(|associated| &associated.object == object)
+                .map(|associated| associated.platform_pointer as usize)
+        };
+        let address = platform_address?;
+        assert!(
+            !self.mutably_borrowed_platforms.borrow().contains(&address),
+            "re-entrant mutable platform access during a mutable platform borrow"
+        );
+        // SAFETY: The marker and reachability invariants are the same as in
+        // `with_object_any`. The `&mut self` receiver makes this the
+        // exclusive host-data access path for the duration of the returned
+        // borrow; marking is atomic, so no concurrent marker reads the
+        // platform data while it is mutated.
+        let platform = unsafe { &mut *(address as *mut V8PlatformData) };
+        Some(platform.as_any_mut())
     }
 
     fn with_object_any_mut_with(
@@ -2990,27 +3612,51 @@ impl ExecutionContext<V8Types> for V8Engine {
         object: &V8Object,
         operation: Box<dyn FnOnce(&mut dyn Any, &mut dyn ExecutionContext<V8Types>) + '_>,
     ) {
-        let data_pointer: Option<*mut dyn Any> = if let Some(pointer) = object.0.host_data {
-            // SAFETY: The validated host pointer remains alive because
-            // `object` owns a Global handle. Converting to a raw trait-object
-            // pointer lets the callback borrow both the record and the engine;
-            // no other access to the record occurs until the callback returns.
-            let record = unsafe { &mut *pointer.cast::<HostObjectRecord>().as_ptr() };
-            Some(record.data.as_mut())
+        let platform_address: Option<usize> = if let Some(pointer) = object.0.host_data {
+            Some(pointer.as_ptr() as usize)
         } else {
             self.realm_host_data_mut()
                 .associated_objects
                 .iter_mut()
-                .find(|(candidate, _)| candidate == object)
-                .map(|(_, data)| data.as_mut() as *mut dyn Any)
+                .find(|associated| &associated.object == object)
+                .map(|associated| associated.platform_pointer as usize)
         };
-        if let Some(data_pointer) = data_pointer {
-            // SAFETY: `data_pointer` was obtained from storage exclusively
-            // borrowed above and is used only for this call.
-            unsafe {
-                operation(&mut *data_pointer, self);
-            }
+        let Some(address) = platform_address else {
+            return;
+        };
+        // Register the platform as mutably borrowed for the duration of the
+        // operation: a re-entrant `with_object_any`/`with_object_any_mut`
+        // access to the same platform through the passed-in execution
+        // context would otherwise create a second live reference to the
+        // same data (an aliasing violation) — this turns it into a panic.
+        assert!(
+            self.mutably_borrowed_platforms.borrow_mut().insert(address),
+            "re-entrant mutable platform access through the execution context"
+        );
+        let set_pointer = &mut self.mutably_borrowed_platforms as *mut RefCell<HashSet<usize>>;
+        let _guard = PlatformBorrowGuard {
+            set: set_pointer,
+            address,
+        };
+        // SAFETY: The address was obtained from the validated host pointer
+        // or the associated platform record, both kept alive by their
+        // tracing owners; the guard prevents any second access to this
+        // platform through the execution context for the duration of the
+        // operation, so the `&mut dyn Any` is the only live reference.
+        let data_pointer =
+            unsafe { (&mut *(address as *mut V8PlatformData)).as_any_mut() } as *mut dyn Any;
+        // SAFETY: `data_pointer` was obtained from storage exclusively
+        // borrowed above and is used only for this call.
+        unsafe {
+            operation(&mut *data_pointer, self);
         }
+    }
+
+    fn store_js_object(&mut self, slot: &mut Option<V8Object>, value: V8Object) {
+        *slot = Some(value);
+        // Convert the stored object's rooted handles into cppgc edges so the
+        // slot participates in unified-heap cycle collection.
+        crate::gc::Trace::store(slot, self);
     }
 
     fn new_type_error(&mut self, message: &str) -> V8Value {
@@ -3156,21 +3802,28 @@ impl ExecutionContext<V8Types> for V8Engine {
 mod tests {
     use std::any::TypeId;
     use std::cell::{Cell, RefCell};
+    use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::ptr::from_ref;
     use std::rc::Rc;
 
     use rusty_v8 as v8;
 
-    use crate::{EcmascriptHost, ExecutionContext, JsTypes};
-
-    use super::super::{V8AsyncGenerator, V8WeakMap, V8WeakRef, V8WeakSet};
-    use super::{
-        CURRENT_CALLBACK_ISOLATE_ID, CURRENT_CALLBACK_SCOPE, V8ArrayBuffer, V8Constructor,
-        V8DataView, V8Engine, V8Function, V8Generator, V8Map, V8Object, V8Promise, V8Set,
-        V8SharedArrayBuffer, V8TypedArray, V8Types,
+    use crate::gc::{Finalize, GcCell, Trace, gc_cell_new};
+    use crate::v8_gc::Visitor;
+    use crate::{
+        EcmascriptHost, ExecutionContext, HostHooks, JsEngine, JsTypes, PropertyDescriptor,
     };
 
-    struct DropFlag(Rc<Cell<bool>>);
+    use super::super::types::V8Handle;
+    use super::super::{V8AsyncGenerator, V8PlatformData, V8WeakMap, V8WeakRef, V8WeakSet};
+    use super::{
+        CALLBACK_HANDLE_COMPACTION_THRESHOLD, CURRENT_CALLBACK_ISOLATE_ID, CURRENT_CALLBACK_SCOPE,
+        StoredBehaviour, V8ArrayBuffer, V8Constructor, V8DataView, V8Engine, V8Function,
+        V8Generator, V8Map, V8Object, V8Promise, V8Set, V8SharedArrayBuffer, V8TypedArray, V8Types,
+        local_object,
+    };
+
+    pub(crate) struct DropFlag(pub(crate) Rc<Cell<bool>>);
 
     struct RealmMarker(&'static str);
 
@@ -3212,41 +3865,65 @@ mod tests {
 
         let array_buffer = evaluate_object("new ArrayBuffer(8)");
         let array_buffer = V8Types::object_as_array_buffer(&array_buffer)
-            .expect("ArrayBuffer must retain a Global<ArrayBuffer>");
-        let _: &v8::Global<v8::ArrayBuffer> = &array_buffer.1;
+            .expect("ArrayBuffer must retain a typed handle");
+        assert!(
+            !matches!(array_buffer.1, V8Handle::Edge(_)),
+            "fresh values are rooted"
+        );
 
         let shared_array_buffer = evaluate_object("new SharedArrayBuffer(8)");
         let shared_array_buffer = V8Types::object_as_shared_array_buffer(&shared_array_buffer)
-            .expect("SharedArrayBuffer must retain a Global<SharedArrayBuffer>");
-        let _: &v8::Global<v8::SharedArrayBuffer> = &shared_array_buffer.1;
+            .expect("SharedArrayBuffer must retain a typed handle");
+        assert!(
+            !matches!(shared_array_buffer.1, V8Handle::Edge(_)),
+            "fresh values are rooted"
+        );
 
         let typed_array = evaluate_object("new Uint8Array(8)");
         let typed_array = V8Types::object_as_typed_array(&typed_array)
-            .expect("TypedArray must retain a Global<TypedArray>");
-        let _: &v8::Global<v8::TypedArray> = &typed_array.1;
+            .expect("TypedArray must retain a typed handle");
+        assert!(
+            !matches!(typed_array.1, V8Handle::Edge(_)),
+            "fresh values are rooted"
+        );
 
         let data_view = evaluate_object("new DataView(new ArrayBuffer(8))");
-        let data_view = V8Types::object_as_data_view(&data_view)
-            .expect("DataView must retain a Global<DataView>");
-        let _: &v8::Global<v8::DataView> = &data_view.1;
+        let data_view =
+            V8Types::object_as_data_view(&data_view).expect("DataView must retain a typed handle");
+        assert!(
+            !matches!(data_view.1, V8Handle::Edge(_)),
+            "fresh values are rooted"
+        );
 
         let promise = evaluate_object("Promise.resolve(1)");
         let promise =
-            V8Types::object_as_promise(&promise).expect("Promise must retain a Global<Promise>");
-        let _: &v8::Global<v8::Promise> = &promise.1;
+            V8Types::object_as_promise(&promise).expect("Promise must retain a typed handle");
+        assert!(
+            !matches!(promise.1, V8Handle::Edge(_)),
+            "fresh values are rooted"
+        );
 
         let map = evaluate_object("new Map()");
-        let map = V8Types::object_as_map(&map).expect("Map must retain a Global<Map>");
-        let _: &v8::Global<v8::Map> = &map.1;
+        let map = V8Types::object_as_map(&map).expect("Map must retain a typed handle");
+        assert!(
+            !matches!(map.1, V8Handle::Edge(_)),
+            "fresh values are rooted"
+        );
 
         let set = evaluate_object("new Set()");
-        let set = V8Types::object_as_set(&set).expect("Set must retain a Global<Set>");
-        let _: &v8::Global<v8::Set> = &set.1;
+        let set = V8Types::object_as_set(&set).expect("Set must retain a typed handle");
+        assert!(
+            !matches!(set.1, V8Handle::Edge(_)),
+            "fresh values are rooted"
+        );
 
         let function = evaluate_object("(function typedFunction() {})");
-        let function = V8Types::object_as_function(&function)
-            .expect("Function must retain a Global<Function>");
-        let _: &v8::Global<v8::Function> = &function.1;
+        let function =
+            V8Types::object_as_function(&function).expect("Function must retain a typed handle");
+        assert!(
+            !matches!(function.1, V8Handle::Edge(_)),
+            "fresh values are rooted"
+        );
     }
 
     #[test]
@@ -3769,5 +4446,750 @@ mod tests {
 
         assert!(host_object_dropped.get());
         assert!(callback_dropped.get());
+    }
+
+    /// A traced platform payload with a finalization probe and the three
+    /// reference kinds production platform objects carry: a reflector edge
+    /// back to the JS wrapper, a peer edge to another wrapper, and a nested
+    /// cell holding JS references.
+    struct TestPlatform {
+        dropped: DropFlag,
+        reflector: Option<V8Object>,
+        peer: Option<V8Object>,
+        cell: Option<GcCell<Option<V8Object>>>,
+    }
+
+    // SAFETY: Every edge the platform holds is visited exactly once: the
+    // reflector, the peer, and the nested cell (whose trace walks the Member
+    // to the heap cell). The finalization probe is not traced.
+    unsafe impl Trace for TestPlatform {
+        unsafe fn trace(&self, visitor: &mut Visitor) {
+            if let Some(reflector) = &self.reflector {
+                // SAFETY: Delegated to the field's own trace implementation.
+                unsafe { Trace::trace(reflector, visitor) }
+            }
+            if let Some(peer) = &self.peer {
+                // SAFETY: Delegated to the field's own trace implementation.
+                unsafe { Trace::trace(peer, visitor) }
+            }
+            if let Some(cell) = &self.cell {
+                // SAFETY: Delegated to the field's own trace implementation.
+                unsafe { Trace::trace(cell, visitor) }
+            }
+        }
+
+        fn store(&mut self, ec: &mut dyn ExecutionContext<V8Types>) {
+            if let Some(reflector) = &mut self.reflector {
+                Trace::store(reflector, ec);
+            }
+            if let Some(peer) = &mut self.peer {
+                Trace::store(peer, ec);
+            }
+            if let Some(cell) = &mut self.cell {
+                Trace::store(cell, ec);
+            }
+        }
+    }
+
+    impl Finalize for TestPlatform {}
+
+    /// Install a guaranteed finalizer on `object`; the returned weak handle
+    /// must stay alive for the finalizer to run.
+    fn install_guaranteed_finalizer(
+        engine: &mut V8Engine,
+        object: &V8Object,
+        flag: Rc<Cell<bool>>,
+    ) -> v8::Weak<v8::Object> {
+        let isolate_id = engine.isolate_id;
+        v8_engine_scope_with_context!(scope, engine, &engine.realm_state.realm.context, {
+            let local = local_object(scope, isolate_id, object)
+                .expect("finalizer installation received a reclaimed or cross-isolate object");
+            v8::Weak::with_guaranteed_finalizer(scope, local, Box::new(move || flag.set(true)))
+        })
+    }
+
+    #[test]
+    fn reflector_cycle_is_collected_by_forced_gc() {
+        let mut engine = V8Engine::new();
+        let platform_dropped = Rc::new(Cell::new(false));
+        let prototype = engine.create_plain_object(None);
+        let platform = V8PlatformData::new(TestPlatform {
+            dropped: DropFlag(Rc::clone(&platform_dropped)),
+            reflector: None,
+            peer: None,
+            cell: None,
+        });
+        let wrapper = engine.create_object_with_any(prototype, Box::new(platform));
+
+        // The platform stores an edge back to its own wrapper: the wrapper
+        // traces the platform (v8::Object::wrap) and the platform traces the
+        // wrapper (reflector edge) — a cross-heap cycle.
+        engine.with_object_any_mut_with(
+            &wrapper,
+            Box::new(|data, ec| {
+                let platform = data
+                    .downcast_mut::<TestPlatform>()
+                    .expect("wrapper carries test platform data");
+                assert!(
+                    !platform.dropped.0.get(),
+                    "the probe must not fire while the platform is alive"
+                );
+                ec.store_js_object(&mut platform.reflector, wrapper.clone());
+            }),
+        );
+
+        let wrapper_collected = Rc::new(Cell::new(false));
+        let wrapper_weak =
+            install_guaranteed_finalizer(&mut engine, &wrapper, Rc::clone(&wrapper_collected));
+
+        drop(wrapper);
+        // One full collection: the unified heap marks the wrapper and its
+        // platform together, so the cycle is reclaimed in a single pass.
+        engine.gc();
+
+        assert!(
+            platform_dropped.get(),
+            "the platform must be collected with its unreachable wrapper"
+        );
+        assert!(
+            wrapper_collected.get(),
+            "the wrapper must be collected with its reflector-holding platform"
+        );
+        drop(wrapper_weak);
+    }
+
+    #[test]
+    fn mutual_platform_object_cycle_is_collected() {
+        let mut engine = V8Engine::new();
+        let a_dropped = Rc::new(Cell::new(false));
+        let b_dropped = Rc::new(Cell::new(false));
+        let prototype = engine.create_plain_object(None);
+        let a = engine.create_object_with_any(
+            prototype.clone(),
+            Box::new(V8PlatformData::new(TestPlatform {
+                dropped: DropFlag(Rc::clone(&a_dropped)),
+                reflector: None,
+                peer: None,
+                cell: None,
+            })),
+        );
+        let b = engine.create_object_with_any(
+            prototype,
+            Box::new(V8PlatformData::new(TestPlatform {
+                dropped: DropFlag(Rc::clone(&b_dropped)),
+                reflector: None,
+                peer: None,
+                cell: None,
+            })),
+        );
+
+        engine.with_object_any_mut_with(
+            &a,
+            Box::new(|data, ec| {
+                let platform = data
+                    .downcast_mut::<TestPlatform>()
+                    .expect("wrapper A carries test platform data");
+                assert!(
+                    !platform.dropped.0.get(),
+                    "the probe must not fire while platform A is alive"
+                );
+                ec.store_js_object(&mut platform.peer, b.clone());
+            }),
+        );
+        engine.with_object_any_mut_with(
+            &b,
+            Box::new(|data, ec| {
+                let platform = data
+                    .downcast_mut::<TestPlatform>()
+                    .expect("wrapper B carries test platform data");
+                assert!(
+                    !platform.dropped.0.get(),
+                    "the probe must not fire while platform B is alive"
+                );
+                ec.store_js_object(&mut platform.peer, a.clone());
+            }),
+        );
+
+        let a_wrapper_collected = Rc::new(Cell::new(false));
+        let b_wrapper_collected = Rc::new(Cell::new(false));
+        let a_weak = install_guaranteed_finalizer(&mut engine, &a, Rc::clone(&a_wrapper_collected));
+        let b_weak = install_guaranteed_finalizer(&mut engine, &b, Rc::clone(&b_wrapper_collected));
+
+        drop(a);
+        drop(b);
+        // One full collection: the two wrappers and their platforms form a
+        // single cross-heap cycle, reclaimed in one pass.
+        engine.gc();
+
+        assert!(
+            a_dropped.get(),
+            "platform A must be collected with the cycle"
+        );
+        assert!(
+            b_dropped.get(),
+            "platform B must be collected with the cycle"
+        );
+        assert!(
+            a_wrapper_collected.get(),
+            "wrapper A must be collected with the cycle"
+        );
+        assert!(
+            b_wrapper_collected.get(),
+            "wrapper B must be collected with the cycle"
+        );
+        drop(a_weak);
+        drop(b_weak);
+    }
+
+    #[test]
+    fn stored_js_reference_dies_with_its_cell() {
+        let mut engine = V8Engine::new();
+
+        // X is a plain object reachable only through the cell edge below.
+        let x = ExecutionContext::evaluate_script(&mut engine, "({ marker: 'payload' })")
+            .expect("the payload object must evaluate");
+        let x_object = V8Types::value_as_object(&x).expect("the payload must be an object");
+        let x_collected = Rc::new(Cell::new(false));
+        let x_weak = install_guaranteed_finalizer(&mut engine, &x_object, Rc::clone(&x_collected));
+
+        // gc_cell_new converts the rooted handle into a cppgc edge.
+        let cell = gc_cell_new(Some(x_object), &mut engine);
+        drop(x);
+
+        // A platform object owns the cell so it is traced while the platform
+        // lives (the production pattern for stream controller state).
+        let platform_dropped = Rc::new(Cell::new(false));
+        let prototype = engine.create_plain_object(None);
+        let owner = engine.create_object_with_any(
+            prototype,
+            Box::new(V8PlatformData::new(TestPlatform {
+                dropped: DropFlag(Rc::clone(&platform_dropped)),
+                reflector: None,
+                peer: None,
+                cell: Some(cell),
+            })),
+        );
+        assert!(
+            engine
+                .with_object_any(&owner)
+                .and_then(|data| data.downcast_ref::<TestPlatform>())
+                .is_some_and(|platform| !platform.dropped.0.get()),
+            "the probe must not fire while the owner is alive"
+        );
+
+        drop(owner);
+        // One full collection: the payload edge dies with the cell, and the
+        // cell dies with its owning platform, all in the same pass.
+        engine.gc();
+
+        assert!(
+            platform_dropped.get(),
+            "the owning platform must be collected"
+        );
+        assert!(
+            x_collected.get(),
+            "the payload referenced only through the cell edge must be collected with it"
+        );
+        drop(x_weak);
+    }
+
+    #[test]
+    fn platform_data_finalized_at_isolate_destruction() {
+        let platform_dropped = Rc::new(Cell::new(false));
+        {
+            let mut engine = V8Engine::new();
+            let prototype = engine.create_plain_object(None);
+            let owner = engine.create_object_with_any(
+                prototype,
+                Box::new(V8PlatformData::new(TestPlatform {
+                    dropped: DropFlag(Rc::clone(&platform_dropped)),
+                    reflector: None,
+                    peer: None,
+                    cell: None,
+                })),
+            );
+            // Keep the wrapper alive: destruction must finalize the platform
+            // data even though no collection ran.
+            assert!(
+                engine
+                    .with_object_any(&owner)
+                    .and_then(|data| data.downcast_ref::<TestPlatform>())
+                    .is_some_and(|platform| !platform.dropped.0.get()),
+                "the platform must be alive before destruction"
+            );
+        }
+        assert!(
+            platform_dropped.get(),
+            "platform data must be finalized when the isolate is destroyed"
+        );
+    }
+
+    #[test]
+    fn arrow_functions_are_not_constructors() {
+        let mut engine = V8Engine::new();
+        let arrow = ExecutionContext::evaluate_script(&mut engine, "(() => 1)")
+            .expect("the arrow function must evaluate");
+        assert!(
+            !engine.is_constructor(&arrow),
+            "arrow functions are callable but have no [[Construct]]"
+        );
+        let arrow_object = V8Types::value_as_object(&arrow).expect("the arrow must be an object");
+        assert!(
+            V8Types::object_as_constructor(&arrow_object).is_none(),
+            "object_as_constructor must reject non-constructible functions"
+        );
+
+        let normal = ExecutionContext::evaluate_script(&mut engine, "(function normal() {})")
+            .expect("the normal function must evaluate");
+        assert!(engine.is_constructor(&normal));
+        let normal_object =
+            V8Types::value_as_object(&normal).expect("the function must be an object");
+        assert!(
+            V8Types::object_as_constructor(&normal_object).is_some(),
+            "ordinary functions are constructors"
+        );
+
+        let generator = ExecutionContext::evaluate_script(&mut engine, "(function* gen() {})")
+            .expect("the generator function must evaluate");
+        assert!(
+            !engine.is_constructor(&generator),
+            "generator functions are callable but have no [[Construct]]"
+        );
+    }
+
+    #[test]
+    fn define_property_or_throw_preserves_absent_descriptor_fields() {
+        let mut engine = V8Engine::new();
+        let object = ExecutionContext::evaluate_script(
+            &mut engine,
+            "globalThis.__descriptorTarget = { value: 7 }; globalThis.__descriptorTarget",
+        )
+        .expect("the target object must evaluate");
+        let object = V8Types::value_as_object(&object).expect("the target must be an object");
+        let value_key = engine.property_key_from_str("value");
+        let original = engine
+            .get_own_property(object.clone(), value_key.clone())
+            .expect("the own property must be readable")
+            .expect("the property must exist");
+        assert_eq!(original.writable, Some(true));
+
+        // Define only `enumerable: false`: value and writable must be untouched.
+        engine
+            .define_property_or_throw(
+                object.clone(),
+                value_key.clone(),
+                PropertyDescriptor {
+                    value: None,
+                    writable: None,
+                    get: None,
+                    set: None,
+                    enumerable: Some(false),
+                    configurable: None,
+                },
+            )
+            .expect("defining only enumerable must succeed");
+        let after = engine
+            .get_own_property(object.clone(), value_key.clone())
+            .expect("the property must remain readable")
+            .expect("the property must still exist");
+        assert_eq!(after.writable, Some(true), "writability must be preserved");
+        let value = ExecutionContext::get(&mut engine, object.clone(), value_key)
+            .expect("the value must be readable");
+        assert_eq!(
+            engine.to_number(value).expect("the value must be numeric"),
+            7.0,
+            "the property value must be preserved"
+        );
+    }
+
+    #[test]
+    fn accessor_update_with_only_a_setter_preserves_the_getter() {
+        let mut engine = V8Engine::new();
+        let object = ExecutionContext::evaluate_script(
+            &mut engine,
+            "globalThis.__accessorTarget = { get field() { return 'getter'; }, set field(v) {} }; globalThis.__accessorTarget",
+        )
+        .expect("the accessor object must evaluate");
+        let object = V8Types::value_as_object(&object).expect("the target must be an object");
+        let key = engine.property_key_from_str("field");
+        let setter = ExecutionContext::evaluate_script(&mut engine, "(value => {})")
+            .expect("the setter function must evaluate");
+        let setter = V8Types::value_as_object(&setter)
+            .and_then(|object| V8Types::object_as_function(&object))
+            .expect("the setter must be a function");
+
+        // Define only the setter: the existing getter must be preserved.
+        engine
+            .define_property_or_throw(
+                object.clone(),
+                key.clone(),
+                PropertyDescriptor {
+                    value: None,
+                    writable: None,
+                    get: None,
+                    set: Some(setter),
+                    enumerable: None,
+                    configurable: None,
+                },
+            )
+            .expect("defining only the setter must succeed");
+        let after = engine
+            .get_own_property(object, key)
+            .expect("the property must remain readable")
+            .expect("the property must still exist");
+        assert!(
+            after.get.is_some(),
+            "the existing getter must survive a setter-only update"
+        );
+    }
+
+    #[test]
+    fn number_wrapper_data_extracts_script_created_wrappers() {
+        let mut engine = V8Engine::new();
+        for source in ["new Number(42)", "new Number('42')"] {
+            let wrapper = ExecutionContext::evaluate_script(&mut engine, source)
+                .expect("the wrapper expression must evaluate");
+            let object = V8Types::value_as_object(&wrapper).expect("the wrapper must be an object");
+            assert!(V8Types::object_is_number_wrapper(&object));
+            assert_eq!(
+                V8Types::number_wrapper_data(&object),
+                Some(42.0),
+                "the wrapper's [[NumberData]] must be extracted from `{source}`"
+            );
+        }
+    }
+
+    #[test]
+    fn wrapper_constructors_coerce_their_arguments() {
+        let mut engine = V8Engine::new();
+        let intrinsics = engine.realm_intrinsics(&engine.current_realm());
+
+        let string_arg = engine.value_from_string(engine.js_string_from_str("42"));
+        let number_wrapper = engine
+            .construct(intrinsics.number.clone(), &[string_arg], None)
+            .expect("constructing Number must succeed");
+        assert_eq!(
+            V8Types::number_wrapper_data(&number_wrapper),
+            Some(42.0),
+            "new Number('42') must record the coerced number"
+        );
+
+        let number_arg = engine.value_from_number(42.0);
+        let string_wrapper = engine
+            .construct(intrinsics.string.clone(), &[number_arg], None)
+            .expect("constructing String must succeed");
+        assert_eq!(
+            V8Types::string_wrapper_data(&string_wrapper)
+                .map(|string| { String::from_utf16_lossy(&string.utf16) }),
+            Some("42".to_owned()),
+            "new String(42) must record the coerced string"
+        );
+
+        let number_arg = engine.value_from_number(3.0);
+        let boolean_wrapper = engine
+            .construct(intrinsics.boolean.clone(), &[number_arg], None)
+            .expect("constructing Boolean must succeed");
+        assert_eq!(
+            V8Types::boolean_wrapper_data(&boolean_wrapper),
+            Some(true),
+            "new Boolean(3) must record the coerced boolean"
+        );
+    }
+
+    #[test]
+    fn is_array_and_to_number_ignore_patched_page_globals() {
+        let mut engine = V8Engine::new();
+        ExecutionContext::evaluate_script(
+            &mut engine,
+            "Array.isArray = () => false; Number = () => 999;",
+        )
+        .expect("the global patch must evaluate");
+        let array = ExecutionContext::evaluate_script(&mut engine, "[1, 2, 3]")
+            .expect("the array must evaluate");
+        assert!(
+            engine.is_array(&array).expect("is_array must not fail"),
+            "IsArray must not consult the patched Array.isArray"
+        );
+        let string = engine.value_from_string(engine.js_string_from_str("42"));
+        assert_eq!(
+            engine.to_number(string).expect("ToNumber must not fail"),
+            42.0,
+            "ToNumber must not consult the patched Number global"
+        );
+    }
+
+    #[test]
+    fn helper_operations_ignore_patched_page_globals() {
+        let mut engine = V8Engine::new();
+        ExecutionContext::evaluate_script(
+            &mut engine,
+            "Object.getPrototypeOf = () => null; Reflect.ownKeys = () => [];",
+        )
+        .expect("the global patch must evaluate");
+        let object = ExecutionContext::evaluate_script(&mut engine, "({ a: 1 })")
+            .expect("the object must evaluate");
+        let object = V8Types::value_as_object(&object).expect("the object must be an object");
+        assert!(
+            engine
+                .get_prototype_of(object.clone())
+                .expect("GetPrototypeOf must not fail")
+                .is_some(),
+            "GetPrototypeOf must not consult the patched Object.getPrototypeOf"
+        );
+        let keys = engine
+            .own_property_keys(object)
+            .expect("OwnPropertyKeys must not fail");
+        assert_eq!(
+            keys.len(),
+            1,
+            "OwnPropertyKeys must not consult the patched Reflect.ownKeys"
+        );
+    }
+
+    #[test]
+    fn create_realm_registers_its_own_intrinsics() {
+        let mut engine = V8Engine::new();
+        let realm = engine.create_realm();
+        let intrinsics = engine.realm_intrinsics(&realm);
+        // The intrinsics of the new realm are its own Object.prototype: the
+        // realm's `Object.prototype` object.
+        let value = JsEngine::evaluate_script(&mut engine, "Object.prototype", &realm)
+            .expect("the realm script must evaluate");
+        let proto = V8Types::value_as_object(&value).expect("the prototype must be an object");
+        assert!(
+            engine.same_value(
+                &V8Types::value_from_object(intrinsics.object_prototype.clone()),
+                &V8Types::value_from_object(proto),
+            ),
+            "realm_intrinsics must source from the created realm"
+        );
+        let caller_proto = engine
+            .realm_intrinsics(&engine.current_realm())
+            .object_prototype;
+        assert!(
+            !engine.same_value(
+                &V8Types::value_from_object(intrinsics.object_prototype.clone()),
+                &V8Types::value_from_object(caller_proto),
+            ),
+            "realm_intrinsics must not fall back to the caller's realm"
+        );
+    }
+
+    #[test]
+    fn allocate_array_buffer_honors_the_supplied_constructor() {
+        let mut engine = V8Engine::new();
+        let subclass =
+            ExecutionContext::evaluate_script(&mut engine, "class Sub extends ArrayBuffer {}; Sub")
+                .expect("the subclass must evaluate");
+        let subclass = V8Types::value_as_object(&subclass)
+            .and_then(|object| V8Types::object_as_constructor(&object))
+            .expect("Sub must be a constructor");
+        let buffer = ExecutionContext::allocate_array_buffer(&mut engine, subclass, 8, None)
+            .expect("the allocation must succeed");
+        let prototype = engine
+            .get_prototype_of(buffer.0)
+            .expect("the buffer prototype must be readable")
+            .expect("the buffer must have a prototype");
+        let sub_prototype = ExecutionContext::evaluate_script(&mut engine, "Sub.prototype")
+            .expect("Sub.prototype must evaluate");
+        let sub_prototype =
+            V8Types::value_as_object(&sub_prototype).expect("Sub.prototype must be an object");
+        assert!(
+            engine.same_value(
+                &V8Types::value_from_object(prototype),
+                &V8Types::value_from_object(sub_prototype),
+            ),
+            "AllocateArrayBuffer must construct through the supplied subclass"
+        );
+    }
+
+    #[test]
+    fn module_import_invokes_the_load_imported_module_hook() {
+        let mut engine = V8Engine::new();
+        let hook_called = Rc::new(Cell::new(false));
+        let hook_flag = Rc::clone(&hook_called);
+        let mut hooks = HostHooks::empty();
+        hooks.load_imported_module = Some(Box::new(move |_request, _capability| {
+            hook_flag.set(true);
+        }));
+        engine.set_host_hooks(hooks);
+        let realm = engine.current_realm();
+        let result = JsEngine::evaluate_module(
+            &mut engine,
+            "import 'virtual-module'; export const answer = 42;",
+            &realm,
+        );
+        assert!(
+            result.is_err(),
+            "synchronous instantiation of an imported module must fail"
+        );
+        assert!(
+            hook_called.get(),
+            "the load_imported_module hook must be invoked for the import"
+        );
+    }
+
+    #[test]
+    fn panicking_load_imported_module_hook_does_not_unwind() {
+        let mut engine = V8Engine::new();
+        let mut hooks = HostHooks::empty();
+        hooks.load_imported_module = Some(Box::new(|_request, _capability| {
+            panic!("load_imported_module hook panicked");
+        }));
+        engine.set_host_hooks(hooks);
+        let realm = engine.current_realm();
+        let result = JsEngine::evaluate_module(
+            &mut engine,
+            "import 'virtual-module'; export const answer = 42;",
+            &realm,
+        );
+        assert!(
+            result.is_err(),
+            "a panicking import hook must surface as an evaluation error, not unwind across V8"
+        );
+    }
+
+    #[test]
+    fn callback_records_are_reclaimed_after_collection() {
+        let mut engine = V8Engine::new();
+        let record_dropped = Rc::new(Cell::new(false));
+        let captured = DropFlag(Rc::clone(&record_dropped));
+        let behaviour: StoredBehaviour = Box::new(move |_args, _this, ec| {
+            let _ = &captured;
+            Ok(ec.value_undefined())
+        });
+        let function = engine.make_builtin_function(
+            behaviour,
+            0,
+            engine.property_key_from_str("test_fn"),
+            false,
+        );
+        drop(function);
+        // A full collection runs the guaranteed weak finalizer, which must
+        // release the callback record (and with it the captured behaviour
+        // closure).
+        engine.gc();
+        assert!(
+            record_dropped.get(),
+            "the callback record must be freed once its function is collected"
+        );
+    }
+
+    #[test]
+    fn callback_handles_compact_stale_entries() {
+        let mut engine = V8Engine::new();
+        let make_function = |engine: &mut V8Engine| {
+            let behaviour: StoredBehaviour = Box::new(|_args, _this, ec| Ok(ec.value_undefined()));
+            engine.make_builtin_function(
+                behaviour,
+                0,
+                engine.property_key_from_str("test_fn"),
+                false,
+            )
+        };
+        // Cross the compaction threshold, then drop every function so each
+        // registry entry goes stale.
+        let functions: Vec<_> = (0..CALLBACK_HANDLE_COMPACTION_THRESHOLD + 8)
+            .map(|_| make_function(&mut engine))
+            .collect();
+        assert_eq!(
+            engine.shared_isolate.callback_handles.borrow().len(),
+            CALLBACK_HANDLE_COMPACTION_THRESHOLD + 8,
+            "every native function must be registered"
+        );
+        drop(functions);
+        engine.gc();
+        // The next registration compacts the stale entries out of the
+        // registry instead of letting it grow for the isolate's lifetime.
+        let _keep = make_function(&mut engine);
+        let live_count = engine.shared_isolate.callback_handles.borrow().len();
+        assert!(
+            live_count <= CALLBACK_HANDLE_COMPACTION_THRESHOLD,
+            "the registry must compact stale entries (len={live_count})"
+        );
+    }
+
+    #[test]
+    fn reentrant_platform_access_panics() {
+        let mut engine = V8Engine::new();
+        let prototype = engine.create_plain_object(None);
+        let wrapper =
+            engine.create_object_with_any(prototype, Box::new(DropFlag(Rc::new(Cell::new(false)))));
+        let object = wrapper.clone();
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            engine.with_object_any_mut_with(
+                &wrapper,
+                Box::new(move |_data, ec| {
+                    let _ = ec.with_object_any(&object);
+                }),
+            );
+        }));
+        assert!(
+            result.is_err(),
+            "re-entrant platform access must panic instead of aliasing"
+        );
+    }
+
+    #[test]
+    fn associated_platform_cells_survive_forced_gc() {
+        let mut engine = V8Engine::new();
+        let global = engine.realm_global_object();
+
+        // A payload object reachable only through the associated platform's
+        // cell (the Window pattern: event listeners, timers, ...).
+        let payload = ExecutionContext::evaluate_script(&mut engine, "({ marker: 'payload' })")
+            .expect("the payload object must evaluate");
+        let payload_object =
+            V8Types::value_as_object(&payload).expect("the payload must be an object");
+        let payload_collected = Rc::new(Cell::new(false));
+        let payload_weak = install_guaranteed_finalizer(
+            &mut engine,
+            &payload_object,
+            Rc::clone(&payload_collected),
+        );
+
+        let cell = gc_cell_new(Some(payload_object), &mut engine);
+        drop(payload);
+
+        // The content path associates the raw platform (e.g. the Window) with
+        // the realm global through the generic helper, which wraps it with
+        // its real trace on the cppgc heap.
+        crate::associate_existing_object(
+            &mut engine,
+            &global,
+            TestPlatform {
+                dropped: DropFlag(Rc::new(Cell::new(false))),
+                reflector: None,
+                peer: None,
+                cell: Some(cell),
+            },
+        );
+
+        assert!(
+            engine
+                .with_object_any(&global)
+                .and_then(|data| data.downcast_ref::<TestPlatform>())
+                .and_then(|platform| platform.cell.as_ref())
+                .is_some(),
+            "the associated platform must be reachable through the global object"
+        );
+
+        // A full collection must not sweep the associated platform's cells or
+        // the JS payload they reference.
+        engine.gc();
+
+        assert!(
+            !payload_collected.get(),
+            "the payload referenced only through the associated platform cell must survive gc"
+        );
+        assert!(
+            engine
+                .with_object_any(&global)
+                .and_then(|data| data.downcast_ref::<TestPlatform>())
+                .and_then(|platform| platform.cell.as_ref())
+                .is_some(),
+            "the associated platform cell must survive gc"
+        );
+        drop(payload_weak);
     }
 }

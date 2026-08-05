@@ -216,20 +216,42 @@ where
     finished: Rc<Cell<bool>>,
 }
 
-#[cfg(not(feature = "boa"))]
+#[cfg(all(not(feature = "boa"), not(feature = "v8")))]
 unsafe impl<T: AsyncValueIterable + 'static> js_engine::gc::Trace for DefaultAsyncIterator<T> {}
-#[cfg(not(feature = "boa"))]
+#[cfg(all(not(feature = "boa"), not(feature = "v8")))]
+impl<T: AsyncValueIterable + 'static> js_engine::gc::Finalize for DefaultAsyncIterator<T> {}
+
+// V8: the iterator walks its traced fields; the promise cell keeps its JS
+// object alive while this iterator is traced.
+#[cfg(feature = "v8")]
+unsafe impl<T: AsyncValueIterable + 'static> js_engine::gc::Trace for DefaultAsyncIterator<T> {
+    unsafe fn trace(&self, visitor: &mut js_engine::v8_gc::Visitor) {
+        // SAFETY: Delegated to the field traces.
+        unsafe {
+            js_engine::gc::Trace::trace(&self.target, visitor);
+            js_engine::gc::Trace::trace(&self.state, visitor);
+            js_engine::gc::Trace::trace(&self.ongoing_promise, visitor);
+        }
+    }
+
+    fn store(&mut self, ec: &mut dyn js_engine::ExecutionContext<crate::js::Types>) {
+        self.target.store(ec);
+        self.state.store(ec);
+        self.ongoing_promise.store(ec);
+    }
+}
+#[cfg(feature = "v8")]
 impl<T: AsyncValueIterable + 'static> js_engine::gc::Finalize for DefaultAsyncIterator<T> {}
 
 impl<T> DefaultAsyncIterator<T>
 where
     T: AsyncValueIterable,
 {
-    fn new(target: T, state: T::State) -> Self {
+    fn new(target: T, state: T::State, ec: &mut dyn ExecutionContext<crate::js::Types>) -> Self {
         Self {
             target,
             state,
-            ongoing_promise: gc_cell_new(None),
+            ongoing_promise: gc_cell_new(None, ec),
             finished: Rc::new(Cell::new(false)),
         }
     }
@@ -246,7 +268,7 @@ where
         // the GcCell borrow guard across the entire block, which would
         // prevent a subsequent borrow_mut() (the temporary in `if let`
         // lives until the end of the block in Rust).
-        let ongoing = self.ongoing_promise.borrow().clone();
+        let ongoing = self.ongoing_promise.borrow(ec).clone();
         if let Some(previous) = ongoing {
             // Step 10: "If ongoingPromise is not null, then:"
             // Step 10.1: "Let afterOngoingPromiseCapability be ! NewPromiseCapability(%Promise%)."
@@ -282,13 +304,13 @@ where
             // Step 10.4: "Set object's ongoing promise to afterOngoingPromiseCapability.[[Promise]]."
             let result_obj = Types::value_as_object(&then_value)
                 .ok_or_else(|| ec.new_type_error("PerformPromiseThen did not return an object"))?;
-            *self.ongoing_promise.borrow_mut() = Some(result_obj.clone());
+            *self.ongoing_promise.borrow_mut(ec) = Some(result_obj.clone());
             Ok(result_obj)
         } else {
             // Step 11: "Otherwise:"
             // Step 11.1: "Set object's ongoing promise to the result of running nextSteps."
             let promise = self.start_operation(operation, ec)?;
-            *self.ongoing_promise.borrow_mut() = Some(promise.clone());
+            *self.ongoing_promise.borrow_mut(ec) = Some(promise.clone());
             Ok(promise)
         }
     }
@@ -543,19 +565,10 @@ where
 {
     let prototype = create_async_iterator_prototype::<T>(ec);
 
-    // Wrap in TraceableBox on the Boa backend so the GC can trace through
-    // the GcCell<Option<JsObject>> (ongoing_promise) and the state's reader
-    // field stored inside the type-erased Box<dyn Any>.  Without this, the
-    // Boa GC cannot see those references and may collect them.
-    #[cfg(boa_backend)]
-    {
-        let boxed = js_engine::boa::TraceableBox::new(iterator);
-        ec.create_object_with_any(prototype, Box::new(boxed))
-    }
-    #[cfg(not(boa_backend))]
-    {
-        ec.create_object_with_any(prototype, Box::new(iterator))
-    }
+    // The engine stores the iterator data in a GC wrapper so the
+    // `ongoing_promise` cell and the state's JS references are traced from
+    // the JS wrapper.
+    js_engine::create_platform_object(ec, &prototype, iterator)
 }
 
 fn default_async_iterator_from_this<T>(
@@ -683,7 +696,7 @@ where
     // Step 7: "Run the asynchronous iterator initialization steps for definition with idlObject, iterator, and idlArgs, if any such steps exist."
     let state = target.create_async_iterator_state(args, ec)?;
 
-    let iterator = DefaultAsyncIterator::new(target, state);
+    let iterator = DefaultAsyncIterator::new(target, state, ec);
 
     // Step 8: "Return iterator."
     Ok(create_default_async_iterator_object(iterator, ec))

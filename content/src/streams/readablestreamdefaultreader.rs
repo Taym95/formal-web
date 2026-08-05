@@ -20,19 +20,34 @@ type JsObject = <Types as JsTypes>::JsObject;
 
 /// default readers and BYOB readers.
 pub(crate) trait ReadableStreamGenericReader: Clone {
-    fn stream_slot_value(&self) -> Option<ReadableStream>;
-    fn set_stream_slot_value(&self, stream: Option<ReadableStream>);
-    fn closed_promise_slot_value(&self) -> Option<JsObject>;
-    fn set_closed_promise_slot_value(&self, promise: Option<JsObject>);
+    fn stream_slot_value(&self, ec: &mut dyn ExecutionContext<Types>) -> Option<ReadableStream>;
+    fn set_stream_slot_value(
+        &self,
+        stream: Option<ReadableStream>,
+        ec: &mut dyn ExecutionContext<Types>,
+    );
+    fn closed_promise_slot_value(&self, ec: &mut dyn ExecutionContext<Types>) -> Option<JsObject>;
+    fn set_closed_promise_slot_value(
+        &self,
+        promise: Option<JsObject>,
+        ec: &mut dyn ExecutionContext<Types>,
+    );
     /// promise is still pending.
-    fn closed_resolvers_slot_value(&self) -> Option<PromiseResolvers<Types>>;
-    fn set_closed_resolvers_slot_value(&self, resolvers: Option<PromiseResolvers<Types>>);
+    fn closed_resolvers_slot_value(
+        &self,
+        ec: &mut dyn ExecutionContext<Types>,
+    ) -> Option<PromiseResolvers<Types>>;
+    fn set_closed_resolvers_slot_value(
+        &self,
+        resolvers: Option<PromiseResolvers<Types>>,
+        ec: &mut dyn ExecutionContext<Types>,
+    );
     fn as_reader_slot(&self) -> ReadableStreamReader;
 
     /// <https://streams.spec.whatwg.org/#generic-reader-closed>
     fn closed(&self, ec: &mut dyn ExecutionContext<Types>) -> Completion<JsObject, Types> {
         // Step 1: "Return this.[[closedPromise]]."
-        self.closed_promise_slot_value()
+        self.closed_promise_slot_value(ec)
             .ok_or_else(|| ec.new_type_error("ReadableStream reader is missing its closed promise"))
     }
 
@@ -43,7 +58,7 @@ pub(crate) trait ReadableStreamGenericReader: Clone {
         ec: &mut dyn ExecutionContext<Types>,
     ) -> Completion<JsObject, Types> {
         // Step 1: "If this.[[stream]] is undefined, return a promise rejected with a TypeError exception."
-        if self.stream_slot_value().is_none() {
+        if self.stream_slot_value(ec).is_none() {
             return rejected_type_error_promise(
                 "Cannot cancel a stream using a released reader",
                 ec,
@@ -61,12 +76,12 @@ pub(crate) trait ReadableStreamGenericReader: Clone {
         ec: &mut dyn ExecutionContext<Types>,
     ) -> Completion<JsObject, Types> {
         // Step 1: "Let stream be reader.[[stream]]."
-        let stream = self.stream_slot_value().ok_or_else(|| {
+        let stream = self.stream_slot_value(ec).ok_or_else(|| {
             ec.new_type_error("ReadableStream reader is not attached to a stream")
         })?;
 
         // Step 2: "Assert: stream is not undefined."
-        debug_assert!(self.stream_slot_value().is_some());
+        debug_assert!(self.stream_slot_value(ec).is_some());
 
         // Step 3: "Return ! ReadableStreamCancel(stream, reason)."
         readable_stream_cancel(stream, reason, ec)
@@ -79,10 +94,10 @@ pub(crate) trait ReadableStreamGenericReader: Clone {
         ec: &mut dyn ExecutionContext<Types>,
     ) -> Completion<(), Types> {
         // Step 1: "Set reader.[[stream]] to stream."
-        self.set_stream_slot_value(Some(stream.clone()));
+        self.set_stream_slot_value(Some(stream.clone()), ec);
 
         // Step 2: "Set stream.[[reader]] to reader."
-        stream.set_reader_slot(Some(self.as_reader_slot()));
+        stream.set_reader_slot(Some(self.as_reader_slot()), ec);
 
         // Step 3: "If stream.[[state]] is \"readable\","
         if stream.state() == ReadableStreamState::Readable {
@@ -91,8 +106,8 @@ pub(crate) trait ReadableStreamGenericReader: Clone {
             let promise_obj = promise
                 .as_object()
                 .ok_or_else(|| ec.new_type_error("new_promise_pending did not return an object"))?;
-            self.set_closed_promise_slot_value(Some(promise_obj));
-            self.set_closed_resolvers_slot_value(Some(resolvers));
+            self.set_closed_promise_slot_value(Some(promise_obj), ec);
+            self.set_closed_resolvers_slot_value(Some(resolvers), ec);
             return Ok(());
         }
 
@@ -100,8 +115,8 @@ pub(crate) trait ReadableStreamGenericReader: Clone {
         if stream.state() == ReadableStreamState::Closed {
             // Step 4.1: "Set reader.[[closedPromise]] to a promise resolved with undefined."
             let promise = resolved_promise(ec.value_undefined(), ec)?.clone();
-            self.set_closed_promise_slot_value(Some(promise));
-            self.set_closed_resolvers_slot_value(None);
+            self.set_closed_promise_slot_value(Some(promise), ec);
+            self.set_closed_resolvers_slot_value(None, ec);
             return Ok(());
         }
 
@@ -114,10 +129,10 @@ pub(crate) trait ReadableStreamGenericReader: Clone {
         let promise_object = promise
             .as_object()
             .ok_or_else(|| ec.new_type_error("new_promise_pending did not return an object"))?;
-        self.set_closed_promise_slot_value(Some(promise_object.clone()));
-        self.set_closed_resolvers_slot_value(None);
+        self.set_closed_promise_slot_value(Some(promise_object.clone()), ec);
+        self.set_closed_resolvers_slot_value(None, ec);
         mark_promise_as_handled(&promise_object, ec)?;
-        resolvers.reject(stream.stored_error(), ec)?;
+        resolvers.reject(stream.stored_error(ec), ec)?;
         Ok(())
     }
 
@@ -129,46 +144,48 @@ pub(crate) trait ReadableStreamGenericReader: Clone {
         // Step 1: "Let stream be reader.[[stream]]."
         let not_attached_error =
             ec.new_type_error("ReadableStream reader is not attached to a stream");
-        let stream = self.stream_slot_value().ok_or_else(|| not_attached_error)?;
+        let stream = self
+            .stream_slot_value(ec)
+            .ok_or_else(|| not_attached_error)?;
 
         // Step 2: "Assert: stream is not undefined."
-        debug_assert!(self.stream_slot_value().is_some());
+        debug_assert!(self.stream_slot_value(ec).is_some());
 
         // Step 3: "Assert: stream.[[reader]] is reader."
-        debug_assert!(stream.reader_slot().is_some());
+        debug_assert!(stream.reader_slot(ec).is_some());
 
         let release_error = type_error_value("Reader was released", ec)?;
 
         // Step 4: "If stream.[[state]] is \"readable\", reject reader.[[closedPromise]] with a TypeError exception."
         if stream.state() == ReadableStreamState::Readable {
-            if let Some(resolvers) = self.closed_resolvers_slot_value() {
+            if let Some(resolvers) = self.closed_resolvers_slot_value(ec) {
                 let undefined = ec.value_undefined();
                 ec.call(&resolvers.reject, &undefined, &[release_error.clone()])?;
             }
         } else {
             // Step 5: "Otherwise, set reader.[[closedPromise]] to a promise rejected with a TypeError exception."
             let closed_promise = rejected_promise(release_error.clone(), ec)?;
-            self.set_closed_promise_slot_value(Some(closed_promise.clone()));
-            self.set_closed_resolvers_slot_value(None);
+            self.set_closed_promise_slot_value(Some(closed_promise.clone()), ec);
+            self.set_closed_resolvers_slot_value(None, ec);
         }
 
         // Step 6: "Set reader.[[closedPromise]].[[PromiseIsHandled]] to true."
-        if let Some(closed_promise) = self.closed_promise_slot_value() {
+        if let Some(closed_promise) = self.closed_promise_slot_value(ec) {
             mark_promise_as_handled(&closed_promise, ec)?;
         }
 
         // Step 7: "Perform ! stream.[[controller]].[[ReleaseSteps]]()."
         let no_controller_error = ec.new_type_error("ReadableStream is missing its controller");
         let controller = stream
-            .controller_slot()
+            .controller_slot(ec)
             .ok_or_else(|| no_controller_error)?;
         controller.release_steps(ec)?;
 
         // Step 8: "Set stream.[[reader]] to undefined."
-        stream.set_reader_slot(None);
+        stream.set_reader_slot(None, ec);
 
         // Step 9: "Set reader.[[stream]] to undefined."
-        self.set_stream_slot_value(None);
+        self.set_stream_slot_value(None, ec);
         Ok(())
     }
 }
@@ -189,12 +206,12 @@ pub struct ReadableStreamDefaultReader {
 }
 
 impl ReadableStreamDefaultReader {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(ec: &mut dyn ExecutionContext<Types>) -> Self {
         Self {
-            stream: gc_cell_new(None),
-            closed_promise: gc_cell_new(None),
-            closed_resolvers: gc_cell_new(None),
-            read_requests: gc_cell_new(Vec::new()),
+            stream: gc_cell_new(None, ec),
+            closed_promise: gc_cell_new(None, ec),
+            closed_resolvers: gc_cell_new(None, ec),
+            read_requests: gc_cell_new(Vec::new(), ec),
         }
     }
 
@@ -205,7 +222,7 @@ impl ReadableStreamDefaultReader {
         ec: &mut dyn ExecutionContext<Types>,
     ) -> Completion<(), Types> {
         // Step 1: "If ! IsReadableStreamLocked(stream) is true, throw a TypeError exception."
-        if stream.is_readable_stream_locked() {
+        if stream.is_readable_stream_locked(ec) {
             return Err(
                 ec.new_type_error("Cannot create a reader for a stream that already has a reader")
             );
@@ -215,20 +232,30 @@ impl ReadableStreamDefaultReader {
         self.readable_stream_reader_generic_initialize(stream, ec)?;
 
         // Step 3: "Set reader.[[readRequests]] to a new empty list."
-        self.read_requests.borrow_mut().clear();
+        self.read_requests.borrow_mut(ec).clear();
         Ok(())
     }
-    pub(crate) fn take_read_requests(&self) -> Vec<ReadRequest> {
-        mem::take(&mut self.read_requests.borrow_mut())
+    pub(crate) fn take_read_requests(
+        &self,
+        ec: &mut dyn ExecutionContext<Types>,
+    ) -> Vec<ReadRequest> {
+        mem::take(&mut self.read_requests.borrow_mut(ec))
     }
-    pub(crate) fn read_requests_len(&self) -> usize {
-        self.read_requests.borrow().len()
+    pub(crate) fn read_requests_len(&self, ec: &mut dyn ExecutionContext<Types>) -> usize {
+        self.read_requests.borrow(ec).len()
     }
-    pub(crate) fn push_read_request(&self, read_request: ReadRequest) {
-        self.read_requests.borrow_mut().push(read_request);
+    pub(crate) fn push_read_request(
+        &self,
+        read_request: ReadRequest,
+        ec: &mut dyn ExecutionContext<Types>,
+    ) {
+        self.read_requests.borrow_mut(ec).push(read_request);
     }
-    pub(crate) fn shift_read_request(&self) -> Option<ReadRequest> {
-        let mut read_requests = self.read_requests.borrow_mut();
+    pub(crate) fn shift_read_request(
+        &self,
+        ec: &mut dyn ExecutionContext<crate::js::Types>,
+    ) -> Option<ReadRequest> {
+        let mut read_requests = self.read_requests.borrow_mut(ec);
         if read_requests.is_empty() {
             None
         } else {
@@ -256,7 +283,7 @@ impl ReadableStreamDefaultReader {
     /// <https://streams.spec.whatwg.org/#default-reader-read>
     pub(crate) fn read(&self, ec: &mut dyn ExecutionContext<Types>) -> Completion<JsObject, Types> {
         // Step 1: "If this.[[stream]] is undefined, return a promise rejected with a TypeError exception."
-        if self.stream_slot_value().is_none() {
+        if self.stream_slot_value(ec).is_none() {
             return rejected_type_error_promise("Cannot read from a released reader", ec);
         }
 
@@ -281,7 +308,7 @@ impl ReadableStreamDefaultReader {
         read_request: ReadRequest,
         ec: &mut dyn ExecutionContext<Types>,
     ) -> Completion<(), Types> {
-        if self.stream_slot_value().is_none() {
+        if self.stream_slot_value(ec).is_none() {
             return Err(ec.new_type_error("Cannot read from a released reader"));
         }
 
@@ -296,11 +323,11 @@ impl ReadableStreamDefaultReader {
     ) -> Completion<(), Types> {
         // Step 1: "Let stream be reader.[[stream]]."
         let stream = self
-            .stream_slot_value()
+            .stream_slot_value(ec)
             .ok_or_else(|| ec.new_type_error("reader is not attached to a stream"))?;
 
         // Step 2: "Assert: stream is not undefined."
-        debug_assert!(self.stream_slot_value().is_some());
+        debug_assert!(self.stream_slot_value(ec).is_some());
 
         // Step 3: "Set stream.[[disturbed]] to true."
         stream.set_disturbed(true);
@@ -312,7 +339,7 @@ impl ReadableStreamDefaultReader {
 
         // Step 5: "Otherwise, if stream.[[state]] is \"errored\", perform readRequest's error steps given stream.[[storedError]]."
         if stream.state() == ReadableStreamState::Errored {
-            return read_request.error_steps(stream.stored_error(), ec);
+            return read_request.error_steps(stream.stored_error(ec), ec);
         }
 
         // Step 6.1: "Assert: stream.[[state]] is \"readable\"."
@@ -320,7 +347,7 @@ impl ReadableStreamDefaultReader {
 
         // Step 6.2: "Perform ! stream.[[controller]].[[PullSteps]](readRequest)."
         let controller = stream
-            .controller_slot()
+            .controller_slot(ec)
             .ok_or_else(|| ec.new_type_error("ReadableStream is missing its controller"))?;
         controller.pull_steps(read_request, ec)
     }
@@ -331,7 +358,7 @@ impl ReadableStreamDefaultReader {
         ec: &mut dyn ExecutionContext<Types>,
     ) -> Completion<(), Types> {
         // Step 1: "If this.[[stream]] is undefined, return."
-        if self.stream_slot_value().is_none() {
+        if self.stream_slot_value(ec).is_none() {
             return Ok(());
         }
 
@@ -341,23 +368,31 @@ impl ReadableStreamDefaultReader {
 }
 
 impl ReadableStreamGenericReader for ReadableStreamDefaultReader {
-    fn stream_slot_value(&self) -> Option<ReadableStream> {
-        self.stream.borrow().clone()
+    fn stream_slot_value(&self, ec: &mut dyn ExecutionContext<Types>) -> Option<ReadableStream> {
+        self.stream.borrow(ec).clone()
     }
 
-    fn set_stream_slot_value(&self, stream: Option<ReadableStream>) {
-        *self.stream.borrow_mut() = stream;
+    fn set_stream_slot_value(
+        &self,
+        stream: Option<ReadableStream>,
+        ec: &mut dyn ExecutionContext<Types>,
+    ) {
+        *self.stream.borrow_mut(ec) = stream;
     }
 
-    fn closed_promise_slot_value(&self) -> Option<JsObject> {
-        self.closed_promise.borrow().clone()
+    fn closed_promise_slot_value(&self, ec: &mut dyn ExecutionContext<Types>) -> Option<JsObject> {
+        self.closed_promise.borrow(ec).clone()
     }
 
-    fn set_closed_promise_slot_value(&self, promise: Option<JsObject>) {
+    fn set_closed_promise_slot_value(
+        &self,
+        promise: Option<JsObject>,
+        ec: &mut dyn ExecutionContext<Types>,
+    ) {
         // JSC: protect new value from GC, unprotect old value
         #[cfg(feature = "jsc")]
         {
-            let old = self.closed_promise.borrow().clone();
+            let old = self.closed_promise.borrow(ec).clone();
             if let Some(ref old_obj) = old {
                 unsafe {
                     js_engine::jsc_sys::JSValueUnprotect(old_obj.ctx(), old_obj.as_value_ref());
@@ -369,15 +404,22 @@ impl ReadableStreamGenericReader for ReadableStreamDefaultReader {
                 }
             }
         }
-        *self.closed_promise.borrow_mut() = promise;
+        *self.closed_promise.borrow_mut(ec) = promise;
     }
 
-    fn closed_resolvers_slot_value(&self) -> Option<PromiseResolvers<Types>> {
-        self.closed_resolvers.borrow().clone()
+    fn closed_resolvers_slot_value(
+        &self,
+        ec: &mut dyn ExecutionContext<Types>,
+    ) -> Option<PromiseResolvers<Types>> {
+        self.closed_resolvers.borrow(ec).clone()
     }
 
-    fn set_closed_resolvers_slot_value(&self, resolvers: Option<PromiseResolvers<Types>>) {
-        *self.closed_resolvers.borrow_mut() = resolvers;
+    fn set_closed_resolvers_slot_value(
+        &self,
+        resolvers: Option<PromiseResolvers<Types>>,
+        ec: &mut dyn ExecutionContext<Types>,
+    ) {
+        *self.closed_resolvers.borrow_mut(ec) = resolvers;
     }
 
     fn as_reader_slot(&self) -> ReadableStreamReader {
@@ -399,9 +441,10 @@ pub(crate) fn construct_readable_stream_default_reader(
         .ok_or_else(|| {
             ec.new_type_error("ReadableStreamDefaultReader requires a ReadableStream")
         })?;
-    let stream =
-        with_readable_stream_ref(&stream_object, ec, |stream: &ReadableStream| stream.clone())?;
-    let reader = ReadableStreamDefaultReader::new();
+    let stream = with_readable_stream_ref(&stream_object, ec, |stream: &ReadableStream, _ec| {
+        stream.clone()
+    })?;
+    let reader = ReadableStreamDefaultReader::new(ec);
 
     // Step 1: "Perform ? SetUpReadableStreamDefaultReader(this, stream)."
     reader.set_up_readable_stream_default_reader(stream, ec)?;
@@ -416,7 +459,7 @@ pub(crate) fn acquire_readable_stream_default_reader(
     // Step 1: "Let reader be a new ReadableStreamDefaultReader."
     let reader_object = create_readable_stream_default_reader(ec)?;
     let reader =
-        with_readable_stream_default_reader_ref(&reader_object, ec, |reader| reader.clone())?;
+        with_readable_stream_default_reader_ref(&reader_object, ec, |reader, _ec| reader.clone())?;
 
     // Step 2: "Perform ? SetUpReadableStreamDefaultReader(reader, stream)."
     reader.set_up_readable_stream_default_reader(stream, ec)?;
@@ -428,7 +471,7 @@ pub(crate) fn acquire_readable_stream_default_reader(
 fn create_readable_stream_default_reader(
     ec: &mut dyn ExecutionContext<Types>,
 ) -> Completion<JsObject, Types> {
-    let reader = ReadableStreamDefaultReader::new();
+    let reader = ReadableStreamDefaultReader::new(ec);
     let reader_object: JsObject =
         create_interface_instance::<Types, ReadableStreamDefaultReader>(reader, ec)?.into();
     Ok(reader_object)
@@ -437,16 +480,18 @@ fn create_readable_stream_default_reader(
 pub(crate) fn with_readable_stream_default_reader_ref<R>(
     object: &JsObject,
     ec: &mut dyn ExecutionContext<Types>,
-    f: impl FnOnce(&ReadableStreamDefaultReader) -> R,
+    f: impl FnOnce(&ReadableStreamDefaultReader, &mut dyn ExecutionContext<Types>) -> R,
 ) -> Completion<R, Types> {
-    let reader_ref = ec
+    // Clone the handle out of the object registry so `f` can borrow `ec`
+    // mutably; the clone shares all GC-managed state with the registered
+    // platform object.
+    let reader = ec
         .with_object_any(object)
-        .and_then(|a| a.downcast_ref::<ReadableStreamDefaultReader>());
-    let reader = match reader_ref {
-        Some(r) => r,
-        None => return Err(ec.new_type_error("object is not a ReadableStreamDefaultReader")),
+        .and_then(|a| a.downcast_ref::<ReadableStreamDefaultReader>().cloned());
+    let Some(reader) = reader else {
+        return Err(ec.new_type_error("object is not a ReadableStreamDefaultReader"));
     };
-    Ok(f(reader))
+    Ok(f(&reader, ec))
 }
 
 /// <https://streams.spec.whatwg.org/#abstract-opdef-readablestreamdefaultreadererrorreadrequests>
@@ -456,7 +501,7 @@ pub(crate) fn readable_stream_default_reader_error_read_requests(
     ec: &mut dyn ExecutionContext<Types>,
 ) -> Completion<(), Types> {
     // Step 1: "Let readRequests be reader.[[readRequests]]."
-    let read_requests = reader.take_read_requests();
+    let read_requests = reader.take_read_requests(ec);
 
     // Step 2: "Set reader.[[readRequests]] to a new empty list."
     // Note: `take_read_requests()` empties the list before iteration.

@@ -54,7 +54,7 @@ fn get_signal(
     let obj = crate::js::Types::value_as_object(this)
         .ok_or_else(|| ec.new_type_error("AbortController receiver is not an object"))?;
     let signal_object =
-        try_with_abort_controller_ref(&obj, ec, |controller| controller.signal_object())?;
+        try_with_abort_controller_ref(&obj, ec, |controller, ec| controller.signal_object(ec))?;
     let signal_object = signal_object
         .ok_or_else(|| ec.new_type_error("AbortSignal is missing its JavaScript object"))?;
     Ok(crate::js::Types::value_from_object(signal_object))
@@ -68,7 +68,8 @@ fn abort(
     let reason = abort_reason_from_argument(args.get(0), ec)?;
     let controller = crate::js::Types::value_as_object(this)
         .ok_or_else(|| ec.new_type_error("AbortController receiver is not an object"))?;
-    let signal = try_with_abort_controller_ref(&controller, ec, |controller| controller.signal())?;
+    let signal =
+        try_with_abort_controller_ref(&controller, ec, |controller, _ec| controller.signal())?;
     signal_abort(&signal, reason, ec)?;
     Ok(ec.value_undefined())
 }

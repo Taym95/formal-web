@@ -33,6 +33,18 @@ Never write any unsafe code withou the user's explicit approval.
 
 When using `grep` (or `rg`/`find`), **never** search paths outside the repository root or under `vendor/` without explicit narrowing. In particular, avoid searching `~/.cargo/registry/` or other system-wide locations — those directories are large and the search will hang indefinitely. Instead, use `cargo doc` and check the generated docs, or browse the relevant source files directly with `read`.
 
+# Search loops over large outputs
+
+Never run multi-line `awk`/`sed` loops that walk the entire output of a compiler or test run line by line (e.g. `awk '/error/{...} while(...)'` over a full `cargo check` log). These run at 100% CPU and take far too long to complete. When you need to inspect compiler errors or other large logs:
+
+- Read the log file in chunks with the `read` tool (it truncates at 2000 lines / 50KB with an offset to continue).
+- Use single simple `grep` invocations with narrow patterns (e.g. `grep -E "error\[E" file | head`) — one pass, no loops.
+- Prefer filtering at the source: run the command with `2>&1 | tail -N` or pipe to `grep` once, then save the output to a file and `read` it.
+
+# Long sleeps in bash commands
+
+Avoid `sleep` commands longer than a few seconds in bash. A long `sleep N` (N > 5) inside a tool call blocks the session for no benefit: run the command that produces the result (a test run, a build, a poll) with an appropriate `timeout` on the tool call instead, and let it finish naturally. Prefer running the real command to completion over sleep-then-kill patterns; if a long-running command must be backgrounded, wait on its output file with a short poll loop rather than a single fixed sleep.
+
 # Documentation Chain
 
 Read repository documentation from general to specific:
@@ -173,27 +185,28 @@ shared dependency resolution and incremental compilation.
   - `formal-web-graphics` owns per-webview compositors and video/audio playback (media backend).
     It receives `PaintFrame` and `VideoFrame` payloads and sends back composed scenes with
     `FrameHitInfo` for hit-testing.
-- **`js_engine` crate**: a generic JS engine trait and ECMA-262 abstract operations. Two backends: Boa (default, most operational) and JSC (macOS opt-in). WebAssembly is a separate feature (`wasm`). See `js_engine/README.md`.
+- **`js_engine` crate**: a generic JS engine trait and ECMA-262 abstract operations. Three backends: V8 (default, runs WPT), Boa (opt-in, required for WebAssembly), and JSC (macOS opt-in). WebAssembly is a separate feature (`wasm`). See `js_engine/README.md`.
 - **`js_engine_macros` crate**: proc-macro companion providing `#[gc_struct]` for GC-traced platform objects.
 
 ### Feature flags
 
 | Flag | Effect | Default |
 |---|---|---|
-| `boa` | Boa JS engine backend (most operational, runs WPT) | yes |
+| `v8` | V8 backend via `rusty_v8` (macOS arm64, runs WPT) | **yes** |
+| `boa` | Boa JS engine backend (opt-in; required for `wasm`) | no |
 | `jsc` | JavaScriptCore backend (macOS only, experimental) | no |
 | `wasm` | WebAssembly support via wasmtime (opt-in, Boa only) | no |
 | `media` | Video/audio playback support | yes |
 
-Boa is the primary backend for running WPT tests.  Wasm is a separate feature
-to avoid pulling in wasmtime when not needed.  JSC is macOS-only and
-experimental (see `js_engine/README.md` for known issues).
+V8 is the default backend for running WPT tests.  Wasm is a separate feature
+(and Boa-only) to avoid pulling in wasmtime when not needed.  JSC is
+macOS-only and experimental (see `js_engine/README.md` for known issues).
 
 ### Three verbs
 
 ## Build commands
 
-### Default build (Boa, no WebAssembly)
+### Default build (V8, no WebAssembly)
 
 ```bash
 # Check all — type-check every package
@@ -209,10 +222,17 @@ rustup run 1.94.0 cargo run --release
 rustup run 1.94.0 cargo run --release -- wpt
 ```
 
-### With WebAssembly (opt-in)
+### Boa (opt-in; required for WebAssembly)
 
 ```bash
-rustup run 1.94.0 cargo build --release --features wasm
+rustup run 1.94.0 cargo build --release --no-default-features --features boa,media
+rustup run 1.94.0 cargo run --release --no-default-features --features boa,media -- wpt
+```
+
+### With WebAssembly (opt-in, Boa only)
+
+```bash
+rustup run 1.94.0 cargo build --release --features boa,wasm,media
 ```
 
 ### JSC backend (macOS only)
@@ -391,6 +411,26 @@ Statics and atomics are only justified for genuinely cross-thread shared
 mutable state (e.g. a counter accessed from multiple OS threads).  Do not
 reach for them as a convenience — a plain local is simpler, testable, and
 ever correct.
+
+# GcCell Borrow Discipline
+
+**Never call an engine method (any `ec` operation) while a `GcCell` borrow
+(`borrow`/`borrow_mut` guard) is live — shared or mutable.** An engine call
+may allocate, and an allocation can trigger a GC trace that reads the cell
+while the borrow is live; on the V8 backend a mutable borrow being traced is
+an aliasing violation (undefined behavior). The rule is deliberately
+engine-independent: content code must never depend on which engine
+operations allocate. The approved patterns are:
+
+- Clone the value out of the cell and use the owned value, then write it
+  back (`let mut value = cell.borrow(ec).clone(); ...; cell.set(value, ec);`).
+- Scope the borrow to the section that touches the cell, dropping the guard
+  before any `ec` call.
+
+Do not write new code that hands `ec` to a closure while a cell borrow is
+live (e.g. `with_..._mut(|data, ec| ...)` patterns). See
+`js_engine/README.md` ("GcCell borrow discipline") for the mechanism and the
+remaining exception class.
 
 # Never Assume Test Failures Are Pre-Existing
 
@@ -581,10 +621,10 @@ At the end of each task, run the following steps **in order**:
 
 8. **Run all verification steps** — Every end-of-task run executes ALL verification steps unconditionally. Do not skip any step based on a subjective assessment of "relevance" — changes to seemingly unrelated files (test pages, configuration, documentation) routinely break downstream steps in this multi-process system. Running everything catches regressions the agent cannot predict.
 
-   Two engines are supported: Boa (primary, runs WPT) and JSC (experimental,
-   content crate compiles but `run_content_process` returns an error at
-   runtime).  All verification runs use the Boa backend unless stated
-   otherwise.
+   Two engines run WPT: V8 (default) and Boa (opt-in). JSC is experimental
+   (content crate compiles but `run_content_process` returns an error at
+   runtime).  Default verification runs use the V8 backend (the default
+   features); run Boa with `--no-default-features --features boa,media`.
 
    - **Default WPT run** —
 

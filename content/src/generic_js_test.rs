@@ -1596,6 +1596,18 @@ mod tests {
         let arr = engine.create_empty_array();
         let arr_val = TestTypes::value_from_object(arr);
         assert!(!engine.is_constructor(&arr_val));
+
+        // Callable-but-not-constructible functions (arrow, generator) must
+        // not be reported as constructors.
+        let realm = engine.current_realm();
+        let arrow = JsEngine::evaluate_script(&mut engine, "(() => 1)", &realm).unwrap();
+        assert!(!engine.is_constructor(&arrow));
+        let generator =
+            JsEngine::evaluate_script(&mut engine, "(function* gen() {})", &realm).unwrap();
+        assert!(!engine.is_constructor(&generator));
+        let normal =
+            JsEngine::evaluate_script(&mut engine, "(function normal() {})", &realm).unwrap();
+        assert!(engine.is_constructor(&normal));
     }
 
     #[test]

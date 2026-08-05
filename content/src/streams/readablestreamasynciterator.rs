@@ -24,27 +24,31 @@ pub(crate) struct ReadableStreamAsyncIteratorState {
 }
 
 impl ReadableStreamAsyncIteratorState {
-    fn new(reader: ReadableStreamDefaultReader, prevent_cancel: bool) -> Self {
+    fn new(
+        reader: ReadableStreamDefaultReader,
+        prevent_cancel: bool,
+        ec: &mut dyn ExecutionContext<Types>,
+    ) -> Self {
         Self {
-            reader: gc_cell_new(Some(reader)),
+            reader: gc_cell_new(Some(reader), ec),
             prevent_cancel: Rc::new(Cell::new(prevent_cancel)),
         }
     }
 
-    fn reader(&self) -> Option<ReadableStreamDefaultReader> {
-        self.reader.borrow().clone()
+    fn reader(&self, ec: &mut dyn ExecutionContext<Types>) -> Option<ReadableStreamDefaultReader> {
+        self.reader.borrow(ec).clone()
     }
 
     fn finish(&self, ec: &mut dyn ExecutionContext<Types>) -> Completion<(), Types> {
-        let Some(reader) = self.reader.borrow().clone() else {
+        let Some(reader) = self.reader.borrow(ec).clone() else {
             return Ok(());
         };
 
-        if reader.stream_slot_value().is_some() {
+        if reader.stream_slot_value(ec).is_some() {
             reader.release_lock(ec)?;
         }
 
-        *self.reader.borrow_mut() = None;
+        *self.reader.borrow_mut(ec) = None;
         Ok(())
     }
 }
@@ -87,6 +91,7 @@ impl AsyncValueIterable for ReadableStream {
         Ok(ReadableStreamAsyncIteratorState::new(
             reader,
             prevent_cancel,
+            ec,
         ))
     }
 
@@ -96,7 +101,7 @@ impl AsyncValueIterable for ReadableStream {
         state: &Self::State,
         ec: &mut dyn ExecutionContext<Types>,
     ) -> Completion<<Types as js_engine::JsTypes>::JsObject, Types> {
-        let reader = state.reader().ok_or_else(|| {
+        let reader = state.reader(ec).ok_or_else(|| {
             ec.new_type_error("ReadableStream async iterator is missing its reader")
         })?;
 
@@ -122,7 +127,7 @@ impl AsyncValueIterable for ReadableStream {
         value: JsValue,
         ec: &mut dyn ExecutionContext<Types>,
     ) -> Completion<<Types as js_engine::JsTypes>::JsObject, Types> {
-        let Some(reader) = state.reader() else {
+        let Some(reader) = state.reader(ec) else {
             return resolved_promise(ec.value_undefined(), ec);
         };
 

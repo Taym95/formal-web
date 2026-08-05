@@ -193,7 +193,7 @@ fn get_locked(
 ) -> Completion<JsValue, Types> {
     let stream_object = <Types as JsTypes>::value_as_object(this)
         .ok_or_else(|| ec.new_type_error("WritableStream receiver is not an object"))?;
-    let locked = with_writable_stream_ref(&stream_object, ec, |stream| stream.locked())?;
+    let locked = with_writable_stream_ref(&stream_object, ec, |stream, ec| stream.locked(ec))?;
     Ok(ec.value_from_bool(locked))
 }
 
@@ -204,7 +204,7 @@ fn abort_method(
 ) -> Completion<JsValue, Types> {
     let stream_object = <Types as JsTypes>::value_as_object(this)
         .ok_or_else(|| ec.new_type_error("WritableStream receiver is not an object"))?;
-    let stream = with_writable_stream_ref(&stream_object, ec, |s| s.clone())?;
+    let stream = with_writable_stream_ref(&stream_object, ec, |s, _ec| s.clone())?;
     let promise = stream.abort(
         args.get(0).cloned().unwrap_or_else(|| ec.value_undefined()),
         ec,
@@ -219,7 +219,7 @@ fn close_method(
 ) -> Completion<JsValue, Types> {
     let stream_object = <Types as JsTypes>::value_as_object(this)
         .ok_or_else(|| ec.new_type_error("WritableStream receiver is not an object"))?;
-    let stream = with_writable_stream_ref(&stream_object, ec, |s| s.clone())?;
+    let stream = with_writable_stream_ref(&stream_object, ec, |s, _ec| s.clone())?;
     let promise = stream.close(ec)?;
     Ok(Types::value_from_object(promise))
 }
@@ -231,7 +231,7 @@ fn get_writer_method(
 ) -> Completion<JsValue, Types> {
     let stream_object = <Types as JsTypes>::value_as_object(this)
         .ok_or_else(|| ec.new_type_error("WritableStream receiver is not an object"))?;
-    let stream = with_writable_stream_ref(&stream_object, ec, |s| s.clone())?;
+    let stream = with_writable_stream_ref(&stream_object, ec, |s, _ec| s.clone())?;
     let writer = stream.get_writer(ec)?;
     Ok(Types::value_from_object(writer))
 }
@@ -245,7 +245,7 @@ fn get_signal(
         ec.new_type_error("WritableStreamDefaultController receiver is not an object")
     })?;
     let controller =
-        with_writable_stream_default_controller_ref(&controller_object, ec, |c| c.clone())?;
+        with_writable_stream_default_controller_ref(&controller_object, ec, |c, _ec| c.clone())?;
     let signal = controller.signal_value(ec)?;
     Ok(JsValue::from(signal))
 }
@@ -259,7 +259,7 @@ fn error_method(
         ec.new_type_error("WritableStreamDefaultController receiver is not an object")
     })?;
     let controller =
-        with_writable_stream_default_controller_ref(&controller_object, ec, |c| c.clone())?;
+        with_writable_stream_default_controller_ref(&controller_object, ec, |c, _ec| c.clone())?;
     controller.error(
         args.get(0).cloned().unwrap_or_else(|| ec.value_undefined()),
         ec,
@@ -275,7 +275,7 @@ fn get_closed(
     let writer_object = <Types as JsTypes>::value_as_object(this).ok_or_else(|| {
         ec.new_type_error("WritableStreamDefaultWriter receiver is not an object")
     })?;
-    let writer = with_writable_stream_default_writer_ref(&writer_object, ec, |w| w.clone())?;
+    let writer = with_writable_stream_default_writer_ref(&writer_object, ec, |w, _ec| w.clone())?;
     let closed = writer.closed(ec)?;
     Ok(JsValue::from(closed))
 }
@@ -288,7 +288,7 @@ fn get_desired_size(
     let writer_object = <Types as JsTypes>::value_as_object(this).ok_or_else(|| {
         ec.new_type_error("WritableStreamDefaultWriter receiver is not an object")
     })?;
-    let writer = with_writable_stream_default_writer_ref(&writer_object, ec, |w| w.clone())?;
+    let writer = with_writable_stream_default_writer_ref(&writer_object, ec, |w, _ec| w.clone())?;
     let size = writer.desired_size(ec)?;
     Ok(match size {
         Some(size) => ec.value_from_number(size),
@@ -304,7 +304,7 @@ fn get_ready(
     let writer_object = <Types as JsTypes>::value_as_object(this).ok_or_else(|| {
         ec.new_type_error("WritableStreamDefaultWriter receiver is not an object")
     })?;
-    let writer = with_writable_stream_default_writer_ref(&writer_object, ec, |w| w.clone())?;
+    let writer = with_writable_stream_default_writer_ref(&writer_object, ec, |w, _ec| w.clone())?;
     let ready = writer.ready(ec)?;
     Ok(JsValue::from(ready))
 }
@@ -318,7 +318,7 @@ fn abort_writer_method(
         ec.new_type_error("WritableStreamDefaultWriter receiver is not an object")
     })?;
     let reason = args.get(0).cloned().unwrap_or_else(|| ec.value_undefined());
-    let writer = with_writable_stream_default_writer_ref(&writer_object, ec, |w| w.clone())?;
+    let writer = with_writable_stream_default_writer_ref(&writer_object, ec, |w, _ec| w.clone())?;
     let promise = writer.abort(reason, ec)?;
     Ok(Types::value_from_object(promise))
 }
@@ -331,7 +331,7 @@ fn close_writer_method(
     let writer_object = <Types as JsTypes>::value_as_object(this).ok_or_else(|| {
         ec.new_type_error("WritableStreamDefaultWriter receiver is not an object")
     })?;
-    let writer = with_writable_stream_default_writer_ref(&writer_object, ec, |w| w.clone())?;
+    let writer = with_writable_stream_default_writer_ref(&writer_object, ec, |w, _ec| w.clone())?;
     let promise = writer.close(ec)?;
     Ok(Types::value_from_object(promise))
 }
@@ -344,7 +344,7 @@ fn release_lock_method(
     let writer_object = <Types as JsTypes>::value_as_object(this).ok_or_else(|| {
         ec.new_type_error("WritableStreamDefaultWriter receiver is not an object")
     })?;
-    let writer = with_writable_stream_default_writer_ref(&writer_object, ec, |w| w.clone())?;
+    let writer = with_writable_stream_default_writer_ref(&writer_object, ec, |w, _ec| w.clone())?;
     writer.release_lock(ec)?;
     Ok(ec.value_undefined())
 }
@@ -358,7 +358,7 @@ fn write_method(
         ec.new_type_error("WritableStreamDefaultWriter receiver is not an object")
     })?;
     let chunk = args.get(0).cloned().unwrap_or_else(|| ec.value_undefined());
-    let writer = with_writable_stream_default_writer_ref(&writer_object, ec, |w| w.clone())?;
+    let writer = with_writable_stream_default_writer_ref(&writer_object, ec, |w, _ec| w.clone())?;
     let promise = writer.write(chunk, ec)?;
     Ok(Types::value_from_object(promise))
 }

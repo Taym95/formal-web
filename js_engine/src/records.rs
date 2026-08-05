@@ -138,7 +138,7 @@ impl<T: JsTypes> std::fmt::Debug for PromiseResolvers<T> {
     }
 }
 
-#[cfg(not(feature = "boa"))]
+#[cfg(all(not(feature = "boa"), not(feature = "v8")))]
 unsafe impl<T: JsTypes> crate::gc::Trace for PromiseResolvers<T> {}
 
 #[cfg(not(feature = "boa"))]

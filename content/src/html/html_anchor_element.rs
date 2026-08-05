@@ -4,12 +4,13 @@ use blitz_dom::BaseDocument;
 use ipc::IpcSender;
 
 use ipc_messages::content::{Event as ContentEvent, NavigableId, UserNavigationInvolvement};
-use js_engine::gc_struct;
+use js_engine::{ExecutionContext, gc_struct};
 use url::Url;
 
 use crate::html::{
     HTMLElement, HyperlinkElementUtils, navigate, the_rules_for_choosing_a_navigable,
 };
+use crate::js::Types;
 
 /// <https://html.spec.whatwg.org/#htmlanchorelement>
 #[gc_struct]
@@ -20,9 +21,13 @@ pub struct HTMLAnchorElement {
 
 #[allow(dead_code)]
 impl HTMLAnchorElement {
-    pub fn new(document: Rc<RefCell<BaseDocument>>, node_id: usize) -> Self {
+    pub fn new(
+        document: Rc<RefCell<BaseDocument>>,
+        node_id: usize,
+        ec: &mut dyn ExecutionContext<Types>,
+    ) -> Self {
         Self {
-            html_element: HTMLElement::new(document, node_id),
+            html_element: HTMLElement::new(document, node_id, ec),
         }
     }
 

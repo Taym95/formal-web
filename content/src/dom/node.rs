@@ -1,3 +1,5 @@
+use crate::js::Types;
+use js_engine::ExecutionContext;
 use js_engine::gc_struct;
 use std::{cell::RefCell, rc::Rc};
 
@@ -33,17 +35,21 @@ pub struct Node {
 }
 
 impl EventTargetAccess for Node {
-    fn get_event_target(&self) -> EventTarget {
+    fn get_event_target(&self, _ec: &mut dyn ExecutionContext<Types>) -> EventTarget {
         self.event_target.clone()
     }
 }
 
 impl Node {
-    pub fn new(document: Rc<RefCell<BaseDocument>>, node_id: usize) -> Self {
+    pub fn new(
+        document: Rc<RefCell<BaseDocument>>,
+        node_id: usize,
+        ec: &mut dyn ExecutionContext<Types>,
+    ) -> Self {
         Self {
             document,
             node_id,
-            event_target: EventTarget::default(),
+            event_target: EventTarget::new(ec),
         }
     }
 

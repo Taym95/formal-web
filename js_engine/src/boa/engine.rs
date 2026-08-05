@@ -278,11 +278,104 @@ pub unsafe fn ec_to_ctx<'a>(
     }
 }
 
+/// Internal host hooks used when building a context for the content layer.
+///
+/// The execution context is stored on the hooks after the initial context is
+/// built, so the platform-object factory runs with the context available when
+/// the real realm's global object is created. The initial realm created by
+/// the builder has placeholder data; it is replaced by the realm built from
+/// the factory (see [`BoaContext::build`]).
+struct GlobalObjectHostHooks<D> {
+    /// Builds the realm's platform object (the Window) from the document the
+    /// content layer is setting up.
+    factory: std::cell::RefCell<Option<Box<dyn Fn(&mut dyn ExecutionContext<BoaTypes>) -> D>>>,
+    /// The execution context, stored after the initial context is built.
+    ec: std::cell::RefCell<Option<*mut dyn ExecutionContext<BoaTypes>>>,
+}
+
+impl<D> boa_engine::context::HostHooks for GlobalObjectHostHooks<D>
+where
+    D: std::any::Any + crate::gc::Trace + 'static,
+{
+    fn create_global_object(
+        &self,
+        intrinsics: &boa_engine::context::intrinsics::Intrinsics,
+    ) -> JsObject {
+        let ec_pointer = *self.ec.borrow();
+        if let Some(ec_pointer) = ec_pointer {
+            let factory = self.factory.borrow();
+            let factory = factory.as_ref().expect("global object factory consumed");
+            // SAFETY: The execution context is stored once, after the initial
+            // context is built, and remains valid for the lifetime of this
+            // host hook. `create_global_object` runs synchronously inside
+            // realm creation, where no other borrow of the context is active.
+            let ec = unsafe { &mut *ec_pointer };
+            let data = factory(ec);
+            JsObject::from_proto_and_data(
+                intrinsics.constructors().object().prototype(),
+                NativeDataWrapper(TraceableBox::new(data)),
+            )
+        } else {
+            // Initial builder realm: no execution context yet, so the global
+            // object carries placeholder platform data. This realm is
+            // replaced by the real one below.
+            JsObject::from_proto_and_data(
+                intrinsics.constructors().object().prototype(),
+                NativeDataWrapper(TraceableBox::noop(Box::new(()))),
+            )
+        }
+    }
+}
+
 impl BoaContext {
     pub fn new() -> Self {
         Self {
             context: Context::default(),
         }
+    }
+
+    /// Build a Boa context with the realm's global object carrying the
+    /// platform object produced by `factory`.
+    ///
+    /// The initial realm created by the builder has placeholder platform
+    /// data; once the execution context exists it is stored on the host hooks
+    /// and the real realm is created with the factory, so `create_global_object`
+    /// can construct the Window with isolate-scoped proof.
+    pub fn build<D>(
+        factory: impl Fn(&mut dyn ExecutionContext<BoaTypes>) -> D + 'static,
+    ) -> Result<Self, String>
+    where
+        D: std::any::Any + crate::gc::Trace + 'static,
+    {
+        let hooks = std::rc::Rc::new(GlobalObjectHostHooks::<D> {
+            factory: std::cell::RefCell::new(Some(Box::new(factory))),
+            ec: std::cell::RefCell::new(None),
+        });
+        let context = boa_engine::context::ContextBuilder::new()
+            .host_hooks(std::rc::Rc::clone(&hooks))
+            .job_executor(std::rc::Rc::new(boa_engine::job::SimpleJobExecutor::new()))
+            .build()
+            .map_err(|error| error.to_string())?;
+        let mut engine = BoaContext::from_context(context);
+        // Store the execution context on the host hooks so
+        // `create_global_object` can build the real platform object.
+        hooks
+            .ec
+            .replace(Some(&mut engine as *mut dyn ExecutionContext<BoaTypes>));
+        // Create the real realm: `Context::create_realm` runs
+        // `Realm::create` with the context's host hooks, whose stored
+        // execution context is now set, then installs the default global
+        // bindings on the new realm's global object.
+        let realm = engine
+            .context()
+            .create_realm()
+            .map_err(|error| error.to_string())?;
+        engine.context().enter_realm(realm);
+        // The stored pointer is only valid for the realm creation above; any
+        // later use (e.g. a child realm built from the same hooks) falls back
+        // to the placeholder branch.
+        hooks.ec.replace(None);
+        Ok(engine)
     }
 
     /// Wrap an existing `Context` into a `BoaContext`.
@@ -513,6 +606,10 @@ impl JsEngine<BoaTypes> for BoaContext {
 
 impl ExecutionContext<BoaTypes> for BoaContext {
     fn as_any_mut(&mut self) -> &mut dyn core::any::Any {
+        self
+    }
+
+    fn as_any(&self) -> &dyn core::any::Any {
         self
     }
 
@@ -2211,8 +2308,11 @@ pub struct TraceableBox {
 
 impl TraceableBox {
     /// Create a new `TraceableBox` for a concrete type that implements
-    /// `Trace` + `Finalize`.
-    pub fn new<T: std::any::Any + boa_gc::Trace + boa_gc::Finalize>(data: T) -> Self {
+    /// `Trace`.
+    ///
+    /// The `Trace` bound implies `boa_gc::Trace` (its supertrait on the Boa
+    /// backend), which supplies the tracing used by the stored vtables.
+    pub fn new<T: std::any::Any + crate::gc::Trace>(data: T) -> Self {
         unsafe fn trace_impl<T: boa_gc::Trace + 'static>(
             data: &dyn std::any::Any,
             tracer: &mut boa_gc::Tracer,

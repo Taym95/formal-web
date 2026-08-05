@@ -1,7 +1,9 @@
 use std::{cell::RefCell, rc::Rc};
 
+use crate::js::Types;
 use blitz_dom::BaseDocument;
 use html5ever::{LocalName, Prefix, QualName, ns};
+use js_engine::ExecutionContext;
 use js_engine::gc_struct;
 use style::dom_apis::{
     MayUseInvalidation, QueryAll, QueryFirst, QuerySelectorAllResult,
@@ -67,15 +69,19 @@ pub struct Element {
 }
 
 impl EventTargetAccess for Element {
-    fn get_event_target(&self) -> EventTarget {
-        self.node.get_event_target()
+    fn get_event_target(&self, ec: &mut dyn ExecutionContext<Types>) -> EventTarget {
+        self.node.get_event_target(ec)
     }
 }
 
 impl Element {
-    pub fn new(document: Rc<RefCell<BaseDocument>>, node_id: usize) -> Self {
+    pub fn new(
+        document: Rc<RefCell<BaseDocument>>,
+        node_id: usize,
+        ec: &mut dyn ExecutionContext<Types>,
+    ) -> Self {
         Self {
-            node: Node::new(document, node_id),
+            node: Node::new(document, node_id, ec),
         }
     }
 

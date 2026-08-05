@@ -544,30 +544,31 @@ fn appendable_node(
 ) -> Completion<Node, crate::js::Types> {
     let object = crate::js::Types::value_as_object(value)
         .ok_or_else(|| ec.new_type_error("appendChild requires a Node"))?;
-    if let Some(data) = ec.with_object_any(&object) {
+    // Clone the handle out of the object registry so `Node::new` can borrow
+    // `ec` mutably; the clone shares all GC-managed state.
+    let node = ec.with_object_any(&object).and_then(|data| {
         if let Some(node) = data.downcast_ref::<Node>() {
-            return Ok(Node::new(Rc::clone(&node.document), node.node_id));
-        }
-        if let Some(element) = data.downcast_ref::<Element>() {
-            return Ok(Node::new(
-                Rc::clone(&element.node.document),
-                element.node.node_id,
-            ));
-        }
-        if let Some(html_element) = data.downcast_ref::<HTMLElement>() {
-            return Ok(Node::new(
+            Some((Rc::clone(&node.document), node.node_id))
+        } else if let Some(element) = data.downcast_ref::<Element>() {
+            Some((Rc::clone(&element.node.document), element.node.node_id))
+        } else if let Some(html_element) = data.downcast_ref::<HTMLElement>() {
+            Some((
                 Rc::clone(&html_element.element.node.document),
                 html_element.element.node.node_id,
-            ));
-        }
-        if let Some(html_iframe_element) = data.downcast_ref::<HTMLIFrameElement>() {
-            return Ok(Node::new(
+            ))
+        } else if let Some(html_iframe_element) = data.downcast_ref::<HTMLIFrameElement>() {
+            Some((
                 Rc::clone(&html_iframe_element.html_element.element.node.document),
                 html_iframe_element.html_element.element.node.node_id,
-            ));
+            ))
+        } else {
+            None
         }
-    }
-    Err(ec.new_type_error("appendChild requires a Node"))
+    });
+    let Some((document, node_id)) = node else {
+        return Err(ec.new_type_error("appendChild requires a Node"));
+    };
+    Ok(Node::new(document, node_id, ec))
 }
 
 fn remove(

@@ -6,13 +6,17 @@ formal-web is a Rust web-engine prototype with a modular architecture and suppor
 
 The project has only been run on macOS; all build commands assume macOS.
 
-The default: **Boa** as the js engine and **AVFoundation** as the media backend:
+The default: **V8** as the js engine and **AVFoundation** as the media backend:
 ```bash
 cargo build --release
 cargo run --release
 ```
 
-For Boa, wasm support can be added via Wasmtime by way of `--features wasm`.
+**Boa** (alternative; required for `wasm` support via Wasmtime):
+```bash
+cargo build --release --no-default-features --features boa,media
+cargo run --release --no-default-features --features boa,media
+```
 
 **JSC** (experimental):
 ```bash
@@ -20,13 +24,7 @@ cargo build --release --no-default-features --features jsc,media
 cargo run --release --no-default-features --features jsc,media
 ```
 
-**V8** (experimental):
-```bash
-cargo build --release --no-default-features --features v8,media
-cargo run --release --no-default-features --features v8,media
-```
-
-**GStreamer** media backend instead of AVFoundation:
+**GStreamer** media backend instead of AVFoundation (Boa):
 ```bash
 cargo build --release --no-default-features --features backend-gstreamer,boa,media
 ```
@@ -61,15 +59,6 @@ delivers CPU bytes):
 | macOS default | zero-copy (IOSurface) | AVFoundation (GPU) | fully zero-copy |
 | macOS + `--no-default-features --features backend-gstreamer,boa,media` | zero-copy (IOSurface) | GStreamer (CPU bytes) | video via CPU, scene zero-copy |
 | macOS + `-p graphics --features cpu_readback` | CPU readback | either | scene via shared memory |
-
-Trade-offs: zero-copy avoids a GPU→CPU readback, IPC pixel bytes, and a
-CPU→GPU upload per frame but needs macOS (IOSurface); CPU readback works
-everywhere. AVFoundation keeps video on the GPU (macOS only); GStreamer
-runs everywhere but copies each decoded video frame through the CPU.
-
-The main idea behind the current modular implementations:
-- one fast Apple path (tested on Mac OS only for now, intent for it to work in IOS as well)
-- one slow cross platform path (tested on Mac OS only for now).
 
 ## Formal verification
 

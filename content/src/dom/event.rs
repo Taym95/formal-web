@@ -53,7 +53,6 @@ pub(crate) struct EventListener {
 
 /// <https://dom.spec.whatwg.org/#interface-eventtarget>
 #[gc_struct]
-#[derive(Default)]
 pub struct EventTarget {
     pub(crate) reflector: Option<JsObject>,
 
@@ -64,8 +63,18 @@ pub struct EventTarget {
     next_listener_id: Cell<u64>,
 }
 
+impl EventTarget {
+    pub(crate) fn new(ec: &mut dyn ExecutionContext<Types>) -> Self {
+        Self {
+            reflector: None,
+            event_listener_list: gc_cell_new(Vec::new(), ec),
+            next_listener_id: Cell::new(0),
+        }
+    }
+}
+
 pub(crate) trait EventTargetAccess {
-    fn get_event_target(&self) -> EventTarget;
+    fn get_event_target(&self, ec: &mut dyn ExecutionContext<Types>) -> EventTarget;
 
     /// <https://dom.spec.whatwg.org/#eventtarget-activation-behavior>
     fn has_activation_behavior(&self) -> bool {
@@ -84,7 +93,7 @@ pub(crate) trait EventTargetAccess {
 }
 
 impl EventTargetAccess for EventTarget {
-    fn get_event_target(&self) -> EventTarget {
+    fn get_event_target(&self, _ec: &mut dyn ExecutionContext<Types>) -> EventTarget {
         self.clone()
     }
 }
@@ -135,10 +144,11 @@ impl EventTarget {
         once: bool,
         passive: Option<bool>,
         signal: Option<AbortSignal>,
+        ec: &mut dyn ExecutionContext<Types>,
     ) {
         // Step 2: If listener's signal is non-null and is aborted, then return.
         if let Some(signal) = signal.as_ref() {
-            if signal.aborted_value() {
+            if signal.aborted_value(ec) {
                 return;
             }
         }
@@ -159,14 +169,14 @@ impl EventTarget {
         // listener's callback, and capture is listener's capture, then
         // append listener to eventTarget's event listener list.
         let listener_id = self.next_listener_id.get().wrapping_add(1);
-        let mut listeners = self.event_listener_list.borrow_mut();
+        let mut listeners = self.event_listener_list.borrow_mut(ec);
         let duplicate = listeners.iter().any(|listener| {
             listener.type_ == type_
                 && listener.capture == capture
                 && listener
                     .callback
                     .as_ref()
-                    .is_some_and(|existing| existing.equals(&callback))
+                    .is_some_and(|existing| existing.equals(&callback, ec))
         });
 
         if !duplicate {
@@ -187,10 +197,13 @@ impl EventTarget {
             // following abort steps to it: Remove an event listener with
             // eventTarget and listener.
             if let Some(signal) = signal {
-                signal.add_abort_algorithm(AbortAlgorithm::RemoveEventListener {
-                    event_target: event_target.clone(),
-                    listener_id,
-                });
+                signal.add_abort_algorithm(
+                    AbortAlgorithm::RemoveEventListener {
+                        event_target: event_target.clone(),
+                        listener_id,
+                    },
+                    ec,
+                );
             }
         }
     }
@@ -201,17 +214,18 @@ impl EventTarget {
         type_: &str,
         callback: &Callback,
         capture: bool,
+        ec: &mut dyn ExecutionContext<Types>,
     ) {
         // Step 2: Set listener's removed to true and remove listener from
         // eventTarget's event listener list.
-        let mut listeners = self.event_listener_list.borrow_mut();
+        let mut listeners = self.event_listener_list.borrow_mut(ec);
         for listener in listeners.iter_mut() {
             if listener.type_ == type_
                 && listener.capture == capture
                 && listener
                     .callback
                     .as_ref()
-                    .is_some_and(|existing| existing.equals(callback))
+                    .is_some_and(|existing| existing.equals(callback, ec))
             {
                 listener.removed = true;
             }
@@ -221,10 +235,14 @@ impl EventTarget {
     }
 
     /// <https://dom.spec.whatwg.org/#remove-an-event-listener>
-    pub(crate) fn remove_event_listener_by_id(&self, listener_id: u64) {
+    pub(crate) fn remove_event_listener_by_id(
+        &self,
+        listener_id: u64,
+        ec: &mut dyn ExecutionContext<Types>,
+    ) {
         // Step 2: Set listener's removed to true and remove listener from
         // eventTarget's event listener list.
-        let mut listeners = self.event_listener_list.borrow_mut();
+        let mut listeners = self.event_listener_list.borrow_mut(ec);
         for listener in listeners.iter_mut() {
             if listener.id == listener_id {
                 listener.removed = true;
@@ -237,9 +255,13 @@ impl EventTarget {
     // Note: Defined by the spec but not yet used by the current dispatch code.
     // <https://dom.spec.whatwg.org/#concept-event-listener>
     #[allow(dead_code)]
-    pub(crate) fn listener_is_active(&self, listener_id: u64) -> bool {
+    pub(crate) fn listener_is_active(
+        &self,
+        listener_id: u64,
+        ec: &mut dyn ExecutionContext<Types>,
+    ) -> bool {
         self.event_listener_list
-            .borrow()
+            .borrow(ec)
             .iter()
             .any(|listener| listener.id == listener_id && !listener.removed)
     }
@@ -253,14 +275,14 @@ impl EventTarget {
     ) -> Completion<bool, Types> {
         // Step 1: If event's dispatch flag is set, or if its initialized flag is not set,
         // then throw an "InvalidStateError" DOMException.
-        if *event.dispatch_flag.borrow() || !*event.initialized_flag.borrow() {
+        if *event.dispatch_flag.borrow(ec) || !*event.initialized_flag.borrow(ec) {
             return Err(ec.new_type_error(
                 "InvalidStateError: event is already being dispatched or not initialized",
             ));
         }
 
         // Step 2: Initialize event's isTrusted attribute to false.
-        *event.is_trusted.borrow_mut() = false;
+        *event.is_trusted.borrow_mut(ec) = false;
 
         // Step 3: Return the result of dispatching event to this.
         crate::dom::dispatch_event(ec, path, event)
@@ -327,24 +349,25 @@ impl Event {
         composed: bool,
         is_trusted: bool,
         time_stamp: f64,
+        ec: &mut dyn ExecutionContext<Types>,
     ) -> Self {
         Self {
             reflector: None,
             type_,
-            target: gc_cell_new(None::<EventTarget>),
-            current_target: gc_cell_new(None),
-            event_phase: gc_cell_new(NONE),
-            bubbles: gc_cell_new(bubbles),
-            cancelable: gc_cell_new(cancelable),
-            composed: gc_cell_new(composed),
-            is_trusted: gc_cell_new(is_trusted),
-            time_stamp: gc_cell_new(time_stamp),
-            stop_propagation_flag: gc_cell_new(false),
-            stop_immediate_propagation_flag: gc_cell_new(false),
-            canceled_flag: gc_cell_new(false),
-            in_passive_listener_flag: gc_cell_new(false),
-            dispatch_flag: gc_cell_new(false),
-            initialized_flag: gc_cell_new(true),
+            target: gc_cell_new(None::<EventTarget>, ec),
+            current_target: gc_cell_new(None, ec),
+            event_phase: gc_cell_new(NONE, ec),
+            bubbles: gc_cell_new(bubbles, ec),
+            cancelable: gc_cell_new(cancelable, ec),
+            composed: gc_cell_new(composed, ec),
+            is_trusted: gc_cell_new(is_trusted, ec),
+            time_stamp: gc_cell_new(time_stamp, ec),
+            stop_propagation_flag: gc_cell_new(false, ec),
+            stop_immediate_propagation_flag: gc_cell_new(false, ec),
+            canceled_flag: gc_cell_new(false, ec),
+            in_passive_listener_flag: gc_cell_new(false, ec),
+            dispatch_flag: gc_cell_new(false, ec),
+            initialized_flag: gc_cell_new(true, ec),
         }
     }
 
@@ -354,72 +377,75 @@ impl Event {
     }
 
     /// <https://dom.spec.whatwg.org/#dom-event-target>
-    pub(crate) fn target_value(&self) -> Option<EventTarget> {
-        self.target.borrow().clone()
+    pub(crate) fn target_value(&self, ec: &mut dyn ExecutionContext<Types>) -> Option<EventTarget> {
+        self.target.borrow(ec).clone()
     }
 
     /// <https://dom.spec.whatwg.org/#dom-event-currenttarget>
-    pub(crate) fn current_target_value(&self) -> Option<EventTarget> {
-        self.current_target.borrow().clone()
+    pub(crate) fn current_target_value(
+        &self,
+        ec: &mut dyn ExecutionContext<Types>,
+    ) -> Option<EventTarget> {
+        self.current_target.borrow(ec).clone()
     }
 
     /// <https://dom.spec.whatwg.org/#dom-event-eventphase>
-    pub(crate) fn event_phase_value(&self) -> u16 {
-        *self.event_phase.borrow()
+    pub(crate) fn event_phase_value(&self, ec: &mut dyn ExecutionContext<Types>) -> u16 {
+        *self.event_phase.borrow(ec)
     }
 
     /// <https://dom.spec.whatwg.org/#dom-event-bubbles>
-    pub(crate) fn bubbles_value(&self) -> bool {
-        *self.bubbles.borrow()
+    pub(crate) fn bubbles_value(&self, ec: &mut dyn ExecutionContext<Types>) -> bool {
+        *self.bubbles.borrow(ec)
     }
 
     /// <https://dom.spec.whatwg.org/#dom-event-cancelable>
-    pub(crate) fn cancelable_value(&self) -> bool {
-        *self.cancelable.borrow()
+    pub(crate) fn cancelable_value(&self, ec: &mut dyn ExecutionContext<Types>) -> bool {
+        *self.cancelable.borrow(ec)
     }
 
     /// <https://dom.spec.whatwg.org/#dom-event-defaultprevented>
-    pub(crate) fn default_prevented(&self) -> bool {
-        *self.canceled_flag.borrow()
+    pub(crate) fn default_prevented(&self, ec: &mut dyn ExecutionContext<Types>) -> bool {
+        *self.canceled_flag.borrow(ec)
     }
 
     /// <https://dom.spec.whatwg.org/#dom-event-cancelbubble>
-    pub(crate) fn cancel_bubble(&self) -> bool {
-        *self.stop_propagation_flag.borrow()
+    pub(crate) fn cancel_bubble(&self, ec: &mut dyn ExecutionContext<Types>) -> bool {
+        *self.stop_propagation_flag.borrow(ec)
     }
 
     /// <https://dom.spec.whatwg.org/#dom-event-cancelbubble>
-    pub(crate) fn set_cancel_bubble(&self, value: bool) {
+    pub(crate) fn set_cancel_bubble(&self, value: bool, ec: &mut dyn ExecutionContext<Types>) {
         if value {
-            *self.stop_propagation_flag.borrow_mut() = true;
+            *self.stop_propagation_flag.borrow_mut(ec) = true;
         }
     }
 
     /// <https://dom.spec.whatwg.org/#dom-event-istrusted>
-    pub(crate) fn is_trusted(&self) -> bool {
-        *self.is_trusted.borrow()
+    pub(crate) fn is_trusted(&self, ec: &mut dyn ExecutionContext<Types>) -> bool {
+        *self.is_trusted.borrow(ec)
     }
 
     /// <https://dom.spec.whatwg.org/#dom-event-timestamp>
-    pub(crate) fn time_stamp_value(&self) -> f64 {
-        *self.time_stamp.borrow()
+    pub(crate) fn time_stamp_value(&self, ec: &mut dyn ExecutionContext<Types>) -> f64 {
+        *self.time_stamp.borrow(ec)
     }
 
     /// <https://dom.spec.whatwg.org/#dom-event-stoppropagation>
-    pub(crate) fn stop_propagation(&self) {
-        *self.stop_propagation_flag.borrow_mut() = true;
+    pub(crate) fn stop_propagation(&self, ec: &mut dyn ExecutionContext<Types>) {
+        *self.stop_propagation_flag.borrow_mut(ec) = true;
     }
 
     /// <https://dom.spec.whatwg.org/#dom-event-stopimmediatepropagation>
-    pub(crate) fn stop_immediate_propagation(&self) {
-        *self.stop_propagation_flag.borrow_mut() = true;
-        *self.stop_immediate_propagation_flag.borrow_mut() = true;
+    pub(crate) fn stop_immediate_propagation(&self, ec: &mut dyn ExecutionContext<Types>) {
+        *self.stop_propagation_flag.borrow_mut(ec) = true;
+        *self.stop_immediate_propagation_flag.borrow_mut(ec) = true;
     }
 
     /// <https://dom.spec.whatwg.org/#dom-event-preventdefault>
-    pub(crate) fn prevent_default(&self) {
-        if *self.cancelable.borrow() && !*self.in_passive_listener_flag.borrow() {
-            *self.canceled_flag.borrow_mut() = true;
+    pub(crate) fn prevent_default(&self, ec: &mut dyn ExecutionContext<Types>) {
+        if *self.cancelable.borrow(ec) && !*self.in_passive_listener_flag.borrow(ec) {
+            *self.canceled_flag.borrow_mut(ec) = true;
         }
     }
 }
@@ -439,7 +465,12 @@ pub struct UIEvent {
 }
 
 impl UIEvent {
-    pub fn from_dom_event(dom_event: &DomEvent, view: Option<JsObject>, time_stamp: f64) -> Self {
+    pub fn from_dom_event(
+        dom_event: &DomEvent,
+        view: Option<JsObject>,
+        time_stamp: f64,
+        ec: &mut dyn ExecutionContext<Types>,
+    ) -> Self {
         Self {
             event: Event::new(
                 dom_event.name().to_owned(),
@@ -448,6 +479,7 @@ impl UIEvent {
                 false,
                 true,
                 time_stamp,
+                ec,
             ),
             view,
             detail: 0,
@@ -464,8 +496,12 @@ impl UIEvent {
         self.detail
     }
 
-    pub fn apply_to_event_state(&self, event_state: &mut EventState) {
-        if *self.event.canceled_flag.borrow() {
+    pub fn apply_to_event_state(
+        &self,
+        event_state: &mut EventState,
+        ec: &mut dyn ExecutionContext<Types>,
+    ) {
+        if *self.event.canceled_flag.borrow(ec) {
             event_state.prevent_default();
         }
     }

@@ -32,10 +32,11 @@ enum ListenerPhase {
 
 pub(crate) fn simple_path(
     target_access: &dyn super::event::EventTargetAccess,
+    ec: &mut dyn ExecutionContext<Types>,
 ) -> Vec<EventPathItem> {
     vec![EventPathItem {
-        invocation_target: target_access.get_event_target(),
-        shadow_adjusted_target: Some(target_access.get_event_target()),
+        invocation_target: target_access.get_event_target(ec),
+        shadow_adjusted_target: Some(target_access.get_event_target(ec)),
     }]
 }
 
@@ -60,6 +61,7 @@ pub(crate) fn fire_event(
         false, // composed
         true,  // isTrusted
         time_millis,
+        ec,
     );
     let event_object = create_interface_instance::<Types, Event>(event_domain, ec)?;
     // Clone the Event domain object from the JsObject — GcCell fields share
@@ -72,7 +74,7 @@ pub(crate) fn fire_event(
 
     // Step 5: Return the result of dispatching event at target, with
     // legacy target override flag set if set.
-    let path = build_path_for_target(target, legacy_target_override);
+    let path = build_path_for_target(target, legacy_target_override, ec);
     dispatch_event(ec, &path, &event)
 }
 
@@ -107,13 +109,14 @@ fn append_to_event_path(
 fn build_path_for_target(
     target_access: &dyn super::event::EventTargetAccess,
     _legacy_target_override: bool,
+    ec: &mut dyn ExecutionContext<Types>,
 ) -> Vec<EventPathItem> {
     let mut path: Vec<EventPathItem> = Vec::new();
 
     // Step 6.3: Append to an event path with event, target, targetOverride,
     // relatedTarget, touchTargets, and false.
     // Note: targetOverride, relatedTarget, and touchTargets are not yet modeled.
-    let et = target_access.get_event_target();
+    let et = target_access.get_event_target(ec);
     append_to_event_path(&mut path, et.clone(), Some(et));
 
     // Step 6.6: Let slottable be target, if target is a slottable…
@@ -142,7 +145,7 @@ pub(crate) fn dispatch_event(
     event: &Event,
 ) -> Completion<bool, Types> {
     // Step 1: Set event's dispatch flag.
-    *event.dispatch_flag.borrow_mut() = true;
+    *event.dispatch_flag.borrow_mut(ec) = true;
 
     // Step 3: Let activationTarget be null.
     // Step 6.5: If isActivationEvent is true and target has activation behavior,
@@ -165,7 +168,7 @@ pub(crate) fn dispatch_event(
         };
 
         // Step 6.13.1-2: Set event's eventPhase.
-        *event.event_phase.borrow_mut() = phase;
+        *event.event_phase.borrow_mut(ec) = phase;
 
         // Step 6.13.3: Invoke with item, event, "capturing".
         invoke(ec, path, index, event, ListenerPhase::Capturing)?;
@@ -175,7 +178,7 @@ pub(crate) fn dispatch_event(
     for (index, entry) in path.iter().enumerate() {
         let phase = if entry.shadow_adjusted_target.is_some() {
             super::AT_TARGET
-        } else if *event.bubbles.borrow() {
+        } else if *event.bubbles.borrow(ec) {
             BUBBLING_PHASE
         } else {
             // Step 6.14.2.1: If event's bubbles attribute is false, then continue.
@@ -183,26 +186,26 @@ pub(crate) fn dispatch_event(
         };
 
         // Step 6.14.1-2: Set event's eventPhase.
-        *event.event_phase.borrow_mut() = phase;
+        *event.event_phase.borrow_mut(ec) = phase;
 
         // Step 6.14.3: Invoke with item, event, "bubbling".
         invoke(ec, path, index, event, ListenerPhase::Bubbling)?;
     }
 
-    let canceled = *event.canceled_flag.borrow();
+    let canceled = *event.canceled_flag.borrow(ec);
 
     // Step 7: Set event's eventPhase attribute to NONE.
-    *event.event_phase.borrow_mut() = NONE;
+    *event.event_phase.borrow_mut(ec) = NONE;
 
     // Step 8: Set event's currentTarget attribute to null.
-    *event.current_target.borrow_mut() = None;
+    *event.current_target.borrow_mut(ec) = None;
 
     // Step 9: Set event's path to the empty list. (Not stored on Event yet.)
     // Step 10: Unset event's dispatch flag, stop propagation flag, and
     //          stop immediate propagation flag.
-    *event.dispatch_flag.borrow_mut() = false;
-    *event.stop_propagation_flag.borrow_mut() = false;
-    *event.stop_immediate_propagation_flag.borrow_mut() = false;
+    *event.dispatch_flag.borrow_mut(ec) = false;
+    *event.stop_propagation_flag.borrow_mut(ec) = false;
+    *event.stop_immediate_propagation_flag.borrow_mut(ec) = false;
 
     // Step 12: If activationTarget is non-null:
     if let Some(idx) = activation_target_idx {
@@ -237,7 +240,7 @@ fn invoke(
     let target = target_item.and_then(|item| item.shadow_adjusted_target.clone());
 
     // Step 3: Set event's target to targetItem's shadow-adjusted target.
-    *event.target.borrow_mut() = target;
+    *event.target.borrow_mut(ec) = target;
 
     // Step 4: Set event's relatedTarget to pathItem's relatedTarget.
     // TODO: relatedTarget is not yet modeled.
@@ -245,15 +248,19 @@ fn invoke(
     // TODO: touch target list is not yet modeled.
 
     // Step 6: If event's stop propagation flag is set, then return.
-    if *event.stop_propagation_flag.borrow() {
+    if *event.stop_propagation_flag.borrow(ec) {
         return Ok(());
     }
 
     // Step 7: Initialize event's currentTarget attribute to pathItem's invocation target.
-    *event.current_target.borrow_mut() = Some(entry.invocation_target.clone());
+    *event.current_target.borrow_mut(ec) = Some(entry.invocation_target.clone());
 
     // Step 8: Let listeners be a clone of event's currentTarget attribute value's event listener list.
-    let listeners = entry.invocation_target.event_listener_list.borrow().clone();
+    let listeners = entry
+        .invocation_target
+        .event_listener_list
+        .borrow(ec)
+        .clone();
 
     // Step 9: Let invocationTargetInShadowTree be pathItem's invocation-target-in-shadow-tree.
     // TODO: Shadow tree is not yet modeled.
@@ -316,12 +323,12 @@ fn inner_invoke(
 
         // Step 2.5: If listener's once is true, then remove an event listener.
         if listener.once {
-            current_target.remove_event_listener_by_id(listener.id);
+            current_target.remove_event_listener_by_id(listener.id, ec);
         }
 
         // Step 2.9: If listener's passive is true, set event's in passive listener flag.
         if listener.passive == Some(true) {
-            *event.in_passive_listener_flag.borrow_mut() = true;
+            *event.in_passive_listener_flag.borrow_mut(ec) = true;
         }
 
         // Step 2.11: Call a user object's operation with listener's callback,
@@ -350,10 +357,10 @@ fn inner_invoke(
         }
 
         // Step 2.12: Unset event's in passive listener flag.
-        *event.in_passive_listener_flag.borrow_mut() = false;
+        *event.in_passive_listener_flag.borrow_mut(ec) = false;
 
         // Step 2.14: If event's stop immediate propagation flag is set, break.
-        if *event.stop_immediate_propagation_flag.borrow() {
+        if *event.stop_immediate_propagation_flag.borrow(ec) {
             break;
         }
     }

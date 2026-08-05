@@ -96,6 +96,9 @@ pub trait EcmascriptHost<T: JsTypes> {
 pub trait ExecutionContext<T: JsTypes + JsTypesWithRealm>: EcmascriptHost<T> {
     /// Downcast to `&mut dyn Any` for extracting the concrete engine type.
     fn as_any_mut(&mut self) -> &mut dyn core::any::Any;
+
+    /// Downcast to `&dyn Any` for extracting the concrete engine type.
+    fn as_any(&self) -> &dyn core::any::Any;
     // ────────────────────────────────────────────────────────────────────────
     // §7.1 Type Conversion
     // ────────────────────────────────────────────────────────────────────────
@@ -697,6 +700,15 @@ pub trait ExecutionContext<T: JsTypes + JsTypesWithRealm>: EcmascriptHost<T> {
     /// needs to call back into ECMA-262 operations.
     fn with_object_any_mut_with(&mut self, object: &T::JsObject, f: ObjectDataMutation<'_, T>);
 
+    /// Store a JS object into a traced platform-object slot.
+    ///
+    /// On V8 the value's rooted handles are converted into cppgc edges before
+    /// the slot is written, so the slot participates in the unified heap's
+    /// cycle collection; other engines assign directly.
+    fn store_js_object(&mut self, slot: &mut Option<T::JsObject>, value: T::JsObject) {
+        *slot = Some(value);
+    }
+
     // ── Error Construction ──────────────────────────────────────────────
 
     /// <https://tc39.es/ecma262/#sec-native-error-types-used-in-this-standard-typeerror>
@@ -1001,4 +1013,39 @@ impl<T: JsTypesWithRealm> HostHooks<T> {
             load_imported_module: None,
         }
     }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Engine construction
+// ────────────────────────────────────────────────────────────────────────────
+
+/// Create a new engine with a realm whose global object carries the
+/// platform object produced by `factory` (e.g. the Window the content layer
+/// is setting up).
+///
+/// Synchronous on every backend; the content layer calls this once per realm
+/// and then runs its shared `setup_realm` path (registering interfaces,
+/// wiring prototypes, etc.).
+#[cfg(feature = "boa")]
+pub fn create_engine<D>(
+    factory: impl Fn(&mut dyn ExecutionContext<crate::boa::BoaTypes>) -> D + 'static,
+) -> Result<crate::boa::BoaContext, String>
+where
+    D: std::any::Any + crate::gc::Trace + 'static,
+{
+    crate::boa::BoaContext::build(factory)
+}
+
+/// Create a new engine with a realm whose global object is prepared for
+/// platform-data association.
+#[cfg(feature = "jsc")]
+pub fn create_engine() -> Result<crate::jsc::JscEngine, String> {
+    Ok(crate::jsc::JscEngine::new())
+}
+
+/// Create a new engine with a realm whose global object is prepared for
+/// platform-data association.
+#[cfg(feature = "v8")]
+pub fn create_engine() -> Result<crate::v8::V8Engine, String> {
+    Ok(crate::v8::V8Engine::new())
 }

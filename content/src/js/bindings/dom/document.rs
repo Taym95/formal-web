@@ -155,16 +155,20 @@ impl WebIdlInterface<crate::js::Types> for Document {
 fn try_with_document<R>(
     this: &JsValue,
     ec: &mut dyn ExecutionContext<crate::js::Types>,
-    f: impl FnOnce(&Document) -> R,
+    f: impl FnOnce(&Document, &mut dyn ExecutionContext<crate::js::Types>) -> R,
 ) -> Completion<R, crate::js::Types> {
     let obj = crate::js::Types::value_as_object(this)
         .ok_or_else(|| ec.new_type_error("document receiver is not an object"))?;
-    if let Some(data) = ec.with_object_any(&obj) {
-        if let Some(doc) = data.downcast_ref::<Document>() {
-            return Ok(f(doc));
-        }
-    }
-    Err(ec.new_type_error("receiver is not a Document"))
+    // Clone the handle out of the object registry so `f` can borrow `ec`
+    // mutably; the clone shares all GC-managed state with the registered
+    // platform object.
+    let document = ec
+        .with_object_any(&obj)
+        .and_then(|data| data.downcast_ref::<Document>().cloned());
+    let Some(document) = document else {
+        return Err(ec.new_type_error("receiver is not a Document"));
+    };
+    Ok(f(&document, ec))
 }
 
 fn get_element_by_id(
@@ -174,7 +178,7 @@ fn get_element_by_id(
 ) -> Completion<JsValue, crate::js::Types> {
     let value_undefined = ec.value_undefined();
     let id = ec.to_rust_string(args.first().cloned().unwrap_or(value_undefined))?;
-    let node_id = try_with_document(this, ec, |document| document.get_element_by_id(&id))?;
+    let node_id = try_with_document(this, ec, |document, _ec| document.get_element_by_id(&id))?;
     match node_id {
         Some(node_id) => {
             let obj = resolve_element_object(node_id, ec)?;
@@ -191,7 +195,7 @@ fn query_selector(
 ) -> Completion<JsValue, crate::js::Types> {
     let value_undefined = ec.value_undefined();
     let selector = ec.to_rust_string(args.first().cloned().unwrap_or(value_undefined.clone()))?;
-    let node_id = try_with_document(this, ec, |document| document.query_selector(&selector))?
+    let node_id = try_with_document(this, ec, |document, _ec| document.query_selector(&selector))?
         .map_err(|error| ec.new_syntax_error(&error))?;
     match node_id {
         Some(node_id) => {
@@ -209,8 +213,10 @@ fn query_selector_all(
 ) -> Completion<JsValue, crate::js::Types> {
     let value_undefined = ec.value_undefined();
     let selector = ec.to_rust_string(args.first().cloned().unwrap_or(value_undefined.clone()))?;
-    let node_ids = try_with_document(this, ec, |document| document.query_selector_all(&selector))?
-        .map_err(|error| ec.new_syntax_error(&error))?;
+    let node_ids = try_with_document(this, ec, |document, _ec| {
+        document.query_selector_all(&selector)
+    })?
+    .map_err(|error| ec.new_syntax_error(&error))?;
     let array = ec.create_empty_array();
     for node_id in node_ids {
         let obj = resolve_element_object(node_id, ec)?;
@@ -227,7 +233,7 @@ fn get_elements_by_tag_name(
     let value_undefined = ec.value_undefined();
     let qualified_name =
         ec.to_rust_string(args.first().cloned().unwrap_or(value_undefined.clone()))?;
-    let node_ids = try_with_document(this, ec, |document| {
+    let node_ids = try_with_document(this, ec, |document, _ec| {
         document.get_elements_by_tag_name(&qualified_name)
     })?
     .map_err(|error| ec.new_syntax_error(&error))?;
@@ -246,7 +252,9 @@ fn create_element(
 ) -> Completion<JsValue, crate::js::Types> {
     let value_undefined = ec.value_undefined();
     let local_name = ec.to_rust_string(args.first().cloned().unwrap_or(value_undefined))?;
-    let node_id = try_with_document(this, ec, |document| document.create_element(&local_name))?;
+    let node_id = try_with_document(this, ec, |document, _ec| {
+        document.create_element(&local_name)
+    })?;
     let obj = resolve_element_object(node_id, ec)?;
     Ok(crate::js::Types::value_from_object(obj))
 }
@@ -267,7 +275,7 @@ fn create_element_ns(
     };
     let qualified_name =
         ec.to_rust_string(args.get(1).cloned().unwrap_or(value_undefined.clone()))?;
-    let node_id = try_with_document(this, ec, |document| {
+    let node_id = try_with_document(this, ec, |document, _ec| {
         document.create_element_ns(namespace.as_deref(), &qualified_name)
     })?
     .map_err(|error| ec.new_syntax_error(&error))?;
@@ -282,7 +290,7 @@ fn create_text_node(
 ) -> Completion<JsValue, crate::js::Types> {
     let value_undefined = ec.value_undefined();
     let text = ec.to_rust_string(args.first().cloned().unwrap_or(value_undefined))?;
-    let (document, node_id) = try_with_document(this, ec, |document| {
+    let (document, node_id) = try_with_document(this, ec, |document, _ec| {
         (
             Rc::clone(&document.node.document),
             document.create_text_node(&text),
@@ -299,7 +307,7 @@ fn create_comment(
 ) -> Completion<JsValue, crate::js::Types> {
     let value_undefined = ec.value_undefined();
     let data = ec.to_rust_string(args.first().cloned().unwrap_or(value_undefined))?;
-    let (document, node_id) = try_with_document(this, ec, |document| {
+    let (document, node_id) = try_with_document(this, ec, |document, _ec| {
         (
             Rc::clone(&document.node.document),
             document.create_comment(&data),
@@ -314,7 +322,7 @@ fn get_body(
     _: &[JsValue],
     ec: &mut dyn ExecutionContext<crate::js::Types>,
 ) -> Completion<JsValue, crate::js::Types> {
-    let node_id = try_with_document(this, ec, Document::body)?
+    let node_id = try_with_document(this, ec, |document, _ec| Document::body(document))?
         .map_err(|error| ec.new_syntax_error(&error))?;
     match node_id {
         Some(node_id) => {
@@ -330,7 +338,9 @@ fn get_document_element(
     _: &[JsValue],
     ec: &mut dyn ExecutionContext<crate::js::Types>,
 ) -> Completion<JsValue, crate::js::Types> {
-    match try_with_document(this, ec, Document::document_element)? {
+    match try_with_document(this, ec, |document, _ec| {
+        Document::document_element(document)
+    })? {
         Some(node_id) => {
             let obj = resolve_element_object(node_id, ec)?;
             Ok(crate::js::Types::value_from_object(obj))
@@ -344,7 +354,7 @@ fn get_title(
     _: &[JsValue],
     ec: &mut dyn ExecutionContext<crate::js::Types>,
 ) -> Completion<JsValue, crate::js::Types> {
-    let title = try_with_document(this, ec, |document| document.title())?;
+    let title = try_with_document(this, ec, |document, _ec| document.title())?;
     Ok(ec.value_from_string(ec.js_string_from_str(title.as_str())))
 }
 
@@ -355,9 +365,11 @@ fn set_title(
 ) -> Completion<JsValue, crate::js::Types> {
     let value_undefined = ec.value_undefined();
     let title = ec.to_rust_string(args.first().cloned().unwrap_or(value_undefined))?;
-    let dropped_node_ids = try_with_document(this, ec, Document::title_subtree_node_ids)?;
+    let dropped_node_ids = try_with_document(this, ec, |document, _ec| {
+        Document::title_subtree_node_ids(document)
+    })?;
     invalidate_cached_node_ids(ec, &dropped_node_ids)?;
-    try_with_document(this, ec, |document| document.set_title(&title))?;
+    try_with_document(this, ec, |document, ec| document.set_title(&title, ec))?;
     Ok(ec.value_undefined())
 }
 
@@ -366,7 +378,7 @@ fn get_dir(
     _: &[JsValue],
     ec: &mut dyn ExecutionContext<crate::js::Types>,
 ) -> Completion<JsValue, crate::js::Types> {
-    let dir = try_with_document(this, ec, |document| document.dir())?;
+    let dir = try_with_document(this, ec, |document, ec| document.dir(ec))?;
     Ok(ec.value_from_string(ec.js_string_from_str(dir.as_str())))
 }
 
@@ -377,7 +389,7 @@ fn set_dir(
 ) -> Completion<JsValue, crate::js::Types> {
     let value_undefined = ec.value_undefined();
     let dir = ec.to_rust_string(args.first().cloned().unwrap_or(value_undefined))?;
-    try_with_document(this, ec, |document| document.set_dir(&dir))?;
+    try_with_document(this, ec, |document, ec| document.set_dir(&dir, ec))?;
     Ok(ec.value_undefined())
 }
 
@@ -423,7 +435,7 @@ pub(crate) fn create_document_platform_object(
     ),
     crate::js::Types,
 > {
-    let document = crate::dom::Document::new(blitz_document, creation_url);
+    let document = crate::dom::Document::new(blitz_document, creation_url, ec);
     let document_object =
         create_interface_instance::<crate::js::Types, crate::dom::Document>(document, ec)?;
 

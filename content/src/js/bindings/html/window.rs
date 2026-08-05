@@ -272,9 +272,9 @@ fn request_animation_frame_method(
     let mut handle = 0u32;
     ec.with_object_any_mut_with(
         &window_object,
-        Box::new(|data, _ec2| {
+        Box::new(|data, ec| {
             if let Some(window) = data.downcast_ref::<Window>() {
-                handle = window.global_scope.request_animation_frame(callback);
+                handle = window.global_scope.request_animation_frame(callback, ec);
             }
         }),
     );
@@ -325,14 +325,14 @@ fn set_onload(
 
     if let Some(previous) = previous {
         let receiver = crate::js::Types::value_from_object(window_object.clone());
-        try_with_event_target_mut(&receiver, ec, |target| {
-            target.remove_event_listener_entry("load", &previous, false);
+        try_with_event_target_mut(&receiver, ec, |target, ec| {
+            target.remove_event_listener_entry("load", &previous, false, ec);
         })?;
     }
 
     if let Some(callback) = callback {
         let receiver = crate::js::Types::value_from_object(window_object.clone());
-        try_with_event_target_mut(&receiver, ec, |target| {
+        try_with_event_target_mut(&receiver, ec, |target, ec| {
             target.add_event_listener(
                 target.clone(),
                 String::from("load"),
@@ -341,6 +341,7 @@ fn set_onload(
                 false,
                 Some(false),
                 None,
+                ec,
             );
         })?;
     }
@@ -387,9 +388,9 @@ fn cancel_animation_frame_method(
     let window_object = current_window_object_from(this, ec);
     ec.with_object_any_mut_with(
         &window_object,
-        Box::new(|data, _ec2| {
+        Box::new(|data, ec| {
             if let Some(window) = data.downcast_mut::<Window>() {
-                window.global_scope.cancel_animation_frame(handle);
+                window.global_scope.cancel_animation_frame(handle, ec);
             }
         }),
     );
@@ -430,9 +431,9 @@ fn clear_timeout_method(
     let window_object = current_window_object_from(this, ec);
     ec.with_object_any_mut_with(
         &window_object,
-        Box::new(|data, _ec2| {
+        Box::new(|data, ec| {
             if let Some(window) = data.downcast_mut::<Window>() {
-                window.clear_timeout(timer_id);
+                window.clear_timeout(timer_id, ec);
             }
         }),
     );
@@ -473,9 +474,9 @@ fn clear_interval_method(
     let window_object = current_window_object_from(this, ec);
     ec.with_object_any_mut_with(
         &window_object,
-        Box::new(|data, _ec2| {
+        Box::new(|data, ec| {
             if let Some(window) = data.downcast_mut::<Window>() {
-                window.clear_interval(timer_id);
+                window.clear_interval(timer_id, ec);
             }
         }),
     );

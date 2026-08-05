@@ -353,8 +353,8 @@ fn get_locked(
 ) -> Completion<JsValue, Types> {
     let stream_object = Types::value_as_object(this)
         .ok_or_else(|| ec.new_type_error("ReadableStream receiver is not an object"))?;
-    let locked = with_readable_stream_ref(&stream_object, ec, |stream: &ReadableStream| {
-        stream.locked()
+    let locked = with_readable_stream_ref(&stream_object, ec, |stream: &ReadableStream, ec| {
+        stream.locked(ec)
     })?;
     Ok(ec.value_from_bool(locked))
 }
@@ -366,7 +366,8 @@ fn cancel_method(
 ) -> Completion<JsValue, Types> {
     let stream_object = <Types as JsTypes>::value_as_object(this)
         .ok_or_else(|| ec.new_type_error("ReadableStream receiver is not an object"))?;
-    let mut stream = with_readable_stream_ref(&stream_object, ec, |s: &ReadableStream| s.clone())?;
+    let mut stream =
+        with_readable_stream_ref(&stream_object, ec, |s: &ReadableStream, _ec| s.clone())?;
     let promise = stream.cancel(
         args.get(0).cloned().unwrap_or_else(|| ec.value_undefined()),
         ec,
@@ -381,7 +382,8 @@ fn get_reader_method(
 ) -> Completion<JsValue, Types> {
     let stream_object = <Types as JsTypes>::value_as_object(this)
         .ok_or_else(|| ec.new_type_error("ReadableStream receiver is not an object"))?;
-    let mut stream = with_readable_stream_ref(&stream_object, ec, |s: &ReadableStream| s.clone())?;
+    let mut stream =
+        with_readable_stream_ref(&stream_object, ec, |s: &ReadableStream, _ec| s.clone())?;
     let reader = stream.get_reader(
         &args.get(0).cloned().unwrap_or_else(|| ec.value_undefined()),
         ec,
@@ -396,7 +398,8 @@ fn pipe_through_method(
 ) -> Completion<JsValue, Types> {
     let stream_object = <Types as JsTypes>::value_as_object(this)
         .ok_or_else(|| ec.new_type_error("ReadableStream receiver is not an object"))?;
-    let mut stream = with_readable_stream_ref(&stream_object, ec, |s: &ReadableStream| s.clone())?;
+    let mut stream =
+        with_readable_stream_ref(&stream_object, ec, |s: &ReadableStream, _ec| s.clone())?;
     stream.pipe_through(
         &args.get(0).cloned().unwrap_or_else(|| ec.value_undefined()),
         &args.get(1).cloned().unwrap_or_else(|| ec.value_undefined()),
@@ -411,7 +414,8 @@ fn pipe_to_operation(
 ) -> Completion<JsObject, Types> {
     let stream_object = <Types as JsTypes>::value_as_object(this)
         .ok_or_else(|| ec.new_type_error("ReadableStream receiver is not an object"))?;
-    let mut stream = with_readable_stream_ref(&stream_object, ec, |s: &ReadableStream| s.clone())?;
+    let mut stream =
+        with_readable_stream_ref(&stream_object, ec, |s: &ReadableStream, _ec| s.clone())?;
     stream.pipe_to(
         &args.get(0).cloned().unwrap_or_else(|| ec.value_undefined()),
         &args.get(1).cloned().unwrap_or_else(|| ec.value_undefined()),
@@ -450,7 +454,8 @@ fn tee_method(
 ) -> Completion<JsValue, Types> {
     let stream_object = <Types as JsTypes>::value_as_object(this)
         .ok_or_else(|| ec.new_type_error("ReadableStream receiver is not an object"))?;
-    let mut stream = with_readable_stream_ref(&stream_object, ec, |s: &ReadableStream| s.clone())?;
+    let mut stream =
+        with_readable_stream_ref(&stream_object, ec, |s: &ReadableStream, _ec| s.clone())?;
     stream.tee(ec)
 }
 
@@ -461,7 +466,7 @@ pub(crate) fn values_method(
 ) -> Completion<JsValue, Types> {
     let stream_object = <Types as JsTypes>::value_as_object(this)
         .ok_or_else(|| ec.new_type_error("ReadableStream receiver is not an object"))?;
-    let stream = with_readable_stream_ref(&stream_object, ec, |s: &ReadableStream| s.clone())?;
+    let stream = with_readable_stream_ref(&stream_object, ec, |s: &ReadableStream, _ec| s.clone())?;
     let iterator = create_value_async_iterator(stream, args, ec)?;
     Ok(JsValue::from(iterator))
 }
@@ -487,7 +492,7 @@ fn get_desired_size(
         ec.new_type_error("ReadableStreamDefaultController receiver is not an object")
     })?;
     let controller =
-        with_readable_stream_default_controller_ref(&controller_object, ec, |c| c.clone())?;
+        with_readable_stream_default_controller_ref(&controller_object, ec, |c, _ec| c.clone())?;
     let size = controller.desired_size(ec)?;
     Ok(match size {
         Some(size) => ec.value_from_number(size),
@@ -504,7 +509,7 @@ fn get_byte_desired_size(
         ec.new_type_error("ReadableByteStreamController receiver is not an object")
     })?;
     let controller =
-        with_readable_byte_stream_controller_ref(&controller_object, ec, |c| c.clone())?;
+        with_readable_byte_stream_controller_ref(&controller_object, ec, |c, _ec| c.clone())?;
     let size = controller.desired_size(ec)?;
     Ok(match size {
         Some(size) => ec.value_from_number(size),
@@ -521,7 +526,7 @@ fn get_byob_request(
         ec.new_type_error("ReadableByteStreamController receiver is not an object")
     })?;
     let controller =
-        with_readable_byte_stream_controller_ref(&controller_object, ec, |c| c.clone())?;
+        with_readable_byte_stream_controller_ref(&controller_object, ec, |c, _ec| c.clone())?;
     let byob_request = controller.byob_request(ec)?;
     Ok(match byob_request {
         Some(req) => JsValue::from(req),
@@ -538,7 +543,7 @@ fn close_method(
         ec.new_type_error("ReadableStreamDefaultController receiver is not an object")
     })?;
     let controller =
-        with_readable_stream_default_controller_ref(&controller_object, ec, |c| c.clone())?;
+        with_readable_stream_default_controller_ref(&controller_object, ec, |c, _ec| c.clone())?;
     controller.close(ec)?;
     Ok(ec.value_undefined())
 }
@@ -552,7 +557,7 @@ fn close_byte_method(
         ec.new_type_error("ReadableByteStreamController receiver is not an object")
     })?;
     let controller =
-        with_readable_byte_stream_controller_ref(&controller_object, ec, |c| c.clone())?;
+        with_readable_byte_stream_controller_ref(&controller_object, ec, |c, _ec| c.clone())?;
     controller.close(ec)?;
     Ok(ec.value_undefined())
 }
@@ -566,7 +571,7 @@ fn enqueue_method(
         ec.new_type_error("ReadableStreamDefaultController receiver is not an object")
     })?;
     let controller =
-        with_readable_stream_default_controller_ref(&controller_object, ec, |c| c.clone())?;
+        with_readable_stream_default_controller_ref(&controller_object, ec, |c, _ec| c.clone())?;
     controller.enqueue(
         args.get(0).cloned().unwrap_or_else(|| ec.value_undefined()),
         ec,
@@ -583,7 +588,7 @@ fn enqueue_byte_method(
         ec.new_type_error("ReadableByteStreamController receiver is not an object")
     })?;
     let controller =
-        with_readable_byte_stream_controller_ref(&controller_object, ec, |c| c.clone())?;
+        with_readable_byte_stream_controller_ref(&controller_object, ec, |c, _ec| c.clone())?;
     controller.enqueue(
         args.get(0).cloned().unwrap_or_else(|| ec.value_undefined()),
         ec,
@@ -600,7 +605,7 @@ fn error_method(
         ec.new_type_error("ReadableStreamDefaultController receiver is not an object")
     })?;
     let controller =
-        with_readable_stream_default_controller_ref(&controller_object, ec, |c| c.clone())?;
+        with_readable_stream_default_controller_ref(&controller_object, ec, |c, _ec| c.clone())?;
     controller.error(
         args.get(0).cloned().unwrap_or_else(|| ec.value_undefined()),
         ec,
@@ -617,7 +622,7 @@ fn error_byte_method(
         ec.new_type_error("ReadableByteStreamController receiver is not an object")
     })?;
     let controller =
-        with_readable_byte_stream_controller_ref(&controller_object, ec, |c| c.clone())?;
+        with_readable_byte_stream_controller_ref(&controller_object, ec, |c, _ec| c.clone())?;
     controller.error(
         args.get(0).cloned().unwrap_or_else(|| ec.value_undefined()),
         ec,
@@ -633,7 +638,7 @@ fn get_closed(
     let reader_object = <Types as JsTypes>::value_as_object(this).ok_or_else(|| {
         ec.new_type_error("ReadableStreamDefaultReader receiver is not an object")
     })?;
-    let reader = with_readable_stream_default_reader_ref(&reader_object, ec, |r| r.clone())?;
+    let reader = with_readable_stream_default_reader_ref(&reader_object, ec, |r, _ec| r.clone())?;
     let closed = reader.closed(ec)?;
     Ok(JsValue::from(closed))
 }
@@ -645,7 +650,7 @@ fn get_byob_closed(
 ) -> Completion<JsValue, Types> {
     let reader_object = <Types as JsTypes>::value_as_object(this)
         .ok_or_else(|| ec.new_type_error("ReadableStreamBYOBReader receiver is not an object"))?;
-    let reader = with_readable_stream_byob_reader_ref(&reader_object, ec, |r| r.clone())?;
+    let reader = with_readable_stream_byob_reader_ref(&reader_object, ec, |r, _ec| r.clone())?;
     let closed = reader.closed(ec)?;
     Ok(JsValue::from(closed))
 }
@@ -658,7 +663,7 @@ fn cancel_reader_method(
     let reader_object = <Types as JsTypes>::value_as_object(this).ok_or_else(|| {
         ec.new_type_error("ReadableStreamDefaultReader receiver is not an object")
     })?;
-    let reader = with_readable_stream_default_reader_ref(&reader_object, ec, |r| r.clone())?;
+    let reader = with_readable_stream_default_reader_ref(&reader_object, ec, |r, _ec| r.clone())?;
     let promise = reader.cancel(
         args.get(0).cloned().unwrap_or_else(|| ec.value_undefined()),
         ec,
@@ -674,7 +679,7 @@ fn read_method(
     let reader_object = <Types as JsTypes>::value_as_object(this).ok_or_else(|| {
         ec.new_type_error("ReadableStreamDefaultReader receiver is not an object")
     })?;
-    let reader = with_readable_stream_default_reader_ref(&reader_object, ec, |r| r.clone())?;
+    let reader = with_readable_stream_default_reader_ref(&reader_object, ec, |r, _ec| r.clone())?;
     let promise = reader.read(ec)?;
     Ok(JsValue::from(promise))
 }
@@ -686,7 +691,7 @@ fn cancel_byob_reader_method(
 ) -> Completion<JsValue, Types> {
     let reader_object = <Types as JsTypes>::value_as_object(this)
         .ok_or_else(|| ec.new_type_error("ReadableStreamBYOBReader receiver is not an object"))?;
-    let reader = with_readable_stream_byob_reader_ref(&reader_object, ec, |r| r.clone())?;
+    let reader = with_readable_stream_byob_reader_ref(&reader_object, ec, |r, _ec| r.clone())?;
     let promise = reader.cancel(
         args.get(0).cloned().unwrap_or_else(|| ec.value_undefined()),
         ec,
@@ -701,7 +706,7 @@ fn read_byob_method(
 ) -> Completion<JsValue, Types> {
     let reader_object = <Types as JsTypes>::value_as_object(this)
         .ok_or_else(|| ec.new_type_error("ReadableStreamBYOBReader receiver is not an object"))?;
-    let reader = with_readable_stream_byob_reader_ref(&reader_object, ec, |r| r.clone())?;
+    let reader = with_readable_stream_byob_reader_ref(&reader_object, ec, |r, _ec| r.clone())?;
     let promise = reader.read(
         &args.get(0).cloned().unwrap_or_else(|| ec.value_undefined()),
         &args.get(1).cloned().unwrap_or_else(|| ec.value_undefined()),
@@ -718,7 +723,7 @@ fn release_lock_method(
     let reader_object = <Types as JsTypes>::value_as_object(this).ok_or_else(|| {
         ec.new_type_error("ReadableStreamDefaultReader receiver is not an object")
     })?;
-    let reader = with_readable_stream_default_reader_ref(&reader_object, ec, |r| r.clone())?;
+    let reader = with_readable_stream_default_reader_ref(&reader_object, ec, |r, _ec| r.clone())?;
     reader.release_lock(ec)?;
     Ok(ec.value_undefined())
 }
@@ -730,7 +735,7 @@ fn release_byob_lock_method(
 ) -> Completion<JsValue, Types> {
     let reader_object = <Types as JsTypes>::value_as_object(this)
         .ok_or_else(|| ec.new_type_error("ReadableStreamBYOBReader receiver is not an object"))?;
-    let reader = with_readable_stream_byob_reader_ref(&reader_object, ec, |r| r.clone())?;
+    let reader = with_readable_stream_byob_reader_ref(&reader_object, ec, |r, _ec| r.clone())?;
     reader.release_lock(ec)?;
     Ok(ec.value_undefined())
 }
@@ -743,7 +748,7 @@ fn get_byob_view(
     let request_object = <Types as JsTypes>::value_as_object(this)
         .ok_or_else(|| ec.new_type_error("ReadableStreamBYOBRequest receiver is not an object"))?;
     let view =
-        with_readable_stream_byob_request_ref(&request_object, ec, |request| request.view())?;
+        with_readable_stream_byob_request_ref(&request_object, ec, |request, ec| request.view(ec))?;
     Ok(match view {
         Some(v) => JsValue::from(v),
         None => ec.value_null(),
@@ -759,7 +764,7 @@ fn respond_method(
         .ok_or_else(|| ec.new_type_error("ReadableStreamBYOBRequest receiver is not an object"))?;
     let arg = args.get(0).cloned().unwrap_or_else(|| ec.value_undefined());
     let bytes_written = ec.to_uint32(arg)?;
-    let request = with_readable_stream_byob_request_ref(&request_object, ec, |r| r.clone())?;
+    let request = with_readable_stream_byob_request_ref(&request_object, ec, |r, _ec| r.clone())?;
     request.respond(bytes_written as usize, ec)?;
     Ok(ec.value_undefined())
 }
@@ -771,7 +776,7 @@ fn respond_with_new_view_method(
 ) -> Completion<JsValue, Types> {
     let request_object = <Types as JsTypes>::value_as_object(this)
         .ok_or_else(|| ec.new_type_error("ReadableStreamBYOBRequest receiver is not an object"))?;
-    let request = with_readable_stream_byob_request_ref(&request_object, ec, |r| r.clone())?;
+    let request = with_readable_stream_byob_request_ref(&request_object, ec, |r, _ec| r.clone())?;
     request.respond_with_new_view(
         args.get(0).cloned().unwrap_or_else(|| ec.value_undefined()),
         ec,
@@ -782,14 +787,16 @@ fn respond_with_new_view_method(
 fn with_readable_stream_default_controller_ref<R>(
     object: &JsObject,
     ec: &mut dyn ExecutionContext<Types>,
-    f: impl FnOnce(&ReadableStreamDefaultController) -> R,
+    f: impl FnOnce(&ReadableStreamDefaultController, &mut dyn ExecutionContext<Types>) -> R,
 ) -> Completion<R, Types> {
-    let ctrl_ref = ec
+    // Clone the handle out of the object registry so `f` can borrow `ec`
+    // mutably; the clone shares all GC-managed state with the registered
+    // platform object.
+    let controller = ec
         .with_object_any(object)
-        .and_then(|a| a.downcast_ref::<ReadableStreamDefaultController>());
-    let controller = match ctrl_ref {
-        Some(c) => c,
-        None => return Err(ec.new_type_error("object is not a ReadableStreamDefaultController")),
+        .and_then(|a| a.downcast_ref::<ReadableStreamDefaultController>().cloned());
+    let Some(controller) = controller else {
+        return Err(ec.new_type_error("object is not a ReadableStreamDefaultController"));
     };
-    Ok(f(controller))
+    Ok(f(&controller, ec))
 }
