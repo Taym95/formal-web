@@ -297,6 +297,14 @@ mod jsc_cells {
 // mirroring Boa's `Gc<GcRefCell<T>>` clone semantics. The value itself lives
 // in an `UnsafeCell` guarded by the isolate-scoped access discipline; the
 // borrow counter restores the runtime double-borrow checks of `RefCell`.
+//
+// Borrow discipline: never call engine methods (any `ec` operation) while a
+// borrow guard is live — shared or mutable. An engine call may allocate and
+// trigger a cppgc trace that reads the cell while the borrow is live; a
+// mutable borrow being traced is undefined behavior. Clone the value out
+// instead (`borrow(ec).clone()` … `set(value, ec)`), or scope the borrow to
+// a non-engine section. `HeapCell::trace` aborts on a live mutable borrow as
+// a backstop. See `js_engine/README.md` ("GcCell borrow discipline").
 #[cfg(feature = "v8")]
 pub use v8_cells::*;
 

@@ -149,8 +149,13 @@ impl AbortSignal {
     }
 
     pub(crate) fn set_reflector(&self, reflector: JsObject, ec: &mut dyn ExecutionContext<Types>) {
-        let mut state = self.shared.borrow_mut(ec);
-        ec.store_js_object(&mut state.reflector, reflector);
+        // `store_js_object` allocates (it converts the stored handle into a
+        // cppgc edge), so the reflector is stored into a local slot first and
+        // written into the cell under a borrow held only for the assignment —
+        // no engine call runs while the cell is borrowed.
+        let mut reflector_slot = self.shared.borrow(ec).reflector.clone();
+        ec.store_js_object(&mut reflector_slot, reflector);
+        self.shared.borrow_mut(ec).reflector = reflector_slot;
     }
 
     pub(crate) fn object(&self, ec: &mut dyn ExecutionContext<Types>) -> Option<JsObject> {
@@ -162,8 +167,14 @@ impl AbortSignal {
         f: impl FnOnce(&mut EventTarget, &mut dyn ExecutionContext<Types>) -> R,
         ec: &mut dyn ExecutionContext<Types>,
     ) -> R {
-        let mut state = self.shared.borrow_mut(ec);
-        f(&mut state.event_target, ec)
+        // The closure may call the engine (listener registration, reflector
+        // storage — both allocate), so the event target is cloned out of the
+        // cell and no borrow is held across the closure; the result is
+        // written back under a borrow held only for the assignment.
+        let mut event_target = self.shared.borrow(ec).event_target.clone();
+        let result = f(&mut event_target, ec);
+        (*self.shared.borrow_mut(ec)).event_target = event_target;
+        result
     }
 
     /// <https://dom.spec.whatwg.org/#dom-abortsignal-aborted>

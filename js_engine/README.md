@@ -40,6 +40,35 @@ Two categories of abstraction:
 | `jsc/` | JSC backend implementation (macOS only) |
 | `v8/` | V8 backend implementation through `rusty_v8` (macOS arm64 only) |
 
+### GcCell borrow discipline
+
+Domain code must **never call an engine method (any `ec` operation) while a
+`GcCell` borrow guard (`borrow`/`borrow_mut`) is live** — shared or mutable.
+The rule is engine-independent: an engine call may allocate, and on the V8
+backend an allocation can trigger a cppgc trace that reads the cell while the
+borrow is live. A *mutable* borrow being traced is an aliasing violation
+(undefined behavior); a *shared* borrow being traced is legal aliasing, but
+the rule still forbids it so content code never has to know which engine
+operations allocate (and a shared-borrow site can silently become a
+mutable-borrow site later). The approved patterns are:
+
+- **Clone out, write back** — `let mut value = cell.borrow(ec).clone();` …
+  use the owned value (mutably, across `ec` calls) …
+  `cell.set(value, ec);`.
+- **Scope the borrow** — hold the guard only for the section that touches
+the cell, and drop it before any `ec` call (an explicit `drop(guard)` where
+the control flow is not obvious).
+
+The V8 backend enforces the rule as a backstop: `HeapCell::trace` aborts if
+marking visits a mutably-borrowed cell (a Rust panic there would unwind
+across the C++ marking visitor, so the failure is a hard abort with a log
+line), and there is deliberately no `Trace` impl for bare
+`std::cell::RefCell` — a `#[gc_struct]` field that needs interior mutability
+must use `GcCell`, or be marked `#[ignore_trace]` when it holds no cppgc
+edges. The one remaining exception class is the `with_object_any_mut_with`
+platform-object closure pattern (it hands `&mut dyn Any` and `ec` to the
+operation; see "Remaining work").
+
 ## Feature flags
 
 | Flag | Engine | Default |
@@ -196,6 +225,30 @@ is finalized at isolate destruction. Remaining:
    created, used for a bounded sequence of C calls, and dropped) and the
    underlying memory is C++-owned, but the pattern is not Stacked-Borrows
    clean; a Miri run would flag it.
+5. **`with_object_any_mut_with` vs. cppgc tracing.** The operation receives
+   `&mut dyn Any` into the platform data AND an execution context; if it
+   allocates, a trace pass can read the platform data while the mutable
+   borrow is live — the same aliasing hazard the `HeapCell` writer check
+   closes for `GcCell`. The `with_object_any_mut` variant is
+   compiler-protected (the `&mut` is tied to `&mut ec`, so `ec` cannot be
+   used while the borrow is outstanding); the `_with` variant exists for
+   operations that need both. Not reproduced as a crash; structurally open.
+
+### ArrayBuffer / IsConstructor gaps (V8)
+
+- `allocate_array_buffer`/`allocate_shared_array_buffer` honor the supplied
+  constructor via a full `[[Construct]]` call, but `AllocateArrayBuffer`
+  (§25.1.2.1) only reads the constructor's `.prototype`
+  (`OrdinaryCreateFromConstructor`) and never runs a subclass constructor
+  body. Untriggered today — every caller passes the realm's intrinsic
+  `ArrayBuffer` — but a future `SpeciesConstructor`-aware
+  `ArrayBuffer.prototype.slice` would run subclass bodies the spec forbids.
+- `is_constructor` (the `ObjectProfile` bit cached at wrap time) is a
+  heuristic — own `prototype` property with generator/async functions
+  excluded — not ECMA-262 `IsConstructor` (§7.2.4). It can go stale after
+  `delete Foo.prototype` (false negative) or a `prototype` assignment on an
+  arrow function (false positive). `rusty_v8` 150.1.0 exposes no native
+  predicate; a JS-side probe would be needed.
 
 ### BYOB byte-stream WPT failures (both backends)
 
@@ -271,7 +324,7 @@ promise states fail because stream algorithms poll CHAINED promises (via
 - **`WindowTimer.arguments`** — `Vec<JsValue>` elements unprotected from GC.
   Needs `GcRootHandle` wrapping.
 - **`detach_array_buffer` (JSC)** — No-op (`Ok(())`).
-- **`species_constructor`** — Always returns `default_constructor`.
-- **Cross-realm `new.target`** — `get_function_realm` always returns current realm.
+- **`species_constructor` (JSC)** — Always returns `default_constructor`.
+- **Cross-realm `new.target` (JSC)** — `get_function_realm` always returns current realm.
 - **WASM compile/instantiate timeout (JSC)** — Background compilation requires
   the creating thread's run loop to be pumped.

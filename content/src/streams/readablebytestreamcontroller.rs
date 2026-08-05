@@ -541,12 +541,17 @@ impl ReadableByteStreamController {
         let Some(object) = self.byob_request_object.borrow(ec).clone() else {
             return Ok(());
         };
-        let maybe_view = if let Some(descriptor) = self.pending_pull_intos.borrow(ec).front() {
-            Some(
-                descriptor
-                    .view
-                    .create_remaining_view(descriptor.bytes_filled, ec)?,
-            )
+        // Clone the descriptor out of the borrow so the guard is released
+        // before `create_remaining_view` runs: constructing the typed-array
+        // view allocates, and a cppgc trace must not read the cell while a
+        // borrow is live.
+        let pending_view = self
+            .pending_pull_intos
+            .borrow(ec)
+            .front()
+            .map(|descriptor| (descriptor.view.clone(), descriptor.bytes_filled));
+        let maybe_view = if let Some((view, bytes_filled)) = pending_view {
+            Some(view.create_remaining_view(bytes_filled, ec)?)
         } else {
             None
         };
@@ -1234,27 +1239,38 @@ impl ReadableByteStreamController {
 
         let mut copied = Vec::with_capacity(total_to_copy);
         let mut remaining = total_to_copy;
-        {
-            let mut queue = self.queue.borrow_mut(ec);
-            while remaining > 0 {
-                let mut entry = queue
-                    .pop_front()
-                    .ok_or_else(|| ec.new_type_error("Readable byte stream queue is empty"))?;
-                let to_take = remaining.min(entry.remaining_len());
-                let start = entry.remaining_byte_offset();
-                let bytes = {
-                    let data = ec.array_buffer_data(&entry.buffer).ok_or_else(|| {
-                        ec.new_type_error("Readable byte stream queue entry buffer is detached")
-                    })?;
-                    data[start..start + to_take].to_vec()
-                };
-                copied.extend_from_slice(&bytes);
-                entry.offset += to_take;
-                if entry.remaining_len() > 0 {
-                    queue.push_front(entry);
+        while remaining > 0 {
+            // Pop one entry with the borrow held, then release it before any
+            // engine call below: domain code must not depend on which engine
+            // operations allocate (an allocating call can trigger a cppgc
+            // trace that must not read the cell while the mutable borrow is
+            // live), so the borrow never spans an engine call.
+            let mut entry = {
+                let mut queue = self.queue.borrow_mut(ec);
+                match queue.pop_front() {
+                    Some(entry) => entry,
+                    None => {
+                        drop(queue);
+                        return Err(ec.new_type_error("Readable byte stream queue is empty"));
+                    }
                 }
-                remaining -= to_take;
+            };
+            let to_take = remaining.min(entry.remaining_len());
+            let start = entry.remaining_byte_offset();
+            let bytes = match ec.array_buffer_data(&entry.buffer) {
+                Some(data) => data[start..start + to_take].to_vec(),
+                None => {
+                    return Err(
+                        ec.new_type_error("Readable byte stream queue entry buffer is detached")
+                    );
+                }
+            };
+            copied.extend_from_slice(&bytes);
+            entry.offset += to_take;
+            if entry.remaining_len() > 0 {
+                self.queue.borrow_mut(ec).push_front(entry);
             }
+            remaining -= to_take;
         }
 
         self.queue_total_size

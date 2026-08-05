@@ -14,6 +14,7 @@ use std::cell::{Cell, UnsafeCell};
 use std::marker::PhantomData;
 use std::ops::{Deref, DerefMut};
 
+use log::error;
 use rusty_v8 as v8;
 use v8::cppgc::{self, GarbageCollected, GetRustObj, Member};
 
@@ -110,14 +111,44 @@ impl<T> HeapCell<T> {
     }
 }
 
+impl<T> HeapCell<T> {
+    /// Returns `Err` when a mutable borrow of the cell is live during marking.
+    ///
+    /// A live `V8GcRefMut` means Rust code holds `&mut T` into `value`; the
+    /// marker independently deriving a shared `&T` there would alias the
+    /// exclusive reference (undefined behavior). The check runs before any
+    /// dereference so the violation is detected while the state is still
+    /// sound.
+    fn trace_conflict(&self) -> Result<(), &'static str> {
+        if self.writer.get() {
+            Err("GcCell<T> is mutably borrowed during cppgc marking")
+        } else {
+            Ok(())
+        }
+    }
+}
+
 // SAFETY: `HeapCell` is traced by delegating to `T`'s trace — every
 // `TracedReference` edge and nested cell reachable from `T` is visited during
 // marking. Marking is stop-the-world (the heap is created with atomic marking
 // support), so the `UnsafeCell` is never read concurrently with a write.
 unsafe impl<T: Trace + 'static> GarbageCollected for HeapCell<T> {
     fn trace(&self, visitor: &mut cppgc::Visitor) {
+        // A live `borrow_mut` guard means the cell is being mutated while the
+        // marker would read it — the aliasing hazard described on
+        // `trace_conflict`. The trace runs inside V8's C++ marking visitor
+        // (`rusty_v8_RustObj_trace`), so a Rust panic here would unwind
+        // across the FFI boundary; fail with a hard abort instead, after
+        // logging, so the interleaving becomes a deterministic, debuggable
+        // crash rather than silent undefined behavior. Shared borrows are
+        // legal aliasing and do not trip this check.
+        if let Err(message) = self.trace_conflict() {
+            error!("{message}; aborting to avoid aliasing undefined behavior");
+            std::process::abort();
+        }
         // SAFETY: The trace runs during stop-the-world marking on the isolate
-        // thread; no Rust code mutates the cell while the marker reads it.
+        // thread and the borrow counter proves no mutable borrow is live; no
+        // Rust code mutates the cell while the marker reads it.
         unsafe { <T as Trace>::trace(&*self.value.get(), visitor) }
     }
 
@@ -158,9 +189,13 @@ impl<T: Trace + 'static> V8GcCell<T> {
     /// Immutably borrow the wrapped value.
     ///
     /// The returned guard's lifetime is tied to `&self`, not to the execution
-    /// context, so other engine operations remain callable while a borrow is
-    /// held. The heap cell is kept alive by this edge (`Member`) for the whole
-    /// borrow, and the borrow counter prevents mutable aliasing.
+    /// context, so the compiler does not prevent calling back into the engine
+    /// while a borrow is held — and the borrow discipline forbids it: an
+    /// engine call can allocate and trigger a cppgc trace that reads the cell
+    /// while the borrow is live (see `js_engine/README.md`). Clone the value
+    /// out instead, or scope the borrow to a non-engine section. The heap
+    /// cell is kept alive by this edge (`Member`) for the whole borrow, and
+    /// the borrow counter prevents mutable aliasing.
     pub(crate) fn borrow<'a>(&'a self, _ec: &dyn ExecutionContext<V8Types>) -> V8GcRef<'a, T> {
         let heap_cell = unsafe { self.0.get() }.expect("V8 GcCell edge holds no heap cell");
         if heap_cell.writer.get() {
@@ -176,6 +211,14 @@ impl<T: Trace + 'static> V8GcCell<T> {
     }
 
     /// Mutably borrow the wrapped value.
+    ///
+    /// The guard is not tied to the execution context, so the compiler does
+    /// not prevent calling back into the engine while the borrow is held —
+    /// and the borrow discipline forbids it: an engine call can allocate and
+    /// trigger a cppgc trace that would alias the `&mut T` (undefined
+    /// behavior; `HeapCell::trace` aborts on this as a backstop). Clone the
+    /// value out and write it back with `set` instead, or scope the borrow
+    /// to a non-engine section.
     pub(crate) fn borrow_mut<'a>(
         &'a self,
         _ec: &mut dyn ExecutionContext<V8Types>,
@@ -279,5 +322,32 @@ impl<T> Drop for V8GcRefMut<'_, T> {
         unsafe {
             (*self.cell).writer.set(false);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The writer flag is the sole signal the marker has that a `borrow_mut`
+    /// guard is live; `trace_conflict` must report it before `trace` would
+    /// dereference the cell.
+    #[test]
+    fn mutably_borrowed_cell_flagged_during_marking() {
+        let cell = HeapCell::new(());
+        assert!(
+            cell.trace_conflict().is_ok(),
+            "an unborrowed cell must pass the marking check"
+        );
+        cell.writer.set(true);
+        assert!(
+            cell.trace_conflict().is_err(),
+            "a mutably borrowed cell must be flagged during marking"
+        );
+        cell.writer.set(false);
+        assert!(
+            cell.trace_conflict().is_ok(),
+            "the check must clear once the borrow ends"
+        );
     }
 }

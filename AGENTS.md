@@ -412,6 +412,26 @@ mutable state (e.g. a counter accessed from multiple OS threads).  Do not
 reach for them as a convenience — a plain local is simpler, testable, and
 ever correct.
 
+# GcCell Borrow Discipline
+
+**Never call an engine method (any `ec` operation) while a `GcCell` borrow
+(`borrow`/`borrow_mut` guard) is live — shared or mutable.** An engine call
+may allocate, and an allocation can trigger a GC trace that reads the cell
+while the borrow is live; on the V8 backend a mutable borrow being traced is
+an aliasing violation (undefined behavior). The rule is deliberately
+engine-independent: content code must never depend on which engine
+operations allocate. The approved patterns are:
+
+- Clone the value out of the cell and use the owned value, then write it
+  back (`let mut value = cell.borrow(ec).clone(); ...; cell.set(value, ec);`).
+- Scope the borrow to the section that touches the cell, dropping the guard
+  before any `ec` call.
+
+Do not write new code that hands `ec` to a closure while a cell borrow is
+live (e.g. `with_..._mut(|data, ec| ...)` patterns). See
+`js_engine/README.md` ("GcCell borrow discipline") for the mechanism and the
+remaining exception class.
+
 # Never Assume Test Failures Are Pre-Existing
 
 Every test failure is a regression until proven otherwise.  A failure

@@ -265,17 +265,12 @@ unsafe impl<T: Trace> Trace for VecDeque<T> {
     }
 }
 
-// SAFETY: The borrowed value is visited; no borrow is held during marking.
-unsafe impl<T: Trace> Trace for std::cell::RefCell<T> {
-    unsafe fn trace(&self, visitor: &mut Visitor) {
-        // SAFETY: Delegated to the inner value's trace.
-        unsafe { self.borrow().trace(visitor) }
-    }
-
-    fn store(&mut self, ec: &mut dyn ExecutionContext<V8Types>) {
-        self.get_mut().store(ec);
-    }
-}
+// NOTE: there is deliberately no `Trace` impl for bare `std::cell::RefCell`.
+// A `#[gc_struct]` field that needs interior mutability must use `GcCell<T>`,
+// whose runtime borrow counters coordinate with the marker; a bare `RefCell`
+// field compiles only when marked `#[ignore_trace]` (content that holds no
+// cppgc edges, e.g. an enum state flag). A blanket impl would either alias a
+// live `borrow_mut` during marking or panic inside V8's C++ marking visitor.
 
 // SAFETY: The shared value is visited.
 unsafe impl<T: Trace> Trace for Rc<T> {

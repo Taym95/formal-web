@@ -37,6 +37,10 @@ const HOST_OBJECT_TAG: u16 = 1;
 static HOST_OBJECT_MARKER: u8 = 0;
 static NEXT_ISOLATE_ID: AtomicU64 = AtomicU64::new(1);
 
+/// The registry of native-function weak handles is compacted opportunistically
+/// once it reaches this many entries (see `make_builtin_function`).
+const CALLBACK_HANDLE_COMPACTION_THRESHOLD: usize = 64;
+
 type StoredBehaviour = Box<
     dyn Fn(&[V8Value], V8Value, &mut dyn ExecutionContext<V8Types>) -> Completion<V8Value, V8Types>,
 >;
@@ -65,6 +69,20 @@ struct CallbackRecord {
     isolate_id: u64,
     creation_realm: RcWeak<V8RealmState>,
     behaviour: StoredBehaviour,
+}
+
+/// A registered native-function weak handle paired with the callback record
+/// it keeps alive.
+///
+/// `weak` must be retained for the function's lifetime: dropping a
+/// `v8::Weak` cancels its guaranteed finalizer, which would leak the record.
+/// `record` is the shared ownership slot: the guaranteed finalizer and the
+/// compaction pass each take the boxed record when the function dies, so the
+/// record is freed exactly once by whichever owner gets there first (and at
+/// isolate teardown by the slot itself when both owners drop).
+struct CallbackHandle {
+    weak: v8::Weak<v8::Function>,
+    record: Rc<RefCell<Option<Box<CallbackRecord>>>>,
 }
 
 /// A platform object associated with an existing JS object (the realm
@@ -151,7 +169,7 @@ struct SharedIsolate {
     isolate_id: u64,
     realm_states: RefCell<Vec<RcWeak<V8RealmState>>>,
     queued_jobs: RefCell<VecDeque<QueuedJob>>,
-    callback_handles: RefCell<Vec<v8::Weak<v8::Function>>>,
+    callback_handles: RefCell<Vec<CallbackHandle>>,
     isolate: RefCell<v8::OwnedIsolate>,
     microtask_queue: v8::UniqueRef<v8::MicrotaskQueue>,
 }
@@ -759,13 +777,15 @@ fn native_callback(
         return;
     }
 
-    // SAFETY: Callback records are allocated by `make_builtin_function` and
-    // released only by the function's guaranteed weak finalizer. V8 invokes
-    // this callback while the function is strongly reachable. CURRENT_ENGINE
-    // is installed around every operation that can execute JavaScript and is
-    // restricted to the isolate thread. The isolate id check below prevents a
-    // record from being used by another isolate. `catch_unwind` prevents Rust
-    // unwinding from crossing V8's callback boundary.
+    // SAFETY: Callback records are created by `make_builtin_function` and
+    // released once the function dies (by the guaranteed weak finalizer, by
+    // the registry compaction, or at isolate teardown); V8 invokes this
+    // callback only while the function is strongly reachable, so the record
+    // is still in its slot. CURRENT_ENGINE is installed around every
+    // operation that can execute JavaScript and is restricted to the isolate
+    // thread. The isolate id check below prevents a record from being used
+    // by another isolate. `catch_unwind` prevents Rust unwinding from
+    // crossing V8's callback boundary.
     let (result, callback_isolate_id) = unsafe {
         let record = &*record_pointer;
         let engine = &mut *engine_pointer;
@@ -921,7 +941,22 @@ fn resolve_module_import<'scope>(
             }
         };
         if let Some(hook) = &engine.host_hooks.load_imported_module {
-            hook(module_request, capability);
+            // The hook is embedder-supplied Rust code invoked from inside a
+            // callback V8's module resolver calls synchronously; like the
+            // capability creation above and `native_callback`, it must not
+            // unwind across the V8 C++ boundary, so a panic is converted into
+            // a thrown TypeError.
+            let result = catch_unwind(AssertUnwindSafe(|| {
+                hook(module_request, capability);
+            }));
+            if result.is_err() {
+                error!("load_imported_module hook panicked during module resolution");
+                let message = v8::String::new(scope, "module import hook panicked")
+                    .expect("static module error allocation failed");
+                let exception = v8::Exception::type_error(scope, message);
+                scope.throw_exception(exception);
+                return None;
+            }
         }
         // V8's module resolver is synchronous, while host module loading
         // resolves its promise capability asynchronously, so no Module can be
@@ -1256,12 +1291,24 @@ impl V8Engine {
             creation_realm: Rc::downgrade(&self.realm_state),
             behaviour,
         });
-        let record_pointer = Box::into_raw(record);
+        // The record lives in a shared slot owned by both the guaranteed
+        // finalizer and the callback-handle registry entry; whichever drops
+        // the function first frees it. The raw pointer handed to V8's
+        // `External` data is derived from the box inside the slot and stays
+        // valid while the function is alive (the slot is only taken once the
+        // function has been collected, at which point V8 can no longer invoke
+        // the callback).
+        let record_slot = Rc::new(RefCell::new(Some(record)));
+        let record_pointer = record_slot
+            .borrow()
+            .as_ref()
+            .expect("callback record slot is empty before the function exists")
+            .as_ref() as *const CallbackRecord;
         let isolate_id = self.isolate_id;
         let function_name = self.property_key_to_rust_string(&name);
 
         v8_engine_scope_with_context!(scope, self, &self.realm_state.realm.context, {
-            let external = v8::External::new(scope, record_pointer.cast());
+            let external = v8::External::new(scope, record_pointer.cast_mut().cast());
             let constructor_behavior = if is_constructor {
                 v8::ConstructorBehavior::Allow
             } else {
@@ -1285,25 +1332,42 @@ impl V8Engine {
                 profile.is_constructor = is_constructor;
             }
 
-            // The weak handle is retained by the engine. The finalizer owns the
-            // callback record and is guaranteed to release it before isolate
+            // The weak handle is retained by the engine; the finalizer owns a
+            // share of the callback record and releases it before isolate
             // destruction, even if no collection happens first.
+            let finalizer_slot = Rc::clone(&record_slot);
             let callback_handle = v8::Weak::with_guaranteed_finalizer(
                 scope,
                 function,
                 Box::new(move || {
-                    // SAFETY: `record_pointer` came from one Box::into_raw above
-                    // and this guaranteed finalizer is its sole owner. The weak
-                    // handle invokes this closure at most once.
-                    unsafe {
-                        drop(Box::from_raw(record_pointer));
+                    if let Some(record) = finalizer_slot.borrow_mut().take() {
+                        drop(record);
                     }
                 }),
             );
-            self.shared_isolate
-                .callback_handles
-                .borrow_mut()
-                .push(callback_handle);
+            let mut callback_handles = self.shared_isolate.callback_handles.borrow_mut();
+            // Opportunistic compaction: stale entries (functions already
+            // collected) are removed so the registry does not grow for the
+            // lifetime of the isolate. The record is taken from the slot
+            // first — the guaranteed finalizer may not have run yet, and
+            // dropping the weak handle below would cancel it, so the slot
+            // hand-off is what prevents a leaked or double-freed record.
+            if callback_handles.len() >= CALLBACK_HANDLE_COMPACTION_THRESHOLD {
+                callback_handles.retain(|handle| {
+                    if handle.weak.is_empty() {
+                        if let Some(record) = handle.record.borrow_mut().take() {
+                            drop(record);
+                        }
+                        false
+                    } else {
+                        true
+                    }
+                });
+            }
+            callback_handles.push(CallbackHandle {
+                weak: callback_handle,
+                record: record_slot,
+            });
             let object = object_from_wrapped_value(function_value);
             V8Types::object_as_function(&object)
                 .expect("V8 native function wrapper is not a function")
@@ -3753,9 +3817,10 @@ mod tests {
     use super::super::types::V8Handle;
     use super::super::{V8AsyncGenerator, V8PlatformData, V8WeakMap, V8WeakRef, V8WeakSet};
     use super::{
-        CURRENT_CALLBACK_ISOLATE_ID, CURRENT_CALLBACK_SCOPE, V8ArrayBuffer, V8Constructor,
-        V8DataView, V8Engine, V8Function, V8Generator, V8Map, V8Object, V8Promise, V8Set,
-        V8SharedArrayBuffer, V8TypedArray, V8Types, local_object,
+        CALLBACK_HANDLE_COMPACTION_THRESHOLD, CURRENT_CALLBACK_ISOLATE_ID, CURRENT_CALLBACK_SCOPE,
+        StoredBehaviour, V8ArrayBuffer, V8Constructor, V8DataView, V8Engine, V8Function,
+        V8Generator, V8Map, V8Object, V8Promise, V8Set, V8SharedArrayBuffer, V8TypedArray, V8Types,
+        local_object,
     };
 
     pub(crate) struct DropFlag(pub(crate) Rc<Cell<bool>>);
@@ -4961,6 +5026,86 @@ mod tests {
         assert!(
             hook_called.get(),
             "the load_imported_module hook must be invoked for the import"
+        );
+    }
+
+    #[test]
+    fn panicking_load_imported_module_hook_does_not_unwind() {
+        let mut engine = V8Engine::new();
+        let mut hooks = HostHooks::empty();
+        hooks.load_imported_module = Some(Box::new(|_request, _capability| {
+            panic!("load_imported_module hook panicked");
+        }));
+        engine.set_host_hooks(hooks);
+        let realm = engine.current_realm();
+        let result = JsEngine::evaluate_module(
+            &mut engine,
+            "import 'virtual-module'; export const answer = 42;",
+            &realm,
+        );
+        assert!(
+            result.is_err(),
+            "a panicking import hook must surface as an evaluation error, not unwind across V8"
+        );
+    }
+
+    #[test]
+    fn callback_records_are_reclaimed_after_collection() {
+        let mut engine = V8Engine::new();
+        let record_dropped = Rc::new(Cell::new(false));
+        let captured = DropFlag(Rc::clone(&record_dropped));
+        let behaviour: StoredBehaviour = Box::new(move |_args, _this, ec| {
+            let _ = &captured;
+            Ok(ec.value_undefined())
+        });
+        let function = engine.make_builtin_function(
+            behaviour,
+            0,
+            engine.property_key_from_str("test_fn"),
+            false,
+        );
+        drop(function);
+        // A full collection runs the guaranteed weak finalizer, which must
+        // release the callback record (and with it the captured behaviour
+        // closure).
+        engine.gc();
+        assert!(
+            record_dropped.get(),
+            "the callback record must be freed once its function is collected"
+        );
+    }
+
+    #[test]
+    fn callback_handles_compact_stale_entries() {
+        let mut engine = V8Engine::new();
+        let make_function = |engine: &mut V8Engine| {
+            let behaviour: StoredBehaviour = Box::new(|_args, _this, ec| Ok(ec.value_undefined()));
+            engine.make_builtin_function(
+                behaviour,
+                0,
+                engine.property_key_from_str("test_fn"),
+                false,
+            )
+        };
+        // Cross the compaction threshold, then drop every function so each
+        // registry entry goes stale.
+        let functions: Vec<_> = (0..CALLBACK_HANDLE_COMPACTION_THRESHOLD + 8)
+            .map(|_| make_function(&mut engine))
+            .collect();
+        assert_eq!(
+            engine.shared_isolate.callback_handles.borrow().len(),
+            CALLBACK_HANDLE_COMPACTION_THRESHOLD + 8,
+            "every native function must be registered"
+        );
+        drop(functions);
+        engine.gc();
+        // The next registration compacts the stale entries out of the
+        // registry instead of letting it grow for the isolate's lifetime.
+        let _keep = make_function(&mut engine);
+        let live_count = engine.shared_isolate.callback_handles.borrow().len();
+        assert!(
+            live_count <= CALLBACK_HANDLE_COMPACTION_THRESHOLD,
+            "the registry must compact stale entries (len={live_count})"
         );
     }
 

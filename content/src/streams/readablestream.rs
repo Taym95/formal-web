@@ -2590,16 +2590,22 @@ pub(crate) fn readable_byte_stream_tee_pull1_algorithm(
     }
 
     // Step 20.3: "Let byobRequest be ! ReadableByteStreamControllerGetBYOBRequest(branch1.[[controller]])."
-    let byob_request_view = {
+    // The controller is cloned out of the borrow so the guard is released
+    // before `byob_request` runs: it creates interface instances and reads
+    // the request `view` property, both allocating engine operations that a
+    // cppgc trace must not interleave with a live borrow.
+    let controller = {
         let tee = tee_state.borrow(ec);
         tee.branch1
             .as_ref()
             .and_then(|branch| branch.controller_slot(ec))
             .and_then(|controller| controller.as_byte_controller())
-            .and_then(|controller| controller.byob_request(ec).ok().flatten())
-            .and_then(|request| js_engine::EcmascriptHost::get(ec, &request, "view").ok())
-            .filter(|value: &JsValue| !value.is_null() && !value.is_undefined())
     };
+    let byob_request_view = controller
+        .as_ref()
+        .and_then(|controller| controller.byob_request(ec).ok().flatten())
+        .and_then(|request| js_engine::EcmascriptHost::get(ec, &request, "view").ok())
+        .filter(|value: &JsValue| !value.is_null() && !value.is_undefined());
 
     // Step 20.4: "If byobRequest is null, perform pullWithDefaultReader."
     if let Some(view) = byob_request_view {
@@ -2635,16 +2641,22 @@ pub(crate) fn readable_byte_stream_tee_pull2_algorithm(
     }
 
     // Step 21.3: "Let byobRequest be ! ReadableByteStreamControllerGetBYOBRequest(branch2.[[controller]])."
-    let byob_request_view = {
+    // The controller is cloned out of the borrow so the guard is released
+    // before `byob_request` runs: it creates interface instances and reads
+    // the request `view` property, both allocating engine operations that a
+    // cppgc trace must not interleave with a live borrow.
+    let controller = {
         let tee = tee_state.borrow(ec);
         tee.branch2
             .as_ref()
             .and_then(|branch| branch.controller_slot(ec))
             .and_then(|controller| controller.as_byte_controller())
-            .and_then(|controller| controller.byob_request(ec).ok().flatten())
-            .and_then(|request| js_engine::EcmascriptHost::get(ec, &request, "view").ok())
-            .filter(|value: &JsValue| !value.is_null() && !value.is_undefined())
     };
+    let byob_request_view = controller
+        .as_ref()
+        .and_then(|controller| controller.byob_request(ec).ok().flatten())
+        .and_then(|request| js_engine::EcmascriptHost::get(ec, &request, "view").ok())
+        .filter(|value: &JsValue| !value.is_null() && !value.is_undefined());
 
     // Step 21.4: "If byobRequest is null, perform pullWithDefaultReader."
     if let Some(view) = byob_request_view {
@@ -3241,17 +3253,17 @@ impl PipeToState {
             return Ok(());
         }
 
-        let error = {
+        let signal = {
             let state = self.0.borrow(ec);
-            state
-                .signal
-                .as_ref()
-                .map(|signal| signal.reason_value(ec))
-                .ok_or_else(|| {
-                    ec.new_type_error(
-                        "ReadableStreamPipeTo abort algorithm ran without an attached AbortSignal",
-                    )
-                })?
+            state.signal.clone()
+        };
+        let error = match signal {
+            Some(signal) => signal.reason_value(ec),
+            None => {
+                return Err(ec.new_type_error(
+                    "ReadableStreamPipeTo abort algorithm ran without an attached AbortSignal",
+                ));
+            }
         };
 
         self.set_shutdown_error(Some(error), ec);
