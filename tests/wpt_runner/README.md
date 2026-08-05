@@ -40,7 +40,7 @@ cargo run --release -- wpt <args>
   │
   ├─ cargo builds `formal-web` (entrypoint binary)
   │   └─ build.rs pre-builds component binaries (content, net) into
-  │      target/sidecar-prebuild/ and copies them to target/release/
+  │      target/helper-prebuild/ and copies them to target/release/
   │
   ├─ formal-web starts, calls wpt_runner::run(args)
   │   └─ maybe_reexec_test_wpt_runner() checks if the current binary
@@ -110,8 +110,8 @@ There are two places that build the component binaries (`formal-web-embedder`,
 `formal-web-content`, `formal-web-net`):
 
 1. **`build.rs`** (workspace entrypoint) — prebuilds into
-   `target/sidecar-prebuild/` and copies to `target/release/`.
-   Cleans `sidecar-prebuild/` before each build to prevent stale-artifact
+   `target/helper-prebuild/` and copies to `target/release/`.
+   Cleans `helper-prebuild/` before each build to prevent stale-artifact
    dependency resolution conflicts.
 
 2. **`build_runner_executable()`** in `lib.rs` — builds the runner into
@@ -190,9 +190,9 @@ PYTHON=python3.12 target/release/formal-web-wpt <test>
 note: there are multiple different versions of crate `boa_gc` in the dependency graph
 ```
 
-Stale artifacts in `target/sidecar-prebuild/` or `target/wpt-prebuild/`. Clean
+Stale artifacts in `target/helper-prebuild/` or `target/wpt-prebuild/`. Clean
 those directories and retry:
 
 ```bash
-rm -rf target/sidecar-prebuild target/wpt-prebuild
+rm -rf target/helper-prebuild target/wpt-prebuild
 ```

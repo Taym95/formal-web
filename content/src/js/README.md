@@ -8,7 +8,8 @@ JavaScript-facing wrapper identity separate from DOM and HTML
 state.  Content code only sees the generic traits from the `js_engine` crate.
 
 - `content/src/html/environment_settings_object.rs` owns the realm execution
-  context (currently `BoaContext` implementing `ExecutionContext<T>`),
+  context (the selected backend's engine implementing `ExecutionContext<T>` —
+  `V8Engine` on the default V8 build, `BoaContext`/`JscEngine` on opt-in builds),
   global-object construction, and the Rust state that corresponds to an HTML
   environment settings object.
 - `content/src/html/global_scope.rs` owns per-global wrapper caches and
@@ -39,7 +40,8 @@ state.  Content code only sees the generic traits from the `js_engine` crate.
   [inherited
   interfaces](https://webidl.spec.whatwg.org/#dfn-inherited-interfaces) to
   identify the platform object's type, and delegates to domain functions.
-- **Domain code must not depend on `boa_engine` or return `JsValue`.**
+- **Domain code must not depend on a backing engine crate** (e.g. `boa_engine`
+  or `rusty_v8`) **or return `JsValue`.**
   The domain layer returns Rust types; the bindings layer converts to JS
   values as late as possible.
 - Run microtask checkpoints at task boundaries rather than after every
@@ -50,21 +52,29 @@ state.  Content code only sees the generic traits from the `js_engine` crate.
 
 ## Exotic objects
 
-Some HTML spec objects (WindowProxy, Location) require exotic internal methods.
-The `InternalObjectMethods` vtable (`pub(crate)`) is not accessible from outside
-the `boa_engine` crate.  Exotic objects must be implemented using only public
-Boa APIs — primarily `JsProxyBuilder` (from `boa_engine::object::builtins`)
-for proxy-based exotic objects.
+Some HTML spec objects (WindowProxy, Location) require exotic internal methods
+(they override `[[Get]]`, `[[Set]]`, `[[GetPrototypeOf]]`, …).  The generic
+`ExecutionContext` builds them as proxies: each trap is a function created
+with `ec.create_builtin_fn()`, set as a property on a handler object, and
+handed to `ec.create_proxy(target, handler)`.  See
+`content/src/html/windowproxy.rs` for the concrete pattern — the WindowProxy
+is a proxy over the Window, with each trap delegating to the generic
+`ExecutionContext` operations.
 
-See `content/src/webidl/README.md` for the exotic-object implementation pattern,
-and `content/src/html/windowproxy.rs` for a concrete example.
+Each backend executes `create_proxy` natively: the V8 backend uses
+`v8::Proxy::new`, the Boa backend goes through the `%Proxy%` constructor.
+Content code only ever calls the generic trait method.
 
-### Working with Boa's public API: use spec links, not `pub(crate)` internals
+See `content/src/webidl/README.md` for the platform-object integration and
+backend notes.
 
-Boa is an external dependency of the content crate (via crates.io or GitHub).
-The content crate **must not** depend on any `pub(crate)` internal function,
-type, or method
-inside Boa.  Instead, follow this methodology:
+### Working with the engine's public API: use spec links, not `pub(crate)` internals
+
+The JS engine is an external dependency of the content crate, and content code
+sees it only through the generic traits in `js_engine`.  The content crate
+**must not** depend on any `pub(crate)` internal function, type, or method
+inside a backing engine (on the Boa backend this means using only public Boa
+APIs).  Instead, follow this methodology:
 
 1. Read the relevant spec (e.g. HTML §7.2.3 The WindowProxy exotic object)
    using `spec_lookup`.
@@ -72,7 +82,7 @@ inside Boa.  Instead, follow this methodology:
    JS operation references an ECMAScript spec algorithm by URL, e.g.
    [`OrdinaryGetPrototypeOf`](https://tc39.es/ecma262/#sec-ordinarygetprototypeof)
    or [`OrdinaryGetOwnProperty`](https://tc39.es/ecma262/#sec-ordinarygetownproperty).
-3. Check if there is an **already-public equivalent** in Boa:
+3. On the Boa backend, check for an **already-public equivalent** in Boa:
 
    | ECMAScript operation | Public Boa API |
    |---|---|
@@ -85,24 +95,24 @@ inside Boa.  Instead, follow this methodology:
    | `OrdinaryHasProperty` | `JsObject::has_property(key, context)` |
    | `OrdinaryOwnPropertyKeys` | `JsObject::own_property_keys(context)` |
 
-4. When the proxy pattern is needed (WindowProxy, Location, etc.), use
-   `JsProxyBuilder` from `boa_engine::object::builtins`.  This public API
-   lets you supply each trap as a plain `NativeFunctionPointer` — no captures,
-   no custom handler struct, no access to `pub(crate)` internals.
+4. When the proxy pattern is needed (WindowProxy, Location, etc.), use the
+   generic `ec.create_proxy`; on the Boa backend this is `JsProxyBuilder`
+   from `boa_engine::object::builtins`, which lets you supply each trap as a
+   plain `NativeFunctionPointer` — no captures, no custom handler struct, no
+   access to `pub(crate)` internals.
 
 5. When no existing public method covers the exact operation needed (e.g.,
    getting a raw `PropertyDescriptor` for [[GetOwnProperty]]), restructure
-   the implementation to use the available public methods, or submit a PR
-   to the upstream Boa project to add the missing public wrapper.
+   the implementation to use the available public methods, or contribute the
+   missing public wrapper upstream (to `rusty_v8` or Boa).
 
-**Never modify the external Boa dependency to make internal APIs public.**
+**Never modify the external engine dependency to make internal APIs public.**
 
-The WindowProxy currently uses `JsProxyBuilder` (the public Boa API) to
-create a proper Proxy with native-function traps for all 10 overridden
-internal methods (see `content/src/html/windowproxy.rs`).  This avoids any
+The WindowProxy is built with `ec.create_proxy` (see
+`content/src/html/windowproxy.rs`), backed on the Boa backend by
+`JsProxyBuilder` traps over the public `JsObject` methods above — never
 `pub(crate)` access.  When cross-origin support requires additional
-internal-method overrides, follow the same pattern — use `JsProxyBuilder`
-traps backed by the public `JsObject` methods above.
+internal-method overrides, follow the same pattern.
 
 ## Adding a new HTML element type
 
@@ -147,5 +157,5 @@ must have the corresponding wiring lines.
 
 ## Related
 
-- `content/src/webidl/README.md` — Boa platform object integration, exotic pattern
+- `content/src/webidl/README.md` — platform-object integration and exotic-object backend notes
 - `content/src/html/README.md` — WindowProxy, window.open, navigation split

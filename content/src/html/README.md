@@ -10,20 +10,20 @@
 
 ## Structured clone (`safe_passing_of_structured_data.rs`)
 
-### String round-tripping — use `Vec<u16>`, never `to_std_string_escaped()`
+### String round-tripping — use UTF-16 units, never a display-escaped string
 
-Boa's `JsString::to_std_string_escaped()` is a **display-only** method that
-replaces unpaired surrogates with literal `\uXXXX` escape sequences. Using it
-for serialization corrupts strings like lone surrogates (`\uD800`, `\uDC00`).
+Strings are serialized as raw UTF-16 code units. Any display/escaping
+conversion (one that replaces unpaired surrogates with literal `\uXXXX`
+escape sequences) corrupts strings like lone surrogates (`\uD800`, `\uDC00`).
 
 **Correct serialization:**
 ```rust
-let utf16_units: Vec<u16> = js_string.as_str().to_vec();  // serializable
+let utf16_units: Vec<u16> = ec.js_string_to_rust_string(&s).encode_utf16().collect();
 ```
 
 **Correct deserialization:**
 ```rust
-let js_string = JsString::from(&utf16_units[..]);
+let js_string = ec.js_string_from_str(&String::from_utf16_lossy(&utf16_units[..]));
 ```
 
 ### RegExp source — `[[OriginalSource]]` vs the escaped getter
@@ -31,21 +31,25 @@ let js_string = JsString::from(&utf16_units[..]);
 The `source` accessor on RegExp applies `EscapeRegExpPattern` (spec 22.2.3.2.5),
 which escapes `/`, `\n`, `\r`, `\u2028`, and `\u2029`. Passing the escaped form
 back to the RegExp constructor produces a different pattern. Always store the
-raw `[[OriginalSource]]`. Since Boa's accessor is `pub(crate)`, reverse the
-escaping with `unescape_regexp_source()`.
+raw `[[OriginalSource]]`: read `ec.get_regexp_source` and reverse the escaping
+with `unescape_regexp_source()`.
 
 ### Error "message" — `[[GetOwnProperty]]`, not `[[Get]]`
 
 The spec step for Error serialization (step 17.4) uses `[[GetOwnProperty]]` for
 the "message" property — this checks only own data descriptors, ignores the
-prototype chain, and does not invoke accessors. Using `object.get("message")`
-(which is `[[Get]]`) is wrong. Use the property map directly:
+prototype chain, and does not invoke accessors. Using `EcmascriptHost::get`
+(which is `[[Get]]`) is wrong. Use `ec.get_own_property` and read the value
+from the data descriptor:
 ```rust
-let desc = object.borrow().properties().get(&PropertyKey::from(js_string!("message")));
-let message = match desc {
-    Some(d) if d.is_data_descriptor() => {
-        d.value().map(|v| v.to_string(context).map(|s| s.to_std_string_escaped())).transpose()?
-    }
+let msg_key = ec.property_key_from_str("message");
+let msg_desc = ec.get_own_property(object.clone(), msg_key)?;
+let message: Option<String> = match msg_desc {
+    Some(ref desc) if desc.value.is_some() => desc
+        .value
+        .clone()
+        .map(|v| ec.to_rust_string(v))
+        .transpose()?,
     _ => None,
 };
 ```
@@ -53,22 +57,26 @@ let message = match desc {
 ### EnumerableOwnProperties — filter by enumerability
 
 The spec uses `EnumerableOwnProperties(value, "key")`, which returns only
-enumerable own property keys. `own_property_keys()` returns ALL own keys
+enumerable own property keys. `ec.own_property_keys` returns ALL own keys
 (including non-enumerable ones like `length` on arrays). Always check
-enumerability:
+enumerability through `ec.get_own_property`:
 ```rust
-let desc = object.borrow().properties().get(&key);
-let enumerable = desc.as_ref().and_then(|d| d.enumerable()).unwrap_or(false);
+let keys = ec.own_property_keys(object.clone())?;
+// ...for each key:
+let desc = ec.get_own_property(object.clone(), key.clone())?;
+let enumerable = desc.as_ref().and_then(|d| d.enumerable).unwrap_or(false);
 ```
 
 ### Wrapper objects — Boolean/Number/String/BigInt
 
 When serializing, check for `[[BooleanData]]` / `[[NumberData]]` / etc.
 internal slots (steps 7–10). When deserializing, create wrapper *objects*
-with the correct prototype (steps 6–9), not primitive values:
+with the correct prototype (steps 6–9), not primitive values — construct
+through the realm's intrinsic constructor:
 ```rust
-let prototype = context.intrinsics().constructors().boolean().prototype();
-let bool_obj = JsObject::from_proto_and_data(prototype, *b).upcast();
+let num_val = ec.value_from_number(*n);
+let obj = ec.construct(intrinsics.number.clone(), &[num_val], None)?;
+value = Types::value_from_object(obj);
 ```
 
 ### Error cause — serialize custom data

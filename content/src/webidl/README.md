@@ -172,7 +172,7 @@ if let Some(data) = ec.with_object_any(&obj) {
 Err(ec.new_type_error("receiver is not a MyInterface"))
 ```
 
-## Boa integration of [platform objects](https://webidl.spec.whatwg.org/#dfn-platform-object)
+## [Platform objects](https://webidl.spec.whatwg.org/#dfn-platform-object) across backends
 
 The content crate defines Rust types that correspond to Web IDL interface types (e.g.
 `Window`, `Document`, `HTMLAnchorElement`). In comments and documentation, refer to these
@@ -188,22 +188,29 @@ implements — this maps to the Web IDL concept of
 Prefer phrasing like "check the platform object's inherited interfaces" over
 "downcast the platform object".
 
-These types implement `boa_engine::JsData`
-(derived via `#[derive(Trace, Finalize, JsData)]`) and are stored inside Boa `JsObject`s
-via `from_proto_and_data()` or `ObjectInitializer::with_native_data_and_proto()`.
+Platform object types are `#[gc_struct]` Rust structs; the macro derives the
+active backend's GC traits (`Trace`/`Finalize`/`GarbageCollected` on the
+default V8 backend, `boa_gc::Trace`/`Finalize`/`boa_engine::JsData` on Boa).
+The engine stores the struct on its managed heap and links it to the JS
+wrapper: on V8 through `create_object_with_any` (a `V8PlatformData` object on
+the cppgc heap, traced from the wrapper) or `associate_existing_object` (for
+the realm global), on Boa inside the `JsObject` via `from_proto_and_data()` or
+`ObjectInitializer::with_native_data_and_proto()`. Domain code reaches the
+struct through the generic `with_object_any` / `with_object_any_mut` /
+`with_object_any_mut_with` accessors.
 
 The typical pattern for a platform object:
 
 ```rust
-#[derive(Trace, Finalize, JsData)]
+#[gc_struct]
 pub struct MyInterface {
     /// Rust backing state — not JS-visible properties.
-    pub inner: Rc<RefCell<InnerState>>,
+    pub inner: GcCell<InnerState>,
 }
 ```
 
-The JS-visible properties and methods are registered separately via the `Class` trait
-or `ObjectInitializer`. The Rust struct holds only the backing state.
+The JS-visible properties and methods are registered separately via the Web
+IDL bindings (`WebIdlInterface`); the Rust struct holds only the backing state.
 
 ### Where [platform object](https://webidl.spec.whatwg.org/#dfn-platform-object) types live
 
@@ -228,7 +235,7 @@ See `content/src/js/bindings/README.md` for the definitive description.
 
 | What | Where |
 |---|---|
-| Rust struct definition (`WasmModule`), JsData derive | `content/src/<domain>/types.rs` |
+| Rust struct definition (`WasmModule`), `#[gc_struct]` derive | `content/src/<domain>/types.rs` |
 | Spec-algorithm methods returning Rust types (`export_descriptors() → Vec<…>`) | `content/src/<domain>/functions.rs` — `impl WasmModule` |
 | `WebIdlInterface` impl (`define_members`, `create_platform_object`) | `content/src/js/bindings/<domain>/` |
 | Thin JsValue-wrapping function pointers (`fn(this, args, ctx) → JsResult<JsValue>`) | `content/src/js/bindings/<domain>/` |
@@ -245,8 +252,15 @@ Some Web/HTML spec objects (e.g. `WindowProxy`, `Location`) require exotic inter
 methods — they override `[[Get]]`, `[[Set]]`, `[[GetPrototypeOf]]`, etc. rather than
 using the ordinary object behaviour.
 
-Boa supports exotic objects through `InternalObjectMethods` (a vtable stored on every
-`JsObject`). To create an exotic object:
+The generic `ExecutionContext::create_proxy(target, handler)` builds these as
+proxies on every backend — content only ever calls the generic trait method.
+See `content/src/html/windowproxy.rs` for the WindowProxy pattern: each trap
+is a built-in function set on the handler object.
+
+On the **Boa backend** the proxy is created through the `%Proxy%` constructor
+(`JsProxyBuilder`, which supplies each trap as a plain `NativeFunctionPointer`);
+Boa also exposes exotic objects through `InternalObjectMethods` (a vtable
+stored on every `JsObject`):
 
 1. Define a Rust type implementing `JsData` by deriving `#[derive(Trace, Finalize)]`
    and implementing `JsData` manually.
@@ -275,25 +289,22 @@ impl JsData for MyExotic {
    (`get()`, `set()`, `prototype()`, `own_property_keys()`, etc.).
    See `content/src/js/README.md` for the full methodology.
 
-The `content` crate uses this exotic-object pattern with `JsProxyBuilder`
-for `WindowProxy` — see `content/src/html/windowproxy.rs`.
-
-**Rejected approach:** Modifying the external Boa dependency to make internal
-APIs public. All exotic-object implementations must use only public Boa APIs.
+**Rejected approach:** Modifying the external engine dependency to make internal
+APIs public. All exotic-object implementations must use only public engine APIs.
 
 **Note:** `#[derive(JsData)]` cannot be used when manually overriding
 `internal_methods()` because the derive macro generates a conflicting
 implementation. Use `#[derive(Trace, Finalize)]` and implement `JsData` by hand.
 
 **Visibility note:** When implementing exotic objects, **do not modify**
-the external Boa dependency to make internal APIs public. Instead, use only
-what boa already exposes publicly. See `content/src/js/README.md` ("Working
-with Boa's public API: use spec links, not `pub(crate)` internals") for the
-correct methodology.
+the external engine dependency to make internal APIs public. Instead, use only
+what the engine already exposes publicly. See `content/src/js/README.md`
+("Working with the engine's public API: use spec links, not `pub(crate)`
+internals") for the correct methodology.
 
-### The ObjectInitializer pattern
+### The ObjectInitializer pattern (Boa backend)
 
-For platform objects that don't need exotic behaviour and just need a prototype chain:
+For Boa platform objects that don't need exotic behaviour and just need a prototype chain:
 
 ```rust
 let object = ObjectInitializer::with_native_data_and_proto(
@@ -317,7 +328,6 @@ have specific conversion algorithms implemented in `buffer_source.rs`.
 | Function | Spec algorithm | Purpose |
 |---|---|---|
 | `get_a_copy_of_the_buffer_source` | [#dfn-get-buffer-source-copy](https://webidl.spec.whatwg.org/#dfn-get-buffer-source-copy) | Extract bytes from an `ArrayBuffer` or typed array |
-| `convert_js_value_to_idl_array_buffer` | [#js-arraybuffer](https://webidl.spec.whatwg.org/#js-arraybuffer) | Convert a JS value to an IDL `ArrayBuffer`, rejecting `SharedArrayBuffer` |
 | `is_buffer_source` | [#dfn-buffer-source-type](https://webidl.spec.whatwg.org/#dfn-buffer-source-type) | Check whether a JS value is a buffer source type |
 
 The `get_a_copy_of_the_buffer_source` function is called by the bindings layer (e.g.
@@ -325,13 +335,11 @@ The `get_a_copy_of_the_buffer_source` function is called by the bindings layer (
 before passing them to domain functions.  Domain functions receive clean Rust types,
 never raw `JsValue`.
 
-Both `get_a_copy_of_the_buffer_source` and `convert_js_value_to_idl_array_buffer`
-enforce that `SharedArrayBuffer` is rejected (the `[AllowShared]` constraint) and
-note where `IsFixedLengthArrayBuffer` / `[AllowResizable]` checks are skipped due to
-Boa's API surface.
+`SharedArrayBuffer` values do not match `object_as_array_buffer` on the generic
+`JsTypes`, so buffer sources reject them (the `[AllowShared]` constraint).
 
 ## Related documentation
 
 - `content/README.md` — Content-crate overview
-- `content/src/js/README.md` — Boa integration specifics (Context ownership, bindings)
+- `content/src/js/README.md` — JS integration specifics (engine context ownership, bindings)
 - `content/src/html/README.md` — HTML platform objects, WindowProxy, navigation split
