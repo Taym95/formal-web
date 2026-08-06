@@ -109,16 +109,6 @@ impl EventTarget {
 pub(crate) trait EventTargetAccess {
     fn get_event_target(&self, ec: &mut dyn ExecutionContext<Types>) -> EventTarget;
 
-    /// <https://dom.spec.whatwg.org/#eventtarget-activation-behavior>
-    fn has_activation_behavior(&self) -> bool {
-        false
-    }
-
-    /// <https://dom.spec.whatwg.org/#eventtarget-activation-behavior>
-    fn run_activation_behavior(&self, _event: &Event) -> Completion<(), Types> {
-        Ok(())
-    }
-
     /// <https://dom.spec.whatwg.org/#dom-eventtarget-gettheparent>
     fn get_the_parent(&self) -> Option<EventTarget> {
         None

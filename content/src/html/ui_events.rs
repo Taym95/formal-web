@@ -12,7 +12,7 @@ use log::{error, trace};
 
 use crate::dom::event::{Event, EventTarget};
 use crate::dom::{EventPathItem, UIEvent as JsUiEvent, dispatch_with_path};
-use crate::html::{EnvironmentSettingsObject, Window};
+use crate::html::{EnvironmentSettingsObject, HTMLAnchorElement, Window};
 use crate::js::Types;
 use crate::webidl::bindings::create_interface_instance;
 
@@ -203,9 +203,17 @@ fn build_event_path(
             if let Some(event_target) =
                 crate::js::downcast::event_target_from_js_object(ec, &object)
             {
+                // <https://html.spec.whatwg.org/#links-created-by-a-and-area-elements:activation-behaviour-2>
+                let has_activation_behavior = index == 0
+                    && ec
+                        .with_object_any(&object)
+                        .and_then(|data| data.downcast_ref::<HTMLAnchorElement>())
+                        .map(|anchor| anchor.href_attribute().is_some())
+                        .unwrap_or(false);
                 path.push(EventPathItem {
                     invocation_target: event_target.clone(),
                     shadow_adjusted_target: (index == 0).then_some(event_target),
+                    has_activation_behavior,
                 });
             }
         }
@@ -213,11 +221,13 @@ fn build_event_path(
     path.push(EventPathItem {
         invocation_target: document_event_target,
         shadow_adjusted_target: None,
+        has_activation_behavior: false,
     });
     if let Some(global_event_target) = global_event_target {
         path.push(EventPathItem {
             invocation_target: global_event_target,
             shadow_adjusted_target: None,
+            has_activation_behavior: false,
         });
     }
     path

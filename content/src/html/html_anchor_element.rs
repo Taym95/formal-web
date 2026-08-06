@@ -31,7 +31,7 @@ impl HTMLAnchorElement {
         }
     }
 
-    fn href_attribute(&self) -> Option<String> {
+    pub(crate) fn href_attribute(&self) -> Option<String> {
         self.html_element.element.get_attribute("href")
     }
 

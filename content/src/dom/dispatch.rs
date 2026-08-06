@@ -22,6 +22,12 @@ pub(crate) struct EventPathItem {
 
     /// <https://dom.spec.whatwg.org/#event-path-shadow-adjusted-target>
     pub(crate) shadow_adjusted_target: Option<EventTarget>,
+
+    /// <https://html.spec.whatwg.org/#activation-behavior>
+    /// Whether the invocation target has activation behavior (an anchor with
+    /// an href). Set by the path builders; the dispatch runs it for untrusted
+    /// and trusted click events alike.
+    pub(crate) has_activation_behavior: bool,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -37,6 +43,7 @@ pub(crate) fn simple_path(
     vec![EventPathItem {
         invocation_target: target_access.get_event_target(ec),
         shadow_adjusted_target: Some(target_access.get_event_target(ec)),
+        has_activation_behavior: false,
     }]
 }
 
@@ -102,6 +109,7 @@ fn append_to_event_path(
     path.push(EventPathItem {
         invocation_target,
         shadow_adjusted_target,
+        has_activation_behavior: false,
     });
 }
 
@@ -153,7 +161,7 @@ pub(crate) fn dispatch_event(
     let activation_target_idx = if event.type_ == "click" {
         // Only check the first path entry (the target per step 6.3).
         path.first()
-            .filter(|entry| entry.invocation_target.has_activation_behavior())
+            .filter(|entry| entry.has_activation_behavior)
             .map(|_| 0)
     } else {
         None
@@ -208,11 +216,14 @@ pub(crate) fn dispatch_event(
     *event.stop_immediate_propagation_flag.borrow_mut(ec) = false;
 
     // Step 12: If activationTarget is non-null:
-    if let Some(idx) = activation_target_idx {
+    if let Some(_idx) = activation_target_idx {
         // Step 12.1: If event's canceled flag is unset, then run
         //            activationTarget's activation behavior with event.
         if !canceled {
-            path[idx].invocation_target.run_activation_behavior(event)?;
+            // The activation behavior lives in the JS layer (it resolves the
+            // element from the path item's reflector and needs the realm's
+            // global scope for the navigation context).
+            crate::js::platform_objects::run_activation_behavior_for_path(ec, path)?;
         }
     }
 

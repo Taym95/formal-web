@@ -13,13 +13,18 @@ opens `http://localhost:8080/` in a new tab.
 ```bash
 cd artifacts/todo-app
 npm install      # installs react, react-dom, esbuild (one-time)
-npm start        # builds dist/app.js and serves on http://localhost:8080
+npm run build    # writes dist/app.js and the single-file todo.html
 ```
 
-- `npm run build` — esbuild bundle (IIFE, minified) into `dist/app.js`.
-- `npm run serve` — static file server only (needs a prior build).
-- The server logs every request to `requests.log` (git-ignored); a
-  `/health` endpoint returns JSON for quick checks.
+- `todo.html` is a self-contained build (JS bundle inlined, CSS inline): open
+  it directly or via the "React Todo App" link in StartupExample.html — no
+  server needed. It is committed so the link works out of the box; regenerate
+  with `npm run build` after changing the app.
+- `npm run serve` serves the unbundled layout (index.html + dist/app.js) on
+  http://localhost:8080 — optional, for development.
+- `npm start` = build + serve.
+- The server logs every request to `requests.log` (git-ignored); a `/health`
+  endpoint returns JSON for quick checks.
 
 `node_modules/`, `dist/`, and `requests.log` are git-ignored.
 

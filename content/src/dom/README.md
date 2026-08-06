@@ -159,3 +159,37 @@ the dispatch debug trace (content/src/dom/dispatch.rs, since reverted).
 `input` events that reach React's onChange — the JS pipeline was verified by
 clearing the value tracker and dispatching; the editor-driven path was not
 exercised end-to-end.
+
+### 2026-08-06 (cont.) — Anchor activation wiring
+
+While testing the StartupExample "React Todo App" link (target="_blank") and the
+anchor-navigation example, anchor clicks did not navigate at all:
+`run_activation_behavior` was a no-op default and `html_anchor_element.rs`
+`activation_behavior` was dead code.
+
+**Files changed:**
+
+- content/src/dom/dispatch.rs — `EventPathItem` gained a
+  `has_activation_behavior` flag; the click dispatch's Step 12 now calls
+  `crate::js::platform_objects::run_activation_behavior_for_path(ec, path)`
+  instead of the EventTarget no-op.
+- content/src/js/platform_objects.rs — path builders mark the target item when
+  it is an anchor with an href; `run_activation_behavior_for_path` resolves the
+  anchor from the path item's reflector, gathers the navigable context from the
+  global scope, and invokes `HTMLAnchorElement::activation_behavior`.
+- content/src/html/ui_events.rs — the blitz UI-event path builder sets the same
+  flag for the target node.
+- content/src/html/html_anchor_element.rs — `href_attribute` made `pub(crate)`.
+- content/src/dom/event.rs — removed the now-unused
+  `has_activation_behavior`/`run_activation_behavior` defaults from
+  `EventTargetAccess`.
+
+**What was confirmed:** `target="_self"` anchor clicks navigate; `target="_blank"`
+anchors delegate the new top-level traversable to the UA (the
+`the_rules_for_choosing_a_navigable` "delegate to UA" branch), which the
+windowed embedder honors by opening a new tab. Real pointer clicks and JS
+`el.click()` both reach the activation behavior now.
+
+**Not investigated:** named-target lookup (Step 7 of the rules) and the UA-side
+new-webview creation for the anchor path remain stubbed; `window.open` with a
+global scope still creates new traversables locally.

@@ -5,7 +5,7 @@
   "type": "module",
   "description": "A small React todo-list app used to exercise formal-web's web platform APIs.",
   "scripts": {
-    "build": "esbuild src/main.jsx --bundle --minify --format=iife --outfile=dist/app.js --jsx=automatic --define:process.env.NODE_ENV='\"production\"'",
+    "build": "node build-single.mjs",
     "serve": "node serve.mjs",
     "start": "npm run build && npm run serve"
   },

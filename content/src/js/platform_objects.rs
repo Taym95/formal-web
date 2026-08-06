@@ -319,6 +319,7 @@ pub(crate) fn build_path_from_target_js_object(
             path.push(EventPathItem {
                 invocation_target: event_target.clone(),
                 shadow_adjusted_target: Some(event_target),
+                has_activation_behavior: target_is_anchor_with_href(ec, target_object),
             });
         }
         let mut current_node_id = node_id;
@@ -339,6 +340,7 @@ pub(crate) fn build_path_from_target_js_object(
                             path.push(EventPathItem {
                                 invocation_target: parent_event_target,
                                 shadow_adjusted_target: None,
+                                has_activation_behavior: false,
                             });
                         }
                         current_node_id = pid;
@@ -354,8 +356,78 @@ pub(crate) fn build_path_from_target_js_object(
             path.push(EventPathItem {
                 invocation_target: event_target.clone(),
                 shadow_adjusted_target: Some(event_target),
+                has_activation_behavior: target_is_anchor_with_href(ec, target_object),
             });
         }
     }
     path
+}
+
+/// <https://html.spec.whatwg.org/#links-created-by-a-and-area-elements:activation-behaviour-2>
+fn target_is_anchor_with_href(
+    ec: &mut dyn ExecutionContext<Types>,
+    target_object: &JsObject,
+) -> bool {
+    ec.with_object_any(target_object)
+        .and_then(|data| data.downcast_ref::<HTMLAnchorElement>())
+        .map(|anchor| anchor.href_attribute().is_some())
+        .unwrap_or(false)
+}
+
+/// Runs the activation behavior of the dispatch target (an anchor with an
+/// href) after an un-canceled click, per the HTML spec's activation steps.
+/// <https://html.spec.whatwg.org/#activation-behavior>
+pub(crate) fn run_activation_behavior_for_path(
+    ec: &mut dyn ExecutionContext<Types>,
+    path: &[EventPathItem],
+) -> Completion<(), Types> {
+    let Some(first) = path.first().filter(|item| item.has_activation_behavior) else {
+        return Ok(());
+    };
+    // Resolve the anchor element from the invocation target's reflector.
+    let Some(reflector) = first.invocation_target.reflector.as_ref().cloned() else {
+        return Ok(());
+    };
+    let Some(anchor) = ec
+        .with_object_any(&reflector)
+        .and_then(|data| data.downcast_ref::<HTMLAnchorElement>().cloned())
+    else {
+        return Ok(());
+    };
+
+    // Gather the navigation context from the realm's global scope.
+    let context = with_global_scope(ec, |global_scope, _ec| {
+        Ok((
+            global_scope.source_navigable_id(),
+            global_scope.parent_traversable_id(),
+            global_scope.top_level_traversable_id(),
+            global_scope.creation_url(),
+            global_scope.event_sender(),
+        ))
+    })?;
+    let (
+        source_navigable_id,
+        parent_traversable_id,
+        top_level_traversable_id,
+        creation_url,
+        event_sender,
+    ) = context;
+    let (Some(source_navigable_id), Some(creation_url), Some(event_sender)) =
+        (source_navigable_id, creation_url, event_sender)
+    else {
+        return Ok(());
+    };
+    let top_level_traversable_id = top_level_traversable_id.unwrap_or(source_navigable_id);
+
+    anchor
+        .activation_behavior(
+            source_navigable_id,
+            parent_traversable_id,
+            top_level_traversable_id,
+            &creation_url,
+            &reflector,
+            &event_sender,
+        )
+        .map_err(|error| ec.new_type_error(&error))?;
+    Ok(())
 }
