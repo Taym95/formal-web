@@ -259,32 +259,32 @@ because Vello's `register_texture` requires `Rgba8Unorm`.
     RenderingOpportunity TLA pipeline model valid). A
     video-frame arrival should therefore re-note a rendering opportunity
     through the UA (e.g. a `VideoFrameReady` trace event), and the
-    composition itself still happens on the root `PaintFrame` within the
+    composition itself still happens on the top-level `PaintFrame` within the
     cycle.
 - **Composition waits for the latest embedded frames.** Since the
-  FrameNeeded-gated cycle was introduced, a root `PaintFrame` arriving at
+  FrameNeeded-gated cycle was introduced, a top-level `PaintFrame` arriving at
   the graphics process before a child (cross-origin iframe) `PaintFrame`
   — the two are produced in parallel content processes — composed with the
   old buffered child frame, and the UA cleared the child's pending update
   anyway: the child's new frame sat uncomposed until the next UI event
-  noted another opportunity (stale iframes). Now a root arrival marks the
-  composition pending and defers it until every embedded frame it
+  noted another opportunity (stale iframes). Now a top-level arrival marks
+  the composition pending and defers it until every embedded frame it
   references has arrived: child frames (their `PaintFrame` is in flight,
   so the wait is bounded) and video frames whose pipeline is live and has
   not ended/failed (`expected_videos`). A late child or video frame
   completes the pending composition; the composed scene therefore always
   includes the latest embedded frames. The RenderingOpportunity TLA model
-  is unchanged: there is still exactly one composition per root render
+  is unchanged: there is still exactly one composition per top-level render
   cycle.
 - **The composed scene aggregates the animating flag across the composed
   frames.** `PaintFrame.animating` is recorded per stored frame; a
   composition reports `animating = true` when any composed frame animates
-  (the root document, or a cross-origin iframe — same-origin iframes are
-  subdocuments and already fold into the parent's `is_animating()`), and
-  carries the animating frame ids. The UA notes rendering opportunities
-  for those navigables on `PixelFrameReady`, so a CSS animation or video
-  inside a cross-origin iframe keeps both its own process and the
-  top-level rendering until it ends. The RenderingOpportunity TLA model
+  (the top-level document, or a cross-origin iframe — same-origin iframes
+  are subdocuments and already fold into the parent's `is_animating()`),
+  and carries the animating frame ids. The UA notes rendering
+  opportunities for those navigables on `PixelFrameReady`, so a CSS
+  animation or video inside a cross-origin iframe keeps both its own
+  process and the top-level rendering until it ends. The RenderingOpportunity TLA model
   abstracts the hierarchy: `frame_needed`, `pending`, and the per-frame
   counters are traced only for the top-level navigable, and the
   model-checking configuration uses independent top-level frames.

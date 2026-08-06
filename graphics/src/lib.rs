@@ -446,20 +446,20 @@ fn handle_command<B: MediaBackend + 'static, R: SurfaceRenderer>(
                 recorded_scene,
                 is_root_candidate,
             );
-            // Record the animating flag of every stored frame (root and
+            // Record the animating flag of every stored frame (top-level and
             // child): the composed scene aggregates it so the UA keeps
             // noting rendering opportunities while any composing frame
             // animates.
             slot.compositor.note_frame_animating(frame_id, animating);
-            // Only the top-level (root) frame drives composition: child
+            // Only the top-level frame drives composition: child
             // PaintFrames and video frames are buffered locally and included
-            // when the root triggers composition. This ensures exactly one
-            // texture per render cycle regardless of how many embedded
-            // frames exist.
+            // when the top-level frame triggers composition. This ensures
+            // exactly one texture per render cycle regardless of how many
+            // embedded frames exist.
             if is_root_candidate {
-                // Defer composition until every embedded frame the root
-                // references has arrived, so a child frame racing behind
-                // the root is still included (never dropped).
+                // Defer composition until every embedded frame the
+                // top-level frame references has arrived, so a child frame
+                // racing behind it is still included (never dropped).
                 slot.compositor.mark_composition_pending();
             }
             maybe_compose(
@@ -584,11 +584,11 @@ fn expected_videos(
         .collect()
 }
 
-/// Compose the webview's scene when a root frame arrived and every embedded
-/// frame it references has been stored (child frames, and video frames that
-/// are still expected). One composition per root frame, deferred until its
-/// embedded frames catch up — a child frame racing behind the root is still
-/// included instead of being dropped.
+/// Compose the webview's scene when a top-level frame arrived and every
+/// embedded frame it references has been stored (child frames, and video
+/// frames that are still expected). One composition per top-level frame,
+/// deferred until its embedded frames catch up — a child frame racing
+/// behind it is still included instead of being dropped.
 fn maybe_compose<R: SurfaceRenderer>(
     webviews: &mut HashMap<WebviewId, WebviewState<R>>,
     webview_id: WebviewId,
@@ -609,9 +609,9 @@ fn maybe_compose<R: SurfaceRenderer>(
         return;
     }
     info!(
-        "[render-pipe] Graphics compose scene webview={} root_frame={:?}",
+        "[render-pipe] Graphics compose scene webview={} top_level_frame={:?}",
         webview_id.0,
-        slot.compositor.root_frame_id(),
+        slot.compositor.top_level_frame_id(),
     );
     let Some(mut composed) = slot.compositor.compose_scene(webview_id) else {
         return;
@@ -621,9 +621,9 @@ fn maybe_compose<R: SurfaceRenderer>(
         build_child_data(&mut slot.compositor, child_webview_to_parent);
     composed.child_viewports = child_viewports;
     composed.child_frame_to_webview = child_frame_to_webview;
-    // animating comes from the content-process PaintFrame flag on the root
-    // frame. Content knows what's animating (video, CSS animations) and sets
-    // this; the composed scene reports it so the UA keeps re-noting
+    // animating comes from the content-process PaintFrame flag on the
+    // top-level frame. Content knows what's animating (video, CSS animations)
+    // and sets this; the composed scene reports it so the UA keeps re-noting
     // rendering opportunities. Graphics just passes it through.
     if let Err(error) = slot.renderer.submit_scene(composed) {
         error!(

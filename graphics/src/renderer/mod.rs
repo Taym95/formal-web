@@ -45,8 +45,9 @@ pub struct FrameMetadata {
     pub child_viewports: Vec<ChildViewport>,
     pub child_frame_to_webview: HashMap<FrameId, WebviewId>,
     pub animating: bool,
-    /// The composed frames (root and children) that carry the animating
-    /// flag; the UA notes rendering opportunities for these navigables.
+    /// The composed frames (the top-level frame and embedded child frames)
+    /// that carry the animating flag; the UA notes rendering opportunities
+    /// for these navigables.
     pub animating_frame_ids: Vec<FrameId>,
 }
 

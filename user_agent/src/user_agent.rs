@@ -4054,8 +4054,8 @@ impl UserAgentWorker {
                         if let Some(child_wv) = child_frame_to_webview.get(frame_id) {
                             self.queued_rendering_opportunities.insert(child_wv.0);
                         }
-                        // Frame ids not in the child map belong to the root
-                        // frame itself, already noted above.
+                        // Frame ids not in the child map belong to the
+                        // top-level frame itself, already noted above.
                     }
                 }
                 // If the embedder already needs the next frame (a

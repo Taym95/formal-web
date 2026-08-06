@@ -97,7 +97,7 @@ pub struct Compositor {
     resolved_tree_dirty: bool,
     /// Latest frame per video paint id.
     video_frames: HashMap<VideoPaintId, CompositorVideoFrame>,
-    /// True when the latest root frame arrived but its composition is
+    /// True when the latest top-level frame arrived but its composition is
     /// deferred until every embedded frame it references has arrived.
     composition_pending: bool,
     /// Accumulated across the frames of the current composition: whether any
@@ -116,7 +116,7 @@ impl Compositor {
         self.video_frames.clear();
         self.replace_root_on_next_paint = true;
         self.resolved_tree_dirty = true;
-        // The new document's root frame will re-mark the composition pending.
+        // The new document's top-level frame will re-mark the composition pending.
         self.composition_pending = false;
     }
 
@@ -221,7 +221,7 @@ impl Compositor {
         frame.into_recorded_scene(&mut self.font_receiver, shmem_regions)
     }
 
-    /// The latest root frame arrived; its composition must wait for every
+    /// The latest top-level frame arrived; its composition must wait for every
     /// embedded frame it references to arrive before it can be composed.
     pub fn mark_composition_pending(&mut self) {
         self.composition_pending = true;
@@ -244,22 +244,22 @@ impl Compositor {
         self.composition_pending
     }
 
-    pub fn root_frame_id(&self) -> Option<FrameId> {
+    pub fn top_level_frame_id(&self) -> Option<FrameId> {
         self.root_frame_id
     }
 
-    /// Whether every embedded frame the latest root frame references has
+    /// Whether every embedded frame the latest top-level frame references has
     /// arrived: child frames must be in the committed set, and video frames
     /// must be present or not expected (no live pipeline for the paint id,
     /// or the pipeline ended/failed).
     pub fn composition_ready(&self, expected_videos: &HashSet<VideoPaintId>) -> bool {
-        let Some(root_frame_id) = self.root_frame_id else {
+        let Some(top_level_frame_id) = self.root_frame_id else {
             return false;
         };
-        let Some(root_frame) = self.committed_frames.get(&root_frame_id) else {
+        let Some(top_level_frame) = self.committed_frames.get(&top_level_frame_id) else {
             return false;
         };
-        for site in &root_frame.composition.embed_sites {
+        for site in &top_level_frame.composition.embed_sites {
             match site {
                 EmbedSite::Frame(iframe_site) => {
                     if !self
@@ -288,8 +288,8 @@ impl Compositor {
         webview_id: ipc_messages::content::WebviewId,
     ) -> Option<ComposedScene> {
         let root_frame_id = self.root_frame_id?;
-        // The pending composition completes now; the next root frame arrival
-        // re-marks it pending.
+        // The pending composition completes now; the next top-level frame
+        // arrival re-marks it pending.
         self.composition_pending = false;
         self.composing_animating = false;
         self.composing_animating_frames.clear();
