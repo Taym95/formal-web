@@ -193,3 +193,36 @@ windowed embedder honors by opening a new tab. Real pointer clicks and JS
 **Not investigated:** named-target lookup (Step 7 of the rules) and the UA-side
 new-webview creation for the anchor path remain stubbed; `window.open` with a
 global scope still creates new traversables locally.
+
+### 2026-08-06 (cont.) — Anchor _blank tab creation was spawning a new content process
+
+**Symptom:** clicking the StartupExample "React Todo App" link (a plain
+`<a target="_blank">`) took seconds for the tab to appear, intermittently.
+
+**What was confirmed (instrumented timing of the full click flow):**
+
+- The UA-side `handle_navigate` completes in 0 ms; the new webview is created,
+  registered, and painted in the same second as the click.
+- The delay is the **new content process**: per the spec, `_blank` anchors are
+  noopener by default (HTML `noopener()` Step 3: no `rel="opener"` keyword ⇒
+  noopener=true). With noopener=true, `the_rules_for_choosing_a_navigable`
+  takes the null-opener branch, the UA `choose_navigable` runs
+  `create_new_top_level_traversable` → `create_agent` →
+  `spawn_event_loop_entry` → a fresh `formal-web-content` process (boot + realm
+  init), which is the multi-second cost.
+- `window.open` is fast because it takes the opener branch: the content process
+  creates the auxiliary browsing context in its own event loop
+  (`create_auxiliary_context_document` + `new_traversable_info`) and the UA
+  `creating_a_new_top_level_traversable` reuses the existing process.
+
+**Fix:** the anchor activation behavior now forwards the global scope, window
+global, and engine to `the_rules_for_choosing_a_navigable` (previously it
+passed `None` and always delegated to the UA). A `_blank` anchor with
+`rel="opener"` now takes the same in-process opener branch as `window.open` —
+no new process. Verified: click → new tab → app rendered in ~1 s, same content
+process, app fully interactive.
+
+**Files changed:** content/src/html/html_anchor_element.rs (activation
+signature + rules args), content/src/js/platform_objects.rs
+(`run_activation_behavior_for_path` clones the global scope and passes window +
+engine), artifacts/StartupExample.html (`rel="opener"` on the link).

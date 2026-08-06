@@ -8,9 +8,9 @@ use js_engine::{ExecutionContext, gc_struct};
 use url::Url;
 
 use crate::html::{
-    HTMLElement, HyperlinkElementUtils, navigate, the_rules_for_choosing_a_navigable,
+    GlobalScope, HTMLElement, HyperlinkElementUtils, navigate, the_rules_for_choosing_a_navigable,
 };
-use crate::js::Types;
+use crate::js::{Engine, Types};
 
 /// <https://html.spec.whatwg.org/#htmlanchorelement>
 #[gc_struct]
@@ -19,7 +19,6 @@ pub struct HTMLAnchorElement {
     pub html_element: HTMLElement,
 }
 
-#[allow(dead_code)]
 impl HTMLAnchorElement {
     pub fn new(
         document: Rc<RefCell<BaseDocument>>,
@@ -48,6 +47,9 @@ impl HTMLAnchorElement {
         document_creation_url: &Url,
         _event: &<crate::js::Types as js_engine::JsTypes>::JsObject,
         event_sender: &IpcSender<ContentEvent>,
+        global_scope: Option<&GlobalScope>,
+        window_global: Option<<crate::js::Types as js_engine::JsTypes>::JsObject>,
+        parent_engine: Option<&mut Engine>,
     ) -> Result<(), String> {
         // Step 1: "If element has no href attribute, then return."
         if self.href_attribute().is_none() {
@@ -85,9 +87,9 @@ impl HTMLAnchorElement {
             top_level_navigable_id,
             &target,
             noopener,
-            None, // no GlobalScope: anchor nav delegates new traversables to UA
-            None, // anchor nav uses no return window
-            None, // anchor navigation does not create a local realm
+            global_scope,
+            window_global,
+            parent_engine,
         );
 
         navigate(

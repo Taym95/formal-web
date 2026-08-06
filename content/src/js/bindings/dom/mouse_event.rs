@@ -67,8 +67,16 @@ impl WebIdlInterface<crate::js::Types> for MouseEvent {
         ec: &mut dyn ExecutionContext<crate::js::Types>,
     ) -> Completion<Self, crate::js::Types> {
         let undefined = ec.value_undefined();
+        // Step 1: "Let e be the result of creating a new event..."
         let type_ = ec.to_rust_string(args.first().cloned().unwrap_or(undefined))?;
         let init = args.get(1).cloned().unwrap_or(ec.value_undefined());
+        // Step 2: "Initialize the event's type attribute to type."
+        // Step 3: "Initialize the event's bubbles, cancelable, and composed
+        // attributes to the values in eventInitDict."
+        // Note: The mouse-event initialization dictionary fields (coordinate
+        // and modifier values) are read directly below; the UI Events
+        // "initialize the mouse event" sub-steps are collapsed into the
+        // struct construction.
         let detail = init_number(&init, ec, "detail", 0.0)? as i32;
         Ok(MouseEvent {
             ui_event: UIEvent {

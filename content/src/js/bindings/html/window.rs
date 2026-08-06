@@ -14,8 +14,6 @@ use crate::webidl::bindings::{
 };
 use crate::webidl::callback_function_value;
 
-use crate::dom::Element;
-
 use super::hyperlink_element_utils::document_creation_url;
 use super::style_declaration_object;
 
@@ -419,7 +417,6 @@ fn get_computed_style_method(
 
     // Extract element ref using with_object_any, release ec borrow before calling _ec fn.
     let properties = {
-        let err_element = ec.new_type_error("receiver is not an Element");
         let err_object = ec.new_type_error("element receiver is not an object");
         let object = match args
             .first()
@@ -428,14 +425,14 @@ fn get_computed_style_method(
             Some(o) => o,
             None => return Err(err_object),
         };
-        let element = match ec
-            .with_object_any(&object)
-            .and_then(|a| a.downcast_ref::<Element>())
-        {
-            Some(e) => e,
-            None => return Err(err_element),
-        };
-        window_computed_style_properties_for_element(element, pseudo_elt.as_deref())
+        // Element subtypes are distinct platform objects; resolve through the
+        // shared element downcast chain so HTMLElement/input/anchor receivers
+        // work, not just plain Element.
+        let receiver = <crate::js::Types as JsTypes>::value_from_object(object.clone());
+        let element = crate::js::bindings::dom::try_with_element_ref(&receiver, ec, |element| {
+            element.clone()
+        })?;
+        window_computed_style_properties_for_element(&element, pseudo_elt.as_deref())
     };
     // ec borrow from with_object_any is released here.
     style_declaration_object(&properties, ec).map(|obj| crate::js::Types::value_from_object(obj))

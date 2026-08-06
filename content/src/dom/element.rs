@@ -7,7 +7,8 @@ use js_engine::ExecutionContext;
 use js_engine::gc_struct;
 use style::dom_apis::{
     MayUseInvalidation, QueryAll, QueryFirst, QuerySelectorAllResult,
-    element_closest as style_element_closest, query_selector as style_query_selector,
+    element_closest as style_element_closest, element_matches as style_element_matches,
+    query_selector as style_query_selector,
 };
 
 use super::event::{EventTarget, EventTargetAccess};
@@ -155,6 +156,27 @@ impl Element {
         node_ids
     }
 
+    /// <https://dom.spec.whatwg.org/#dom-element-matches>
+    pub(crate) fn matches(&self, selectors: &str) -> Result<bool, String> {
+        let document = self.node.document.borrow();
+        // Step 1: "Let s be the result of parsing selectors."
+        let selector_list = document
+            .try_parse_selector_list(selectors)
+            .map_err(|error| format!("invalid selector `{selectors}`: {error:?}"))?;
+
+        // Step 2: "If this's root is not s's root, then return false."
+        // Note: Shadow trees are not modeled; the root is always the document.
+        // Step 3: "If this matches s, then return true."
+        let Some(node) = document.get_node(self.node.node_id) else {
+            return Ok(false);
+        };
+        Ok(style_element_matches::<&blitz_dom::Node>(
+            &node,
+            &selector_list,
+            style::context::QuirksMode::NoQuirks,
+        ))
+    }
+
     /// <https://dom.spec.whatwg.org/#dom-element-closest>
     pub(crate) fn closest(&self, selectors: &str) -> Result<Option<usize>, String> {
         let document = self.node.document.borrow();
@@ -175,6 +197,7 @@ impl Element {
             &selector_list,
             style::context::QuirksMode::NoQuirks,
         );
+        // Step 4: "Return null."
         Ok(matched.map(|node| node.id))
     }
 
@@ -506,9 +529,6 @@ impl Element {
         Self::suppress_snapshot_on_unstyled_element(&self.node.document, self.node.node_id);
     }
 
-    /// Mark a just-recorded stylo snapshot as handled when the element has no
-    /// computed primary style yet, so the style traversal skips descendant
-    /// invalidation for it (see set_attribute/remove_attribute notes above).
     fn suppress_snapshot_on_unstyled_element(document: &Rc<RefCell<BaseDocument>>, node_id: usize) {
         let document = document.borrow();
         let Some(node) = document.get_node(node_id) else {

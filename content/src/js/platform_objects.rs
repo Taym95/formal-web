@@ -395,29 +395,23 @@ pub(crate) fn run_activation_behavior_for_path(
         return Ok(());
     };
 
-    // Gather the navigation context from the realm's global scope.
-    let context = with_global_scope(ec, |global_scope, _ec| {
-        Ok((
-            global_scope.source_navigable_id(),
-            global_scope.parent_traversable_id(),
-            global_scope.top_level_traversable_id(),
-            global_scope.creation_url(),
-            global_scope.event_sender(),
-        ))
-    })?;
-    let (
-        source_navigable_id,
-        parent_traversable_id,
-        top_level_traversable_id,
-        creation_url,
-        event_sender,
-    ) = context;
+    // Gather the navigation context from the realm's global scope. The scope
+    // is cloned out of the object registry so its lifetime does not borrow `ec`
+    // (the activation behavior also needs the engine for local realm setup).
+    let global_scope = with_global_scope(ec, |global_scope, _ec| Ok(global_scope.clone()))?;
+    let source_navigable_id = global_scope.source_navigable_id();
+    let parent_traversable_id = global_scope.parent_traversable_id();
+    let top_level_traversable_id = global_scope.top_level_traversable_id();
+    let creation_url = global_scope.creation_url();
+    let event_sender = global_scope.event_sender();
     let (Some(source_navigable_id), Some(creation_url), Some(event_sender)) =
         (source_navigable_id, creation_url, event_sender)
     else {
         return Ok(());
     };
     let top_level_traversable_id = top_level_traversable_id.unwrap_or(source_navigable_id);
+    let window_global = ec.global_object();
+    let parent_engine = ec.as_any_mut().downcast_mut::<crate::js::Engine>();
 
     anchor
         .activation_behavior(
@@ -427,6 +421,9 @@ pub(crate) fn run_activation_behavior_for_path(
             &creation_url,
             &reflector,
             &event_sender,
+            Some(&global_scope),
+            Some(window_global),
+            parent_engine,
         )
         .map_err(|error| ec.new_type_error(&error))?;
     Ok(())

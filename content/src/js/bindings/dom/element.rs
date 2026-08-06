@@ -96,6 +96,15 @@ impl WebIdlInterface<crate::js::Types> for Element {
             exposed: None,
         });
         def.add_operation(OperationDef {
+            id: "matches",
+            length: 1,
+            method: matches,
+            static_: false,
+            unforgeable: false,
+            promise_type: false,
+            exposed: None,
+        });
+        def.add_operation(OperationDef {
             id: "closest",
             length: 1,
             method: closest,
@@ -586,6 +595,18 @@ fn query_selector(
         }
         None => Ok(ec.value_null()),
     }
+}
+
+fn matches(
+    this: &JsValue,
+    args: &[JsValue],
+    ec: &mut dyn ExecutionContext<crate::js::Types>,
+) -> Completion<JsValue, crate::js::Types> {
+    let value_undefined = ec.value_undefined();
+    let selector = ec.to_rust_string(args.first().cloned().unwrap_or(value_undefined.clone()))?;
+    let matched = try_with_element_ref(this, ec, |element| element.matches(&selector))?
+        .map_err(|error| ec.new_syntax_error(&error))?;
+    Ok(ec.value_from_bool(matched))
 }
 
 fn closest(

@@ -216,7 +216,7 @@ pub(crate) fn dispatch_event(
     *event.stop_immediate_propagation_flag.borrow_mut(ec) = false;
 
     // Step 12: If activationTarget is non-null:
-    if let Some(_idx) = activation_target_idx {
+    if activation_target_idx.is_some() {
         // Step 12.1: If event's canceled flag is unset, then run
         //            activationTarget's activation behavior with event.
         if !canceled {
