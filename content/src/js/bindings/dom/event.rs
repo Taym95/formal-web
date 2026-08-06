@@ -1,4 +1,5 @@
 use crate::dom::Event;
+use crate::js::bindings::initialization::init_flag;
 use crate::js::downcast::event_from_js_object;
 type JsValue = <crate::js::Types as JsTypes>::JsValue;
 
@@ -207,19 +208,6 @@ impl WebIdlInterface<crate::js::Types> for Event {
             exposed: None,
         });
     }
-}
-
-pub(crate) fn init_flag(
-    init: &JsValue,
-    key: &str,
-    ec: &mut dyn ExecutionContext<crate::js::Types>,
-) -> Completion<bool, crate::js::Types> {
-    let Some(object) = crate::js::Types::value_as_object(init) else {
-        return Ok(false);
-    };
-    let property_key = ec.property_key_from_str(key);
-    let value = ExecutionContext::get(ec, object, property_key)?;
-    Ok(ec.to_boolean(&value))
 }
 
 fn get_type(

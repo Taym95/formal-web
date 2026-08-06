@@ -8,7 +8,8 @@ use js_engine::{ExecutionContext, gc_struct};
 use url::Url;
 
 use crate::html::{
-    GlobalScope, HTMLElement, HyperlinkElementUtils, navigate, the_rules_for_choosing_a_navigable,
+    ActivationBehavior, GlobalScope, HTMLElement, HyperlinkElementUtils, navigate,
+    the_rules_for_choosing_a_navigable,
 };
 use crate::js::{Engine, Types};
 
@@ -37,9 +38,11 @@ impl HTMLAnchorElement {
     pub(crate) fn has_download_attribute(&self) -> bool {
         self.html_element.element.has_attribute("download")
     }
+}
 
+impl ActivationBehavior for HTMLAnchorElement {
     /// <https://html.spec.whatwg.org/#links-created-by-a-and-area-elements:activation-behaviour-2>
-    pub(crate) fn activation_behavior(
+    fn activation_behavior(
         &self,
         source_navigable_id: NavigableId,
         parent_navigable_id: Option<NavigableId>,
@@ -107,7 +110,9 @@ impl HTMLAnchorElement {
         )
         .map_err(|error| format!("failed to send hyperlink activation navigation request: {error}"))
     }
+}
 
+impl HTMLAnchorElement {
     /// <https://html.spec.whatwg.org/#get-an-element's-noopener>
     pub(crate) fn noopener(&self) -> bool {
         // Step 1: "Let noopener be false."

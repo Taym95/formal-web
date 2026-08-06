@@ -1,5 +1,3 @@
-use log::trace;
-
 use super::event::EventTargetAccess;
 use crate::js::Types;
 use crate::webidl::bindings::create_interface_instance;
@@ -9,10 +7,6 @@ use js_engine::{Completion, ExecutionContext, JsTypes};
 use super::BUBBLING_PHASE;
 use super::CAPTURING_PHASE;
 use super::event::{Event, EventListener, EventTarget, NONE};
-
-fn dispatch_debug_enabled() -> bool {
-    std::env::var_os("FORMAL_WEB_DEBUG_INPUT").is_some()
-}
 
 /// <https://dom.spec.whatwg.org/#event-path-item>
 #[derive(Clone)]
@@ -214,21 +208,9 @@ pub(crate) fn dispatch_event(
 
     // Step 12: If activationTarget is non-null:
     if activation_target_idx.is_some() {
-        if dispatch_debug_enabled() && event.type_ == "click" {
-            trace!(
-                "[input-debug][dispatch] step12 activationTarget set; canceled={}",
-                canceled,
-            );
-        }
         // Step 12.1: If event's canceled flag is unset, then run
         //            activationTarget's activation behavior with event.
         if !canceled {
-            if dispatch_debug_enabled() && event.type_ == "click" {
-                trace!(
-                    "[input-debug][dispatch] step12.1 running activation behavior (path len {})",
-                    path.len(),
-                );
-            }
             // The activation behavior lives in the JS layer (it resolves the
             // element from the path item's reflector and needs the realm's
             // global scope for the navigation context).
@@ -287,23 +269,6 @@ fn invoke(
     // Step 10: Let found be the result of running inner invoke with event,
     // listeners, phase, invocationTargetInShadowTree, and
     // legacyOutputDidListenersThrowFlag if given.
-    if dispatch_debug_enabled() && event.type_ == "click" {
-        let matching_listeners = listeners
-            .iter()
-            .filter(|listener| !listener.removed && listener.type_ == "click")
-            .count();
-        let phase_name = match phase {
-            ListenerPhase::Capturing => "capturing",
-            ListenerPhase::Bubbling => "bubbling",
-        };
-        trace!(
-            "[input-debug][dispatch] phase={} listeners={} matching_click_listeners={}",
-            phase_name,
-            listeners.len(),
-            matching_listeners,
-        );
-    }
-
     // Step 10: Let found be the result of inner invoke.
     let _found = inner_invoke(ec, &entry.invocation_target, event, &listeners, phase)?;
 

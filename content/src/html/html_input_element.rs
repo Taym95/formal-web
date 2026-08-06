@@ -26,13 +26,36 @@ impl HTMLInputElement {
 
     /// <https://html.spec.whatwg.org/#dom-input-type>
     pub(crate) fn type_(&self) -> String {
-        // The type IDL attribute reflects the type content attribute, limited to
-        // only known values, with the Text state as both missing and invalid
-        // value default. The reflect getter returns the canonical keyword of the
-        // attribute's state, so an absent attribute and an unknown value both
-        // map to "text".
-        let value = self.html_element.element.get_attribute("type");
-        match value.as_deref() {
+        // <https://html.spec.whatwg.org/#reflecting-content-attributes-in-idl-attributes>
+        // Step 1: Let element be the result of running this's get the element.
+        //         (The reflected target is the input element; element is `self`.)
+        // Step 2: Let contentAttributeValue be the result of running this's
+        //         get the content attribute.
+        let content_attribute_value = self.html_element.element.get_attribute("type");
+
+        // Step 3: Let attributeDefinition be the attribute definition of
+        //         element's content attribute whose namespace is null and
+        //         local name is the reflected content attribute name.
+        //         (The type attribute is an enumerated attribute with the
+        //         keywords listed in INPUT_TYPE_KEYWORDS.)
+        // Step 4: If attributeDefinition indicates it is an enumerated
+        //         attribute and the reflected IDL attribute is defined to be
+        //         limited to only known values:
+        // Step 4.1: If contentAttributeValue does not correspond to any state
+        //           of attributeDefinition (e.g., it is null and there is no
+        //           missing value default), or if it is in a state of
+        //           attributeDefinition with no associated keyword value,
+        //           then return the empty string.
+        //         (The type attribute's missing value default and invalid
+        //         value default are both the Text state, so every
+        //         contentAttributeValue corresponds to a state and this
+        //         return is never taken.)
+        // Step 4.2: Return the canonical keyword for the state of
+        //           attributeDefinition that contentAttributeValue
+        //           corresponds to.
+        //         (The missing value default and invalid value default are
+        //         both the Text state, whose canonical keyword is "text".)
+        match content_attribute_value.as_deref() {
             None => String::from("text"),
             Some(value) => {
                 let lower = value.to_ascii_lowercase();
@@ -47,8 +70,8 @@ impl HTMLInputElement {
 
     /// <https://html.spec.whatwg.org/#dom-input-type>
     pub(crate) fn set_type(&self, value: &str) {
-        // The setter steps are to run the reflected target's set the content
-        // attribute with the given value.
+        // Step 1: The setter steps are to run this's set the content attribute
+        //         with the given value.
         self.html_element.element.set_attribute("type", value);
     }
 

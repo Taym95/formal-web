@@ -28,54 +28,54 @@ pub(crate) struct UIEventInit {
     pub detail: i32,
 }
 
-/// <https://w3c.github.io/uievents/#interface-mouseevent>
+/// <https://w3c.github.io/pointerevents/#interface-mouseevent>
 #[gc_struct]
 pub struct MouseEvent {
     /// <https://w3c.github.io/uievents/#interface-uievent>
     pub ui_event: UIEvent,
 
-    /// <https://w3c.github.io/uievents/#dom-mouseevent-screenx>
+    /// <https://w3c.github.io/pointerevents/#dom-mouseevent-screenx>
     #[ignore_trace]
     pub screen_x: f64,
 
-    /// <https://w3c.github.io/uievents/#dom-mouseevent-screeny>
+    /// <https://w3c.github.io/pointerevents/#dom-mouseevent-screeny>
     #[ignore_trace]
     pub screen_y: f64,
 
-    /// <https://w3c.github.io/uievents/#dom-mouseevent-clientx>
+    /// <https://w3c.github.io/pointerevents/#dom-mouseevent-clientx>
     #[ignore_trace]
     pub client_x: f64,
 
-    /// <https://w3c.github.io/uievents/#dom-mouseevent-clienty>
+    /// <https://w3c.github.io/pointerevents/#dom-mouseevent-clienty>
     #[ignore_trace]
     pub client_y: f64,
 
-    /// <https://w3c.github.io/uievents/#dom-mouseevent-button>
+    /// <https://w3c.github.io/pointerevents/#dom-mouseevent-button>
     #[ignore_trace]
     pub button: i16,
 
-    /// <https://w3c.github.io/uievents/#dom-mouseevent-buttons>
+    /// <https://w3c.github.io/pointerevents/#dom-mouseevent-buttons>
     #[ignore_trace]
     pub buttons: u16,
 
-    /// <https://w3c.github.io/uievents/#dom-mouseevent-ctrlkey>
+    /// <https://w3c.github.io/pointerevents/#dom-mouseevent-ctrlkey>
     #[ignore_trace]
     pub ctrl_key: bool,
 
-    /// <https://w3c.github.io/uievents/#dom-mouseevent-shiftkey>
+    /// <https://w3c.github.io/pointerevents/#dom-mouseevent-shiftkey>
     #[ignore_trace]
     pub shift_key: bool,
 
-    /// <https://w3c.github.io/uievents/#dom-mouseevent-altkey>
+    /// <https://w3c.github.io/pointerevents/#dom-mouseevent-altkey>
     #[ignore_trace]
     pub alt_key: bool,
 
-    /// <https://w3c.github.io/uievents/#dom-mouseevent-metakey>
+    /// <https://w3c.github.io/pointerevents/#dom-mouseevent-metakey>
     #[ignore_trace]
     pub meta_key: bool,
 }
 
-/// <https://w3c.github.io/uievents/#dictdef-mouseeventinit>
+/// <https://w3c.github.io/pointerevents/#dictdef-mouseeventinit>
 pub(crate) struct MouseEventInit {
     pub bubbles: bool,
     pub cancelable: bool,
@@ -187,7 +187,7 @@ impl UIEvent {
 }
 
 impl MouseEvent {
-    /// <https://w3c.github.io/uievents/#dom-mouseevent-mouseevent>
+    /// <https://w3c.github.io/pointerevents/#dom-mouseevent-mouseevent>
     pub(crate) fn new(
         type_: String,
         init: MouseEventInit,
@@ -230,52 +230,52 @@ impl MouseEvent {
         }
     }
 
-    /// <https://w3c.github.io/uievents/#dom-mouseevent-clientx>
+    /// <https://w3c.github.io/pointerevents/#dom-mouseevent-clientx>
     pub(crate) fn client_x_value(&self) -> f64 {
         self.client_x
     }
 
-    /// <https://w3c.github.io/uievents/#dom-mouseevent-clienty>
+    /// <https://w3c.github.io/pointerevents/#dom-mouseevent-clienty>
     pub(crate) fn client_y_value(&self) -> f64 {
         self.client_y
     }
 
-    /// <https://w3c.github.io/uievents/#dom-mouseevent-screenx>
+    /// <https://w3c.github.io/pointerevents/#dom-mouseevent-screenx>
     pub(crate) fn screen_x_value(&self) -> f64 {
         self.screen_x
     }
 
-    /// <https://w3c.github.io/uievents/#dom-mouseevent-screeny>
+    /// <https://w3c.github.io/pointerevents/#dom-mouseevent-screeny>
     pub(crate) fn screen_y_value(&self) -> f64 {
         self.screen_y
     }
 
-    /// <https://w3c.github.io/uievents/#dom-mouseevent-button>
+    /// <https://w3c.github.io/pointerevents/#dom-mouseevent-button>
     pub(crate) fn button_value(&self) -> i16 {
         self.button
     }
 
-    /// <https://w3c.github.io/uievents/#dom-mouseevent-buttons>
+    /// <https://w3c.github.io/pointerevents/#dom-mouseevent-buttons>
     pub(crate) fn buttons_value(&self) -> u16 {
         self.buttons
     }
 
-    /// <https://w3c.github.io/uievents/#dom-mouseevent-ctrlkey>
+    /// <https://w3c.github.io/pointerevents/#dom-mouseevent-ctrlkey>
     pub(crate) fn ctrl_key_value(&self) -> bool {
         self.ctrl_key
     }
 
-    /// <https://w3c.github.io/uievents/#dom-mouseevent-shiftkey>
+    /// <https://w3c.github.io/pointerevents/#dom-mouseevent-shiftkey>
     pub(crate) fn shift_key_value(&self) -> bool {
         self.shift_key
     }
 
-    /// <https://w3c.github.io/uievents/#dom-mouseevent-altkey>
+    /// <https://w3c.github.io/pointerevents/#dom-mouseevent-altkey>
     pub(crate) fn alt_key_value(&self) -> bool {
         self.alt_key
     }
 
-    /// <https://w3c.github.io/uievents/#dom-mouseevent-metakey>
+    /// <https://w3c.github.io/pointerevents/#dom-mouseevent-metakey>
     pub(crate) fn meta_key_value(&self) -> bool {
         self.meta_key
     }

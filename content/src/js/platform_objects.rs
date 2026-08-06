@@ -7,21 +7,16 @@ use html5ever::{local_name, ns};
 
 use crate::dom::{Document, Element, EventPathItem, Node};
 use crate::html::{
-    GlobalScope, HTMLAnchorElement, HTMLElement, HTMLIFrameElement, HTMLInputElement,
-    HTMLMediaElement, HTMLVideoElement, Window,
+    ActivationBehavior, GlobalScope, HTMLAnchorElement, HTMLElement, HTMLIFrameElement,
+    HTMLInputElement, HTMLMediaElement, HTMLVideoElement, Window,
 };
 use crate::js::downcast::event_target_from_js_object;
 use crate::webidl::bindings::create_interface_instance;
 use js_engine::{Completion, ExecutionContext, JsTypes};
-use log::trace;
 
 use crate::js::Types;
 
 type JsObject = <Types as JsTypes>::JsObject;
-
-fn input_debug_enabled() -> bool {
-    std::env::var_os("FORMAL_WEB_DEBUG_INPUT").is_some()
-}
 
 /// <https://html.spec.whatwg.org/#global-object>
 pub(crate) struct GlobalObjectSlot;
@@ -382,57 +377,38 @@ fn target_is_anchor_with_href(
         .unwrap_or(false)
 }
 
-/// Runs the activation behavior of the dispatch target (an anchor with an
-/// href) after an un-canceled click, per the HTML spec's activation steps.
-/// <https://html.spec.whatwg.org/#activation-behavior>
+/// <https://dom.spec.whatwg.org/#concept-event-dispatch>
+// Note: This is the content-process portion of the dispatch algorithm's
+// Step 12.1, "run activationTarget's activation behavior with event". The
+// element kind is resolved from the path item's platform object and the
+// behavior is dispatched to the element's ActivationBehavior implementation.
 pub(crate) fn run_activation_behavior_for_path(
     ec: &mut dyn ExecutionContext<Types>,
     path: &[EventPathItem],
 ) -> Completion<(), Types> {
-    if input_debug_enabled() {
-        trace!(
-            "[input-debug][activation] run_activation_behavior_for_path path_len={} activation_flags={:?}",
-            path.len(),
-            path.iter()
-                .map(|item| item.has_activation_behavior)
-                .collect::<Vec<_>>(),
-        );
-    }
     let Some(activation_item) = path.iter().find(|item| item.has_activation_behavior) else {
-        if input_debug_enabled() {
-            trace!(
-                "[input-debug][activation] early return: no path item with has_activation_behavior"
-            );
-        }
         return Ok(());
     };
-    // Resolve the anchor element from the invocation target's reflector.
+    // Resolve the element from the invocation target's reflector.
     let Some(reflector) = activation_item
         .invocation_target
         .reflector
         .as_ref()
         .cloned()
     else {
-        if input_debug_enabled() {
-            trace!("[input-debug][activation] early return: no reflector on invocation target");
-        }
         return Ok(());
     };
+    // Dispatch to the element kind's activation behavior implementation: the
+    // platform object is downcast to the concrete element struct (e.g.
+    // HTMLAnchorElement), which implements ActivationBehavior.
     let Some(anchor) = ec
         .with_object_any(&reflector)
         .and_then(|data| data.downcast_ref::<HTMLAnchorElement>().cloned())
     else {
-        if input_debug_enabled() {
-            trace!("[input-debug][activation] early return: reflector is not an HTMLAnchorElement");
-        }
+        // TODO: HTMLAreaElement, HTMLInputElement, HTMLButtonElement, and
+        // other element kinds with activation behavior are not yet modeled.
         return Ok(());
     };
-    if input_debug_enabled() {
-        trace!(
-            "[input-debug][activation] anchor resolved, href={:?}",
-            anchor.href_attribute()
-        );
-    }
 
     // Gather the navigation context from the realm's global scope. The scope
     // is cloned out of the object registry so its lifetime does not borrow `ec`

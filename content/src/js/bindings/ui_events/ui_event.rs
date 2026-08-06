@@ -1,4 +1,4 @@
-use crate::js::bindings::dom::event::init_flag;
+use crate::js::bindings::initialization::{init_flag, init_number};
 use crate::ui_events::{UIEvent, UIEventInit};
 type JsValue = <crate::js::Types as JsTypes>::JsValue;
 
@@ -19,22 +19,6 @@ fn with_ui_event_ref<R>(
         return Err(ec.new_type_error("receiver is not a UIEvent"));
     };
     Ok(f(&ui_event, ec))
-}
-
-fn init_number(
-    init: &JsValue,
-    ec: &mut dyn ExecutionContext<crate::js::Types>,
-    key: &str,
-    default: f64,
-) -> Completion<f64, crate::js::Types> {
-    if let Some(object) = crate::js::Types::value_as_object(init) {
-        let property_key = ec.property_key_from_str(key);
-        let value = ExecutionContext::get(ec, object, property_key)?;
-        if !crate::js::Types::value_is_undefined(&value) {
-            return ec.to_number(value);
-        }
-    }
-    Ok(default)
 }
 
 use crate::webidl::bindings::{AttributeDef, InterfaceDefinition, WebIdlInterface};

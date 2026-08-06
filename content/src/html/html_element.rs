@@ -3,10 +3,12 @@ use std::{cell::Cell, cell::RefCell, collections::BTreeMap, rc::Rc};
 use blitz_dom::BaseDocument;
 
 use crate::dom::event::EventTargetAccess;
-use crate::dom::{Element, Event, EventTarget};
+use crate::dom::{Element, Event, EventTarget, dispatch_with_path};
 use crate::js::Types;
+use crate::js::platform_objects::{build_path_from_target_js_object, resolve_element_object};
+use crate::webidl::bindings::create_interface_instance;
 use js_engine::gc_struct;
-use js_engine::{Completion, ExecutionContext};
+use js_engine::{Completion, ExecutionContext, JsTypes};
 
 /// <https://html.spec.whatwg.org/#htmlelement>
 #[gc_struct]
@@ -103,27 +105,57 @@ impl HTMLElement {
 
         // Step 4: Fire a synthetic pointer event named click at this element,
         //         with the not trusted flag set.
-        // Note: A plain "click" Event is dispatched rather than a synthetic
-        // PointerEvent; the dispatch path applies activation behavior to it.
-        let event = Event::new("click".into(), true, true, true, false, 0.0, ec);
-        let event_object =
-            crate::webidl::bindings::create_interface_instance::<Types, Event>(event, ec)?;
-        let domain_event = ec
-            .with_object_any(&event_object)
-            .and_then(|data| data.downcast_ref::<Event>().cloned())
-            .ok_or_else(|| ec.new_type_error("click event construction failed"))?;
-        let reflector =
-            crate::js::platform_objects::resolve_element_object(self.element.node.node_id, ec)?;
-        let path = crate::js::platform_objects::build_path_from_target_js_object(&reflector, ec);
-        self.element
-            .node
-            .event_target
-            .dispatch_event(&domain_event, &path, ec)?;
+        // <https://html.spec.whatwg.org/#fire-a-synthetic-pointer-event>
+        let reflector = resolve_element_object(self.element.node.node_id, ec)?;
+        fire_a_synthetic_pointer_event(&reflector, "click", true, ec)?;
 
         // Step 5: Unset this element's click in progress flag.
         self.click_in_progress_flag.set(false);
         Ok(())
     }
+}
+
+/// <https://html.spec.whatwg.org/#fire-a-synthetic-pointer-event>
+pub(crate) fn fire_a_synthetic_pointer_event(
+    target_object: &<Types as JsTypes>::JsObject,
+    name: &str,
+    not_trusted: bool,
+    ec: &mut dyn ExecutionContext<Types>,
+) -> Completion<bool, Types> {
+    // Step 1: Let event be the result of creating an event using PointerEvent.
+    // Note: PointerEvent is not yet modeled; a plain Event with the same
+    // type, bubbles, cancelable, composed, and isTrusted state is created
+    // instead, and the dispatch path applies activation behavior to it.
+    // Step 2: Initialize event's type attribute to e.
+    // Step 3: Initialize event's bubbles and cancelable attributes to true.
+    // Step 4: Set event's composed flag.
+    // Step 5: If the not trusted flag is set, initialize event's isTrusted
+    //         attribute to false.
+    let event = Event::new(name.to_owned(), true, true, true, !not_trusted, 0.0, ec);
+    let event_object = create_interface_instance::<Types, Event>(event, ec)?;
+    let event = ec
+        .with_object_any(&event_object)
+        .and_then(|data| data.downcast_ref::<Event>().cloned())
+        .ok_or_else(|| ec.new_type_error("event creation failed"))?;
+
+    // Step 6: Initialize event's ctrlKey, shiftKey, altKey, and metaKey
+    //         attributes according to the current state of the key input
+    //         device, if any (false for any keys that are not available).
+    // TODO: Not yet implemented — the plain Event exposes no modifier-key
+    // properties.
+    // Step 7: Initialize event's view attribute to target's node document's
+    //         Window object, if any, and null otherwise.
+    // TODO: Not yet implemented — the Event domain object has no view
+    // attribute.
+    // Step 8: event's getModifierState() method is to return values
+    //         appropriately describing the current state of the key input
+    //         device.
+    // TODO: Not yet implemented.
+
+    // Step 9: Return the result of dispatching event at target.
+    // <https://dom.spec.whatwg.org/#concept-event-dispatch>
+    let path = build_path_from_target_js_object(target_object, ec);
+    dispatch_with_path(ec, &path, &event)
 }
 
 /// <https://drafts.csswg.org/cssom/#dom-htmlelement-style>
