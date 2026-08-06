@@ -13,10 +13,15 @@ use crate::html::{
 use crate::js::downcast::event_target_from_js_object;
 use crate::webidl::bindings::create_interface_instance;
 use js_engine::{Completion, ExecutionContext, JsTypes};
+use log::trace;
 
 use crate::js::Types;
 
 type JsObject = <Types as JsTypes>::JsObject;
+
+fn input_debug_enabled() -> bool {
+    std::env::var_os("FORMAL_WEB_DEBUG_INPUT").is_some()
+}
 
 /// <https://html.spec.whatwg.org/#global-object>
 pub(crate) struct GlobalObjectSlot;
@@ -340,7 +345,10 @@ pub(crate) fn build_path_from_target_js_object(
                             path.push(EventPathItem {
                                 invocation_target: parent_event_target,
                                 shadow_adjusted_target: None,
-                                has_activation_behavior: false,
+                                has_activation_behavior: target_is_anchor_with_href(
+                                    ec,
+                                    &parent_object,
+                                ),
                             });
                         }
                         current_node_id = pid;
@@ -381,19 +389,50 @@ pub(crate) fn run_activation_behavior_for_path(
     ec: &mut dyn ExecutionContext<Types>,
     path: &[EventPathItem],
 ) -> Completion<(), Types> {
-    let Some(first) = path.first().filter(|item| item.has_activation_behavior) else {
+    if input_debug_enabled() {
+        trace!(
+            "[input-debug][activation] run_activation_behavior_for_path path_len={} activation_flags={:?}",
+            path.len(),
+            path.iter()
+                .map(|item| item.has_activation_behavior)
+                .collect::<Vec<_>>(),
+        );
+    }
+    let Some(activation_item) = path.iter().find(|item| item.has_activation_behavior) else {
+        if input_debug_enabled() {
+            trace!(
+                "[input-debug][activation] early return: no path item with has_activation_behavior"
+            );
+        }
         return Ok(());
     };
     // Resolve the anchor element from the invocation target's reflector.
-    let Some(reflector) = first.invocation_target.reflector.as_ref().cloned() else {
+    let Some(reflector) = activation_item
+        .invocation_target
+        .reflector
+        .as_ref()
+        .cloned()
+    else {
+        if input_debug_enabled() {
+            trace!("[input-debug][activation] early return: no reflector on invocation target");
+        }
         return Ok(());
     };
     let Some(anchor) = ec
         .with_object_any(&reflector)
         .and_then(|data| data.downcast_ref::<HTMLAnchorElement>().cloned())
     else {
+        if input_debug_enabled() {
+            trace!("[input-debug][activation] early return: reflector is not an HTMLAnchorElement");
+        }
         return Ok(());
     };
+    if input_debug_enabled() {
+        trace!(
+            "[input-debug][activation] anchor resolved, href={:?}",
+            anchor.href_attribute()
+        );
+    }
 
     // Gather the navigation context from the realm's global scope. The scope
     // is cloned out of the object registry so its lifetime does not borrow `ec`

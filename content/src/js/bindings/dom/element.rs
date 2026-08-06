@@ -5,7 +5,7 @@ use crate::html::{
     HTMLAnchorElement, HTMLElement, HTMLIFrameElement, HTMLInputElement, HTMLMediaElement,
     HTMLVideoElement,
 };
-use crate::js::bindings::dom::global_event_handlers::define_global_event_handlers;
+use crate::js::bindings::html::global_event_handlers::define_global_event_handlers;
 use crate::js::platform_objects::{invalidate_cached_node_ids, resolve_element_object};
 use crate::webidl::bindings::{
     AttributeDef, InterfaceDefinition, OperationDef, WebIdlInterface, create_interface_instance,

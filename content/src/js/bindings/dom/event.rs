@@ -1,4 +1,5 @@
-use crate::dom::{Event, MouseEvent, UIEvent};
+use crate::dom::Event;
+use crate::js::downcast::event_from_js_object;
 type JsValue = <crate::js::Types as JsTypes>::JsValue;
 
 fn with_event_ref<R>(
@@ -11,21 +12,7 @@ fn with_event_ref<R>(
     // Clone the handle out of the object registry so `f` can borrow `ec`
     // mutably while the platform object is accessed. The clone shares all
     // GC-managed state with the registered platform object.
-    let event = ec.with_object_any(&obj).and_then(|data| {
-        data.downcast_ref::<Event>()
-            .cloned()
-            .or_else(|| {
-                // Handle Event subclasses that embed Event as a field.
-                // Note: this mirrors the hierarchy-walking pattern used in
-                // try_with_element_ref for Element/HTMLElement/etc.
-                data.downcast_ref::<UIEvent>()
-                    .map(|ui_event| ui_event.event.clone())
-            })
-            .or_else(|| {
-                data.downcast_ref::<MouseEvent>()
-                    .map(|mouse_event| mouse_event.ui_event.event.clone())
-            })
-    });
+    let event = event_from_js_object(ec, &obj);
     let Some(event) = event else {
         return Err(ec.new_type_error("receiver is not an Event"));
     };
@@ -313,8 +300,8 @@ fn get_cancel_bubble(
     Ok(ec.value_from_bool(val))
 }
 
-/// Like [`with_event_ref`] but for mutable access, handling Event subclass
-/// data layouts (e.g. UIEvent embeds an `event` field).
+/// Like [`with_event_ref`] but for mutable access; the receiver downcasts to
+/// its embedded `Event` via [`event_from_js_object`].
 fn with_event_mut<R>(
     this: &JsValue,
     ec: &mut dyn ExecutionContext<crate::js::Types>,
@@ -325,18 +312,7 @@ fn with_event_mut<R>(
     // Clone the handle out of the object registry so `f` can borrow `ec`
     // mutably while the platform object is accessed. The clone shares all
     // GC-managed state with the registered platform object.
-    let event = ec.with_object_any(&obj).and_then(|data| {
-        data.downcast_ref::<Event>()
-            .cloned()
-            .or_else(|| {
-                data.downcast_ref::<UIEvent>()
-                    .map(|ui_event| ui_event.event.clone())
-            })
-            .or_else(|| {
-                data.downcast_ref::<MouseEvent>()
-                    .map(|mouse_event| mouse_event.ui_event.event.clone())
-            })
-    });
+    let event = event_from_js_object(ec, &obj);
     let Some(mut event) = event else {
         return Err(ec.new_type_error("receiver is not an Event"));
     };

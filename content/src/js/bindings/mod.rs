@@ -2,6 +2,7 @@ pub(crate) mod dom;
 pub(crate) mod html;
 pub(crate) mod streams;
 pub(crate) mod testutils;
+pub(crate) mod ui_events;
 #[cfg(all(boa_backend, feature = "wasm"))]
 pub(crate) mod wasm;
 

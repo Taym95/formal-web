@@ -158,15 +158,18 @@ impl Element {
 
     /// <https://dom.spec.whatwg.org/#dom-element-matches>
     pub(crate) fn matches(&self, selectors: &str) -> Result<bool, String> {
+        // Step 1: Let selector be the result of parse a selector from selectors.
+        // Step 2: If selector is failure, then throw a "SyntaxError" DOMException.
         let document = self.node.document.borrow();
-        // Step 1: "Let s be the result of parsing selectors."
         let selector_list = document
             .try_parse_selector_list(selectors)
             .map_err(|error| format!("invalid selector `{selectors}`: {error:?}"))?;
 
-        // Step 2: "If this's root is not s's root, then return false."
-        // Note: Shadow trees are not modeled; the root is always the document.
-        // Step 3: "If this matches s, then return true."
+        // Step 3: If the result of match a selector against an element, using
+        //         selector, this, and scoping root this, returns success, then
+        //         return true; otherwise, return false.
+        // Note: Shadow trees are not modeled; the scoping root is the element's
+        // document.
         let Some(node) = document.get_node(self.node.node_id) else {
             return Ok(false);
         };
@@ -179,25 +182,27 @@ impl Element {
 
     /// <https://dom.spec.whatwg.org/#dom-element-closest>
     pub(crate) fn closest(&self, selectors: &str) -> Result<Option<usize>, String> {
+        // Step 1: Let selector be the result of parse a selector from selectors.
+        // Step 2: If selector is failure, then throw a "SyntaxError" DOMException.
         let document = self.node.document.borrow();
-        // Step 1: "Let s be the result of parsing selectors."
         let selector_list = document
             .try_parse_selector_list(selectors)
             .map_err(|error| format!("invalid selector `{selectors}`: {error:?}"))?;
 
-        // Step 2: "Let elements be s's flat tree ancestors of this element, in
-        // order, ending with this element itself."
+        // Step 3: Let elements be this's inclusive ancestors that are elements,
+        //         in reverse tree order.
+        // Step 4: For each element of elements: if match a selector against an
+        //         element, using selector, element, and scoping root this,
+        //         returns success, return element.
+        // Step 5: Return null.
         let Some(root_node) = document.get_node(self.node.node_id) else {
             return Ok(None);
         };
-        // Step 3: "For each element in elements: if element matches s, then
-        // return element."
         let matched = style_element_closest::<&blitz_dom::Node>(
             root_node,
             &selector_list,
             style::context::QuirksMode::NoQuirks,
         );
-        // Step 4: "Return null."
         Ok(matched.map(|node| node.id))
     }
 
@@ -452,11 +457,6 @@ impl Element {
                 value,
             );
         }
-        // Note: blitz's set_attribute records a stylo snapshot for descendant
-        // invalidation. On an element whose primary style has never been
-        // computed the snapshot makes the style traversal panic
-        // (ElementStyles::primary() unwraps a None primary). Mark it handled
-        // so the fresh element is styled from its current attributes instead.
         Self::suppress_snapshot_on_unstyled_element(&self.node.document, self.node.node_id);
     }
 
@@ -486,11 +486,6 @@ impl Element {
                 value,
             );
         }
-        // Note: blitz's set_attribute records a stylo snapshot for descendant
-        // invalidation. On an element whose primary style has never been
-        // computed the snapshot makes the style traversal panic
-        // (ElementStyles::primary() unwraps a None primary). Mark it handled
-        // so the fresh element is styled from its current attributes instead.
         Self::suppress_snapshot_on_unstyled_element(&self.node.document, self.node.node_id);
     }
 
@@ -521,15 +516,18 @@ impl Element {
         mutator.clear_attribute(self.node.node_id, name);
         drop(mutator);
         drop(document);
-        // Note: blitz's clear_attribute records a stylo snapshot for descendant
-        // invalidation. On an element whose primary style has never been
-        // computed the snapshot makes the style traversal panic
-        // (ElementStyles::primary() unwraps a None primary). Mark it handled
-        // so the fresh element is styled from its current attributes instead.
         Self::suppress_snapshot_on_unstyled_element(&self.node.document, self.node.node_id);
     }
 
     fn suppress_snapshot_on_unstyled_element(document: &Rc<RefCell<BaseDocument>>, node_id: usize) {
+        // Note: blitz's set_attribute/clear_attribute record a stylo snapshot
+        // for descendant invalidation on every attribute change, and the
+        // snapshot invalidation path assumes computed styles exist: stylo's
+        // ElementStyles::primary() unwraps a None primary, panicking the style
+        // traversal for never-styled elements. blitz is a pinned git
+        // dependency, so the content side marks the snapshot handled for
+        // never-styled elements, which makes stylo skip it; the fresh element
+        // is then styled from its current attributes.
         let document = document.borrow();
         let Some(node) = document.get_node(node_id) else {
             return;

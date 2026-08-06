@@ -6,7 +6,7 @@
 - `Document` and `Element` compose `Node`, so shared tree algorithms live on `Node` while type-specific Web IDL behavior stays on the owning [platform object](https://webidl.spec.whatwg.org/#dfn-platform-object).
 - HTML-owned global-object [platform objects](https://webidl.spec.whatwg.org/#dfn-platform-object) such as `GlobalScope` (implementing the [global object](https://html.spec.whatwg.org/#global-object) concept) and [Window](https://html.spec.whatwg.org/#window) live in `content/src/html`, and DOM dispatch code here depends on them when the DOM Standard talks about window-backed targets.
 - `content/src/js/bindings` should delegate DOM algorithms here instead of embedding DOM logic in the binding layer.
-- Native UI-event to DOM-dispatch bridging belongs here, with activation-target selection kept in `dispatch.rs`.
+- Native UI-event to DOM-dispatch bridging lives in `content/src/html/ui_events.rs`; activation-target selection stays in `dispatch.rs`.
 - Use the `web_standards` extension (`spec_lookup`) with `https://dom.spec.whatwg.org/` to read the DOM spec, and for single-sentence spec definitions quote the defining sentence instead of inventing `Step N:` comments.
 
 ## Event dispatch architecture
@@ -15,18 +15,19 @@ The dispatch algorithm (implemented in `dispatch.rs`) operates on two domain typ
 
 ### EventTargetAccess trait
 
-Types that embed an `EventTarget` (Node, Window, AbortSignal, Element, etc.) implement `EventTargetAccess`:
+Types that embed an `EventTarget` (Node, Window, AbortSignal, Element, etc.)
+implement `EventTargetAccess`:
 
 ```rust
 pub(crate) trait EventTargetAccess {
     fn get_event_target(&self) -> EventTarget;                   // clone of embedded EventTarget
-    fn has_activation_behavior(&self) -> bool;                    // activation behavior check
-    fn run_activation_behavior(&self, _event: &Event) -> Completion<(), Types>;
     fn get_the_parent(&self) -> Option<EventTarget>;             // parent EventTarget for path building
 }
 ```
 
-Dispatch functions (`fire_event`, `dispatch`) take `target: &dyn EventTargetAccess` and build the event path from domain EventTargets only — no JsObject is involved in path building.
+Dispatch functions (`fire_event`, `dispatch_with_path`) take `EventTarget`
+values and pre-built `EventPathItem` paths — no JsObject is involved in path
+building or the dispatch loop.
 
 ### Interior mutability via GcCell
 
@@ -50,6 +51,8 @@ Methods take `&self` and use `borrow()`/`borrow_mut()`.  Since `GcCell` shares i
 `EventPathItem` stores:
 - `invocation_target: EventTarget` — the current target in the propagation path
 - `shadow_adjusted_target: Option<EventTarget>` — the shadow-adjusted target for `event.target`
+- `has_activation_behavior: bool` — whether the item is an anchor with an href
+  (activation-target selection per dispatch step 6.9.6.1)
 
 No JsObject appears in path items.
 
@@ -57,14 +60,21 @@ No JsObject appears in path items.
 
 | Function | Takes | Creates path? | Used by |
 |---|---|---|---|
-| `fire_event` | `ec`, `&dyn EventTargetAccess`, event_type, time, flags | Yes (via path_for_target) | Domain callers (main.rs, html_iframe_element, abort) |
-| `dispatch` | `ec`, `&dyn EventTargetAccess`, event_object, flags | Yes (via path_for_target) | JS bindings (dispatchEvent) |
-| `dispatch_with_path` | `ec`, `&[EventPathItem]`, event_object | No (pre-built path) | BlitzEventDriver (UI events) |
+| `fire_event` | `ec`, `&dyn EventTargetAccess`, event_type, time, flags | Yes (via simple_path) | Domain callers (main.rs, html_iframe_element, abort) |
+| `dispatch_event` | `ec`, `&[EventPathItem]`, `&Event` | No (pre-built path) | EventTarget.dispatchEvent, activation behavior |
+| `dispatch_with_path` | `ec`, `&[EventPathItem]`, event_object | No (pre-built path) | UI-event pipeline (html/ui_events.rs) |
 | `simple_path` | `&dyn EventTargetAccess` | Yes (single entry) | html/dispatch.rs (fire_global_event) |
 
-### Path building for UI events (ui_event_dispatch.rs)
+### Path building for UI events (content/src/html/ui_events.rs)
 
-`ui_event_dispatch.rs` owns `build_event_path()` which resolves blitz node chains into `Vec<EventPathItem>` by extracting `EventTarget` from each node's platform object. It uses `EnvironmentSettingsObject.document.node.event_target` for the document path entry and extracts the Window's EventTarget from the realm global object. This is the only module that resolves JsObject → EventTarget for path building.
+`build_event_path()` resolves a blitz node chain into `Vec<EventPathItem>` by
+extracting the `EventTarget` from each node's platform object. The chain is the
+event target followed by its ancestors (DOM dispatch steps 6.3-6.9); the
+document and Window event targets close the path. The trusted-click builder
+`build_path_from_target_js_object` (content/src/js/platform_objects.rs) walks
+the same parent chain from a JS target object. Both builders mark
+`has_activation_behavior` on anchor-with-href items so dispatch step 12 can
+run the anchor's activation behavior.
 
 ### EnvironmentSettingsObject owns a Document platform object
 
@@ -75,7 +85,7 @@ No JsObject appears in path items.
 - Do not add JsObject parameters to dispatch functions — domain dispatch operates on EventTarget only.
 - Do not use `&mut self` on EventTarget methods — use `GcCell` fields with `&self`.
 - Do not clone Event or EventTarget and sync back — `GcCell` shares data across clones.
-- Do not put JsObject-only helpers (like `event_target_from_object`) in dispatch.rs — keep domain dispatch pure. Such helpers belong in `ui_event_dispatch.rs` or `platform_objects.rs`.
+- Do not put JsObject-only helpers (like `event_target_from_object`) in dispatch.rs — keep domain dispatch pure. Such helpers belong in `platform_objects.rs` or `html/ui_events.rs`.
 
 ## GcCell interior mutability pattern elsewhere
 
@@ -86,143 +96,3 @@ Types that currently use `&mut self` for mutation but could use `GcCell` + `&sel
 - **Streams** — writable/readable stream state machines use `Cell<bool>`/`RefCell`; some could use GcCell for GC-traced callback fields.
 - **AbortSignal** — already uses `GcCell<AbortSignalState>` at the top level; internal fields like `onabort` could move to GcCell if needed.
 
-## Session investigation log
-
-### 2026-08-06 — React app crashes: stylo panic + missing DOM APIs
-
-Investigation of running a production React 19 todo app (artifacts/todo-app) in
-formal-web; the app crashed the content process at load with a nondeterministic
-stylo panic, then, after the panic was fixed, failed on several missing DOM APIs.
-
-**Files changed:**
-
-- content/src/dom/element.rs — snapshot suppression on unstyled elements (fixes
-  the stylo panic); added `Element::closest`.
-- content/src/js/bindings/dom/node.rs — added `HTMLInputElement`/`HTMLMediaElement`/
-  `HTMLVideoElement` arms to `try_with_node_ref` and `appendable_node`.
-- content/src/js/downcast.rs, content/src/js/platform_objects.rs — added the same
-  arms to `event_target_from_js_object`, `build_path_from_target_js_object`, and
-  `try_set_event_target_reflector`.
-- content/src/dom/event.rs — added `EventTarget` event-handler storage and the
-  `MouseEvent` domain type.
-- content/src/js/bindings/dom/global_event_handlers.rs (new) — `on*` IDL
-  attributes for `Element`, `Document`, `Window`.
-- content/src/js/bindings/dom/mouse_event.rs (new) — `MouseEvent` interface.
-- content/src/js/bindings/dom/event.rs, event_target.rs — `MouseEvent`/`UIEvent`
-  downcast arms in `with_event_ref` and `dispatchEvent`.
-- content/src/js/bindings/html/html_input_element.rs — `input.type`.
-- content/src/js/bindings/html/html_element.rs — `HTMLElement.click()`.
-- content/src/js/build_context.rs — registered `MouseEvent`.
-- content/src/html/window.rs, content/src/js/bindings/html/window.rs — removed the
-  bespoke `window.onload` storage; the global handler covers it.
-
-**Instrumentation added:** temporary backtrace printing in the content panic hook
-(content/src/bin/content_process.rs, since reverted) and an `input`-event arm in
-the dispatch debug trace (content/src/dom/dispatch.rs, since reverted).
-
-**What was confirmed:**
-
-- The panic was `ElementStyles::primary()` unwrap of `None` inside stylo's style
-  traversal (`TreeStyleInvalidator::invalidate_descendants` ->
-  `should_process_descendants`), reached when a freshly JS-created element had a
-  recorded attribute snapshot but no computed primary style. blitz's
-  `set_attribute` snapshots unconditionally, including for never-styled elements.
-  Content-side fix: after `set_attribute`/`clear_attribute`, mark the snapshot
-  handled when `primary_styles().is_none()` — the element is then styled from its
-  current attributes instead. 20/20 stress runs clean after the fix.
-- `appendChild(input)` threw "appendChild requires a Node": the downcast
-  whitelists in the Node bindings omitted `HTMLInputElement` (and media/video),
-  aborting React's commit mid-tree. Fixed in node.rs.
-- Events dispatched on an `<input>` never reached ancestor listeners: the event
-  path builders omitted the same types. Fixed in platform_objects.rs/downcast.rs.
-- React's `onChange` never fired because `"oninput" in document` was false (no
-  `on*` IDL attributes), forcing React onto a keydown/keyup-only polyfill. Fixed
-  by the GlobalEventHandlers attributes. A second blocker was `input.type`
-  missing, which made `isTextInputElement` return false.
-- `HTMLElement.click()` and `Element.prototype.closest` were absent; `MouseEvent`
-  was not registered. All added.
-- `new MouseEvent(...)` dispatched to no listeners until
-  `try_set_event_target_reflector` gained a MouseEvent arm — without it the inner
-  Event's reflector is never set and `inner_invoke` skips the callback.
-
-**What was ruled out:**
-
-- The stylo panic was not caused by the page's CSS or markup (static equivalents
-  rendered fine) and not by React's event system; it reproduced with plain JS DOM
-  building (jsmount probe) and only with JS-created, attribute-set elements.
-- `MessageChannel`, `queueMicrotask`, `Element.prototype.contains`, and
-  `compareDocumentPosition` are absent but React degrades gracefully around all
-  of them (scheduler falls back to Promise/setTimeout; `containsNode` returns
-  false). No fix needed.
-
-**Not investigated:** whether real keyboard input (blitz editor path) fires
-`input` events that reach React's onChange — the JS pipeline was verified by
-clearing the value tracker and dispatching; the editor-driven path was not
-exercised end-to-end.
-
-### 2026-08-06 (cont.) — Anchor activation wiring
-
-While testing the StartupExample "React Todo App" link (target="_blank") and the
-anchor-navigation example, anchor clicks did not navigate at all:
-`run_activation_behavior` was a no-op default and `html_anchor_element.rs`
-`activation_behavior` was dead code.
-
-**Files changed:**
-
-- content/src/dom/dispatch.rs — `EventPathItem` gained a
-  `has_activation_behavior` flag; the click dispatch's Step 12 now calls
-  `crate::js::platform_objects::run_activation_behavior_for_path(ec, path)`
-  instead of the EventTarget no-op.
-- content/src/js/platform_objects.rs — path builders mark the target item when
-  it is an anchor with an href; `run_activation_behavior_for_path` resolves the
-  anchor from the path item's reflector, gathers the navigable context from the
-  global scope, and invokes `HTMLAnchorElement::activation_behavior`.
-- content/src/html/ui_events.rs — the blitz UI-event path builder sets the same
-  flag for the target node.
-- content/src/html/html_anchor_element.rs — `href_attribute` made `pub(crate)`.
-- content/src/dom/event.rs — removed the now-unused
-  `has_activation_behavior`/`run_activation_behavior` defaults from
-  `EventTargetAccess`.
-
-**What was confirmed:** `target="_self"` anchor clicks navigate; `target="_blank"`
-anchors delegate the new top-level traversable to the UA (the
-`the_rules_for_choosing_a_navigable` "delegate to UA" branch), which the
-windowed embedder honors by opening a new tab. Real pointer clicks and JS
-`el.click()` both reach the activation behavior now.
-
-**Not investigated:** named-target lookup (Step 7 of the rules) and the UA-side
-new-webview creation for the anchor path remain stubbed; `window.open` with a
-global scope still creates new traversables locally.
-
-### 2026-08-06 (cont.) — Anchor _blank tab creation was spawning a new content process
-
-**Symptom:** clicking the StartupExample "React Todo App" link (a plain
-`<a target="_blank">`) took seconds for the tab to appear, intermittently.
-
-**What was confirmed (instrumented timing of the full click flow):**
-
-- The UA-side `handle_navigate` completes in 0 ms; the new webview is created,
-  registered, and painted in the same second as the click.
-- The delay is the **new content process**: per the spec, `_blank` anchors are
-  noopener by default (HTML `noopener()` Step 3: no `rel="opener"` keyword ⇒
-  noopener=true). With noopener=true, `the_rules_for_choosing_a_navigable`
-  takes the null-opener branch, the UA `choose_navigable` runs
-  `create_new_top_level_traversable` → `create_agent` →
-  `spawn_event_loop_entry` → a fresh `formal-web-content` process (boot + realm
-  init), which is the multi-second cost.
-- `window.open` is fast because it takes the opener branch: the content process
-  creates the auxiliary browsing context in its own event loop
-  (`create_auxiliary_context_document` + `new_traversable_info`) and the UA
-  `creating_a_new_top_level_traversable` reuses the existing process.
-
-**Fix:** the anchor activation behavior now forwards the global scope, window
-global, and engine to `the_rules_for_choosing_a_navigable` (previously it
-passed `None` and always delegated to the UA). A `_blank` anchor with
-`rel="opener"` now takes the same in-process opener branch as `window.open` —
-no new process. Verified: click → new tab → app rendered in ~1 s, same content
-process, app fully interactive.
-
-**Files changed:** content/src/html/html_anchor_element.rs (activation
-signature + rules args), content/src/js/platform_objects.rs
-(`run_activation_behavior_for_path` clones the global scope and passes window +
-engine), artifacts/StartupExample.html (`rel="opener"` on the link).

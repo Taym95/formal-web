@@ -24,6 +24,34 @@ impl HTMLInputElement {
         }
     }
 
+    /// <https://html.spec.whatwg.org/#dom-input-type>
+    pub(crate) fn type_(&self) -> String {
+        // The type IDL attribute reflects the type content attribute, limited to
+        // only known values, with the Text state as both missing and invalid
+        // value default. The reflect getter returns the canonical keyword of the
+        // attribute's state, so an absent attribute and an unknown value both
+        // map to "text".
+        let value = self.html_element.element.get_attribute("type");
+        match value.as_deref() {
+            None => String::from("text"),
+            Some(value) => {
+                let lower = value.to_ascii_lowercase();
+                if INPUT_TYPE_KEYWORDS.contains(&lower.as_str()) {
+                    lower
+                } else {
+                    String::from("text")
+                }
+            }
+        }
+    }
+
+    /// <https://html.spec.whatwg.org/#dom-input-type>
+    pub(crate) fn set_type(&self, value: &str) {
+        // The setter steps are to run the reflected target's set the content
+        // attribute with the given value.
+        self.html_element.element.set_attribute("type", value);
+    }
+
     /// <https://html.spec.whatwg.org/#dom-input-value>
     pub(crate) fn value(&self) -> String {
         // Step 1: Return the element's current value.
@@ -66,6 +94,33 @@ impl HTMLInputElement {
         // until we wire up per-keystroke input-event integration.
     }
 }
+
+/// The keywords of the `type` attribute's enumerated states, from the input
+/// element's type attribute table.
+const INPUT_TYPE_KEYWORDS: &[&str] = &[
+    "hidden",
+    "text",
+    "search",
+    "tel",
+    "url",
+    "email",
+    "password",
+    "date",
+    "month",
+    "week",
+    "time",
+    "datetime-local",
+    "number",
+    "range",
+    "color",
+    "checkbox",
+    "radio",
+    "file",
+    "submit",
+    "image",
+    "reset",
+    "button",
+];
 
 /// <https://html.spec.whatwg.org/#value-sanitization-algorithm>
 fn value_to_string(value: &str) -> String {

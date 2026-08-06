@@ -11,9 +11,10 @@ use keyboard_types::{Key, Modifiers as KeyboardModifiers};
 use log::{error, trace};
 
 use crate::dom::event::{Event, EventTarget};
-use crate::dom::{EventPathItem, UIEvent as JsUiEvent, dispatch_with_path};
+use crate::dom::{EventPathItem, dispatch_with_path};
 use crate::html::{EnvironmentSettingsObject, HTMLAnchorElement, Window};
 use crate::js::Types;
+use crate::ui_events::UIEvent as JsUiEvent;
 use crate::webidl::bindings::create_interface_instance;
 
 fn input_debug_enabled() -> bool {
@@ -191,6 +192,11 @@ fn localize_ui_event_for_document(
     }
 }
 
+/// Builds the event path for a UI event whose target is a node in `chain`.
+/// This is the content-process portion of DOM dispatch steps 6.3-6.9:
+/// chain[0] is the event target (step 6.3) and the remaining items are the
+/// ancestors appended by step 6.9.6.2 while walking "get the parent" (step
+/// 6.9.9); the document and window event targets close the path.
 fn build_event_path(
     chain: &[usize],
     document_event_target: EventTarget,
@@ -199,17 +205,22 @@ fn build_event_path(
 ) -> Vec<EventPathItem> {
     let mut path = Vec::with_capacity(chain.len() + 2);
     for (index, node_id) in chain.iter().enumerate() {
+        // Step 6.3 / Step 6.9.6.2: Append to an event path with the event
+        // target, then each ancestor, in target-to-root order.
         if let Ok(object) = crate::js::platform_objects::resolve_element_object(*node_id, ec) {
             if let Some(event_target) =
                 crate::js::downcast::event_target_from_js_object(ec, &object)
             {
+                // Step 6.9.6.1: If isActivationEvent is true, event's bubbles
+                //               attribute is true, activationTarget is null,
+                //               and parent has activation behavior, then set
+                //               activationTarget to parent.
                 // <https://html.spec.whatwg.org/#links-created-by-a-and-area-elements:activation-behaviour-2>
-                let has_activation_behavior = index == 0
-                    && ec
-                        .with_object_any(&object)
-                        .and_then(|data| data.downcast_ref::<HTMLAnchorElement>())
-                        .map(|anchor| anchor.href_attribute().is_some())
-                        .unwrap_or(false);
+                let has_activation_behavior = ec
+                    .with_object_any(&object)
+                    .and_then(|data| data.downcast_ref::<HTMLAnchorElement>())
+                    .map(|anchor| anchor.href_attribute().is_some())
+                    .unwrap_or(false);
                 path.push(EventPathItem {
                     invocation_target: event_target.clone(),
                     shadow_adjusted_target: (index == 0).then_some(event_target),
@@ -218,6 +229,9 @@ fn build_event_path(
             }
         }
     }
+    // Step 6.9.9: If parent is non-null, then set parent to the result of
+    // invoking parent's get the parent with event. (The document and window
+    // close the parent chain.)
     path.push(EventPathItem {
         invocation_target: document_event_target,
         shadow_adjusted_target: None,
@@ -229,6 +243,16 @@ fn build_event_path(
             shadow_adjusted_target: None,
             has_activation_behavior: false,
         });
+    }
+    if std::env::var_os("FORMAL_WEB_DEBUG_INPUT").is_some() {
+        trace!(
+            "[input-debug][path] build_event_path chain_len={} path_len={} activation_flags={:?}",
+            chain.len(),
+            path.len(),
+            path.iter()
+                .map(|item| item.has_activation_behavior)
+                .collect::<Vec<_>>(),
+        );
     }
     path
 }
@@ -305,7 +329,7 @@ impl EventHandler for BlitzJSEventHandler<'_> {
             .expect("UIEvent construction must succeed");
         let domain_event: Event = ec
             .with_object_any(&event_object)
-            .and_then(|data| data.downcast_ref::<crate::dom::UIEvent>())
+            .and_then(|data| data.downcast_ref::<JsUiEvent>())
             .map(|uie| uie.event.clone())
             .expect("event_object must wrap a UIEvent");
 
@@ -459,12 +483,13 @@ mod tests {
     use serde_json::json;
     use url::Url;
 
-    use crate::dom::{Event, UIEvent as JsUiEvent, dispatch_with_path};
+    use crate::dom::{Event, dispatch_with_path};
     use crate::html::{
         EnvironmentSettingsObject, execute_parser_scripts, parse_html_into_document,
     };
     use crate::js::Types;
     use crate::js::platform_objects::{build_path_from_target_js_object, resolve_element_object};
+    use crate::ui_events::UIEvent as JsUiEvent;
     use crate::webidl::bindings::create_interface_instance;
 
     use super::dispatch_trusted_click_event;

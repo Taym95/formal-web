@@ -13,6 +13,7 @@ pub mod dom;
 mod generic_js_test;
 pub mod html;
 pub mod streams;
+pub mod ui_events;
 #[cfg(all(boa_backend, feature = "wasm"))]
 pub mod wasm;
 pub mod webidl;

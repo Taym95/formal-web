@@ -1,18 +1,22 @@
-use std::{cell::RefCell, collections::BTreeMap, rc::Rc};
+use std::{cell::Cell, cell::RefCell, collections::BTreeMap, rc::Rc};
 
 use blitz_dom::BaseDocument;
 
 use crate::dom::event::EventTargetAccess;
-use crate::dom::{Element, EventTarget};
+use crate::dom::{Element, Event, EventTarget};
 use crate::js::Types;
-use js_engine::ExecutionContext;
 use js_engine::gc_struct;
+use js_engine::{Completion, ExecutionContext};
 
 /// <https://html.spec.whatwg.org/#htmlelement>
 #[gc_struct]
 pub struct HTMLElement {
     /// <https://dom.spec.whatwg.org/#interface-element>
     pub element: Element,
+
+    /// <https://html.spec.whatwg.org/#click-in-progress-flag>
+    #[ignore_trace]
+    click_in_progress_flag: Cell<bool>,
 }
 
 impl EventTargetAccess for HTMLElement {
@@ -29,6 +33,7 @@ impl HTMLElement {
     ) -> Self {
         Self {
             element: Element::new(document, node_id, ec),
+            click_in_progress_flag: Cell::new(false),
         }
     }
 
@@ -83,6 +88,41 @@ impl HTMLElement {
         } else {
             self.element.remove_attribute("hidden");
         }
+    }
+
+    /// <https://html.spec.whatwg.org/#dom-click>
+    pub(crate) fn click(&self, ec: &mut dyn ExecutionContext<Types>) -> Completion<(), Types> {
+        // Step 1: If this element is a form control that is disabled, then return.
+        // Note: Disabled form-control state is not modeled, so the check is skipped.
+        // Step 2: If this element's click in progress flag is set, then return.
+        if self.click_in_progress_flag.get() {
+            return Ok(());
+        }
+        // Step 3: Set this element's click in progress flag.
+        self.click_in_progress_flag.set(true);
+
+        // Step 4: Fire a synthetic pointer event named click at this element,
+        //         with the not trusted flag set.
+        // Note: A plain "click" Event is dispatched rather than a synthetic
+        // PointerEvent; the dispatch path applies activation behavior to it.
+        let event = Event::new("click".into(), true, true, true, false, 0.0, ec);
+        let event_object =
+            crate::webidl::bindings::create_interface_instance::<Types, Event>(event, ec)?;
+        let domain_event = ec
+            .with_object_any(&event_object)
+            .and_then(|data| data.downcast_ref::<Event>().cloned())
+            .ok_or_else(|| ec.new_type_error("click event construction failed"))?;
+        let reflector =
+            crate::js::platform_objects::resolve_element_object(self.element.node.node_id, ec)?;
+        let path = crate::js::platform_objects::build_path_from_target_js_object(&reflector, ec);
+        self.element
+            .node
+            .event_target
+            .dispatch_event(&domain_event, &path, ec)?;
+
+        // Step 5: Unset this element's click in progress flag.
+        self.click_in_progress_flag.set(false);
+        Ok(())
     }
 }
 

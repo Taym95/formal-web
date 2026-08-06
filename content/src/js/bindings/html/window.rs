@@ -7,7 +7,7 @@ use crate::html::{
     safe_passing_of_structured_data::StructuredCloneOptions,
     window_computed_style_properties_for_element,
 };
-use crate::js::bindings::dom::global_event_handlers::define_global_event_handlers;
+use crate::js::bindings::html::global_event_handlers::define_global_event_handlers;
 use crate::js::platform_objects;
 use crate::webidl::bindings::{
     AttributeDef, InterfaceDefinition, OperationDef, WebIdlInterface, create_interface_instance,
@@ -425,9 +425,6 @@ fn get_computed_style_method(
             Some(o) => o,
             None => return Err(err_object),
         };
-        // Element subtypes are distinct platform objects; resolve through the
-        // shared element downcast chain so HTMLElement/input/anchor receivers
-        // work, not just plain Element.
         let receiver = <crate::js::Types as JsTypes>::value_from_object(object.clone());
         let element = crate::js::bindings::dom::try_with_element_ref(&receiver, ec, |element| {
             element.clone()

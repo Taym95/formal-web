@@ -7,6 +7,7 @@ type JsObject = <Types as JsTypes>::JsObject;
 use log::error;
 pub(crate) mod dispatch;
 mod environment_settings_object;
+pub(crate) mod event_handler;
 mod global_scope;
 mod html_anchor_element;
 mod html_dom_tree;

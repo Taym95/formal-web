@@ -4,7 +4,7 @@ use std::rc::Rc;
 type JsValue = <crate::js::Types as JsTypes>::JsValue;
 
 use crate::dom::Document;
-use crate::js::bindings::dom::global_event_handlers::define_global_event_handlers;
+use crate::js::bindings::html::global_event_handlers::define_global_event_handlers;
 use crate::js::platform_objects::{
     document_object, invalidate_cached_node_ids, resolve_element_object,
     resolve_or_create_text_node_object,

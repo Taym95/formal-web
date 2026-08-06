@@ -155,6 +155,21 @@ prototype-to-parent and constructor-to-parent linkages are done by explicit
 `build_context.rs`.  Each new type that inherits from an existing interface
 must have the corresponding wiring lines.
 
+## Event platform-object downcast convention
+
+Every Event platform-object type (Event itself and its subclasses UIEvent,
+MouseEvent, …) embeds the base `Event` — `Event` is the type itself, subclasses
+carry it as an `event` field (possibly through their parent chain).  Each type
+implements `crate::dom::event::HasEvent` (`event()` / `event_mut()`), and
+`crate::js::downcast::event_from_js_object` walks the known types once.  Code
+that needs the embedded `Event` from a JS object calls that helper; it must
+**not** hand-roll its own downcast chain.  When adding a new Event subclass,
+embed the parent type (which embeds `Event`), implement `HasEvent`, and add an
+arm to `event_from_js_object`.
+
+The UI Events spec types (UIEvent, MouseEvent) live in `content/src/ui_events/`,
+not `content/src/dom/` — spec code is placed by which spec it implements.
+
 ## Related
 
 - `content/src/webidl/README.md` — platform-object integration and exotic-object backend notes

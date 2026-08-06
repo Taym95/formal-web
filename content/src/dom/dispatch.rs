@@ -23,10 +23,7 @@ pub(crate) struct EventPathItem {
     /// <https://dom.spec.whatwg.org/#event-path-shadow-adjusted-target>
     pub(crate) shadow_adjusted_target: Option<EventTarget>,
 
-    /// <https://html.spec.whatwg.org/#activation-behavior>
-    /// Whether the invocation target has activation behavior (an anchor with
-    /// an href). Set by the path builders; the dispatch runs it for untrusted
-    /// and trusted click events alike.
+    /// <https://dom.spec.whatwg.org/#eventtarget-activation-behavior>
     pub(crate) has_activation_behavior: bool,
 }
 
@@ -158,11 +155,11 @@ pub(crate) fn dispatch_event(
     // Step 3: Let activationTarget be null.
     // Step 6.5: If isActivationEvent is true and target has activation behavior,
     //           then set activationTarget to target.
+    // Step 6.9.6.1: If isActivationEvent is true, event's bubbles attribute is
+    //               true, activationTarget is null, and parent has activation
+    //               behavior, then set activationTarget to parent.
     let activation_target_idx = if event.type_ == "click" {
-        // Only check the first path entry (the target per step 6.3).
-        path.first()
-            .filter(|entry| entry.has_activation_behavior)
-            .map(|_| 0)
+        path.iter().position(|entry| entry.has_activation_behavior)
     } else {
         None
     };
@@ -217,9 +214,21 @@ pub(crate) fn dispatch_event(
 
     // Step 12: If activationTarget is non-null:
     if activation_target_idx.is_some() {
+        if dispatch_debug_enabled() && event.type_ == "click" {
+            trace!(
+                "[input-debug][dispatch] step12 activationTarget set; canceled={}",
+                canceled,
+            );
+        }
         // Step 12.1: If event's canceled flag is unset, then run
         //            activationTarget's activation behavior with event.
         if !canceled {
+            if dispatch_debug_enabled() && event.type_ == "click" {
+                trace!(
+                    "[input-debug][dispatch] step12.1 running activation behavior (path len {})",
+                    path.len(),
+                );
+            }
             // The activation behavior lives in the JS layer (it resolves the
             // element from the path item's reflector and needs the realm's
             // global scope for the navigation context).

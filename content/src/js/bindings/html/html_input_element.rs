@@ -59,20 +59,10 @@ fn get_type(
     let obj = crate::js::Types::value_as_object(this)
         .ok_or_else(|| ec.new_type_error("expected object"))?;
     let err = ec.new_type_error("expected HTMLInputElement");
-    // "On getting, it must return the value of the content attribute,
-    // lowercased." The content attribute defaults to "text" when absent.
-    // Note: The content attribute defaults to "text" when absent.
     let type_ = ec
         .with_object_any(&obj)
         .and_then(|data| data.downcast_ref::<HTMLInputElement>())
-        .map(|input| {
-            input
-                .html_element
-                .element
-                .get_attribute("type")
-                .unwrap_or_else(|| "text".to_owned())
-                .to_ascii_lowercase()
-        })
+        .map(|input| input.type_())
         .ok_or(err)?;
     Ok(ec.value_from_string(ec.js_string_from_str(&type_)))
 }
@@ -94,16 +84,7 @@ fn set_type(
         .with_object_any(&obj)
         .and_then(|data| data.downcast_ref::<HTMLInputElement>())
         .ok_or(err)?;
-    // "On setting, if the value is an ASCII case-insensitive match for the
-    // string \"text\", then it must remove the content attribute."
-    if value.eq_ignore_ascii_case("text") {
-        input.html_element.element.remove_attribute("type");
-    } else {
-        input
-            .html_element
-            .element
-            .set_attribute("type", &value.to_ascii_lowercase());
-    }
+    input.set_type(&value);
     Ok(ec.value_undefined())
 }
 

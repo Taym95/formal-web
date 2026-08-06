@@ -1,9 +1,8 @@
+use crate::js::bindings::dom::event::init_flag;
+use crate::ui_events::{MouseEvent, MouseEventInit};
 type JsValue = <crate::js::Types as JsTypes>::JsValue;
 
-use crate::dom::{Event, MouseEvent, UIEvent};
 use crate::webidl::bindings::{AttributeDef, InterfaceDefinition, WebIdlInterface};
-
-use super::event::init_flag;
 
 use js_engine::{Completion, ExecutionContext, JsTypes};
 
@@ -33,7 +32,7 @@ fn init_number(
         let property_key = ec.property_key_from_str(key);
         let value = ExecutionContext::get(ec, object, property_key)?;
         if !crate::js::Types::value_is_undefined(&value) {
-            return Ok(ec.to_number(value)?);
+            return ec.to_number(value);
         }
     }
     Ok(default)
@@ -67,42 +66,28 @@ impl WebIdlInterface<crate::js::Types> for MouseEvent {
         ec: &mut dyn ExecutionContext<crate::js::Types>,
     ) -> Completion<Self, crate::js::Types> {
         let undefined = ec.value_undefined();
-        // Step 1: "Let e be the result of creating a new event..."
         let type_ = ec.to_rust_string(args.first().cloned().unwrap_or(undefined))?;
         let init = args.get(1).cloned().unwrap_or(ec.value_undefined());
-        // Step 2: "Initialize the event's type attribute to type."
-        // Step 3: "Initialize the event's bubbles, cancelable, and composed
-        // attributes to the values in eventInitDict."
-        // Note: The mouse-event initialization dictionary fields (coordinate
-        // and modifier values) are read directly below; the UI Events
-        // "initialize the mouse event" sub-steps are collapsed into the
-        // struct construction.
-        let detail = init_number(&init, ec, "detail", 0.0)? as i32;
-        Ok(MouseEvent {
-            ui_event: UIEvent {
-                event: Event::new(
-                    type_,
-                    init_flag(&init, "bubbles", ec)?,
-                    init_flag(&init, "cancelable", ec)?,
-                    init_flag(&init, "composed", ec)?,
-                    false,
-                    0.0,
-                    ec,
-                ),
-                view: None,
-                detail,
+        Ok(MouseEvent::new(
+            type_,
+            MouseEventInit {
+                bubbles: init_flag(&init, "bubbles", ec)?,
+                cancelable: init_flag(&init, "cancelable", ec)?,
+                composed: init_flag(&init, "composed", ec)?,
+                detail: init_number(&init, ec, "detail", 0.0)? as i32,
+                screen_x: init_number(&init, ec, "screenX", 0.0)?,
+                screen_y: init_number(&init, ec, "screenY", 0.0)?,
+                client_x: init_number(&init, ec, "clientX", 0.0)?,
+                client_y: init_number(&init, ec, "clientY", 0.0)?,
+                button: init_number(&init, ec, "button", 0.0)? as i16,
+                buttons: init_number(&init, ec, "buttons", 0.0)? as u16,
+                ctrl_key: init_flag_bool(&init, ec, "ctrlKey")?,
+                shift_key: init_flag_bool(&init, ec, "shiftKey")?,
+                alt_key: init_flag_bool(&init, ec, "altKey")?,
+                meta_key: init_flag_bool(&init, ec, "metaKey")?,
             },
-            screen_x: init_number(&init, ec, "screenX", 0.0)?,
-            screen_y: init_number(&init, ec, "screenY", 0.0)?,
-            client_x: init_number(&init, ec, "clientX", 0.0)?,
-            client_y: init_number(&init, ec, "clientY", 0.0)?,
-            button: init_number(&init, ec, "button", 0.0)? as i16,
-            buttons: init_number(&init, ec, "buttons", 0.0)? as u16,
-            ctrl_key: init_flag_bool(&init, ec, "ctrlKey")?,
-            shift_key: init_flag_bool(&init, ec, "shiftKey")?,
-            alt_key: init_flag_bool(&init, ec, "altKey")?,
-            meta_key: init_flag_bool(&init, ec, "metaKey")?,
-        })
+            ec,
+        ))
     }
 
     fn define_members(def: &mut InterfaceDefinition<crate::js::Types>) {

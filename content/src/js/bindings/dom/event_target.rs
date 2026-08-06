@@ -2,6 +2,7 @@ type JsValue = <crate::js::Types as JsTypes>::JsValue;
 type JsObject = <crate::js::Types as JsTypes>::JsObject;
 
 use crate::dom::EventTarget;
+use crate::js::downcast::event_from_js_object;
 use crate::js::try_with_event_target_mut;
 use crate::webidl::{
     callback_interface_type_value, convert_boolean_or_add_event_listener_options, nullable_value,
@@ -127,19 +128,7 @@ fn dispatch_event(
         Some(obj) => obj,
         None => return Err(ec.new_type_error("dispatchEvent requires an Event")),
     };
-    let event: crate::dom::Event = ec
-        .with_object_any(&event_obj)
-        .and_then(|data| {
-            if let Some(event) = data.downcast_ref::<crate::dom::Event>() {
-                Some(event.clone())
-            } else if let Some(ui_event) = data.downcast_ref::<crate::dom::UIEvent>() {
-                Some(ui_event.event.clone())
-            } else if let Some(mouse_event) = data.downcast_ref::<crate::dom::MouseEvent>() {
-                Some(mouse_event.ui_event.event.clone())
-            } else {
-                None
-            }
-        })
+    let event: crate::dom::Event = event_from_js_object(ec, &event_obj)
         .ok_or_else(|| ec.new_type_error("dispatchEvent: event_obj is not an Event"))?;
 
     let target_object = current_event_target_object(this, ec);

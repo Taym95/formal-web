@@ -9,9 +9,7 @@ use crate::html::{
     HTMLAnchorElement, HTMLElement, HTMLIFrameElement, HTMLInputElement, HTMLMediaElement,
     HTMLVideoElement, inline_style_properties_for_element,
 };
-use crate::webidl::bindings::{
-    AttributeDef, InterfaceDefinition, OperationDef, WebIdlInterface, create_interface_instance,
-};
+use crate::webidl::bindings::{AttributeDef, InterfaceDefinition, OperationDef, WebIdlInterface};
 
 use js_engine::{Completion, ExecutionContext, JsTypes};
 
@@ -105,27 +103,30 @@ fn click_method(
     _args: &[JsValue],
     ec: &mut dyn ExecutionContext<Types>,
 ) -> Completion<JsValue, Types> {
-    // Step 1: "If this element is a form control that is disabled, then return."
-    // Note: Disabled form-control state is not modeled, so the check is skipped.
     let object = Types::value_as_object(this)
         .ok_or_else(|| ec.new_type_error("click receiver is not an object"))?;
-
-    // Step 2: "Fire a synthetic pointer event named click at this element, with
-    // the not trusted flag set..."
-    // Note: A plain "click" Event is dispatched rather than a synthetic
-    // PointerEvent; the dispatch path applies activation behavior to it.
-    let event = crate::dom::Event::new("click".into(), true, true, true, false, 0.0, ec);
-    let event_object = create_interface_instance::<Types, crate::dom::Event>(event, ec)?;
-    let domain_event = ec
-        .with_object_any(&event_object)
-        .and_then(|data| data.downcast_ref::<crate::dom::Event>().cloned())
-        .ok_or_else(|| ec.new_type_error("click event construction failed"))?;
-
-    let path = crate::js::platform_objects::build_path_from_target_js_object(&object, ec);
-    let target_value = Types::value_from_object(object.clone());
-    let target =
-        crate::js::try_with_event_target_mut(&target_value, ec, |target, _ec| target.clone())?;
-    target.dispatch_event(&domain_event, &path, ec)?;
+    // Clone the HTMLElement out of the object registry so the domain method
+    // can use `ec` (it creates and dispatches the click event).
+    let html_element = ec.with_object_any(&object).and_then(|data| {
+        data.downcast_ref::<HTMLElement>()
+            .cloned()
+            .or_else(|| {
+                data.downcast_ref::<HTMLAnchorElement>()
+                    .map(|anchor| anchor.html_element.clone())
+            })
+            .or_else(|| {
+                data.downcast_ref::<HTMLInputElement>()
+                    .map(|input| input.html_element.clone())
+            })
+            .or_else(|| {
+                data.downcast_ref::<HTMLIFrameElement>()
+                    .map(|iframe| iframe.html_element.clone())
+            })
+    });
+    let Some(html_element) = html_element else {
+        return Err(ec.new_type_error("receiver is not an HTMLElement"));
+    };
+    html_element.click(ec)?;
     Ok(ec.value_undefined())
 }
 

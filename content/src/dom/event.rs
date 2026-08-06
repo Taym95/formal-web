@@ -1,5 +1,3 @@
-use blitz_traits::events::{DomEvent, EventState};
-
 use crate::js::Types;
 use crate::webidl::Callback;
 use js_engine::gc::{GcCell, gc_cell_new};
@@ -59,7 +57,7 @@ pub struct EventTarget {
     /// <https://dom.spec.whatwg.org/#eventtarget-event-listener-list>
     pub(crate) event_listener_list: GcCell<Vec<EventListener>>,
 
-    /// <https://html.spec.whatwg.org/#event-handler-idl-attributes>
+    /// <https://html.spec.whatwg.org/#event-handler-map>
     event_handlers: GcCell<Vec<(String, Callback)>>,
 
     #[ignore_trace]
@@ -103,6 +101,25 @@ impl EventTarget {
         if let Some(callback) = callback {
             handlers.push((type_.to_owned(), callback));
         }
+    }
+}
+
+/// Every Event platform-object type embeds the base `Event` (as a field or
+/// through its parent chain); this trait exposes it so the JS layer can
+/// downcast any Event subclass to its embedded `Event` in one place.
+pub(crate) trait HasEvent {
+    fn event(&self) -> &Event;
+
+    fn event_mut(&mut self) -> &mut Event;
+}
+
+impl HasEvent for Event {
+    fn event(&self) -> &Event {
+        self
+    }
+
+    fn event_mut(&mut self) -> &mut Event {
+        self
     }
 }
 
@@ -469,162 +486,6 @@ impl Event {
     pub(crate) fn prevent_default(&self, ec: &mut dyn ExecutionContext<Types>) {
         if *self.cancelable.borrow(ec) && !*self.in_passive_listener_flag.borrow(ec) {
             *self.canceled_flag.borrow_mut(ec) = true;
-        }
-    }
-}
-
-/// <https://w3c.github.io/uievents/#interface-uievent>
-#[gc_struct]
-pub struct UIEvent {
-    /// <https://dom.spec.whatwg.org/#event>
-    pub event: Event,
-
-    /// <https://w3c.github.io/uievents/#dom-uievent-view>
-    pub view: Option<JsObject>,
-
-    /// <https://w3c.github.io/uievents/#dom-uievent-detail>
-    #[ignore_trace]
-    pub detail: i32,
-}
-
-/// <https://w3c.github.io/uievents/#interface-mouseevent>
-#[gc_struct]
-pub struct MouseEvent {
-    /// <https://w3c.github.io/uievents/#interface-uievent>
-    pub ui_event: UIEvent,
-
-    /// <https://w3c.github.io/uievents/#dom-mouseevent-screenx>
-    #[ignore_trace]
-    pub screen_x: f64,
-
-    /// <https://w3c.github.io/uievents/#dom-mouseevent-screeny>
-    #[ignore_trace]
-    pub screen_y: f64,
-
-    /// <https://w3c.github.io/uievents/#dom-mouseevent-clientx>
-    #[ignore_trace]
-    pub client_x: f64,
-
-    /// <https://w3c.github.io/uievents/#dom-mouseevent-clienty>
-    #[ignore_trace]
-    pub client_y: f64,
-
-    /// <https://w3c.github.io/uievents/#dom-mouseevent-button>
-    #[ignore_trace]
-    pub button: i16,
-
-    /// <https://w3c.github.io/uievents/#dom-mouseevent-buttons>
-    #[ignore_trace]
-    pub buttons: u16,
-
-    /// <https://w3c.github.io/uievents/#dom-mouseevent-ctrlkey>
-    #[ignore_trace]
-    pub ctrl_key: bool,
-
-    /// <https://w3c.github.io/uievents/#dom-mouseevent-shiftkey>
-    #[ignore_trace]
-    pub shift_key: bool,
-
-    /// <https://w3c.github.io/uievents/#dom-mouseevent-altkey>
-    #[ignore_trace]
-    pub alt_key: bool,
-
-    /// <https://w3c.github.io/uievents/#dom-mouseevent-metakey>
-    #[ignore_trace]
-    pub meta_key: bool,
-}
-
-impl MouseEvent {
-    /// <https://w3c.github.io/uievents/#dom-mouseevent-clientx>
-    pub(crate) fn client_x_value(&self) -> f64 {
-        self.client_x
-    }
-
-    /// <https://w3c.github.io/uievents/#dom-mouseevent-clienty>
-    pub(crate) fn client_y_value(&self) -> f64 {
-        self.client_y
-    }
-
-    /// <https://w3c.github.io/uievents/#dom-mouseevent-screenx>
-    pub(crate) fn screen_x_value(&self) -> f64 {
-        self.screen_x
-    }
-
-    /// <https://w3c.github.io/uievents/#dom-mouseevent-screeny>
-    pub(crate) fn screen_y_value(&self) -> f64 {
-        self.screen_y
-    }
-
-    /// <https://w3c.github.io/uievents/#dom-mouseevent-button>
-    pub(crate) fn button_value(&self) -> i16 {
-        self.button
-    }
-
-    /// <https://w3c.github.io/uievents/#dom-mouseevent-buttons>
-    pub(crate) fn buttons_value(&self) -> u16 {
-        self.buttons
-    }
-
-    /// <https://w3c.github.io/uievents/#dom-mouseevent-ctrlkey>
-    pub(crate) fn ctrl_key_value(&self) -> bool {
-        self.ctrl_key
-    }
-
-    /// <https://w3c.github.io/uievents/#dom-mouseevent-shiftkey>
-    pub(crate) fn shift_key_value(&self) -> bool {
-        self.shift_key
-    }
-
-    /// <https://w3c.github.io/uievents/#dom-mouseevent-altkey>
-    pub(crate) fn alt_key_value(&self) -> bool {
-        self.alt_key
-    }
-
-    /// <https://w3c.github.io/uievents/#dom-mouseevent-metakey>
-    pub(crate) fn meta_key_value(&self) -> bool {
-        self.meta_key
-    }
-}
-
-impl UIEvent {
-    pub fn from_dom_event(
-        dom_event: &DomEvent,
-        view: Option<JsObject>,
-        time_stamp: f64,
-        ec: &mut dyn ExecutionContext<Types>,
-    ) -> Self {
-        Self {
-            event: Event::new(
-                dom_event.name().to_owned(),
-                dom_event.bubbles,
-                dom_event.cancelable,
-                false,
-                true,
-                time_stamp,
-                ec,
-            ),
-            view,
-            detail: 0,
-        }
-    }
-
-    /// <https://w3c.github.io/uievents/#dom-uievent-view>
-    pub(crate) fn view_value(&self) -> Option<JsObject> {
-        self.view.clone()
-    }
-
-    /// <https://w3c.github.io/uievents/#dom-uievent-detail>
-    pub(crate) fn detail_value(&self) -> i32 {
-        self.detail
-    }
-
-    pub fn apply_to_event_state(
-        &self,
-        event_state: &mut EventState,
-        ec: &mut dyn ExecutionContext<Types>,
-    ) {
-        if *self.event.canceled_flag.borrow(ec) {
-            event_state.prevent_default();
         }
     }
 }

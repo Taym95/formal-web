@@ -86,8 +86,7 @@ fn setup_realm(engine: &mut Engine, _document: Rc<RefCell<BaseDocument>>) -> Res
     #[cfg(not(boa_backend))]
     let document = _document;
     use crate::dom::{
-        AbortController, AbortSignal, DOMException, Document, Element, Event, EventTarget,
-        MouseEvent, Node, UIEvent,
+        AbortController, AbortSignal, DOMException, Document, Element, Event, EventTarget, Node,
     };
     #[cfg(not(boa_backend))]
     use crate::html::GlobalScope;
@@ -102,6 +101,7 @@ fn setup_realm(engine: &mut Engine, _document: Rc<RefCell<BaseDocument>>) -> Res
         TransformStreamDefaultController, WritableStream, WritableStreamDefaultController,
         WritableStreamDefaultWriter,
     };
+    use crate::ui_events::{MouseEvent, UIEvent};
     use crate::webidl::bindings::{
         get_registry_prototype, initialize_registry, register_interface_spec,
         wire_registry_constructor_prototype, wire_registry_prototype,
