@@ -5,6 +5,8 @@ mod dom_exception;
 mod element;
 mod event;
 mod event_target;
+pub(crate) mod global_event_handlers;
+mod mouse_event;
 mod node;
 mod ui_event;
 

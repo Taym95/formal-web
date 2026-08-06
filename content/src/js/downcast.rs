@@ -4,7 +4,7 @@
 //! to extract native Rust data from JavaScript platform objects.
 
 use crate::dom::{
-    AbortController, AbortSignal, Document, Element, Event, EventTarget, Node, UIEvent,
+    AbortController, AbortSignal, Document, Element, Event, EventTarget, MouseEvent, Node, UIEvent,
 };
 use crate::html::{
     HTMLAnchorElement, HTMLElement, HTMLIFrameElement, HTMLInputElement, HTMLMediaElement,
@@ -140,6 +140,8 @@ pub(crate) fn try_set_event_target_reflector(
                     ec.store_js_object(&mut event.reflector, reflector);
                 } else if let Some(ui_event) = data.downcast_mut::<UIEvent>() {
                     ec.store_js_object(&mut ui_event.event.reflector, reflector);
+                } else if let Some(mouse_event) = data.downcast_mut::<MouseEvent>() {
+                    ec.store_js_object(&mut mouse_event.ui_event.event.reflector, reflector);
                 }
             }),
         );
@@ -159,6 +161,24 @@ pub(crate) fn event_target_from_js_object(
             Some(element.node.event_target.clone())
         } else if let Some(html_element) = data.downcast_ref::<HTMLElement>() {
             Some(html_element.element.node.event_target.clone())
+        } else if let Some(anchor) = data.downcast_ref::<HTMLAnchorElement>() {
+            Some(anchor.html_element.element.node.event_target.clone())
+        } else if let Some(iframe) = data.downcast_ref::<HTMLIFrameElement>() {
+            Some(iframe.html_element.element.node.event_target.clone())
+        } else if let Some(input) = data.downcast_ref::<HTMLInputElement>() {
+            Some(input.html_element.element.node.event_target.clone())
+        } else if let Some(media) = data.downcast_ref::<HTMLMediaElement>() {
+            Some(media.html_element.element.node.event_target.clone())
+        } else if let Some(video) = data.downcast_ref::<HTMLVideoElement>() {
+            Some(
+                video
+                    .media_element
+                    .html_element
+                    .element
+                    .node
+                    .event_target
+                    .clone(),
+            )
         } else if let Some(node) = data.downcast_ref::<Node>() {
             Some(node.event_target.clone())
         } else if let Some(event_target) = data.downcast_ref::<EventTarget>() {

@@ -82,6 +82,80 @@ No JsObject appears in path items.
 Types that currently use `&mut self` for mutation but could use `GcCell` + `&self`:
 
 - **Node** — `child_node_ids` is read-only; other mutating methods could use GcCell.
-- **Window** — `onload`, `setTimeout` callbacks stored behind GcCell.
+- **Window** — `setTimeout` callbacks stored behind GcCell.
 - **Streams** — writable/readable stream state machines use `Cell<bool>`/`RefCell`; some could use GcCell for GC-traced callback fields.
 - **AbortSignal** — already uses `GcCell<AbortSignalState>` at the top level; internal fields like `onabort` could move to GcCell if needed.
+
+## Session investigation log
+
+### 2026-08-06 — React app crashes: stylo panic + missing DOM APIs
+
+Investigation of running a production React 19 todo app (artifacts/todo-app) in
+formal-web; the app crashed the content process at load with a nondeterministic
+stylo panic, then, after the panic was fixed, failed on several missing DOM APIs.
+
+**Files changed:**
+
+- content/src/dom/element.rs — snapshot suppression on unstyled elements (fixes
+  the stylo panic); added `Element::closest`.
+- content/src/js/bindings/dom/node.rs — added `HTMLInputElement`/`HTMLMediaElement`/
+  `HTMLVideoElement` arms to `try_with_node_ref` and `appendable_node`.
+- content/src/js/downcast.rs, content/src/js/platform_objects.rs — added the same
+  arms to `event_target_from_js_object`, `build_path_from_target_js_object`, and
+  `try_set_event_target_reflector`.
+- content/src/dom/event.rs — added `EventTarget` event-handler storage and the
+  `MouseEvent` domain type.
+- content/src/js/bindings/dom/global_event_handlers.rs (new) — `on*` IDL
+  attributes for `Element`, `Document`, `Window`.
+- content/src/js/bindings/dom/mouse_event.rs (new) — `MouseEvent` interface.
+- content/src/js/bindings/dom/event.rs, event_target.rs — `MouseEvent`/`UIEvent`
+  downcast arms in `with_event_ref` and `dispatchEvent`.
+- content/src/js/bindings/html/html_input_element.rs — `input.type`.
+- content/src/js/bindings/html/html_element.rs — `HTMLElement.click()`.
+- content/src/js/build_context.rs — registered `MouseEvent`.
+- content/src/html/window.rs, content/src/js/bindings/html/window.rs — removed the
+  bespoke `window.onload` storage; the global handler covers it.
+
+**Instrumentation added:** temporary backtrace printing in the content panic hook
+(content/src/bin/content_process.rs, since reverted) and an `input`-event arm in
+the dispatch debug trace (content/src/dom/dispatch.rs, since reverted).
+
+**What was confirmed:**
+
+- The panic was `ElementStyles::primary()` unwrap of `None` inside stylo's style
+  traversal (`TreeStyleInvalidator::invalidate_descendants` ->
+  `should_process_descendants`), reached when a freshly JS-created element had a
+  recorded attribute snapshot but no computed primary style. blitz's
+  `set_attribute` snapshots unconditionally, including for never-styled elements.
+  Content-side fix: after `set_attribute`/`clear_attribute`, mark the snapshot
+  handled when `primary_styles().is_none()` — the element is then styled from its
+  current attributes instead. 20/20 stress runs clean after the fix.
+- `appendChild(input)` threw "appendChild requires a Node": the downcast
+  whitelists in the Node bindings omitted `HTMLInputElement` (and media/video),
+  aborting React's commit mid-tree. Fixed in node.rs.
+- Events dispatched on an `<input>` never reached ancestor listeners: the event
+  path builders omitted the same types. Fixed in platform_objects.rs/downcast.rs.
+- React's `onChange` never fired because `"oninput" in document` was false (no
+  `on*` IDL attributes), forcing React onto a keydown/keyup-only polyfill. Fixed
+  by the GlobalEventHandlers attributes. A second blocker was `input.type`
+  missing, which made `isTextInputElement` return false.
+- `HTMLElement.click()` and `Element.prototype.closest` were absent; `MouseEvent`
+  was not registered. All added.
+- `new MouseEvent(...)` dispatched to no listeners until
+  `try_set_event_target_reflector` gained a MouseEvent arm — without it the inner
+  Event's reflector is never set and `inner_invoke` skips the callback.
+
+**What was ruled out:**
+
+- The stylo panic was not caused by the page's CSS or markup (static equivalents
+  rendered fine) and not by React's event system; it reproduced with plain JS DOM
+  building (jsmount probe) and only with JS-created, attribute-set elements.
+- `MessageChannel`, `queueMicrotask`, `Element.prototype.contains`, and
+  `compareDocumentPosition` are absent but React degrades gracefully around all
+  of them (scheduler falls back to Promise/setTimeout; `containsNode` returns
+  false). No fix needed.
+
+**Not investigated:** whether real keyboard input (blitz editor path) fires
+`input` events that reach React's onChange — the JS pipeline was verified by
+clearing the value tracker and dispatching; the editor-driven path was not
+exercised end-to-end.

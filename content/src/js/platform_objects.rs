@@ -8,7 +8,7 @@ use html5ever::{local_name, ns};
 use crate::dom::{Document, Element, EventPathItem, Node};
 use crate::html::{
     GlobalScope, HTMLAnchorElement, HTMLElement, HTMLIFrameElement, HTMLInputElement,
-    HTMLVideoElement, Window,
+    HTMLMediaElement, HTMLVideoElement, Window,
 };
 use crate::js::downcast::event_target_from_js_object;
 use crate::webidl::bindings::create_interface_instance;
@@ -273,6 +273,37 @@ pub(crate) fn build_path_from_target_js_object(
             Some((
                 html_element.element.node.node_id,
                 html_element.element.node.document.clone(),
+            ))
+        } else if let Some(anchor) = data.downcast_ref::<HTMLAnchorElement>() {
+            Some((
+                anchor.html_element.element.node.node_id,
+                anchor.html_element.element.node.document.clone(),
+            ))
+        } else if let Some(iframe) = data.downcast_ref::<HTMLIFrameElement>() {
+            Some((
+                iframe.html_element.element.node.node_id,
+                iframe.html_element.element.node.document.clone(),
+            ))
+        } else if let Some(input) = data.downcast_ref::<HTMLInputElement>() {
+            Some((
+                input.html_element.element.node.node_id,
+                input.html_element.element.node.document.clone(),
+            ))
+        } else if let Some(media) = data.downcast_ref::<HTMLMediaElement>() {
+            Some((
+                media.html_element.element.node.node_id,
+                media.html_element.element.node.document.clone(),
+            ))
+        } else if let Some(video) = data.downcast_ref::<HTMLVideoElement>() {
+            Some((
+                video.media_element.html_element.element.node.node_id,
+                video
+                    .media_element
+                    .html_element
+                    .element
+                    .node
+                    .document
+                    .clone(),
             ))
         } else if let Some(node) = data.downcast_ref::<Node>() {
             Some((node.node_id, node.document.clone()))

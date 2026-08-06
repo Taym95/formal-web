@@ -59,6 +59,9 @@ pub struct EventTarget {
     /// <https://dom.spec.whatwg.org/#eventtarget-event-listener-list>
     pub(crate) event_listener_list: GcCell<Vec<EventListener>>,
 
+    /// <https://html.spec.whatwg.org/#event-handler-idl-attributes>
+    event_handlers: GcCell<Vec<(String, Callback)>>,
+
     #[ignore_trace]
     next_listener_id: Cell<u64>,
 }
@@ -68,7 +71,37 @@ impl EventTarget {
         Self {
             reflector: None,
             event_listener_list: gc_cell_new(Vec::new(), ec),
+            event_handlers: gc_cell_new(Vec::new(), ec),
             next_listener_id: Cell::new(0),
+        }
+    }
+}
+
+impl EventTarget {
+    /// <https://html.spec.whatwg.org/#getting-the-current-value-of-the-event-handler>
+    pub(crate) fn event_handler_value(
+        &self,
+        type_: &str,
+        ec: &mut dyn ExecutionContext<Types>,
+    ) -> Option<Callback> {
+        self.event_handlers
+            .borrow(ec)
+            .iter()
+            .find(|(handler_type, _)| handler_type == type_)
+            .map(|(_, callback)| callback.clone())
+    }
+
+    /// <https://html.spec.whatwg.org/#event-handler-idl-attributes>
+    pub(crate) fn set_event_handler_value(
+        &self,
+        type_: &str,
+        callback: Option<Callback>,
+        ec: &mut dyn ExecutionContext<Types>,
+    ) {
+        let mut handlers = self.event_handlers.borrow_mut(ec);
+        handlers.retain(|(handler_type, _)| handler_type != type_);
+        if let Some(callback) = callback {
+            handlers.push((type_.to_owned(), callback));
         }
     }
 }
@@ -462,6 +495,105 @@ pub struct UIEvent {
     /// <https://w3c.github.io/uievents/#dom-uievent-detail>
     #[ignore_trace]
     pub detail: i32,
+}
+
+/// <https://w3c.github.io/uievents/#interface-mouseevent>
+#[gc_struct]
+pub struct MouseEvent {
+    /// <https://w3c.github.io/uievents/#interface-uievent>
+    pub ui_event: UIEvent,
+
+    /// <https://w3c.github.io/uievents/#dom-mouseevent-screenx>
+    #[ignore_trace]
+    pub screen_x: f64,
+
+    /// <https://w3c.github.io/uievents/#dom-mouseevent-screeny>
+    #[ignore_trace]
+    pub screen_y: f64,
+
+    /// <https://w3c.github.io/uievents/#dom-mouseevent-clientx>
+    #[ignore_trace]
+    pub client_x: f64,
+
+    /// <https://w3c.github.io/uievents/#dom-mouseevent-clienty>
+    #[ignore_trace]
+    pub client_y: f64,
+
+    /// <https://w3c.github.io/uievents/#dom-mouseevent-button>
+    #[ignore_trace]
+    pub button: i16,
+
+    /// <https://w3c.github.io/uievents/#dom-mouseevent-buttons>
+    #[ignore_trace]
+    pub buttons: u16,
+
+    /// <https://w3c.github.io/uievents/#dom-mouseevent-ctrlkey>
+    #[ignore_trace]
+    pub ctrl_key: bool,
+
+    /// <https://w3c.github.io/uievents/#dom-mouseevent-shiftkey>
+    #[ignore_trace]
+    pub shift_key: bool,
+
+    /// <https://w3c.github.io/uievents/#dom-mouseevent-altkey>
+    #[ignore_trace]
+    pub alt_key: bool,
+
+    /// <https://w3c.github.io/uievents/#dom-mouseevent-metakey>
+    #[ignore_trace]
+    pub meta_key: bool,
+}
+
+impl MouseEvent {
+    /// <https://w3c.github.io/uievents/#dom-mouseevent-clientx>
+    pub(crate) fn client_x_value(&self) -> f64 {
+        self.client_x
+    }
+
+    /// <https://w3c.github.io/uievents/#dom-mouseevent-clienty>
+    pub(crate) fn client_y_value(&self) -> f64 {
+        self.client_y
+    }
+
+    /// <https://w3c.github.io/uievents/#dom-mouseevent-screenx>
+    pub(crate) fn screen_x_value(&self) -> f64 {
+        self.screen_x
+    }
+
+    /// <https://w3c.github.io/uievents/#dom-mouseevent-screeny>
+    pub(crate) fn screen_y_value(&self) -> f64 {
+        self.screen_y
+    }
+
+    /// <https://w3c.github.io/uievents/#dom-mouseevent-button>
+    pub(crate) fn button_value(&self) -> i16 {
+        self.button
+    }
+
+    /// <https://w3c.github.io/uievents/#dom-mouseevent-buttons>
+    pub(crate) fn buttons_value(&self) -> u16 {
+        self.buttons
+    }
+
+    /// <https://w3c.github.io/uievents/#dom-mouseevent-ctrlkey>
+    pub(crate) fn ctrl_key_value(&self) -> bool {
+        self.ctrl_key
+    }
+
+    /// <https://w3c.github.io/uievents/#dom-mouseevent-shiftkey>
+    pub(crate) fn shift_key_value(&self) -> bool {
+        self.shift_key
+    }
+
+    /// <https://w3c.github.io/uievents/#dom-mouseevent-altkey>
+    pub(crate) fn alt_key_value(&self) -> bool {
+        self.alt_key
+    }
+
+    /// <https://w3c.github.io/uievents/#dom-mouseevent-metakey>
+    pub(crate) fn meta_key_value(&self) -> bool {
+        self.meta_key
+    }
 }
 
 impl UIEvent {

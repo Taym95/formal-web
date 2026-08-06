@@ -7,7 +7,7 @@ use js_engine::ExecutionContext;
 use js_engine::gc_struct;
 use style::dom_apis::{
     MayUseInvalidation, QueryAll, QueryFirst, QuerySelectorAllResult,
-    query_selector as style_query_selector,
+    element_closest as style_element_closest, query_selector as style_query_selector,
 };
 
 use super::event::{EventTarget, EventTargetAccess};
@@ -153,6 +153,29 @@ impl Element {
             collect_subtree_node_ids(&document, child_id, &mut node_ids);
         }
         node_ids
+    }
+
+    /// <https://dom.spec.whatwg.org/#dom-element-closest>
+    pub(crate) fn closest(&self, selectors: &str) -> Result<Option<usize>, String> {
+        let document = self.node.document.borrow();
+        // Step 1: "Let s be the result of parsing selectors."
+        let selector_list = document
+            .try_parse_selector_list(selectors)
+            .map_err(|error| format!("invalid selector `{selectors}`: {error:?}"))?;
+
+        // Step 2: "Let elements be s's flat tree ancestors of this element, in
+        // order, ending with this element itself."
+        let Some(root_node) = document.get_node(self.node.node_id) else {
+            return Ok(None);
+        };
+        // Step 3: "For each element in elements: if element matches s, then
+        // return element."
+        let matched = style_element_closest::<&blitz_dom::Node>(
+            root_node,
+            &selector_list,
+            style::context::QuirksMode::NoQuirks,
+        );
+        Ok(matched.map(|node| node.id))
     }
 
     /// <https://dom.spec.whatwg.org/#dom-parentnode-queryselector>
@@ -393,17 +416,25 @@ impl Element {
     /// <https://dom.spec.whatwg.org/#dom-element-setattribute>
     pub(crate) fn set_attribute(&self, qualified_name: &str, value: &str) {
         let normalized_name = self.normalized_attribute_qualified_name(qualified_name);
-        let mut document = self.node.document.borrow_mut();
-        let mut mutator = document.mutate();
-        mutator.set_attribute(
-            self.node.node_id,
-            QualName {
-                prefix: None,
-                ns: "".into(),
-                local: LocalName::from(normalized_name.as_str()),
-            },
-            value,
-        );
+        {
+            let mut document = self.node.document.borrow_mut();
+            let mut mutator = document.mutate();
+            mutator.set_attribute(
+                self.node.node_id,
+                QualName {
+                    prefix: None,
+                    ns: "".into(),
+                    local: LocalName::from(normalized_name.as_str()),
+                },
+                value,
+            );
+        }
+        // Note: blitz's set_attribute records a stylo snapshot for descendant
+        // invalidation. On an element whose primary style has never been
+        // computed the snapshot makes the style traversal panic
+        // (ElementStyles::primary() unwraps a None primary). Mark it handled
+        // so the fresh element is styled from its current attributes instead.
+        Self::suppress_snapshot_on_unstyled_element(&self.node.document, self.node.node_id);
     }
 
     /// <https://dom.spec.whatwg.org/#dom-element-setattributens>
@@ -417,19 +448,27 @@ impl Element {
         // Note: The implementation accepts the already-stringified qualified name shape used by the targeted WPTs and does not yet implement the full validation-and-extraction error surface.
         let (prefix, local_name) = split_qualified_name(qualified_name);
 
-        let mut document = self.node.document.borrow_mut();
-        let mut mutator = document.mutate();
+        {
+            let mut document = self.node.document.borrow_mut();
+            let mut mutator = document.mutate();
 
-        // Step 3: "Set an attribute value for this using localName, verifiedValue, prefix, and namespace."
-        mutator.set_attribute(
-            self.node.node_id,
-            QualName {
-                prefix,
-                ns: namespace.unwrap_or_default().into(),
-                local: local_name,
-            },
-            value,
-        );
+            // Step 3: "Set an attribute value for this using localName, verifiedValue, prefix, and namespace."
+            mutator.set_attribute(
+                self.node.node_id,
+                QualName {
+                    prefix,
+                    ns: namespace.unwrap_or_default().into(),
+                    local: local_name,
+                },
+                value,
+            );
+        }
+        // Note: blitz's set_attribute records a stylo snapshot for descendant
+        // invalidation. On an element whose primary style has never been
+        // computed the snapshot makes the style traversal panic
+        // (ElementStyles::primary() unwraps a None primary). Mark it handled
+        // so the fresh element is styled from its current attributes instead.
+        Self::suppress_snapshot_on_unstyled_element(&self.node.document, self.node.node_id);
     }
 
     /// <https://dom.spec.whatwg.org/#dom-element-removeattribute>
@@ -457,5 +496,27 @@ impl Element {
         let mut document = self.node.document.borrow_mut();
         let mut mutator = document.mutate();
         mutator.clear_attribute(self.node.node_id, name);
+        drop(mutator);
+        drop(document);
+        // Note: blitz's clear_attribute records a stylo snapshot for descendant
+        // invalidation. On an element whose primary style has never been
+        // computed the snapshot makes the style traversal panic
+        // (ElementStyles::primary() unwraps a None primary). Mark it handled
+        // so the fresh element is styled from its current attributes instead.
+        Self::suppress_snapshot_on_unstyled_element(&self.node.document, self.node.node_id);
+    }
+
+    /// Mark a just-recorded stylo snapshot as handled when the element has no
+    /// computed primary style yet, so the style traversal skips descendant
+    /// invalidation for it (see set_attribute/remove_attribute notes above).
+    fn suppress_snapshot_on_unstyled_element(document: &Rc<RefCell<BaseDocument>>, node_id: usize) {
+        let document = document.borrow();
+        let Some(node) = document.get_node(node_id) else {
+            return;
+        };
+        if node.primary_styles().is_none() {
+            node.snapshot_handled
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
     }
 }

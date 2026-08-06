@@ -5,6 +5,7 @@ use crate::html::{
     HTMLAnchorElement, HTMLElement, HTMLIFrameElement, HTMLInputElement, HTMLMediaElement,
     HTMLVideoElement,
 };
+use crate::js::bindings::dom::global_event_handlers::define_global_event_handlers;
 use crate::js::platform_objects::{invalidate_cached_node_ids, resolve_element_object};
 use crate::webidl::bindings::{
     AttributeDef, InterfaceDefinition, OperationDef, WebIdlInterface, create_interface_instance,
@@ -20,6 +21,7 @@ impl WebIdlInterface<crate::js::Types> for Element {
     }
 
     fn define_members(def: &mut InterfaceDefinition<crate::js::Types>) {
+        define_global_event_handlers(def);
         // §3.7.6: Regular attributes
         def.add_attribute(AttributeDef {
             id: "id",
@@ -88,6 +90,15 @@ impl WebIdlInterface<crate::js::Types> for Element {
             id: "querySelectorAll",
             length: 1,
             method: query_selector_all,
+            static_: false,
+            unforgeable: false,
+            promise_type: false,
+            exposed: None,
+        });
+        def.add_operation(OperationDef {
+            id: "closest",
+            length: 1,
+            method: closest,
             static_: false,
             unforgeable: false,
             promise_type: false,
@@ -567,6 +578,24 @@ fn query_selector(
     let value_undefined = ec.value_undefined();
     let selector = ec.to_rust_string(args.first().cloned().unwrap_or(value_undefined.clone()))?;
     let node_id = try_with_element_ref(this, ec, |element| element.query_selector(&selector))?
+        .map_err(|error| ec.new_syntax_error(&error))?;
+    match node_id {
+        Some(node_id) => {
+            let obj = resolve_element_object(node_id, ec)?;
+            Ok(crate::js::Types::value_from_object(obj))
+        }
+        None => Ok(ec.value_null()),
+    }
+}
+
+fn closest(
+    this: &JsValue,
+    args: &[JsValue],
+    ec: &mut dyn ExecutionContext<crate::js::Types>,
+) -> Completion<JsValue, crate::js::Types> {
+    let value_undefined = ec.value_undefined();
+    let selector = ec.to_rust_string(args.first().cloned().unwrap_or(value_undefined.clone()))?;
+    let node_id = try_with_element_ref(this, ec, |element| element.closest(&selector))?
         .map_err(|error| ec.new_syntax_error(&error))?;
     match node_id {
         Some(node_id) => {

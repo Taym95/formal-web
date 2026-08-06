@@ -129,7 +129,17 @@ fn dispatch_event(
     };
     let event: crate::dom::Event = ec
         .with_object_any(&event_obj)
-        .and_then(|data| data.downcast_ref::<crate::dom::Event>().cloned())
+        .and_then(|data| {
+            if let Some(event) = data.downcast_ref::<crate::dom::Event>() {
+                Some(event.clone())
+            } else if let Some(ui_event) = data.downcast_ref::<crate::dom::UIEvent>() {
+                Some(ui_event.event.clone())
+            } else if let Some(mouse_event) = data.downcast_ref::<crate::dom::MouseEvent>() {
+                Some(mouse_event.ui_event.event.clone())
+            } else {
+                None
+            }
+        })
         .ok_or_else(|| ec.new_type_error("dispatchEvent: event_obj is not an Event"))?;
 
     let target_object = current_event_target_object(this, ec);

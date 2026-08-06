@@ -7,12 +7,12 @@ use crate::html::{
     safe_passing_of_structured_data::StructuredCloneOptions,
     window_computed_style_properties_for_element,
 };
+use crate::js::bindings::dom::global_event_handlers::define_global_event_handlers;
 use crate::js::platform_objects;
-use crate::js::try_with_event_target_mut;
 use crate::webidl::bindings::{
     AttributeDef, InterfaceDefinition, OperationDef, WebIdlInterface, create_interface_instance,
 };
-use crate::webidl::{callback_function_value, nullable_value};
+use crate::webidl::callback_function_value;
 
 use crate::dom::Element;
 
@@ -33,19 +33,7 @@ impl WebIdlInterface<crate::js::Types> for Window {
     }
 
     fn define_members(def: &mut InterfaceDefinition<crate::js::Types>) {
-        def.add_attribute(AttributeDef {
-            id: "onload",
-            getter: get_onload,
-            setter: Some(set_onload),
-            static_: false,
-            unforgeable: false,
-            promise_type: false,
-            legacy_lenient_this: false,
-            replaceable: false,
-            put_forwards: None,
-            legacy_lenient_setter: false,
-            exposed: None,
-        });
+        define_global_event_handlers(def);
         def.add_attribute(AttributeDef {
             id: "parent",
             getter: get_parent,
@@ -279,74 +267,6 @@ fn request_animation_frame_method(
         }),
     );
     Ok(ec.value_from_number(handle as f64))
-}
-
-fn get_onload(
-    this: &JsValue,
-    _: &[JsValue],
-    ec: &mut dyn ExecutionContext<crate::js::Types>,
-) -> Completion<JsValue, crate::js::Types> {
-    let window_object = current_window_object_from(this, ec);
-    let err = ec.new_type_error("receiver is not a Window");
-    let window = ec
-        .with_object_any(&window_object)
-        .and_then(|d| d.downcast_ref::<Window>())
-        .ok_or(err)?;
-    Ok(window
-        .onload_value()
-        .map(|callback| callback.to_js_value())
-        .unwrap_or_else(|| ec.value_null()))
-}
-
-fn set_onload(
-    this: &JsValue,
-    args: &[JsValue],
-    ec: &mut dyn ExecutionContext<crate::js::Types>,
-) -> Completion<JsValue, crate::js::Types> {
-    let window_object = current_window_object_from(this, ec);
-    let undefined = ec.value_undefined();
-    let callback = nullable_value(
-        args.first().unwrap_or(&undefined),
-        ec,
-        callback_function_value,
-    )?;
-
-    let previous = {
-        if let Some(data) = ec.with_object_any_mut(&window_object) {
-            if let Some(window) = data.downcast_mut::<Window>() {
-                window.replace_onload(callback.clone())
-            } else {
-                return Err(ec.new_type_error("receiver is not a Window"));
-            }
-        } else {
-            return Err(ec.new_type_error("receiver is not a Window"));
-        }
-    };
-
-    if let Some(previous) = previous {
-        let receiver = crate::js::Types::value_from_object(window_object.clone());
-        try_with_event_target_mut(&receiver, ec, |target, ec| {
-            target.remove_event_listener_entry("load", &previous, false, ec);
-        })?;
-    }
-
-    if let Some(callback) = callback {
-        let receiver = crate::js::Types::value_from_object(window_object.clone());
-        try_with_event_target_mut(&receiver, ec, |target, ec| {
-            target.add_event_listener(
-                target.clone(),
-                String::from("load"),
-                Some(callback),
-                false,
-                false,
-                Some(false),
-                None,
-                ec,
-            );
-        })?;
-    }
-
-    Ok(ec.value_undefined())
 }
 
 fn get_parent(

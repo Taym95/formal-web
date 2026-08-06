@@ -9,7 +9,9 @@ use crate::html::{
     HTMLAnchorElement, HTMLElement, HTMLIFrameElement, HTMLInputElement, HTMLMediaElement,
     HTMLVideoElement, inline_style_properties_for_element,
 };
-use crate::webidl::bindings::{AttributeDef, InterfaceDefinition, WebIdlInterface};
+use crate::webidl::bindings::{
+    AttributeDef, InterfaceDefinition, OperationDef, WebIdlInterface, create_interface_instance,
+};
 
 use js_engine::{Completion, ExecutionContext, JsTypes};
 
@@ -86,7 +88,45 @@ impl WebIdlInterface<crate::js::Types> for HTMLElement {
             legacy_lenient_setter: false,
             exposed: None,
         });
+        def.add_operation(OperationDef {
+            id: "click",
+            length: 0,
+            method: click_method,
+            static_: false,
+            unforgeable: false,
+            promise_type: false,
+            exposed: None,
+        });
     }
+}
+
+fn click_method(
+    this: &JsValue,
+    _args: &[JsValue],
+    ec: &mut dyn ExecutionContext<Types>,
+) -> Completion<JsValue, Types> {
+    // Step 1: "If this element is a form control that is disabled, then return."
+    // Note: Disabled form-control state is not modeled, so the check is skipped.
+    let object = Types::value_as_object(this)
+        .ok_or_else(|| ec.new_type_error("click receiver is not an object"))?;
+
+    // Step 2: "Fire a synthetic pointer event named click at this element, with
+    // the not trusted flag set..."
+    // Note: A plain "click" Event is dispatched rather than a synthetic
+    // PointerEvent; the dispatch path applies activation behavior to it.
+    let event = crate::dom::Event::new("click".into(), true, true, true, false, 0.0, ec);
+    let event_object = create_interface_instance::<Types, crate::dom::Event>(event, ec)?;
+    let domain_event = ec
+        .with_object_any(&event_object)
+        .and_then(|data| data.downcast_ref::<crate::dom::Event>().cloned())
+        .ok_or_else(|| ec.new_type_error("click event construction failed"))?;
+
+    let path = crate::js::platform_objects::build_path_from_target_js_object(&object, ec);
+    let target_value = Types::value_from_object(object.clone());
+    let target =
+        crate::js::try_with_event_target_mut(&target_value, ec, |target, _ec| target.clone())?;
+    target.dispatch_event(&domain_event, &path, ec)?;
+    Ok(ec.value_undefined())
 }
 
 fn try_with_html_element_ref<R>(
