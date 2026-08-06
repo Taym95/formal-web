@@ -1,5 +1,3 @@
-use blitz_traits::events::{DomEvent, EventState};
-
 use crate::js::Types;
 use crate::webidl::Callback;
 use js_engine::gc::{GcCell, gc_cell_new};
@@ -59,6 +57,9 @@ pub struct EventTarget {
     /// <https://dom.spec.whatwg.org/#eventtarget-event-listener-list>
     pub(crate) event_listener_list: GcCell<Vec<EventListener>>,
 
+    /// <https://html.spec.whatwg.org/#event-handler-map>
+    event_handlers: GcCell<Vec<(String, Callback)>>,
+
     #[ignore_trace]
     next_listener_id: Cell<u64>,
 }
@@ -68,23 +69,62 @@ impl EventTarget {
         Self {
             reflector: None,
             event_listener_list: gc_cell_new(Vec::new(), ec),
+            event_handlers: gc_cell_new(Vec::new(), ec),
             next_listener_id: Cell::new(0),
         }
     }
 }
 
+impl EventTarget {
+    /// <https://html.spec.whatwg.org/#getting-the-current-value-of-the-event-handler>
+    pub(crate) fn event_handler_value(
+        &self,
+        type_: &str,
+        ec: &mut dyn ExecutionContext<Types>,
+    ) -> Option<Callback> {
+        self.event_handlers
+            .borrow(ec)
+            .iter()
+            .find(|(handler_type, _)| handler_type == type_)
+            .map(|(_, callback)| callback.clone())
+    }
+
+    /// <https://html.spec.whatwg.org/#event-handler-idl-attributes>
+    pub(crate) fn set_event_handler_value(
+        &self,
+        type_: &str,
+        callback: Option<Callback>,
+        ec: &mut dyn ExecutionContext<Types>,
+    ) {
+        let mut handlers = self.event_handlers.borrow_mut(ec);
+        handlers.retain(|(handler_type, _)| handler_type != type_);
+        if let Some(callback) = callback {
+            handlers.push((type_.to_owned(), callback));
+        }
+    }
+}
+
+/// Every Event platform-object type embeds the base `Event` (as a field or
+/// through its parent chain); this trait exposes it so the JS layer can
+/// downcast any Event subclass to its embedded `Event` in one place.
+pub(crate) trait HasEvent {
+    fn event(&self) -> &Event;
+
+    fn event_mut(&mut self) -> &mut Event;
+}
+
+impl HasEvent for Event {
+    fn event(&self) -> &Event {
+        self
+    }
+
+    fn event_mut(&mut self) -> &mut Event {
+        self
+    }
+}
+
 pub(crate) trait EventTargetAccess {
     fn get_event_target(&self, ec: &mut dyn ExecutionContext<Types>) -> EventTarget;
-
-    /// <https://dom.spec.whatwg.org/#eventtarget-activation-behavior>
-    fn has_activation_behavior(&self) -> bool {
-        false
-    }
-
-    /// <https://dom.spec.whatwg.org/#eventtarget-activation-behavior>
-    fn run_activation_behavior(&self, _event: &Event) -> Completion<(), Types> {
-        Ok(())
-    }
 
     /// <https://dom.spec.whatwg.org/#dom-eventtarget-gettheparent>
     fn get_the_parent(&self) -> Option<EventTarget> {
@@ -446,63 +486,6 @@ impl Event {
     pub(crate) fn prevent_default(&self, ec: &mut dyn ExecutionContext<Types>) {
         if *self.cancelable.borrow(ec) && !*self.in_passive_listener_flag.borrow(ec) {
             *self.canceled_flag.borrow_mut(ec) = true;
-        }
-    }
-}
-
-/// <https://w3c.github.io/uievents/#interface-uievent>
-#[gc_struct]
-pub struct UIEvent {
-    /// <https://dom.spec.whatwg.org/#event>
-    pub event: Event,
-
-    /// <https://w3c.github.io/uievents/#dom-uievent-view>
-    pub view: Option<JsObject>,
-
-    /// <https://w3c.github.io/uievents/#dom-uievent-detail>
-    #[ignore_trace]
-    pub detail: i32,
-}
-
-impl UIEvent {
-    pub fn from_dom_event(
-        dom_event: &DomEvent,
-        view: Option<JsObject>,
-        time_stamp: f64,
-        ec: &mut dyn ExecutionContext<Types>,
-    ) -> Self {
-        Self {
-            event: Event::new(
-                dom_event.name().to_owned(),
-                dom_event.bubbles,
-                dom_event.cancelable,
-                false,
-                true,
-                time_stamp,
-                ec,
-            ),
-            view,
-            detail: 0,
-        }
-    }
-
-    /// <https://w3c.github.io/uievents/#dom-uievent-view>
-    pub(crate) fn view_value(&self) -> Option<JsObject> {
-        self.view.clone()
-    }
-
-    /// <https://w3c.github.io/uievents/#dom-uievent-detail>
-    pub(crate) fn detail_value(&self) -> i32 {
-        self.detail
-    }
-
-    pub fn apply_to_event_state(
-        &self,
-        event_state: &mut EventState,
-        ec: &mut dyn ExecutionContext<Types>,
-    ) {
-        if *self.event.canceled_flag.borrow(ec) {
-            event_state.prevent_default();
         }
     }
 }

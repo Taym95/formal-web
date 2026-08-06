@@ -7,8 +7,8 @@ use html5ever::{local_name, ns};
 
 use crate::dom::{Document, Element, EventPathItem, Node};
 use crate::html::{
-    GlobalScope, HTMLAnchorElement, HTMLElement, HTMLIFrameElement, HTMLInputElement,
-    HTMLVideoElement, Window,
+    ActivationBehavior, GlobalScope, HTMLAnchorElement, HTMLElement, HTMLIFrameElement,
+    HTMLInputElement, HTMLMediaElement, HTMLVideoElement, Window,
 };
 use crate::js::downcast::event_target_from_js_object;
 use crate::webidl::bindings::create_interface_instance;
@@ -274,6 +274,37 @@ pub(crate) fn build_path_from_target_js_object(
                 html_element.element.node.node_id,
                 html_element.element.node.document.clone(),
             ))
+        } else if let Some(anchor) = data.downcast_ref::<HTMLAnchorElement>() {
+            Some((
+                anchor.html_element.element.node.node_id,
+                anchor.html_element.element.node.document.clone(),
+            ))
+        } else if let Some(iframe) = data.downcast_ref::<HTMLIFrameElement>() {
+            Some((
+                iframe.html_element.element.node.node_id,
+                iframe.html_element.element.node.document.clone(),
+            ))
+        } else if let Some(input) = data.downcast_ref::<HTMLInputElement>() {
+            Some((
+                input.html_element.element.node.node_id,
+                input.html_element.element.node.document.clone(),
+            ))
+        } else if let Some(media) = data.downcast_ref::<HTMLMediaElement>() {
+            Some((
+                media.html_element.element.node.node_id,
+                media.html_element.element.node.document.clone(),
+            ))
+        } else if let Some(video) = data.downcast_ref::<HTMLVideoElement>() {
+            Some((
+                video.media_element.html_element.element.node.node_id,
+                video
+                    .media_element
+                    .html_element
+                    .element
+                    .node
+                    .document
+                    .clone(),
+            ))
         } else if let Some(node) = data.downcast_ref::<Node>() {
             Some((node.node_id, node.document.clone()))
         } else if let Some(document) = data.downcast_ref::<Document>() {
@@ -288,6 +319,7 @@ pub(crate) fn build_path_from_target_js_object(
             path.push(EventPathItem {
                 invocation_target: event_target.clone(),
                 shadow_adjusted_target: Some(event_target),
+                has_activation_behavior: target_is_anchor_with_href(ec, target_object),
             });
         }
         let mut current_node_id = node_id;
@@ -308,6 +340,10 @@ pub(crate) fn build_path_from_target_js_object(
                             path.push(EventPathItem {
                                 invocation_target: parent_event_target,
                                 shadow_adjusted_target: None,
+                                has_activation_behavior: target_is_anchor_with_href(
+                                    ec,
+                                    &parent_object,
+                                ),
                             });
                         }
                         current_node_id = pid;
@@ -323,8 +359,87 @@ pub(crate) fn build_path_from_target_js_object(
             path.push(EventPathItem {
                 invocation_target: event_target.clone(),
                 shadow_adjusted_target: Some(event_target),
+                has_activation_behavior: target_is_anchor_with_href(ec, target_object),
             });
         }
     }
     path
+}
+
+/// <https://html.spec.whatwg.org/#links-created-by-a-and-area-elements:activation-behaviour-2>
+fn target_is_anchor_with_href(
+    ec: &mut dyn ExecutionContext<Types>,
+    target_object: &JsObject,
+) -> bool {
+    ec.with_object_any(target_object)
+        .and_then(|data| data.downcast_ref::<HTMLAnchorElement>())
+        .map(|anchor| anchor.href_attribute().is_some())
+        .unwrap_or(false)
+}
+
+/// <https://dom.spec.whatwg.org/#concept-event-dispatch>
+// Note: This is the content-process portion of the dispatch algorithm's
+// Step 12.1, "run activationTarget's activation behavior with event". The
+// element kind is resolved from the path item's platform object and the
+// behavior is dispatched to the element's ActivationBehavior implementation.
+pub(crate) fn run_activation_behavior_for_path(
+    ec: &mut dyn ExecutionContext<Types>,
+    path: &[EventPathItem],
+) -> Completion<(), Types> {
+    let Some(activation_item) = path.iter().find(|item| item.has_activation_behavior) else {
+        return Ok(());
+    };
+    // Resolve the element from the invocation target's reflector.
+    let Some(reflector) = activation_item
+        .invocation_target
+        .reflector
+        .as_ref()
+        .cloned()
+    else {
+        return Ok(());
+    };
+    // Dispatch to the element kind's activation behavior implementation: the
+    // platform object is downcast to the concrete element struct (e.g.
+    // HTMLAnchorElement), which implements ActivationBehavior.
+    let Some(anchor) = ec
+        .with_object_any(&reflector)
+        .and_then(|data| data.downcast_ref::<HTMLAnchorElement>().cloned())
+    else {
+        // TODO: HTMLAreaElement, HTMLInputElement, HTMLButtonElement, and
+        // other element kinds with activation behavior are not yet modeled.
+        return Ok(());
+    };
+
+    // Gather the navigation context from the realm's global scope. The scope
+    // is cloned out of the object registry so its lifetime does not borrow `ec`
+    // (the activation behavior also needs the engine for local realm setup).
+    let global_scope = with_global_scope(ec, |global_scope, _ec| Ok(global_scope.clone()))?;
+    let source_navigable_id = global_scope.source_navigable_id();
+    let parent_traversable_id = global_scope.parent_traversable_id();
+    let top_level_traversable_id = global_scope.top_level_traversable_id();
+    let creation_url = global_scope.creation_url();
+    let event_sender = global_scope.event_sender();
+    let (Some(source_navigable_id), Some(creation_url), Some(event_sender)) =
+        (source_navigable_id, creation_url, event_sender)
+    else {
+        return Ok(());
+    };
+    let top_level_traversable_id = top_level_traversable_id.unwrap_or(source_navigable_id);
+    let window_global = ec.global_object();
+    let parent_engine = ec.as_any_mut().downcast_mut::<crate::js::Engine>();
+
+    anchor
+        .activation_behavior(
+            source_navigable_id,
+            parent_traversable_id,
+            top_level_traversable_id,
+            &creation_url,
+            &reflector,
+            &event_sender,
+            Some(&global_scope),
+            Some(window_global),
+            parent_engine,
+        )
+        .map_err(|error| ec.new_type_error(&error))?;
+    Ok(())
 }

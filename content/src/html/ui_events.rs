@@ -3,35 +3,17 @@ use std::{cell::RefCell, rc::Rc};
 use blitz_dom::{BaseDocument, Document as BlitzDocument, EventDriver, EventHandler};
 use blitz_traits::SmolStr;
 use blitz_traits::events::{BlitzKeyEvent, DomEvent, DomEventData, EventState, UiEvent};
-use ipc::IpcSender;
-use ipc_messages::content::{DocumentId, Event as ContentEvent, NavigableId};
 use js_engine::ExecutionContext;
 #[cfg(target_os = "macos")]
 use keyboard_types::{Key, Modifiers as KeyboardModifiers};
-use log::{error, trace};
+use log::error;
 
 use crate::dom::event::{Event, EventTarget};
-use crate::dom::{EventPathItem, UIEvent as JsUiEvent, dispatch_with_path};
-use crate::html::{EnvironmentSettingsObject, Window};
+use crate::dom::{EventPathItem, dispatch_with_path};
+use crate::html::{EnvironmentSettingsObject, HTMLAnchorElement, Window};
 use crate::js::Types;
+use crate::ui_events::UIEvent as JsUiEvent;
 use crate::webidl::bindings::create_interface_instance;
-
-fn input_debug_enabled() -> bool {
-    std::env::var_os("FORMAL_WEB_DEBUG_INPUT").is_some()
-}
-
-fn ui_event_kind(event: &UiEvent) -> &'static str {
-    match event {
-        UiEvent::PointerMove(_) => "PointerMove",
-        UiEvent::PointerUp(_) => "PointerUp",
-        UiEvent::PointerDown(_) => "PointerDown",
-        UiEvent::Wheel(_) => "Wheel",
-        UiEvent::KeyUp(_) => "KeyUp",
-        UiEvent::KeyDown(_) => "KeyDown",
-        UiEvent::Ime(_) => "Ime",
-        UiEvent::AppleStandardKeybinding(_) => "AppleStandardKeybinding",
-    }
-}
 
 #[derive(Clone, Copy, Debug, Default)]
 struct DeferredAppleStandardKeybinding {
@@ -118,50 +100,6 @@ fn apple_standard_keybinding_for_key_down(event: &BlitzKeyEvent) -> Option<&'sta
     }
 }
 
-fn debug_blitz_node_label(document: &dyn BlitzDocument, node_id: usize) -> Option<String> {
-    let document = document.inner();
-    let node = document.get_node(node_id)?;
-    if node.is_text_node() {
-        return Some("#text".into());
-    }
-    let element = node.element_data()?;
-    let tag_name = element.name.local.as_ref();
-    let id = element
-        .id
-        .as_ref()
-        .map(|id| id.as_ref())
-        .filter(|id| !id.is_empty());
-    let prefix = if node.is_anonymous() {
-        "anonymous:"
-    } else {
-        ""
-    };
-    Some(match id {
-        Some(id) => format!("{prefix}{tag_name}#{id}"),
-        None => format!("{prefix}{tag_name}"),
-    })
-}
-
-fn debug_scroll_state(document: &BaseDocument) -> String {
-    let viewport = document.viewport_scroll();
-    let mut html_scroll = None;
-    let mut body_scroll = None;
-    document.visit(|node_id, node| {
-        if let Some(element) = node.element_data() {
-            let tag_name = element.name.local.as_ref();
-            if tag_name == "html" {
-                html_scroll = Some((node_id, node.scroll_offset.x, node.scroll_offset.y));
-            } else if tag_name == "body" {
-                body_scroll = Some((node_id, node.scroll_offset.x, node.scroll_offset.y));
-            }
-        }
-    });
-    format!(
-        "viewport=({:.1},{:.1}) html={html_scroll:?} body={body_scroll:?}",
-        viewport.x, viewport.y
-    )
-}
-
 fn localize_ui_event_for_document(
     document: &BaseDocument,
     viewport_offset_x: f32,
@@ -191,6 +129,12 @@ fn localize_ui_event_for_document(
     }
 }
 
+/// <https://dom.spec.whatwg.org/#concept-event-dispatch>
+// Note: This is the content-process portion of the dispatch algorithm's
+// path-building steps (6.3, 6.9.6.2, and 6.9.9): chain[0] is the event
+// target (step 6.3) and the remaining items are the ancestors appended by
+// step 6.9.6.2 while walking "get the parent" (step 6.9.9); the document
+// and window event targets close the path.
 fn build_event_path(
     chain: &[usize],
     document_event_target: EventTarget,
@@ -199,53 +143,62 @@ fn build_event_path(
 ) -> Vec<EventPathItem> {
     let mut path = Vec::with_capacity(chain.len() + 2);
     for (index, node_id) in chain.iter().enumerate() {
+        // Step 6.3 / Step 6.9.6.2: Append to an event path with the event
+        // target, then each ancestor, in target-to-root order.
+        // <https://dom.spec.whatwg.org/#concept-event-dispatch>
         if let Ok(object) = crate::js::platform_objects::resolve_element_object(*node_id, ec) {
             if let Some(event_target) =
                 crate::js::downcast::event_target_from_js_object(ec, &object)
             {
+                // Step 6.9.6.1: If isActivationEvent is true, event's bubbles
+                //               attribute is true, activationTarget is null,
+                //               and parent has activation behavior, then set
+                //               activationTarget to parent.
+                // <https://dom.spec.whatwg.org/#concept-event-dispatch>
+                // <https://html.spec.whatwg.org/#links-created-by-a-and-area-elements:activation-behaviour-2>
+                let has_activation_behavior = ec
+                    .with_object_any(&object)
+                    .and_then(|data| data.downcast_ref::<HTMLAnchorElement>())
+                    .map(|anchor| anchor.href_attribute().is_some())
+                    .unwrap_or(false);
                 path.push(EventPathItem {
                     invocation_target: event_target.clone(),
                     shadow_adjusted_target: (index == 0).then_some(event_target),
+                    has_activation_behavior,
                 });
             }
         }
     }
+    // Step 6.9.9: If parent is non-null, then set parent to the result of
+    // invoking parent's get the parent with event. (The document and window
+    // close the parent chain.)
+    // <https://dom.spec.whatwg.org/#concept-event-dispatch>
     path.push(EventPathItem {
         invocation_target: document_event_target,
         shadow_adjusted_target: None,
+        has_activation_behavior: false,
     });
     if let Some(global_event_target) = global_event_target {
         path.push(EventPathItem {
             invocation_target: global_event_target,
             shadow_adjusted_target: None,
+            has_activation_behavior: false,
         });
     }
     path
 }
 
 struct BlitzJSEventHandler<'a> {
-    document_id: DocumentId,
-    source_navigable_id: NavigableId,
-    _document: Rc<RefCell<BaseDocument>>,
     settings: &'a mut EnvironmentSettingsObject,
     deferred_apple_keybinding: Rc<RefCell<DeferredAppleStandardKeybinding>>,
 }
 
 impl<'a> BlitzJSEventHandler<'a> {
     fn new(
-        document_id: DocumentId,
-        source_navigable_id: NavigableId,
-        _parent_navigable_id: Option<NavigableId>,
-        _top_level_navigable_id: NavigableId,
-        document: Rc<RefCell<BaseDocument>>,
         settings: &'a mut EnvironmentSettingsObject,
-        _event_sender: &'a IpcSender<ContentEvent>,
         deferred_apple_keybinding: Rc<RefCell<DeferredAppleStandardKeybinding>>,
     ) -> Self {
         Self {
-            document_id,
-            source_navigable_id,
-            _document: document,
             settings,
             deferred_apple_keybinding,
         }
@@ -257,27 +210,9 @@ impl EventHandler for BlitzJSEventHandler<'_> {
         &mut self,
         chain: &[usize],
         event: &mut DomEvent,
-        doc: &mut dyn BlitzDocument,
+        _doc: &mut dyn BlitzDocument,
         event_state: &mut EventState,
     ) {
-        if input_debug_enabled() {
-            let target_label = debug_blitz_node_label(doc, event.target);
-            let chain_labels: Vec<_> = chain
-                .iter()
-                .map(|n| debug_blitz_node_label(doc, *n).unwrap_or_else(|| format!("node#{n}")))
-                .collect();
-            trace!(
-                "[input-debug][content-dom] document={} traversable={} type={} target_node={} target_label={:?} chain={:?} chain_labels={:?}",
-                self.document_id,
-                self.source_navigable_id,
-                event.name(),
-                event.target,
-                target_label,
-                chain,
-                chain_labels
-            );
-        }
-
         let time_stamp = self.settings.current_time_millis();
         let doc_et = self.settings.document.node.event_target.clone();
         let global_et = {
@@ -295,7 +230,7 @@ impl EventHandler for BlitzJSEventHandler<'_> {
             .expect("UIEvent construction must succeed");
         let domain_event: Event = ec
             .with_object_any(&event_object)
-            .and_then(|data| data.downcast_ref::<crate::dom::UIEvent>())
+            .and_then(|data| data.downcast_ref::<JsUiEvent>())
             .map(|uie| uie.event.clone())
             .expect("event_object must wrap a UIEvent");
 
@@ -334,26 +269,12 @@ impl EventHandler for BlitzJSEventHandler<'_> {
 }
 
 pub(crate) fn dispatch_ui_event(
-    document_id: DocumentId,
-    source_navigable_id: NavigableId,
-    parent_navigable_id: Option<NavigableId>,
-    top_level_navigable_id: NavigableId,
     document: Rc<RefCell<BaseDocument>>,
     settings: &mut EnvironmentSettingsObject,
-    event_sender: &IpcSender<ContentEvent>,
     viewport_offset_x: f32,
     viewport_offset_y: f32,
     event: UiEvent,
 ) -> Result<(), String> {
-    let is_wheel = matches!(event, UiEvent::Wheel(_));
-    if input_debug_enabled() {
-        trace!(
-            "[input-debug][content] document={} traversable={} event={}",
-            document_id,
-            source_navigable_id,
-            ui_event_kind(&event)
-        );
-    }
     let mut event = event;
     {
         let d = document.borrow();
@@ -361,16 +282,7 @@ pub(crate) fn dispatch_ui_event(
     }
     let mut document = document;
     let deferred = Rc::new(RefCell::new(DeferredAppleStandardKeybinding::default()));
-    let handler = BlitzJSEventHandler::new(
-        document_id,
-        source_navigable_id,
-        parent_navigable_id,
-        top_level_navigable_id,
-        Rc::clone(&document),
-        settings,
-        event_sender,
-        Rc::clone(&deferred),
-    );
+    let handler = BlitzJSEventHandler::new(settings, Rc::clone(&deferred));
     let mut driver = EventDriver::new(&mut document, handler);
     driver.handle_ui_event(event);
     let dak = *deferred.borrow();
@@ -379,38 +291,15 @@ pub(crate) fn dispatch_ui_event(
     {
         driver.handle_ui_event(UiEvent::AppleStandardKeybinding(SmolStr::new(command)));
     }
-    if is_wheel && input_debug_enabled() {
-        trace!(
-            "[input-debug][scroll] document={} traversable={} {}",
-            document_id,
-            source_navigable_id,
-            debug_scroll_state(&document.borrow())
-        );
-    }
     Ok(())
 }
 
 pub(crate) fn dispatch_trusted_click_event(
-    document_id: DocumentId,
-    source_navigable_id: NavigableId,
-    parent_navigable_id: Option<NavigableId>,
-    top_level_navigable_id: NavigableId,
-    document: Rc<RefCell<BaseDocument>>,
     settings: &mut EnvironmentSettingsObject,
-    event_sender: &IpcSender<ContentEvent>,
     target_node_id: usize,
 ) -> Result<(), String> {
     let deferred = Rc::new(RefCell::new(DeferredAppleStandardKeybinding::default()));
-    let handler = BlitzJSEventHandler::new(
-        document_id,
-        source_navigable_id,
-        parent_navigable_id,
-        top_level_navigable_id,
-        document,
-        settings,
-        event_sender,
-        deferred,
-    );
+    let handler = BlitzJSEventHandler::new(settings, deferred);
     let time_millis = handler.settings.current_time_millis();
     let event_domain = {
         let ec = handler.settings.ec();
@@ -444,17 +333,16 @@ mod tests {
     use std::{cell::RefCell, rc::Rc};
 
     use blitz_dom::{BaseDocument, DocumentConfig};
-    use ipc::channel;
-    use ipc_messages::content::{DocumentId, Event as ContentEvent, NavigableId};
     use serde_json::json;
     use url::Url;
 
-    use crate::dom::{Event, UIEvent as JsUiEvent, dispatch_with_path};
+    use crate::dom::{Event, dispatch_with_path};
     use crate::html::{
         EnvironmentSettingsObject, execute_parser_scripts, parse_html_into_document,
     };
     use crate::js::Types;
     use crate::js::platform_objects::{build_path_from_target_js_object, resolve_element_object};
+    use crate::ui_events::UIEvent as JsUiEvent;
     use crate::webidl::bindings::create_interface_instance;
 
     use super::dispatch_trusted_click_event;
@@ -495,20 +383,8 @@ mod tests {
             .query_selector("#target")
             .expect("query selector")
             .expect("find click target");
-        let (event_sender, _event_receiver) =
-            channel::<ContentEvent>().expect("create event channel");
-
-        dispatch_trusted_click_event(
-            DocumentId::from_u128(1),
-            NavigableId::from_u128(2),
-            Some(NavigableId::from_u128(1)),
-            NavigableId::from_u128(1),
-            Rc::clone(&child_document),
-            &mut child_settings,
-            &event_sender,
-            target_node_id,
-        )
-        .expect("dispatch trusted click");
+        dispatch_trusted_click_event(&mut child_settings, target_node_id)
+            .expect("dispatch trusted click");
 
         assert_eq!(
             child_settings

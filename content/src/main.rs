@@ -13,6 +13,7 @@ pub mod dom;
 mod generic_js_test;
 pub mod html;
 pub mod streams;
+pub mod ui_events;
 #[cfg(all(boa_backend, feature = "wasm"))]
 pub mod wasm;
 pub mod webidl;
@@ -55,22 +56,19 @@ use ipc_messages::content::{
     TraversableViewport, ViewportSnapshot, WebviewId, WindowTimerKey,
 };
 use ipc_messages::media::{VideoEmbedData, VideoPaintId};
-use log::{debug, error, info, trace, warn};
+use log::{debug, error, info, warn};
 use std::{
     cell::RefCell,
     collections::{HashMap, HashSet},
     env,
     rc::Rc,
-    sync::{Arc, LazyLock, Mutex},
+    sync::{Arc, Mutex},
     time::{SystemTime, UNIX_EPOCH},
 };
 use url::Url;
 use verification::{TLATracer, TraceSender};
 
 pub(crate) const EMPTY_HTML_DOCUMENT: &str = "<html><head></head><body></body></html>";
-
-static LOGGED_INPUT_LAYOUT_DOCUMENTS: LazyLock<Mutex<HashSet<DocumentId>>> =
-    LazyLock::new(|| Mutex::new(HashSet::new()));
 
 fn normalized_content_type_essence(content_type: &str) -> String {
     content_type
@@ -251,63 +249,9 @@ fn render_state_debug_enabled() -> bool {
     env::var_os("FORMAL_WEB_DEBUG_RENDER_STATE").is_some()
 }
 
-fn input_debug_enabled() -> bool {
-    env::var_os("FORMAL_WEB_DEBUG_INPUT").is_some()
-}
-
 fn log_render_state_debug(message: impl AsRef<str>) {
     if render_state_debug_enabled() {
         debug!("[render-state][content] {}", message.as_ref());
-    }
-}
-
-fn maybe_log_input_layout_debug(document_id: DocumentId, document: &BaseDocument) {
-    if !input_debug_enabled() {
-        return;
-    }
-
-    let mut logged_documents = LOGGED_INPUT_LAYOUT_DOCUMENTS
-        .lock()
-        .expect("input layout debug mutex poisoned");
-    if !logged_documents.insert(document_id) {
-        return;
-    }
-
-    let mut interesting_nodes = Vec::new();
-    document.visit(|node_id, node| {
-        let Some(element) = node.element_data() else {
-            return;
-        };
-        let Some(id) = element.id.as_ref().map(|id| id.as_ref()) else {
-            return;
-        };
-
-        if matches!(id, "click-counter-button" | "click-count" | "signal-card") {
-            interesting_nodes.push(node_id);
-        }
-    });
-
-    if interesting_nodes.is_empty() {
-        trace!(
-            "[input-debug][layout] document={} interesting_nodes=none",
-            document_id,
-        );
-        return;
-    }
-
-    trace!(
-        "[input-debug][layout] document={} interesting_nodes={interesting_nodes:?}",
-        document_id,
-    );
-
-    for node_id in interesting_nodes {
-        document.debug_log_node(node_id);
-
-        let mut ancestor_id = document.get_node(node_id).and_then(|node| node.parent);
-        while let Some(current_id) = ancestor_id {
-            document.debug_log_node(current_id);
-            ancestor_id = document.get_node(current_id).and_then(|node| node.parent);
-        }
     }
 }
 
@@ -1196,16 +1140,7 @@ impl ContentProcess {
         }
         .ok_or_else(|| format!("no element matched selector `{selector}`"))?;
 
-        dispatch_trusted_click_event(
-            document_id,
-            document.traversable_id,
-            document.parent_traversable_id,
-            document.top_level_traversable_id,
-            Rc::clone(&document.document),
-            &mut document.settings,
-            &self.event_sender,
-            target_node_id,
-        )
+        dispatch_trusted_click_event(&mut document.settings, target_node_id)
     }
 
     fn destroy_document(&mut self, document_id: DocumentId) -> Result<(), String> {
@@ -1285,22 +1220,12 @@ impl ContentProcess {
                 continue;
             };
 
-            {
-                let document_guard = document.document.borrow();
-                maybe_log_input_layout_debug(document_id, &document_guard);
-            }
-
             // Continues <https://dom.spec.whatwg.org/#concept-event-fire> after the
             // user agent writes the serialized UI event batch to the content process.
             let event = deserialize_ui_event(&event)?;
             dispatch_ui_event(
-                document_id,
-                traversable_id,
-                document.parent_traversable_id,
-                document.top_level_traversable_id,
                 Rc::clone(&document.document),
                 &mut document.settings,
-                &self.event_sender,
                 document.viewport_offset_x,
                 document.viewport_offset_y,
                 event,

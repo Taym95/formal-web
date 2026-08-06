@@ -8,9 +8,10 @@ use js_engine::{ExecutionContext, gc_struct};
 use url::Url;
 
 use crate::html::{
-    HTMLElement, HyperlinkElementUtils, navigate, the_rules_for_choosing_a_navigable,
+    ActivationBehavior, GlobalScope, HTMLElement, HyperlinkElementUtils, navigate,
+    the_rules_for_choosing_a_navigable,
 };
-use crate::js::Types;
+use crate::js::{Engine, Types};
 
 /// <https://html.spec.whatwg.org/#htmlanchorelement>
 #[gc_struct]
@@ -19,7 +20,6 @@ pub struct HTMLAnchorElement {
     pub html_element: HTMLElement,
 }
 
-#[allow(dead_code)]
 impl HTMLAnchorElement {
     pub fn new(
         document: Rc<RefCell<BaseDocument>>,
@@ -31,16 +31,18 @@ impl HTMLAnchorElement {
         }
     }
 
-    fn href_attribute(&self) -> Option<String> {
+    pub(crate) fn href_attribute(&self) -> Option<String> {
         self.html_element.element.get_attribute("href")
     }
 
     pub(crate) fn has_download_attribute(&self) -> bool {
         self.html_element.element.has_attribute("download")
     }
+}
 
+impl ActivationBehavior for HTMLAnchorElement {
     /// <https://html.spec.whatwg.org/#links-created-by-a-and-area-elements:activation-behaviour-2>
-    pub(crate) fn activation_behavior(
+    fn activation_behavior(
         &self,
         source_navigable_id: NavigableId,
         parent_navigable_id: Option<NavigableId>,
@@ -48,6 +50,9 @@ impl HTMLAnchorElement {
         document_creation_url: &Url,
         _event: &<crate::js::Types as js_engine::JsTypes>::JsObject,
         event_sender: &IpcSender<ContentEvent>,
+        global_scope: Option<&GlobalScope>,
+        window_global: Option<<crate::js::Types as js_engine::JsTypes>::JsObject>,
+        parent_engine: Option<&mut Engine>,
     ) -> Result<(), String> {
         // Step 1: "If element has no href attribute, then return."
         if self.href_attribute().is_none() {
@@ -85,9 +90,9 @@ impl HTMLAnchorElement {
             top_level_navigable_id,
             &target,
             noopener,
-            None, // no GlobalScope: anchor nav delegates new traversables to UA
-            None, // anchor nav uses no return window
-            None, // anchor navigation does not create a local realm
+            global_scope,
+            window_global,
+            parent_engine,
         );
 
         navigate(
@@ -105,7 +110,9 @@ impl HTMLAnchorElement {
         )
         .map_err(|error| format!("failed to send hyperlink activation navigation request: {error}"))
     }
+}
 
+impl HTMLAnchorElement {
     /// <https://html.spec.whatwg.org/#get-an-element's-noopener>
     pub(crate) fn noopener(&self) -> bool {
         // Step 1: "Let noopener be false."

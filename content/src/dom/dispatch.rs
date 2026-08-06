@@ -1,5 +1,3 @@
-use log::trace;
-
 use super::event::EventTargetAccess;
 use crate::js::Types;
 use crate::webidl::bindings::create_interface_instance;
@@ -10,10 +8,6 @@ use super::BUBBLING_PHASE;
 use super::CAPTURING_PHASE;
 use super::event::{Event, EventListener, EventTarget, NONE};
 
-fn dispatch_debug_enabled() -> bool {
-    std::env::var_os("FORMAL_WEB_DEBUG_INPUT").is_some()
-}
-
 /// <https://dom.spec.whatwg.org/#event-path-item>
 #[derive(Clone)]
 pub(crate) struct EventPathItem {
@@ -22,6 +16,9 @@ pub(crate) struct EventPathItem {
 
     /// <https://dom.spec.whatwg.org/#event-path-shadow-adjusted-target>
     pub(crate) shadow_adjusted_target: Option<EventTarget>,
+
+    /// <https://dom.spec.whatwg.org/#eventtarget-activation-behavior>
+    pub(crate) has_activation_behavior: bool,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -37,6 +34,7 @@ pub(crate) fn simple_path(
     vec![EventPathItem {
         invocation_target: target_access.get_event_target(ec),
         shadow_adjusted_target: Some(target_access.get_event_target(ec)),
+        has_activation_behavior: false,
     }]
 }
 
@@ -102,6 +100,7 @@ fn append_to_event_path(
     path.push(EventPathItem {
         invocation_target,
         shadow_adjusted_target,
+        has_activation_behavior: false,
     });
 }
 
@@ -150,11 +149,11 @@ pub(crate) fn dispatch_event(
     // Step 3: Let activationTarget be null.
     // Step 6.5: If isActivationEvent is true and target has activation behavior,
     //           then set activationTarget to target.
+    // Step 6.9.6.1: If isActivationEvent is true, event's bubbles attribute is
+    //               true, activationTarget is null, and parent has activation
+    //               behavior, then set activationTarget to parent.
     let activation_target_idx = if event.type_ == "click" {
-        // Only check the first path entry (the target per step 6.3).
-        path.first()
-            .filter(|entry| entry.invocation_target.has_activation_behavior())
-            .map(|_| 0)
+        path.iter().position(|entry| entry.has_activation_behavior)
     } else {
         None
     };
@@ -208,11 +207,14 @@ pub(crate) fn dispatch_event(
     *event.stop_immediate_propagation_flag.borrow_mut(ec) = false;
 
     // Step 12: If activationTarget is non-null:
-    if let Some(idx) = activation_target_idx {
+    if activation_target_idx.is_some() {
         // Step 12.1: If event's canceled flag is unset, then run
         //            activationTarget's activation behavior with event.
         if !canceled {
-            path[idx].invocation_target.run_activation_behavior(event)?;
+            // The activation behavior lives in the JS layer (it resolves the
+            // element from the path item's reflector and needs the realm's
+            // global scope for the navigation context).
+            crate::js::platform_objects::run_activation_behavior_for_path(ec, path)?;
         }
     }
 
@@ -267,23 +269,6 @@ fn invoke(
     // Step 10: Let found be the result of running inner invoke with event,
     // listeners, phase, invocationTargetInShadowTree, and
     // legacyOutputDidListenersThrowFlag if given.
-    if dispatch_debug_enabled() && event.type_ == "click" {
-        let matching_listeners = listeners
-            .iter()
-            .filter(|listener| !listener.removed && listener.type_ == "click")
-            .count();
-        let phase_name = match phase {
-            ListenerPhase::Capturing => "capturing",
-            ListenerPhase::Bubbling => "bubbling",
-        };
-        trace!(
-            "[input-debug][dispatch] phase={} listeners={} matching_click_listeners={}",
-            phase_name,
-            listeners.len(),
-            matching_listeners,
-        );
-    }
-
     // Step 10: Let found be the result of inner invoke.
     let _found = inner_invoke(ec, &entry.invocation_target, event, &listeners, phase)?;
 

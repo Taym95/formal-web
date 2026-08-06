@@ -1,0 +1,19 @@
+{
+  "name": "formal-web-react-todo",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "A small React todo-list app used to exercise formal-web's web platform APIs.",
+  "scripts": {
+    "build": "node build-single.mjs",
+    "serve": "node serve.mjs",
+    "start": "npm run build && npm run serve"
+  },
+  "dependencies": {
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0"
+  },
+  "devDependencies": {
+    "esbuild": "^0.25.0"
+  }
+}

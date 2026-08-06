@@ -9,7 +9,7 @@ use crate::html::{
     HTMLAnchorElement, HTMLElement, HTMLIFrameElement, HTMLInputElement, HTMLMediaElement,
     HTMLVideoElement, inline_style_properties_for_element,
 };
-use crate::webidl::bindings::{AttributeDef, InterfaceDefinition, WebIdlInterface};
+use crate::webidl::bindings::{AttributeDef, InterfaceDefinition, OperationDef, WebIdlInterface};
 
 use js_engine::{Completion, ExecutionContext, JsTypes};
 
@@ -86,7 +86,48 @@ impl WebIdlInterface<crate::js::Types> for HTMLElement {
             legacy_lenient_setter: false,
             exposed: None,
         });
+        def.add_operation(OperationDef {
+            id: "click",
+            length: 0,
+            method: click_method,
+            static_: false,
+            unforgeable: false,
+            promise_type: false,
+            exposed: None,
+        });
     }
+}
+
+fn click_method(
+    this: &JsValue,
+    _args: &[JsValue],
+    ec: &mut dyn ExecutionContext<Types>,
+) -> Completion<JsValue, Types> {
+    let object = Types::value_as_object(this)
+        .ok_or_else(|| ec.new_type_error("click receiver is not an object"))?;
+    // Clone the HTMLElement out of the object registry so the domain method
+    // can use `ec` (it creates and dispatches the click event).
+    let html_element = ec.with_object_any(&object).and_then(|data| {
+        data.downcast_ref::<HTMLElement>()
+            .cloned()
+            .or_else(|| {
+                data.downcast_ref::<HTMLAnchorElement>()
+                    .map(|anchor| anchor.html_element.clone())
+            })
+            .or_else(|| {
+                data.downcast_ref::<HTMLInputElement>()
+                    .map(|input| input.html_element.clone())
+            })
+            .or_else(|| {
+                data.downcast_ref::<HTMLIFrameElement>()
+                    .map(|iframe| iframe.html_element.clone())
+            })
+    });
+    let Some(html_element) = html_element else {
+        return Err(ec.new_type_error("receiver is not an HTMLElement"));
+    };
+    html_element.click(ec)?;
+    Ok(ec.value_undefined())
 }
 
 fn try_with_html_element_ref<R>(

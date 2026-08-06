@@ -14,6 +14,19 @@ impl WebIdlInterface<crate::js::Types> for HTMLInputElement {
 
     fn define_members(def: &mut InterfaceDefinition<crate::js::Types>) {
         def.add_attribute(AttributeDef {
+            id: "type",
+            getter: get_type,
+            setter: Some(set_type),
+            static_: false,
+            unforgeable: false,
+            promise_type: false,
+            legacy_lenient_this: false,
+            replaceable: false,
+            put_forwards: None,
+            legacy_lenient_setter: false,
+            exposed: None,
+        });
+        def.add_attribute(AttributeDef {
             id: "value",
             getter: get_value,
             setter: Some(set_value),
@@ -36,6 +49,43 @@ impl WebIdlInterface<crate::js::Types> for HTMLInputElement {
             exposed: None,
         });
     }
+}
+
+fn get_type(
+    this: &JsValue,
+    _args: &[JsValue],
+    ec: &mut dyn ExecutionContext<crate::js::Types>,
+) -> Completion<JsValue, crate::js::Types> {
+    let obj = crate::js::Types::value_as_object(this)
+        .ok_or_else(|| ec.new_type_error("expected object"))?;
+    let err = ec.new_type_error("expected HTMLInputElement");
+    let type_ = ec
+        .with_object_any(&obj)
+        .and_then(|data| data.downcast_ref::<HTMLInputElement>())
+        .map(|input| input.type_())
+        .ok_or(err)?;
+    Ok(ec.value_from_string(ec.js_string_from_str(&type_)))
+}
+
+fn set_type(
+    this: &JsValue,
+    args: &[JsValue],
+    ec: &mut dyn ExecutionContext<crate::js::Types>,
+) -> Completion<JsValue, crate::js::Types> {
+    let value = if let Some(v) = args.first() {
+        ec.to_rust_string(v.clone())?
+    } else {
+        String::default()
+    };
+    let obj = crate::js::Types::value_as_object(this)
+        .ok_or_else(|| ec.new_type_error("expected object"))?;
+    let err = ec.new_type_error("expected HTMLInputElement");
+    let input = ec
+        .with_object_any(&obj)
+        .and_then(|data| data.downcast_ref::<HTMLInputElement>())
+        .ok_or(err)?;
+    input.set_type(&value);
+    Ok(ec.value_undefined())
 }
 
 fn get_value(

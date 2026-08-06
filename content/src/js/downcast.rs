@@ -4,14 +4,36 @@
 //! to extract native Rust data from JavaScript platform objects.
 
 use crate::dom::{
-    AbortController, AbortSignal, Document, Element, Event, EventTarget, Node, UIEvent,
+    AbortController, AbortSignal, Document, Element, Event, EventTarget, HasEvent, Node,
 };
 use crate::html::{
     HTMLAnchorElement, HTMLElement, HTMLIFrameElement, HTMLInputElement, HTMLMediaElement,
     HTMLVideoElement, Window,
 };
 use crate::js::Types;
+use crate::ui_events::{MouseEvent, UIEvent};
 use js_engine::{Completion, ExecutionContext, JsTypes};
+
+/// Downcasts a JS platform object to its embedded `Event` (the base `Event`
+/// itself, or the `event` field of an Event subclass). Event subclasses must
+/// embed the base `Event` and implement `HasEvent` so this single walk finds it.
+pub(crate) fn event_from_js_object(
+    ec: &dyn ExecutionContext<Types>,
+    object: &<Types as JsTypes>::JsObject,
+) -> Option<Event> {
+    ec.with_object_any(object).and_then(|data| {
+        data.downcast_ref::<Event>()
+            .map(|event| event.event().clone())
+            .or_else(|| {
+                data.downcast_ref::<UIEvent>()
+                    .map(|ui_event| ui_event.event().clone())
+            })
+            .or_else(|| {
+                data.downcast_ref::<MouseEvent>()
+                    .map(|mouse_event| mouse_event.event().clone())
+            })
+    })
+}
 
 pub(crate) fn try_with_abort_signal_mut<R>(
     this: &<Types as JsTypes>::JsValue,
@@ -137,9 +159,11 @@ pub(crate) fn try_set_event_target_reflector(
                         ec,
                     );
                 } else if let Some(event) = data.downcast_mut::<Event>() {
-                    ec.store_js_object(&mut event.reflector, reflector);
+                    ec.store_js_object(&mut event.event_mut().reflector, reflector);
                 } else if let Some(ui_event) = data.downcast_mut::<UIEvent>() {
-                    ec.store_js_object(&mut ui_event.event.reflector, reflector);
+                    ec.store_js_object(&mut ui_event.event_mut().reflector, reflector);
+                } else if let Some(mouse_event) = data.downcast_mut::<MouseEvent>() {
+                    ec.store_js_object(&mut mouse_event.event_mut().reflector, reflector);
                 }
             }),
         );
@@ -159,6 +183,24 @@ pub(crate) fn event_target_from_js_object(
             Some(element.node.event_target.clone())
         } else if let Some(html_element) = data.downcast_ref::<HTMLElement>() {
             Some(html_element.element.node.event_target.clone())
+        } else if let Some(anchor) = data.downcast_ref::<HTMLAnchorElement>() {
+            Some(anchor.html_element.element.node.event_target.clone())
+        } else if let Some(iframe) = data.downcast_ref::<HTMLIFrameElement>() {
+            Some(iframe.html_element.element.node.event_target.clone())
+        } else if let Some(input) = data.downcast_ref::<HTMLInputElement>() {
+            Some(input.html_element.element.node.event_target.clone())
+        } else if let Some(media) = data.downcast_ref::<HTMLMediaElement>() {
+            Some(media.html_element.element.node.event_target.clone())
+        } else if let Some(video) = data.downcast_ref::<HTMLVideoElement>() {
+            Some(
+                video
+                    .media_element
+                    .html_element
+                    .element
+                    .node
+                    .event_target
+                    .clone(),
+            )
         } else if let Some(node) = data.downcast_ref::<Node>() {
             Some(node.event_target.clone())
         } else if let Some(event_target) = data.downcast_ref::<EventTarget>() {

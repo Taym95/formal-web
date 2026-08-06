@@ -511,38 +511,16 @@ The project uses the standard `log` crate with `env_logger` for structured loggi
 - Use `.ok()` only when the `None`/`Err` case carries no diagnostic value (e.g. parsing an optional value from a fallible source where `None` is a valid "not present" signal).
 - The `ConsoleSink::Stderr` variant in `content/src/js/bindings/console.rs` is exempt — it implements the browser Console API output destination, not error logging.
 
-# Session Investigation Documentation
+# README Documentation Policy
 
-Every session that investigates an open bug or unexpected behavior must
-log its findings in the relevant `README.md` file under a
-"Session investigation log" section. The log must follow these rules:
+Repository READMEs track only the current state of the code: architecture,
+conventions, and things that still need fixing. They must never contain
+session logs, histories of what was done, or descriptions of past changes.
 
-1. **Factual only** — Document what was done, what was instrumented, and
-   what tests were run. No speculation about what the fix might be.
-2. **Document dead ends** — Explicitly state what was ruled out and why.
-   The next session needs to know what NOT to retry.
-3. **No speculative solutions** — If you found a fix, implement it and
-   update the issue status. If you did not find a fix, do not suggest what
-   the fix might be. That is for the next session to discover.
-4. **Include investigation scope** — Which files were changed (even for
-   instrumentation), which single test was used to verify, and what the
-   instrumentation confirmed.
-
-Example structure:
-
-```
-### <date> — <issue description>
-
-**Files changed:** <list>
-**Instrumentation added:** <what and where>
-**What was confirmed:** <facts>
-**What was ruled out:** <dead ends>
-**Not investigated:** <what remains to check>
-```
-
-Location: Add the log to the lowest-level README.md in the directory
-hierarchy that owns the feature being investigated (e.g., `content/src/streams/README.md`
-for stream issues, `js_engine/README.md` for JS engine issues).
+The only past-tense content allowed is a note about a failed fix attempt for
+a still-unfixed issue — the symptom, what was tried, and what was ruled out —
+so a future session knows what not to retry. Once an issue is fixed, its
+notes are removed. "Document only verified facts" applies throughout.
 
 # End-of-Task Flow
 

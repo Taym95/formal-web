@@ -7,7 +7,10 @@ type JsValue = <crate::js::Types as JsTypes>::JsValue;
 use js_engine::{Completion, ExecutionContext, JsTypes};
 
 use crate::dom::{DOMException, Document, Element, Node};
-use crate::html::{HTMLAnchorElement, HTMLElement, HTMLIFrameElement};
+use crate::html::{
+    HTMLAnchorElement, HTMLElement, HTMLIFrameElement, HTMLInputElement, HTMLMediaElement,
+    HTMLVideoElement,
+};
 use crate::js::platform_objects::{
     collect_child_subtree_node_ids, document_object, invalidate_cached_node_ids,
     object_for_existing_node,
@@ -266,6 +269,19 @@ fn try_with_node_ref<R>(
         }
         if let Some(html_iframe_element) = data.downcast_ref::<HTMLIFrameElement>() {
             return Ok(f(&html_iframe_element.html_element.element.node));
+        }
+        if let Some(html_input_element) = data.downcast_ref::<HTMLInputElement>() {
+            return Ok(f(&html_input_element.html_element.element.node));
+        }
+        if let Some(html_media_element) = data.downcast_ref::<HTMLMediaElement>() {
+            return Ok(f(&html_media_element.html_element.element.node));
+        }
+        if let Some(html_video_element) = data.downcast_ref::<HTMLVideoElement>() {
+            return Ok(f(&html_video_element
+                .media_element
+                .html_element
+                .element
+                .node));
         }
     }
     Err(ec.new_type_error("receiver is not a Node"))
@@ -560,6 +576,33 @@ fn appendable_node(
             Some((
                 Rc::clone(&html_iframe_element.html_element.element.node.document),
                 html_iframe_element.html_element.element.node.node_id,
+            ))
+        } else if let Some(html_input_element) = data.downcast_ref::<HTMLInputElement>() {
+            Some((
+                Rc::clone(&html_input_element.html_element.element.node.document),
+                html_input_element.html_element.element.node.node_id,
+            ))
+        } else if let Some(html_media_element) = data.downcast_ref::<HTMLMediaElement>() {
+            Some((
+                Rc::clone(&html_media_element.html_element.element.node.document),
+                html_media_element.html_element.element.node.node_id,
+            ))
+        } else if let Some(html_video_element) = data.downcast_ref::<HTMLVideoElement>() {
+            Some((
+                Rc::clone(
+                    &html_video_element
+                        .media_element
+                        .html_element
+                        .element
+                        .node
+                        .document,
+                ),
+                html_video_element
+                    .media_element
+                    .html_element
+                    .element
+                    .node
+                    .node_id,
             ))
         } else {
             None

@@ -1,0 +1,224 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>React Todo — formal-web</title>
+    <style>
+      html, body { min-height: 100%; margin: 0; }
+
+      body {
+        background: #f8f7f4;
+        color: #1e1e2a;
+        font-family: system-ui, -apple-system, sans-serif;
+      }
+
+      #root {
+        max-width: 40rem;
+        margin: 0 auto;
+        padding: 2rem 1rem 3rem;
+      }
+
+      .react-todo-card {
+        background: #ffffff;
+        border: 1px solid #e4e2ec;
+        border-radius: 1.2rem;
+        padding: 1.5rem 1.5rem 1.8rem;
+        box-shadow: 0 4px 16px rgba(0, 0, 0, 0.04);
+      }
+
+      .react-todo-header {
+        display: flex;
+        align-items: center;
+        gap: 0.6rem;
+        margin: 0 0 0.4rem;
+      }
+
+      .react-todo-title {
+        font-size: 1.2rem;
+        font-weight: 600;
+        color: #1a1a2e;
+      }
+
+      .badge {
+        display: inline-flex;
+        align-items: center;
+        padding: 0.15rem 0.55rem;
+        border-radius: 999px;
+        font-size: 0.7rem;
+        font-weight: 600;
+        letter-spacing: 0.04em;
+        text-transform: uppercase;
+        background: #e8e7f0;
+        color: #5a5a72;
+      }
+
+      .badge.working { background: #d4edda; color: #155724; }
+
+      .section-desc {
+        margin: 0 0 1rem;
+        font-size: 0.92rem;
+        color: #6b6b82;
+        line-height: 1.5;
+      }
+
+      .add-row {
+        display: flex;
+        gap: 0.6rem;
+        margin-bottom: 0.9rem;
+      }
+
+      .todo-input {
+        flex: 1;
+        padding: 0.65rem 0.9rem;
+        border: 1px solid #e4e2ec;
+        border-radius: 0.85rem;
+        font: inherit;
+        font-size: 0.95rem;
+        background: #faf9f7;
+        color: #1a1a2e;
+        min-width: 0;
+      }
+
+      .btn {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        gap: 0.4rem;
+        padding: 0.65rem 1rem;
+        border: 0;
+        border-radius: 999px;
+        font: inherit;
+        font-size: 0.9rem;
+        font-weight: 500;
+        cursor: pointer;
+        white-space: nowrap;
+      }
+
+      .btn-primary {
+        background: #4a6cf7;
+        color: #fff;
+        box-shadow: 0 4px 12px rgba(74, 108, 247, 0.25);
+      }
+
+      .todo-meta {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 0.6rem;
+        flex-wrap: wrap;
+        margin-bottom: 0.8rem;
+      }
+
+      .todo-remaining {
+        font-size: 0.85rem;
+        color: #6b6b82;
+      }
+
+      .filter-bar { display: flex; gap: 0.4rem; }
+
+      .filter-btn {
+        padding: 0.3rem 0.7rem;
+        border: 1px solid #e4e2ec;
+        border-radius: 999px;
+        background: #faf9f7;
+        color: #5a5a72;
+        font: inherit;
+        font-size: 0.8rem;
+        cursor: pointer;
+      }
+
+      .filter-btn.active {
+        background: #4a6cf7;
+        border-color: #4a6cf7;
+        color: #fff;
+      }
+
+      .todo-list {
+        list-style: none;
+        margin: 0;
+        padding: 0;
+        display: flex;
+        flex-direction: column;
+        gap: 0.45rem;
+      }
+
+      .todo-item {
+        display: flex;
+        align-items: center;
+        gap: 0.6rem;
+        padding: 0.6rem 0.8rem;
+        border: 1px solid #e4e2ec;
+        border-radius: 0.85rem;
+        background: #faf9f7;
+      }
+
+      .todo-item.done .todo-text {
+        text-decoration: line-through;
+        color: #8a8aa2;
+      }
+
+      .todo-toggle {
+        flex: none;
+        width: 1.6rem;
+        height: 1.6rem;
+        border-radius: 999px;
+        border: 1px solid #c9c7d8;
+        background: #fff;
+        font-size: 0.9rem;
+        line-height: 1;
+        cursor: pointer;
+        color: #28a745;
+      }
+
+      .todo-text {
+        flex: 1;
+        font-size: 0.95rem;
+      }
+
+      .todo-delete {
+        flex: none;
+        width: 1.6rem;
+        height: 1.6rem;
+        border: 0;
+        border-radius: 999px;
+        background: transparent;
+        color: #c0392b;
+        font-size: 0.85rem;
+        cursor: pointer;
+      }
+
+      .todo-delete:hover { background: #f8d7da; }
+
+      .todo-empty {
+        padding: 0.8rem;
+        text-align: center;
+        font-size: 0.85rem;
+        color: #a0a0b8;
+      }
+
+      .boot-status {
+        margin-top: 1rem;
+        font-size: 0.75rem;
+        color: #a0a0b8;
+      }
+
+      .error-box {
+        background: #f8d7da;
+        border: 1px solid #dc3545;
+        border-radius: 0.85rem;
+        padding: 1rem;
+        color: #721c24;
+      }
+
+      .error-box pre {
+        white-space: pre-wrap;
+        font-size: 0.85rem;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script src="dist/app.js"></script>
+  </body>
+</html>

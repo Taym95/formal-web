@@ -1,6 +1,5 @@
 use log::error;
 use std::collections::{BTreeMap, HashMap};
-use std::mem;
 
 use ipc::IpcSender;
 use ipc_messages::content::{Event as ContentEvent, UserNavigationInvolvement};
@@ -13,7 +12,6 @@ type JsValue = <Types as JsTypes>::JsValue;
 
 use crate::dom::Element;
 use crate::dom::event::{EventTarget, EventTargetAccess};
-use crate::webidl::Callback;
 
 use super::resolved_style_properties_for_element;
 use super::windowproxy::create_window_proxy;
@@ -28,9 +26,6 @@ pub struct Window {
 
     /// <https://html.spec.whatwg.org/#global-object>
     pub global_scope: GlobalScope,
-
-    /// <https://html.spec.whatwg.org/#handler-onload>
-    onload: Option<Callback>,
 }
 
 impl EventTargetAccess for Window {
@@ -44,18 +39,7 @@ impl Window {
         Self {
             event_target: EventTarget::new(ec),
             global_scope,
-            onload: None,
         }
-    }
-
-    /// <https://html.spec.whatwg.org/#handler-onload>
-    pub(crate) fn onload_value(&self) -> Option<Callback> {
-        self.onload.clone()
-    }
-
-    /// <https://html.spec.whatwg.org/#handler-onload>
-    pub(crate) fn replace_onload(&mut self, callback: Option<Callback>) -> Option<Callback> {
-        mem::replace(&mut self.onload, callback)
     }
 
     /// <https://html.spec.whatwg.org/#dom-open>

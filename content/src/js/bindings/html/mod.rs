@@ -1,3 +1,4 @@
+pub(crate) mod global_event_handlers;
 mod html_anchor_element;
 mod html_element;
 mod html_iframe_element;

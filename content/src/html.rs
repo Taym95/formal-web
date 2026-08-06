@@ -5,8 +5,10 @@ use crate::js::{Engine, Types};
 type JsValue = <Types as JsTypes>::JsValue;
 type JsObject = <Types as JsTypes>::JsObject;
 use log::error;
+mod activation_behavior;
 pub(crate) mod dispatch;
 mod environment_settings_object;
+pub(crate) mod event_handler;
 mod global_scope;
 mod html_anchor_element;
 mod html_dom_tree;
@@ -30,6 +32,7 @@ use ipc_messages::content::{
     NewChildNavigableInfo, NewTraversableInfo, UserNavigationInvolvement,
 };
 
+pub(crate) use activation_behavior::ActivationBehavior;
 pub use environment_settings_object::EnvironmentSettingsObject;
 pub use global_scope::GlobalScope;
 pub use global_scope::GlobalScopeKind;

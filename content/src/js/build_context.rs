@@ -87,7 +87,6 @@ fn setup_realm(engine: &mut Engine, _document: Rc<RefCell<BaseDocument>>) -> Res
     let document = _document;
     use crate::dom::{
         AbortController, AbortSignal, DOMException, Document, Element, Event, EventTarget, Node,
-        UIEvent,
     };
     #[cfg(not(boa_backend))]
     use crate::html::GlobalScope;
@@ -102,6 +101,7 @@ fn setup_realm(engine: &mut Engine, _document: Rc<RefCell<BaseDocument>>) -> Res
         TransformStreamDefaultController, WritableStream, WritableStreamDefaultController,
         WritableStreamDefaultWriter,
     };
+    use crate::ui_events::{MouseEvent, UIEvent};
     use crate::webidl::bindings::{
         get_registry_prototype, initialize_registry, register_interface_spec,
         wire_registry_constructor_prototype, wire_registry_prototype,
@@ -163,6 +163,7 @@ fn setup_realm(engine: &mut Engine, _document: Rc<RefCell<BaseDocument>>) -> Res
     reg!(DOMException);
     reg!(Event);
     reg!(UIEvent);
+    reg!(MouseEvent);
     reg!(AbortSignal);
     reg!(AbortController);
     reg!(Node);
@@ -192,6 +193,7 @@ fn setup_realm(engine: &mut Engine, _document: Rc<RefCell<BaseDocument>>) -> Res
 
     // Step 6: Wire prototype chains.
     wire_registry_prototype::<crate::js::Types, UIEvent, Event>(engine);
+    wire_registry_prototype::<crate::js::Types, MouseEvent, UIEvent>(engine);
     wire_registry_prototype::<crate::js::Types, AbortSignal, EventTarget>(engine);
     wire_registry_prototype::<crate::js::Types, Node, EventTarget>(engine);
     wire_registry_prototype::<crate::js::Types, Document, Node>(engine);
@@ -208,6 +210,7 @@ fn setup_realm(engine: &mut Engine, _document: Rc<RefCell<BaseDocument>>) -> Res
     // inherit from their parent interface object (WebIDL "create an interface
     // object", step 3).
     wire_registry_constructor_prototype::<crate::js::Types, UIEvent, Event>(engine);
+    wire_registry_constructor_prototype::<crate::js::Types, MouseEvent, UIEvent>(engine);
     wire_registry_constructor_prototype::<crate::js::Types, AbortSignal, EventTarget>(engine);
     wire_registry_constructor_prototype::<crate::js::Types, Node, EventTarget>(engine);
     wire_registry_constructor_prototype::<crate::js::Types, Document, Node>(engine);

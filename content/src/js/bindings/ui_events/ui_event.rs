@@ -1,4 +1,5 @@
-use crate::dom::{Event, UIEvent};
+use crate::js::bindings::initialization::{init_flag, init_number};
+use crate::ui_events::{UIEvent, UIEventInit};
 type JsValue = <crate::js::Types as JsTypes>::JsValue;
 
 fn with_ui_event_ref<R>(
@@ -22,8 +23,6 @@ fn with_ui_event_ref<R>(
 
 use crate::webidl::bindings::{AttributeDef, InterfaceDefinition, WebIdlInterface};
 
-use super::event::init_flag;
-
 use js_engine::{Completion, ExecutionContext, JsTypes};
 
 impl WebIdlInterface<crate::js::Types> for UIEvent {
@@ -41,26 +40,17 @@ impl WebIdlInterface<crate::js::Types> for UIEvent {
         let undefined = ec.value_undefined();
         let type_ = ec.to_rust_string(args.first().cloned().unwrap_or(undefined))?;
         let init = args.get(1).cloned().unwrap_or(ec.value_undefined());
-        let detail = if let Some(object) = crate::js::Types::value_as_object(&init) {
-            let property_key = ec.property_key_from_str("detail");
-            let detail_value = ExecutionContext::get(ec, object, property_key)?;
-            ec.to_number(detail_value)? as i32
-        } else {
-            0
-        };
-        Ok(UIEvent {
-            event: Event::new(
-                type_,
-                init_flag(&init, "bubbles", ec)?,
-                init_flag(&init, "cancelable", ec)?,
-                init_flag(&init, "composed", ec)?,
-                false,
-                0.0,
-                ec,
-            ),
-            view: None,
-            detail,
-        })
+        let detail = init_number(&init, ec, "detail", 0.0)? as i32;
+        Ok(UIEvent::new(
+            type_,
+            UIEventInit {
+                bubbles: init_flag(&init, "bubbles", ec)?,
+                cancelable: init_flag(&init, "cancelable", ec)?,
+                composed: init_flag(&init, "composed", ec)?,
+                detail,
+            },
+            ec,
+        ))
     }
 
     fn define_members(def: &mut InterfaceDefinition<crate::js::Types>) {
