@@ -10,7 +10,7 @@ compile_error!(
     "the `zero_copy` feature requires macOS: IOSurface texture sharing is not available on this platform (use `cpu_readback` or no features)"
 );
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::renderer::{ReadbackChannels, SurfaceRenderer};
 use compositor::{Compositor, CompositorVideoFrame};
@@ -36,10 +36,13 @@ pub struct ComposedScene {
     /// to the child webview_id. Used by the UA to route UI events to the
     /// correct child traversable instead of the root.
     pub child_frame_to_webview: HashMap<FrameId, WebviewId>,
-    /// True when the composed scene contains animated content (video)
-    /// that requires the UA to re-note a rendering opportunity even
-    /// without user input.
+    /// True when the composed scene contains animated content (video, CSS
+    /// animations) that requires the UA to re-note a rendering opportunity
+    /// even without user input. `animating_frame_ids` lists which composed
+    /// frames are animating, so the UA notes those navigables (and not
+    /// static siblings).
     pub animating: bool,
+    pub animating_frame_ids: Vec<FrameId>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -115,6 +118,7 @@ pub fn run_graphics_process<B: MediaBackend + 'static, R: SurfaceRenderer>(
 
     // Drain the first message to check for SetTraceSender.
     let mut tla_tracer = TLATracer::new("Navigation", "formal-web:graphics", None);
+    let mut finished_videos: HashSet<VideoPaintId> = HashSet::new();
     if let Ok(incoming) = cmd_rx.try_recv() {
         if let GraphicsCommand::SetTraceSender(sender) = incoming.payload {
             tla_tracer.set_sender(sender);
@@ -128,6 +132,7 @@ pub fn run_graphics_process<B: MediaBackend + 'static, R: SurfaceRenderer>(
                 &mut HashMap::new(),
                 None::<&mut B>,
                 &mut HashMap::new(),
+                &mut finished_videos,
                 &mut tla_tracer,
                 &channels,
             );
@@ -184,6 +189,7 @@ pub fn run_graphics_process<B: MediaBackend + 'static, R: SurfaceRenderer>(
                     &mut pipeline_webview_map,
                     backend.as_mut(),
                     &mut child_webview_to_parent,
+                    &mut finished_videos,
                     &mut tla_tracer,
                     &channels,
                 ) {
@@ -197,6 +203,8 @@ pub fn run_graphics_process<B: MediaBackend + 'static, R: SurfaceRenderer>(
                     &pipeline_webview_map,
                     &mut webviews,
                     &event_sender,
+                    &child_webview_to_parent,
+                    &mut finished_videos,
                 );
             }
             recv(sample_tick) -> _ => {
@@ -233,6 +241,8 @@ fn handle_media_event<R: SurfaceRenderer>(
     pipeline_webview_map: &HashMap<MediaPipelineId, (WebviewId, VideoPaintId)>,
     webviews: &mut HashMap<WebviewId, WebviewState<R>>,
     composed_scene_sender: &ipc::IpcSender<GraphicsEvent>,
+    child_webview_to_parent: &HashMap<WebviewId, (WebviewId, FrameId)>,
+    finished_videos: &mut HashSet<VideoPaintId>,
 ) {
     match event {
         MediaBackendEvent::Frame(mut video_frame) => {
@@ -259,9 +269,17 @@ fn handle_media_event<R: SurfaceRenderer>(
                 // self.video_frames when rendering EmbedSite::Video embed sites.
                 // Never compose independently from the video handler — doing so
                 // creates an orphan composition with no corresponding
-                // UpdateTheRendering, violating the TLA+ pipeline model.
+                // UpdateTheRendering, violating the TLA+ pipeline model. A
+                // deferred (pending) composition is completed once its frames
+                // have arrived, which is part of the same render cycle.
                 slot.compositor.update_video_frame(cf);
             }
+            maybe_compose(
+                webviews,
+                webview_id,
+                &expected_videos(pipeline_webview_map, finished_videos),
+                child_webview_to_parent,
+            );
         }
         // AVFoundation video frames arrive as GPU pixel buffers and are
         // composited as textures; GStreamer delivers CPU bytes (Frame
@@ -303,9 +321,18 @@ fn handle_media_event<R: SurfaceRenderer>(
                 content: compositor::VideoFrameContent::Texture(resource_id),
             };
             slot.compositor.update_video_frame(cf);
+            maybe_compose(
+                webviews,
+                webview_id,
+                &expected_videos(pipeline_webview_map, finished_videos),
+                child_webview_to_parent,
+            );
         }
         MediaBackendEvent::Eos { pipeline_id } => {
             if let Some(&(webview_id, paint_id)) = pipeline_webview_map.get(&pipeline_id) {
+                // The pipeline will not produce more frames; a pending
+                // composition must not wait on it.
+                finished_videos.insert(paint_id);
                 // Keep the last video frame in the compositor so it continues
                 // to render as a static image. The PaintFrame from content will
                 // carry animating=false, so the UA stops re-noting rendering
@@ -316,6 +343,12 @@ fn handle_media_event<R: SurfaceRenderer>(
                 }) {
                     error!("[graphics] failed to send VideoEnded: {send_error}");
                 }
+                maybe_compose(
+                    webviews,
+                    webview_id,
+                    &expected_videos(pipeline_webview_map, finished_videos),
+                    child_webview_to_parent,
+                );
             }
         }
         MediaBackendEvent::Error {
@@ -323,6 +356,17 @@ fn handle_media_event<R: SurfaceRenderer>(
             message,
         } => {
             error!("[graphics] pipeline {:?} error: {}", pipeline_id, message);
+            // The pipeline will never deliver a frame; a pending composition
+            // must not wait on it.
+            if let Some(&(webview_id, paint_id)) = pipeline_webview_map.get(&pipeline_id) {
+                finished_videos.insert(paint_id);
+                maybe_compose(
+                    webviews,
+                    webview_id,
+                    &expected_videos(pipeline_webview_map, finished_videos),
+                    child_webview_to_parent,
+                );
+            }
         }
         MediaBackendEvent::DurationChanged {
             pipeline_id,
@@ -344,6 +388,7 @@ fn handle_command<B: MediaBackend + 'static, R: SurfaceRenderer>(
     pipeline_webview_map: &mut HashMap<MediaPipelineId, (WebviewId, VideoPaintId)>,
     media_backend: Option<&mut B>,
     child_webview_to_parent: &mut HashMap<WebviewId, (WebviewId, FrameId)>,
+    finished_videos: &mut HashSet<VideoPaintId>,
     tla_tracer: &mut TLATracer,
     channels: &ReadbackChannels<R::RenderData>,
 ) -> bool {
@@ -401,39 +446,28 @@ fn handle_command<B: MediaBackend + 'static, R: SurfaceRenderer>(
                 recorded_scene,
                 is_root_candidate,
             );
-            // Compose whenever the root frame arrives, even at a zero-sized
-            // viewport: the frame is rendered at a minimum size so the UA's
-            // rendering cycle always completes (a skipped frame would leave
-            // the cycle open and stall all future renders).
-            // Only compose and produce a texture when the top-level (root)
-            // frame arrives. Child PaintFrames and video frames are buffered
-            // locally — their LATEST data is included when the root triggers
-            // composition. This ensures exactly one texture per render cycle
-            // regardless of how many embedded frames exist.
-            let should_compose = is_root_candidate;
-            if should_compose {
-                info!(
-                    "[render-pipe] Graphics compose scene webview={} root_frame={}",
-                    webview_id.0, frame_id.0
-                );
-                if let Some(mut composed) = slot.compositor.compose_scene(webview_id) {
-                    // Populate child data for the UA to publish and route.
-                    let (cv, cftw) =
-                        build_child_data(&mut slot.compositor, child_webview_to_parent);
-                    composed.child_viewports = cv;
-                    composed.child_frame_to_webview = cftw;
-                    // animating comes from the content-process PaintFrame flag.
-                    // Content knows what's animating (video, CSS animations)
-                    // and sets this. Graphics just passes it through.
-                    composed.animating = animating;
-                    if let Err(error) = slot.renderer.submit_scene(composed) {
-                        error!(
-                            "[graphics] submit composed scene failed for {:?}: {error:?}",
-                            webview_id
-                        );
-                    }
-                }
+            // Record the animating flag of every stored frame (root and
+            // child): the composed scene aggregates it so the UA keeps
+            // noting rendering opportunities while any composing frame
+            // animates.
+            slot.compositor.note_frame_animating(frame_id, animating);
+            // Only the top-level (root) frame drives composition: child
+            // PaintFrames and video frames are buffered locally and included
+            // when the root triggers composition. This ensures exactly one
+            // texture per render cycle regardless of how many embedded
+            // frames exist.
+            if is_root_candidate {
+                // Defer composition until every embedded frame the root
+                // references has arrived, so a child frame racing behind
+                // the root is still included (never dropped).
+                slot.compositor.mark_composition_pending();
             }
+            maybe_compose(
+                webviews,
+                webview_id,
+                &expected_videos(pipeline_webview_map, finished_videos),
+                child_webview_to_parent,
+            );
         }
         GraphicsCommand::RemoveVideoFrame {
             webview_id,
@@ -510,10 +544,21 @@ fn handle_command<B: MediaBackend + 'static, R: SurfaceRenderer>(
             }
         }
         GraphicsCommand::MediaDestroy { pipeline_id } => {
-            if let Some(p) = pipelines.remove(&pipeline_id)
-                && let Err(e) = p.destroy()
+            if let Some(pipeline) = pipelines.remove(&pipeline_id)
+                && let Err(e) = pipeline.destroy()
             {
                 error!("[graphics:media] destroy: {e}");
+            }
+            // The paint id will never produce more frames; drop it from the
+            // expected set so a pending composition does not wait on it.
+            if let Some((webview_id, paint_id)) = pipeline_webview_map.remove(&pipeline_id) {
+                finished_videos.insert(paint_id);
+                maybe_compose(
+                    webviews,
+                    webview_id,
+                    &expected_videos(pipeline_webview_map, finished_videos),
+                    child_webview_to_parent,
+                );
             }
         }
 
@@ -523,6 +568,69 @@ fn handle_command<B: MediaBackend + 'static, R: SurfaceRenderer>(
         GraphicsCommand::Shutdown => return true,
     }
     false
+}
+
+/// The video paint ids whose pipeline is live and will produce more frames:
+/// a pending composition waits for a frame from these, but never waits on a
+/// paint id with no pipeline or one that ended or failed.
+fn expected_videos(
+    pipeline_webview_map: &HashMap<MediaPipelineId, (WebviewId, VideoPaintId)>,
+    finished_videos: &HashSet<VideoPaintId>,
+) -> HashSet<VideoPaintId> {
+    pipeline_webview_map
+        .values()
+        .map(|(_, paint_id)| *paint_id)
+        .filter(|paint_id| !finished_videos.contains(paint_id))
+        .collect()
+}
+
+/// Compose the webview's scene when a root frame arrived and every embedded
+/// frame it references has been stored (child frames, and video frames that
+/// are still expected). One composition per root frame, deferred until its
+/// embedded frames catch up — a child frame racing behind the root is still
+/// included instead of being dropped.
+fn maybe_compose<R: SurfaceRenderer>(
+    webviews: &mut HashMap<WebviewId, WebviewState<R>>,
+    webview_id: WebviewId,
+    expected_videos: &HashSet<VideoPaintId>,
+    child_webview_to_parent: &HashMap<WebviewId, (WebviewId, FrameId)>,
+) {
+    let Some(slot) = webviews.get_mut(&webview_id) else {
+        return;
+    };
+    if !slot.compositor.has_pending_composition() {
+        return;
+    }
+    if !slot.compositor.composition_ready(expected_videos) {
+        debug!(
+            "[render-pipe] Graphics defer composition webview={} (waiting for embedded frames)",
+            webview_id.0
+        );
+        return;
+    }
+    info!(
+        "[render-pipe] Graphics compose scene webview={} root_frame={:?}",
+        webview_id.0,
+        slot.compositor.root_frame_id(),
+    );
+    let Some(mut composed) = slot.compositor.compose_scene(webview_id) else {
+        return;
+    };
+    // Populate child data for the UA to publish and route.
+    let (child_viewports, child_frame_to_webview) =
+        build_child_data(&mut slot.compositor, child_webview_to_parent);
+    composed.child_viewports = child_viewports;
+    composed.child_frame_to_webview = child_frame_to_webview;
+    // animating comes from the content-process PaintFrame flag on the root
+    // frame. Content knows what's animating (video, CSS animations) and sets
+    // this; the composed scene reports it so the UA keeps re-noting
+    // rendering opportunities. Graphics just passes it through.
+    if let Err(error) = slot.renderer.submit_scene(composed) {
+        error!(
+            "[graphics] submit composed scene failed for {:?}: {error:?}",
+            webview_id
+        );
+    }
 }
 
 /// Extract child frame data from the compositor and match against the

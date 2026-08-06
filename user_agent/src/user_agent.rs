@@ -3977,6 +3977,7 @@ impl UserAgentWorker {
                 webview_id,
                 payload,
                 animating,
+                animating_frame_ids,
                 width,
                 height,
                 generation,
@@ -4042,10 +4043,20 @@ impl UserAgentWorker {
                     self.pending_update_the_rendering.len()
                 );
                 // Animated content wants the next frame: queue an
-                // opportunity so the next FrameNeeded (the next paint)
-                // starts the next frame.
+                // opportunity for the top-level and every composing child
+                // frame that is animating, so the next FrameNeeded (the
+                // next paint) starts the next frame. Only the animating
+                // frames are noted; static composing siblings are not
+                // re-rendered.
                 if *animating {
                     self.queued_rendering_opportunities.insert(webview_id.0);
+                    for frame_id in animating_frame_ids {
+                        if let Some(child_wv) = child_frame_to_webview.get(frame_id) {
+                            self.queued_rendering_opportunities.insert(child_wv.0);
+                        }
+                        // Frame ids not in the child map belong to the root
+                        // frame itself, already noted above.
+                    }
                 }
                 // If the embedder already needs the next frame (a
                 // FrameNeeded arrived while this render was in flight),

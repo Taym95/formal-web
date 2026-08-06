@@ -45,6 +45,9 @@ pub struct FrameMetadata {
     pub child_viewports: Vec<ChildViewport>,
     pub child_frame_to_webview: HashMap<FrameId, WebviewId>,
     pub animating: bool,
+    /// The composed frames (root and children) that carry the animating
+    /// flag; the UA notes rendering opportunities for these navigables.
+    pub animating_frame_ids: Vec<FrameId>,
 }
 
 /// The outcome of delivering a completed frame, reported to the run loop so
@@ -338,6 +341,7 @@ pub(crate) fn frame_metadata(
     child_viewports: HashMap<WebviewId, [f64; 4]>,
     child_frame_to_webview: HashMap<FrameId, WebviewId>,
     animating: bool,
+    animating_frame_ids: Vec<FrameId>,
 ) -> FrameMetadata {
     let child_ports: Vec<ChildViewport> = child_viewports
         .into_iter()
@@ -352,6 +356,7 @@ pub(crate) fn frame_metadata(
         child_viewports: child_ports,
         child_frame_to_webview,
         animating,
+        animating_frame_ids,
     }
 }
 

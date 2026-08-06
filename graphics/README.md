@@ -232,17 +232,20 @@ because Vello's `register_texture` requires `Rgba8Unorm`.
 
 ## Open risks and questions
 
-- **The `animating` flag is the wrong signal for video (follow-up).** Content
-  currently sets `PaintFrame.animating = has_video` (the document has a non-
-  ended video element), which the UA uses to keep re-noting rendering
-  opportunities. That flag drives the render cycle even when the video is not
+- **The `animating` flag is a coarse signal for animation flow (follow-up).**
+  Content sets `PaintFrame.animating = has_video || document.is_animating()`
+  (a non-ended video element, or blitz reporting active CSS
+  animations/transitions, animating same-origin subdocuments, or scroll
+  animations), which the UA uses to keep re-noting rendering opportunities.
+  The video part still drives the render cycle even when the video is not
   producing frames (failed/blocked load, ended-but-not-marked, muted
   autoplay blocked): the content re-renders the same scene, the graphics
-  process re-composes an identical frame, and the embedder repaints identical
-  pixels — observed as the same content frame id re-rendered continuously at
-  ~30fps. Planned follow-up:
+  process re-composes an identical frame, and the embedder repaints
+  identical pixels — observed as the same content frame id re-rendered
+  continuously at ~30fps. Planned follow-up:
   - Set `animating` only when the document has a **pending rAF callback**
-    (script-driven animation).
+    (script-driven animation) or blitz is genuinely advancing CSS
+    animations.
   - Handle video-driven continuous flow separately: either a dedicated
     flag, or — preferred — have the graphics process (which receives both
     the media backend's video frames and content's `PaintFrame`) produce a
@@ -258,6 +261,33 @@ because Vello's `register_texture` requires `Rgba8Unorm`.
     through the UA (e.g. a `VideoFrameReady` trace event), and the
     composition itself still happens on the root `PaintFrame` within the
     cycle.
+- **Composition waits for the latest embedded frames.** Since the
+  FrameNeeded-gated cycle was introduced, a root `PaintFrame` arriving at
+  the graphics process before a child (cross-origin iframe) `PaintFrame`
+  — the two are produced in parallel content processes — composed with the
+  old buffered child frame, and the UA cleared the child's pending update
+  anyway: the child's new frame sat uncomposed until the next UI event
+  noted another opportunity (stale iframes). Now a root arrival marks the
+  composition pending and defers it until every embedded frame it
+  references has arrived: child frames (their `PaintFrame` is in flight,
+  so the wait is bounded) and video frames whose pipeline is live and has
+  not ended/failed (`expected_videos`). A late child or video frame
+  completes the pending composition; the composed scene therefore always
+  includes the latest embedded frames. The RenderingOpportunity TLA model
+  is unchanged: there is still exactly one composition per root render
+  cycle.
+- **The composed scene aggregates the animating flag across the composed
+  frames.** `PaintFrame.animating` is recorded per stored frame; a
+  composition reports `animating = true` when any composed frame animates
+  (the root document, or a cross-origin iframe — same-origin iframes are
+  subdocuments and already fold into the parent's `is_animating()`), and
+  carries the animating frame ids. The UA notes rendering opportunities
+  for those navigables on `PixelFrameReady`, so a CSS animation or video
+  inside a cross-origin iframe keeps both its own process and the
+  top-level rendering until it ends. The RenderingOpportunity TLA model
+  abstracts the hierarchy: `frame_needed`, `pending`, and the per-frame
+  counters are traced only for the top-level navigable, and the
+  model-checking configuration uses independent top-level frames.
 - **Resize**: on resize the whole 2-slot IOSurface double buffer is recreated
   and the embedder re-imports + re-registers the new surfaces. The update
   happens in one large step once the resize settles — there is no incremental

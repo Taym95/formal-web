@@ -55,6 +55,10 @@ struct CachedFrame {
     child_frames: Vec<NavigableContainerLayout>,
     composition: FrameCompositionMetadata,
     scene: RecordedScene,
+    /// True when this frame's document contains animated content (video
+    /// frames still being produced, CSS animations). The composed scene
+    /// aggregates it so the UA keeps noting rendering opportunities.
+    animating: bool,
 }
 
 /// The content of a decoded video frame: CPU bytes (cross-platform) or a
@@ -93,6 +97,13 @@ pub struct Compositor {
     resolved_tree_dirty: bool,
     /// Latest frame per video paint id.
     video_frames: HashMap<VideoPaintId, CompositorVideoFrame>,
+    /// True when the latest root frame arrived but its composition is
+    /// deferred until every embedded frame it references has arrived.
+    composition_pending: bool,
+    /// Accumulated across the frames of the current composition: whether any
+    /// composed frame is animating, and which frames are.
+    composing_animating: bool,
+    composing_animating_frames: Vec<FrameId>,
     /// Font transport state for this webview: fonts registered from content
     /// PaintFrames, resolved when recorded scenes are turned into render
     /// scenes.
@@ -105,6 +116,8 @@ impl Compositor {
         self.video_frames.clear();
         self.replace_root_on_next_paint = true;
         self.resolved_tree_dirty = true;
+        // The new document's root frame will re-mark the composition pending.
+        self.composition_pending = false;
     }
 
     /// Insert a decoded video frame. Returns `true` when this is the first
@@ -166,6 +179,7 @@ impl Compositor {
             child_frames: Vec::new(),
             composition,
             scene,
+            animating: false,
         };
 
         if self.replace_root_on_next_paint {
@@ -207,6 +221,66 @@ impl Compositor {
         frame.into_recorded_scene(&mut self.font_receiver, shmem_regions)
     }
 
+    /// The latest root frame arrived; its composition must wait for every
+    /// embedded frame it references to arrive before it can be composed.
+    pub fn mark_composition_pending(&mut self) {
+        self.composition_pending = true;
+    }
+
+    /// Record the animating flag of a stored frame: its document contains
+    /// animated content (video, CSS animations). The composed scene
+    /// aggregates it so the UA keeps noting rendering opportunities while
+    /// any composed frame animates.
+    pub fn note_frame_animating(&mut self, frame_id: FrameId, animating: bool) {
+        if let Some(frame) = self.committed_frames.get_mut(&frame_id) {
+            frame.animating = animating;
+        }
+        if let Some(frame) = self.pending_frames.get_mut(&frame_id) {
+            frame.animating = animating;
+        }
+    }
+
+    pub fn has_pending_composition(&self) -> bool {
+        self.composition_pending
+    }
+
+    pub fn root_frame_id(&self) -> Option<FrameId> {
+        self.root_frame_id
+    }
+
+    /// Whether every embedded frame the latest root frame references has
+    /// arrived: child frames must be in the committed set, and video frames
+    /// must be present or not expected (no live pipeline for the paint id,
+    /// or the pipeline ended/failed).
+    pub fn composition_ready(&self, expected_videos: &HashSet<VideoPaintId>) -> bool {
+        let Some(root_frame_id) = self.root_frame_id else {
+            return false;
+        };
+        let Some(root_frame) = self.committed_frames.get(&root_frame_id) else {
+            return false;
+        };
+        for site in &root_frame.composition.embed_sites {
+            match site {
+                EmbedSite::Frame(iframe_site) => {
+                    if !self
+                        .committed_frames
+                        .contains_key(&iframe_site.child_frame_id)
+                    {
+                        return false;
+                    }
+                }
+                EmbedSite::Video(video_data) => {
+                    if expected_videos.contains(&video_data.paint_id)
+                        && !self.video_frames.contains_key(&video_data.paint_id)
+                    {
+                        return false;
+                    }
+                }
+            }
+        }
+        true
+    }
+
     /// Compose the final scene for this compositor and return it with
     /// hit-testing info. Caller is responsible for resetting state.
     pub fn compose_scene(
@@ -214,6 +288,11 @@ impl Compositor {
         webview_id: ipc_messages::content::WebviewId,
     ) -> Option<ComposedScene> {
         let root_frame_id = self.root_frame_id?;
+        // The pending composition completes now; the next root frame arrival
+        // re-marks it pending.
+        self.composition_pending = false;
+        self.composing_animating = false;
+        self.composing_animating_frames.clear();
         self.reset_composed_frame_state();
         self.prepare_root_frame(root_frame_id)?;
         let mut stack = HashSet::from([root_frame_id]);
@@ -229,7 +308,8 @@ impl Compositor {
             frame_hit_info,
             child_viewports: HashMap::new(),
             child_frame_to_webview: HashMap::new(),
-            animating: false,
+            animating: self.composing_animating,
+            animating_frame_ids: std::mem::take(&mut self.composing_animating_frames),
         })
     }
 
@@ -397,6 +477,19 @@ impl Compositor {
 
             (embed_sites, scene)
         };
+
+        // Aggregate the animating flag across the composed frames: the
+        // composed scene reports it so the UA keeps noting rendering
+        // opportunities while any composing frame animates.
+        if self
+            .committed_frames
+            .get(&frame_id)
+            .map(|frame| frame.animating)
+            .unwrap_or(false)
+        {
+            self.composing_animating = true;
+            self.composing_animating_frames.push(frame_id);
+        }
 
         let bg_map: HashMap<_, _> = embed_sites
             .iter()

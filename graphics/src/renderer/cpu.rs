@@ -232,6 +232,7 @@ impl SurfaceRenderer for CpuRenderer {
             child_viewports,
             child_frame_to_webview,
             animating,
+            animating_frame_ids,
         } = composed;
         let (width, height) = render_size(&frame_hit_info);
         info!(
@@ -277,6 +278,7 @@ impl SurfaceRenderer for CpuRenderer {
             child_viewports,
             child_frame_to_webview,
             animating,
+            animating_frame_ids,
         );
 
         // Step 1: Vello compute render into the intermediate texture.
@@ -347,6 +349,7 @@ impl SurfaceRenderer for CpuRenderer {
         let child_viewports = metadata.child_viewports;
         let child_frame_to_webview = metadata.child_frame_to_webview;
         let animating = metadata.animating;
+        let animating_frame_ids = metadata.animating_frame_ids;
         // The map is scheduled to complete after this submission finishes on
         // the GPU; the callback fires on the poll thread and delivers the
         // completed frame to the main loop.
@@ -370,6 +373,7 @@ impl SurfaceRenderer for CpuRenderer {
                         child_viewports,
                         child_frame_to_webview,
                         animating,
+                        animating_frame_ids,
                     },
                 }) {
                     error!("[gpu-renderer] failed to deliver readback ready: {send_error}");
@@ -464,6 +468,7 @@ impl SurfaceRenderer for CpuRenderer {
                     webview_id,
                     payload: SurfacePayload::CpuShmem { shmem_key },
                     animating: metadata.animating,
+                    animating_frame_ids: metadata.animating_frame_ids,
                     width,
                     height,
                     generation,
