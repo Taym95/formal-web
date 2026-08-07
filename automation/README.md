@@ -14,7 +14,7 @@ Playwright, or a raw WebSocket) can connect.
 
 ```bash
 # From the workspace root, run the embedder directly:
-embedder/target/debug/formal-web-embedder cdp --port 9222 \
+target/debug/formal-web-embedder cdp --port 9222 \
   --startup-url "file:///path/to/page.html"
 
 # Or via the workspace entrypoint:
@@ -75,7 +75,7 @@ navigation smoke tests and by the WPT runner.
 
 ```bash
 # Start with WebDriver:
-embedder/target/debug/formal-web-embedder webdriver --port 4451 \
+target/debug/formal-web-embedder webdriver --port 4451 \
   --startup-url "file:///path/to/page.html"
 
 # Create a session:

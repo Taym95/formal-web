@@ -185,7 +185,7 @@ shared dependency resolution and incremental compilation.
   - `formal-web-graphics` owns per-webview compositors and video/audio playback (media backend).
     It receives `PaintFrame` and `VideoFrame` payloads and sends back composed scenes with
     `FrameHitInfo` for hit-testing.
-- **`js_engine` crate**: a generic JS engine trait and ECMA-262 abstract operations. Three backends: V8 (default, runs WPT), Boa (opt-in, required for WebAssembly), and JSC (macOS opt-in). WebAssembly is a separate feature (`wasm`). See `js_engine/README.md`.
+- **`js_engine` crate**: a generic JS engine trait and ECMA-262 abstract operations. Three backends: V8 (default, runs WPT), Boa (opt-in), and JSC (macOS opt-in). The `wasm` feature is the Wasmtime-based WebAssembly implementation for the Boa engine only (V8 and JSC implement WebAssembly natively). See `js_engine/README.md`.
 - **`js_engine_macros` crate**: proc-macro companion providing `#[gc_struct]` for GC-traced platform objects.
 
 ### Feature flags
@@ -200,7 +200,8 @@ shared dependency resolution and incremental compilation.
 
 V8 is the default backend for running WPT tests.  Wasm is a separate feature
 (and Boa-only) to avoid pulling in wasmtime when not needed.  JSC is
-macOS-only and experimental (see `js_engine/README.md` for known issues).
+macOS-only and experimental (see `js_engine/src/jsc/README.md` for known
+issues).
 
 ### Three verbs
 
@@ -222,7 +223,7 @@ rustup run 1.94.0 cargo run --release
 rustup run 1.94.0 cargo run --release -- wpt
 ```
 
-### Boa (opt-in; required for WebAssembly)
+### Boa (opt-in; host for the Wasmtime WebAssembly implementation)
 
 ```bash
 rustup run 1.94.0 cargo build --release --no-default-features --features boa,media
@@ -429,7 +430,7 @@ operations allocate. The approved patterns are:
 
 Do not write new code that hands `ec` to a closure while a cell borrow is
 live (e.g. `with_..._mut(|data, ec| ...)` patterns). See
-`js_engine/README.md` ("GcCell borrow discipline") for the mechanism and the
+`content/README.md` ("GcCell borrow discipline") for the mechanism and the
 remaining exception class.
 
 # Never Assume Test Failures Are Pre-Existing

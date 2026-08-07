@@ -48,8 +48,6 @@ These are called by domain code in Streams, HTML, and DOM.  Each follows
 its spec algorithm with `// Step N:` comments and uses only the
 `ExecutionContext<T>` trait — no engine-specific APIs.
 
-**Removed functions:** `a_new_promise()` was removed during the generic JS
-migration — callers now use `ec.new_promise_pending()` directly.
 `wait_for_all()` and `wait_for_all_get_promise()` are spec-complete but
 not yet wired to any domain call site (kept with `#[allow(dead_code)]`).
 
@@ -142,14 +140,6 @@ attributes and operations on it, installs as a property on the global object.
 attribute support (e.g. `[Exposed]`).
 
 ## Design decisions
-
-### `PhantomData<T>` removed
-
-The `AttributeDef`, `OperationDef`, and `ConstantDef` structs previously had
-`_phantom: PhantomData<T>` fields. These were unnecessary because `T` is
-already used through associated type projections (`T::JsValue`) and trait
-bounds (`ExecutionContext<T>`) in the struct fields. Removed during the
-generic JS migration (July 2026).
 
 ### `this`-value checking is manual
 

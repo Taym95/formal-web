@@ -78,7 +78,10 @@ run the anchor's activation behavior.
 
 ### EnvironmentSettingsObject owns a Document platform object
 
-`EnvironmentSettingsObject.document` is now `crate::dom::Document` (the platform object), not `Rc<RefCell<BaseDocument>>`. The blitz BaseDocument is accessible via `document.node.document`. This provides direct access to the Document's `EventTarget` for dispatch path building without going through a JsObject.
+`EnvironmentSettingsObject.document` is `crate::dom::Document` (the platform
+object). The blitz BaseDocument is accessible via `document.node.document`.
+This provides direct access to the Document's `EventTarget` for dispatch
+path building without going through a JsObject.
 
 ### What NOT to do
 

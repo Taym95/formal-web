@@ -3,7 +3,7 @@ use std::vec::Vec;
 
 use js_engine::gc::{GcCell, gc_cell_new};
 use js_engine::gc_struct;
-use js_engine::{JsTypes, records::PromiseResolvers};
+use js_engine::{ExecutionContext, JsTypes, records::PromiseResolvers};
 
 use crate::js::Types;
 
@@ -64,16 +64,20 @@ pub struct WasmState {
 
 #[cfg(all(boa_backend, feature = "wasm"))]
 impl WasmState {
-    pub fn new() -> Self {
+    pub fn new(ec: &mut dyn ExecutionContext<Types>) -> Self {
         Self {
-            pending_requests: gc_cell_new(Vec::new()),
+            pending_requests: gc_cell_new(Vec::new(), ec),
             request_id_counter: Cell::new(0),
-            pending_resolvers: gc_cell_new(Vec::new()),
+            pending_resolvers: gc_cell_new(Vec::new(), ec),
         }
     }
 
-    pub fn push_pending_request(&self, request: PendingRequest) {
-        self.pending_requests.borrow_mut().push(request);
+    pub fn push_pending_request(
+        &self,
+        request: PendingRequest,
+        ec: &mut dyn ExecutionContext<Types>,
+    ) {
+        self.pending_requests.borrow_mut(ec).push(request);
     }
 
     pub fn next_request_id(&self) -> u64 {
@@ -82,8 +86,11 @@ impl WasmState {
         id
     }
 
-    pub fn take_pending_wasm_batches(&self) -> Vec<(u64, Vec<u8>)> {
-        let mut requests = self.pending_requests.borrow_mut();
+    pub fn take_pending_wasm_batches(
+        &self,
+        ec: &mut dyn ExecutionContext<Types>,
+    ) -> Vec<(u64, Vec<u8>)> {
+        let mut requests = self.pending_requests.borrow_mut(ec);
         let mut batches = Vec::new();
         for request in requests.iter_mut() {
             if let PendingRequest::WasmCompile {
@@ -102,8 +109,11 @@ impl WasmState {
         batches
     }
 
-    pub fn take_pending_wasm_instantiates(&self) -> Vec<(u64, wasmtime::Module)> {
-        let mut requests = self.pending_requests.borrow_mut();
+    pub fn take_pending_wasm_instantiates(
+        &self,
+        ec: &mut dyn ExecutionContext<Types>,
+    ) -> Vec<(u64, wasmtime::Module)> {
+        let mut requests = self.pending_requests.borrow_mut(ec);
         let mut instantiates = Vec::new();
         for request in requests.iter_mut() {
             if let PendingRequest::WasmInstantiate {
@@ -126,18 +136,20 @@ impl WasmState {
         request_id: u64,
         promise: JsObject,
         resolvers: PromiseResolvers<Types>,
+        ec: &mut dyn ExecutionContext<Types>,
     ) {
         self.pending_resolvers
-            .borrow_mut()
+            .borrow_mut(ec)
             .push((request_id, promise, resolvers));
     }
 
     pub fn consume_wasm_request(
         &self,
         request_id: u64,
+        ec: &mut dyn ExecutionContext<Types>,
     ) -> Option<(JsObject, PromiseResolvers<Types>)> {
         {
-            let mut requests = self.pending_requests.borrow_mut();
+            let mut requests = self.pending_requests.borrow_mut(ec);
             let idx = requests.iter().position(|r| match r {
                 PendingRequest::WasmCompile {
                     request_id: rid, ..
@@ -150,7 +162,7 @@ impl WasmState {
                 requests.swap_remove(idx);
             }
         }
-        let mut resolvers = self.pending_resolvers.borrow_mut();
+        let mut resolvers = self.pending_resolvers.borrow_mut(ec);
         let idx = resolvers
             .iter()
             .position(|(rid, _, _)| *rid == request_id)?;

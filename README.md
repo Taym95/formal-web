@@ -1,33 +1,78 @@
 # formal-web
 
-formal-web is a Rust web-engine prototype with a modular architecture and support for formal verfication.
+formal-web is a Rust web-engine prototype with a modular architecture and support for formal verification.
 
 ## Getting Started
 
-The project has only been run on macOS; all build commands assume macOS.
+The project has only been run on macOS; all build commands assume macOS. The
+Rust toolchain is pinned to 1.94.0 (`rustup toolchain install 1.94.0`); if it
+is not your default toolchain, prefix the commands below with `rustup run 1.94.0`.
 
-The default: **V8** as the js engine and **AVFoundation** as the media backend:
+The feature flags configure:
+
+- **JS engine** — exactly one of `v8` (default), `boa`, or `jsc` must be
+  enabled; enabling none (`--no-default-features` alone) or more than one
+  fails the build.
+- **Media** — the `media` feature (on by default) enables video/audio
+  playback through a platform media backend; drop it to build without media.
+- **WebAssembly** — the `wasm` feature is the Wasmtime-based WebAssembly
+  implementation for the Boa engine (which has no native WebAssembly).
+  V8 and JSC implement WebAssembly natively, so no feature is needed
+  there.
+
+### Default: V8 + AVFoundation media
+
 ```bash
 cargo build --release
 cargo run --release
 ```
 
-**Boa** (alternative; required for `wasm` support via Wasmtime):
+V8 is the default JS engine. On macOS, media defaults to the AVFoundation
+backend. The WPT suite runs with `cargo run --release -- wpt`.
+
+### No media (no video/audio)
+
+```bash
+cargo build --release --no-default-features --features v8
+cargo run --release --no-default-features --features v8
+```
+
+### Boa engine
+
 ```bash
 cargo build --release --no-default-features --features boa,media
 cargo run --release --no-default-features --features boa,media
 ```
 
-**JSC** (experimental):
+### Boa + WebAssembly
+
+```bash
+cargo build --release --no-default-features --features boa,wasm,media
+```
+
+The `wasm` feature wires the Wasmtime-based WebAssembly implementation,
+which only exists for the Boa engine (Boa has no native WebAssembly);
+V8 and JSC provide WebAssembly natively, so the feature is not needed
+there.
+
+### JSC engine (experimental, macOS only)
+
 ```bash
 cargo build --release --no-default-features --features jsc,media
 cargo run --release --no-default-features --features jsc,media
 ```
 
-**GStreamer** media backend instead of AVFoundation (Boa):
+### GStreamer media backend instead of AVFoundation
+
 ```bash
-cargo build --release --no-default-features --features backend-gstreamer,boa,media
+cargo build --release --features backend-gstreamer
 ```
+
+The media backend is independent of the JS engine. AVFoundation (the macOS
+default) keeps decoded video frames on the GPU; GStreamer delivers CPU bytes
+and is the only backend on non-Apple platforms. To pair GStreamer with a
+different engine, add the engine flags, e.g.
+`cargo build --release --no-default-features --features boa,media,backend-gstreamer`.
 
 ## Project architecture
 
@@ -39,26 +84,17 @@ Besides this, a modular approach is followed by making the following components 
 - The media engine: Gstreamer or AvFoundation.
 - The IPC layer: ipc-channel or Xpc/BrowserKit.
 - The networking layer (planned, for now tokio only).
+- The graphics process, with two independent backends: scene delivery
+  (zero-copy IOSurface on macOS by default, CPU readback via
+  `-p graphics --features cpu_readback` on all platforms) and video frames
+  (GPU buffers with AVFoundation, CPU bytes with GStreamer).
 
-The following procesess are used:
+The following processes are used:
 
 - **Main** (`src/main.rs`): runs the `embedder`, `webview`, and `user_agent` crates.
 - **Content** (`user_agent/src/event_loop.rs`): runs the `content` crate. Multiple processes: one per [similar origin window agent](https://html.spec.whatwg.org/#similar-origin-window-agent).
 - **Graphics** (`graphics/src/bin/graphics_process.rs`): runs the `graphics` and `media` crates.
 - **Net** (`user_agent/src/fetch.rs`): runs the `net` crate.
-
-## Modular design
-
-The graphics process has two independent backends — scene delivery
-(zero-copy IOSurface, macOS only, or CPU readback, all platforms) and
-video frames (AVFoundation keeps decoded frames on the GPU, GStreamer
-delivers CPU bytes):
-
-| Build | Scene delivery | Video | Result |
-|---|---|---|---|
-| macOS default | zero-copy (IOSurface) | AVFoundation (GPU) | fully zero-copy |
-| macOS + `--no-default-features --features backend-gstreamer,boa,media` | zero-copy (IOSurface) | GStreamer (CPU bytes) | video via CPU, scene zero-copy |
-| macOS + `-p graphics --features cpu_readback` | CPU readback | either | scene via shared memory |
 
 ## Formal verification
 

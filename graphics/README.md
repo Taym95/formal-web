@@ -21,7 +21,7 @@ on macOS, and elsewhere (GStreamer media backend) the CPU readback path is
 the only one. The embedder and user agent handle both wire payloads
 regardless of which backend the graphics process was built with.
 
-## Current pipeline (CPU readback + shared memory)
+## CPU readback + shared memory pipeline (all platforms)
 
 Each frame travels through the processes as follows:
 
@@ -61,14 +61,6 @@ Key properties:
 Per-frame copies today: GPU → CPU readback, kernel copy in the IPC transport,
 CPU → GPU upload, and Vello's internal atlas copy.
 
-## Failed approaches: cross-process IOSurface zero-copy
-
-| Approach | Problem |
-|---|---|
-| `IOSurfaceLookup(id)` — look up by global IOSurfaceID | Returns NULL cross-process on modern macOS; deprecated since 10.11 |
-| Mach port via ipc-channel serde — extract port from `OpaqueIpcSender` UB read + hand-rolled `mach_msg` | UB + sender port arrives as 0; custom Mach structs had layout bugs |
-| Bootstrap register/lookup — `bootstrap_register` receive port, graphics sends IOSurface Mach port via `mach_msg` | `mach_msg` fails with `MACH_SEND_INVALID_DEST`; `bootstrap_register` is unreliable on Sequoia |
-
 ## Design: zero-copy GPU texture sharing (IOSurface route)
 
 ### Data flow
@@ -100,7 +92,7 @@ blits it. No readback, no IPC pixel bytes, no upload, no ack.
   `Device::as_hal::<Metal>()` (both `#[cfg(wgpu_core)]`, always enabled
   natively), and `wgpu_hal::metal::Device::texture_from_raw(raw: Retained<...MTLTexture>, format, raw_type, array_layers, mip_levels, copy_size)` plus `raw_device()` (objc2 types, not the `metal` crate).
 
-### Required corrections vs. a naive sketch
+### Shared-texture constraints
 
 - **Format**: the shared texture must be `Rgba8Unorm` (IOSurface `'RGBA'`,
   `MTLPixelFormat::RGBA8Unorm`) — Vello's `register_texture` requires it.
@@ -120,36 +112,17 @@ blits it. No readback, no IPC pixel bytes, no upload, no ack.
 - **Lifecycle**: resize recreates the IOSurface + re-shares + re-registers; the
   texture handle's lifetime must outlive in-flight blits.
 
-### The transport blocker (Mach port over ipc-channel) — solved
+### Transporting the IOSurface Mach port
 
-The `mach_msg` machinery in ipc-channel 0.22 already sends Mach ports in every
-message — but only its own channel endpoints (`OsIpcChannel` ports collected by
-the serializer from `OpaqueIpcSender`/`OpaqueIpcReceiver` values). There was no
-public API to attach an **arbitrary** Mach port (such as an IOSurface's) to a
-message: port names are per-task so the right must physically travel in the
-message.
-
-**Solution (implemented in the `ipc-channel` fork, a git dependency on
-<https://github.com/gterzian/ipc-channel>):** a serializable
-`OsMachPort` type that pushes the port into a serialization thread-local
-(mirroring `OS_IPC_CHANNELS_FOR_SERIALIZATION`) and pops it on deserialize. The
-ports travel as a single `MACH_MSG_OOL_PORTS_DESCRIPTOR` (out-of-line ports,
-`MOVE_SEND`) appended after the shared-memory descriptors; the receive path
-collects them into a third descriptor phase. `IpcSender::send` gathers them
-alongside channel ports. The fork adds `OsIpcSender::send_with_mach_ports`;
-non-macOS platforms are untouched.
-
-Rejected alternatives, for the record:
-
-1. Plain per-port descriptors (`MACH_MSG_PORT_DESCRIPTOR`) for the arbitrary
-   ports — indistinguishable from channel ports on the receive side (the
-   receiver cannot tell how many leading descriptors are channels).
-2. **Implement the raw `mach_msg` in-tree** (in the `ipc` crate), using
-   ipc-channel's own macOS `Message` layout as the reference — the previous
-   failure was a buggy hand-rolled struct, not an impossible one.
-3. **XPC**: `xpc_dictionary_set_iosurface` carries the surface transparently —
-   but the XPC receiver is not implemented (`_xpc_unimplemented`), so this
-   needs the XPC backend finished first.
+The producer creates a Mach port for the IOSurface (`IOSurfaceRef::create_mach_port`)
+and sends it in the `PixelFrameReady` message. The forked `ipc-channel` (a git
+dependency on <https://github.com/gterzian/ipc-channel>) provides a
+serializable `OsMachPort` type: the port is pushed into a serialization
+thread-local (mirroring `OS_IPC_CHANNELS_FOR_SERIALIZATION`) and popped on
+deserialize, traveling as a single `MACH_MSG_OOL_PORTS_DESCRIPTOR`
+(out-of-line ports, `MOVE_SEND`) appended after the shared-memory descriptors;
+the receive path collects them into a third descriptor phase. The fork adds
+`OsIpcSender::send_with_mach_ports`; non-macOS platforms are untouched.
 
 ## Generic surface backend abstraction
 
@@ -261,14 +234,10 @@ because Vello's `register_texture` requires `Rgba8Unorm`.
     through the UA (e.g. a `VideoFrameReady` trace event), and the
     composition itself still happens on the top-level `PaintFrame` within the
     cycle.
-- **Composition waits for the latest embedded frames.** Since the
-  FrameNeeded-gated cycle was introduced, a top-level `PaintFrame` arriving at
-  the graphics process before a child (cross-origin iframe) `PaintFrame`
-  — the two are produced in parallel content processes — composed with the
-  old buffered child frame, and the UA cleared the child's pending update
-  anyway: the child's new frame sat uncomposed until the next UI event
-  noted another opportunity (stale iframes). Now a top-level arrival marks
-  the composition pending and defers it until every embedded frame it
+- **Composition waits for the latest embedded frames.** A top-level
+  `PaintFrame` arriving at the graphics process before a child (cross-origin
+  iframe) `PaintFrame` — the two are produced in parallel content processes —
+  marks the composition pending and defers it until every embedded frame it
   references has arrived: child frames (their `PaintFrame` is in flight,
   so the wait is bounded) and video frames whose pipeline is live and has
   not ended/failed (`expected_videos`). A late child or video frame

@@ -5,11 +5,12 @@ use std::sync::{Arc, Mutex};
 use boa_engine::{Context, JsNativeError, JsValue, js_string, object::JsObject};
 use wasmtime::{Func, Instance as WasmtimeInstance, Module, Store};
 
-use crate::html::Window;
+use crate::js::platform_objects::with_global_scope;
 use crate::wasm::conversions::{default_val_for_type, js_val_to_wasm_val, wasm_val_to_js_value};
 use crate::wasm::types::{WasmInstance, WasmModule};
 use crate::wasm::{PendingRequest, PendingState};
 use crate::webidl::bindings::create_interface_instance;
+use js_engine::boa::context_as_ec;
 use js_engine::gc_struct;
 use js_engine::{Completion, ExecutionContext, JsTypes, records::PromiseResolvers};
 
@@ -59,20 +60,6 @@ fn a_new_promise_boa(
     (promise.into(), resolvers)
 }
 
-/// Extract the `Window` from a Boa `Context`'s global object.
-/// This works around Boa's `JsObject::downcast_ref` not seeing through
-/// the `NativeDataWrapper(TraceableBox(Window))` indirection by using
-/// `create_object_with_any`'s companion `with_object_any` method.
-fn window_from_context(context: &mut Context) -> Option<&Window> {
-    let global = context.global_object();
-    // SAFETY: BoaContext is repr(transparent) over Context.
-    let boa_ctx: &js_engine::boa::BoaContext =
-        unsafe { &*(context as *mut Context as *const js_engine::boa::BoaContext) };
-    boa_ctx
-        .with_object_any(&global)
-        .and_then(|data| data.downcast_ref::<Window>())
-}
-
 /// <https://webassembly.github.io/spec/js-api/#dom-webassembly-validate>
 pub(crate) fn validate_wasm_module(stable_bytes: &[u8]) -> bool {
     // Step 2: "Compile stableBytes as a WebAssembly module and store the results as module."
@@ -104,45 +91,35 @@ fn asynchronously_compile_a_webassembly_module_boa(
     // Step 2: "Run the following steps in parallel:"
     // Phase 1 — Extract request_id and push pending request.
     let request_id = {
-        let window = match window_from_context(context) {
-            Some(w) => w,
-            None => {
-                return Err(native_error_to_js_value(
-                    JsNativeError::typ().with_message("WebAssembly: global object is not a Window"),
-                    context,
-                ));
-            }
-        };
-        let id = window.global_scope.next_wasm_request_id();
-        window
-            .global_scope
-            .push_pending_request(PendingRequest::WasmCompile {
-                bytes: stable_bytes,
-                request_id: id,
-                is_instantiate: false,
-                state: PendingState::Pending,
-            });
-        id
+        let mut request_id = 0;
+        with_global_scope(context_as_ec(context), |global_scope, ec| {
+            let id = global_scope.next_wasm_request_id();
+            global_scope.push_pending_request(
+                PendingRequest::WasmCompile {
+                    bytes: stable_bytes,
+                    request_id: id,
+                    is_instantiate: false,
+                    state: PendingState::Pending,
+                },
+                ec,
+            );
+            request_id = id;
+            Ok(())
+        })?;
+        request_id
     };
     // Phase 2 — Create promise (&mut Context, no outstanding Window borrows).
     let (promise, resolvers) = a_new_promise_boa(context);
-    // Phase 3 — Store resolver (re-acquire &Window).
-    {
-        let window = match window_from_context(context) {
-            Some(w) => w,
-            None => {
-                return Err(native_error_to_js_value(
-                    JsNativeError::typ().with_message("WebAssembly: global object is not a Window"),
-                    context,
-                ));
-            }
-        };
-        window.global_scope.store_wasm_resolver(
+    // Phase 3 — Store resolver.
+    with_global_scope(context_as_ec(context), |global_scope, ec| {
+        global_scope.store_wasm_resolver(
             request_id,
             promise.clone(),
             resolvers_to_generic(resolvers),
+            ec,
         );
-    }
+        Ok(())
+    })?;
 
     // Step 3: "Return promise."
     Ok(JsValue::from(promise))
@@ -173,44 +150,34 @@ fn asynchronously_instantiate_a_webassembly_module_boa(
     // Step 6: "Run the following steps in parallel:"
     // Phase 1 — Push pending request before creating the promise.
     let request_id = {
-        let window = match window_from_context(context) {
-            Some(w) => w,
-            None => {
-                return Err(native_error_to_js_value(
-                    JsNativeError::typ().with_message("WebAssembly: global object is not a Window"),
-                    context,
-                ));
-            }
-        };
-        let id = window.global_scope.next_wasm_request_id();
-        window
-            .global_scope
-            .push_pending_request(PendingRequest::WasmInstantiate {
-                module,
-                request_id: id,
-                state: PendingState::Pending,
-            });
-        id
+        let mut request_id = 0;
+        with_global_scope(context_as_ec(context), |global_scope, ec| {
+            let id = global_scope.next_wasm_request_id();
+            global_scope.push_pending_request(
+                PendingRequest::WasmInstantiate {
+                    module,
+                    request_id: id,
+                    state: PendingState::Pending,
+                },
+                ec,
+            );
+            request_id = id;
+            Ok(())
+        })?;
+        request_id
     };
     // Phase 2 — Create promise (&mut Context, no outstanding Window borrows).
     let (promise, resolvers) = a_new_promise_boa(context);
     // Phase 3 — Store resolver.
-    {
-        let window = match window_from_context(context) {
-            Some(w) => w,
-            None => {
-                return Err(native_error_to_js_value(
-                    JsNativeError::typ().with_message("WebAssembly: global object is not a Window"),
-                    context,
-                ));
-            }
-        };
-        window.global_scope.store_wasm_resolver(
+    with_global_scope(context_as_ec(context), |global_scope, ec| {
+        global_scope.store_wasm_resolver(
             request_id,
             promise.clone(),
             resolvers_to_generic(resolvers),
+            ec,
         );
-    }
+        Ok(())
+    })?;
 
     // Step 7: "Return promise."
     Ok(JsValue::from(promise))
@@ -242,43 +209,33 @@ fn instantiate_bytes_boa(
     // sequentially in the worker and the content process resolves the promise
     // after both complete.
     let request_id = {
-        let window = match window_from_context(context) {
-            Some(w) => w,
-            None => {
-                return Err(native_error_to_js_value(
-                    JsNativeError::typ().with_message("WebAssembly: global object is not a Window"),
-                    context,
-                ));
-            }
-        };
-        let id = window.global_scope.next_wasm_request_id();
-        window
-            .global_scope
-            .push_pending_request(PendingRequest::WasmCompile {
-                bytes: stable_bytes,
-                request_id: id,
-                is_instantiate: true,
-                state: PendingState::Pending,
-            });
-        id
+        let mut request_id = 0;
+        with_global_scope(context_as_ec(context), |global_scope, ec| {
+            let id = global_scope.next_wasm_request_id();
+            global_scope.push_pending_request(
+                PendingRequest::WasmCompile {
+                    bytes: stable_bytes,
+                    request_id: id,
+                    is_instantiate: true,
+                    state: PendingState::Pending,
+                },
+                ec,
+            );
+            request_id = id;
+            Ok(())
+        })?;
+        request_id
     };
     let (promise, resolvers) = a_new_promise_boa(context);
-    {
-        let window = match window_from_context(context) {
-            Some(w) => w,
-            None => {
-                return Err(native_error_to_js_value(
-                    JsNativeError::typ().with_message("WebAssembly: global object is not a Window"),
-                    context,
-                ));
-            }
-        };
-        window.global_scope.store_wasm_resolver(
+    with_global_scope(context_as_ec(context), |global_scope, ec| {
+        global_scope.store_wasm_resolver(
             request_id,
             promise.clone(),
             resolvers_to_generic(resolvers),
+            ec,
         );
-    }
+        Ok(())
+    })?;
     Ok(JsValue::from(promise))
 }
 
