@@ -395,6 +395,19 @@ impl GlobalScope {
             .retain(|entry| !node_ids.contains(&entry.node_id));
     }
 
+    /// Clone every cached node wrapper out of the cache, for teardown walks
+    /// that must clear per-node state without holding the cell borrow.
+    pub(crate) fn cached_node_objects(
+        &self,
+        ec: &mut dyn ExecutionContext<Types>,
+    ) -> Vec<JsObject> {
+        self.node_objects
+            .borrow(ec)
+            .iter()
+            .map(|entry| entry.object.clone())
+            .collect()
+    }
+
     /// <https://html.spec.whatwg.org/#dom-animationframeprovider-requestanimationframe>
     pub(crate) fn request_animation_frame(
         &self,

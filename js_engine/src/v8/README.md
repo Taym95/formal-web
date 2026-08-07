@@ -42,6 +42,35 @@ wrapper↔platform reflector cycle, a two-platform mutual cycle, and a JS
 object referenced only through a cell edge in a single pass; platform data
 is finalized at isolate destruction.
 
+## Native callback records and realm teardown
+
+`make_builtin_function` records live in the shared-isolate callback registry
+until the function is collected. A behaviour closure that captures a strong
+JS handle (interface prototype, promise resolver, bound listener, ...) roots
+that object; if the object transitively references its own realm's wrappers,
+the whole context is pinned: a `v8::Global` held in platform-object cells is
+an isolate root, so V8 can never collect the cycle
+`root → JS object → wrapper → platform → root`. Teardown breaks the cycle
+from both ends: `destroy_document` clears the document's event-listener and
+event-handler callbacks (the largest source of bound-function roots, e.g.
+React's `dispatchEvent.bind` listeners), and `prune_dead_realm_callbacks`
+clears the behaviour of records whose creation realm has been dropped.
+
+**Two capture models exist, with a hard limitation on one of them:**
+
+- `create_builtin_fn_with_captures` (the `create_builtin_fn_with_traced_captures`
+  family in content) keeps the captures in a cppgc-traced platform object
+  rooted by the record's behaviour closure. Marking visits the captures, so
+  their `GcCell` members and JS edges stay alive exactly while the function
+  is reachable and are released when the record is freed — proper liveness
+  (see `traced_captures_keep_payload_alive_and_follow_function_lifetime`).
+- `make_builtin_function` with a bare `Box<dyn Fn>` closure is the **opaque
+  closure path**: a Rust closure's captures cannot be walked generically, so
+  they can never be traced. Records built this way must follow the rule that
+  the closure captures **no strong JS handles** — resolve the realm's objects
+  per call instead (the Web IDL constructor fix in `register_interface_spec`
+  is the model). The teardown prune is the safety net for any violation.
+
 ## Build
 
 ```bash

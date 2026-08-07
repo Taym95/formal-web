@@ -302,3 +302,48 @@ JS bindings glue                 content/src/js/bindings/wasm/interfaces.rs
 - `content/README.md` — Content-crate overview
 - `content/src/webidl/README.md` — Web IDL bindings infrastructure, platform object pattern
 - `content/src/<domain>/README.md` — Domain-specific README (e.g. `content/src/wasm/README.md`)
+
+## Callback/JS-handle strength: three models
+
+Any Rust-held JS handle is either a strong root or a traced edge; which one a
+callback needs depends on what keeps it alive in the Web platform, and the
+difference is enforced at teardown. The three models:
+
+1. **Event listener / event handler callbacks — strong roots, released at
+   document teardown.** `EventListener.callback` (`content/src/dom/event.rs`)
+   is a `v8::Global` root because a registered listener must keep its callback
+   alive until it is removed (a traced edge would let GC collect a
+   still-registered listener). The root is bounded by the registration
+   lifetime: `destroy_document` calls `clear_all_listeners_and_handlers` on
+   every EventTarget of the document (window, document, cached node wrappers)
+   so the strong handles are dropped when the document dies. Without that
+   clearing, each listener's bound function (e.g. React's
+   `dispatchEvent.bind` wrappers) references its own platform wrapper and the
+   root pins the whole dead realm forever — the navigation memory leak.
+
+2. **Reaction/continuation captures — traced edges, lifetime = function
+   reachability.** Streams, promise, and async-iteration callbacks must be
+   created with `create_builtin_fn_with_traced_captures`
+   (`content/src/js/builtin_fn.rs`): the captures live in a cppgc-traced
+   platform object, so their cells and JS edges stay alive exactly while the
+   function is reachable and are released when it dies. They are **not**
+   strong roots: an untraced captured `GcCell` member can be collected while
+   the function is still live (the streams empty-queue panic the teardown GC
+   surfaced), and a strong root pins the realm.
+
+3. **Resolved per call — no persistent handle.** Web IDL interface
+   constructors look up their prototype from the interface registry at
+   invocation time instead of capturing it (`register_interface_spec`): there
+   is no handle to root or trace, so nothing can be retained.
+
+## The `make_builtin_function` limitation
+
+A bare closure passed to the engine's `make_builtin_function` is an opaque
+`Box<dyn Fn>`: a Rust closure's captures cannot be walked by cppgc, so any JS
+handle closed over it is an untraced strong root — model 1 with no teardown,
+i.e. a leak. Native functions that need captures must use
+`create_builtin_fn_with_traced_captures` (model 2). If a callback needs no JS
+captures, pass an empty capture type instead of closing over handles. The
+Web IDL bindings follow model 3 for constructors; `prune_dead_realm_callbacks`
+(js_engine) is the safety net that clears dead-realm records built through
+`make_builtin_function`.

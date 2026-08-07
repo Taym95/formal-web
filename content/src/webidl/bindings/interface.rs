@@ -176,13 +176,8 @@ where
         &def.attributes,
     )?;
 
-    let instance_prototype = proto.clone();
-    let unforgeables_for_closure = unforgeables_obj.clone();
-
     let constructor_fn = engine.create_builtin_function(
-        Box::new({
-            let instance_prototype_for_fn = instance_prototype.clone();
-            let _unforgeables_ref = unforgeables_for_closure.clone();
+        Box::new(
             move |args: &[Ty::JsValue],
                   new_target_or_this: Ty::JsValue,
                   ec: &mut dyn ExecutionContext<Ty>| {
@@ -230,7 +225,16 @@ where
                         ec.new_type_error("TypeError: new.target.prototype is not an object")
                     })?
                 } else {
-                    instance_prototype_for_fn.clone()
+                    // Note: cross-realm fallback not yet implemented; always
+                    // falls back to the current realm's prototype object.
+                    super::registry::get_prototype_from_host_defined::<Ty, I>(ec).ok_or_else(
+                        || {
+                            ec.new_type_error(&format!(
+                                "interface not registered: {}",
+                                std::any::type_name::<I>()
+                            ))
+                        },
+                    )?
                 };
 
                 // Step 1.8 (cont): call I::create_platform_object.
@@ -268,8 +272,8 @@ where
 
                 // Steps 1.11-1.13: Assert and return O.
                 Ok(Ty::value_from_object(instance))
-            }
-        }),
+            },
+        ),
         I::constructor_length() as u32,
         engine.property_key_from_str(I::NAME),
         true,

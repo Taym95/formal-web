@@ -27,6 +27,7 @@ use crate::html::{
     run_dom_removing_steps_for_document, run_iframe_load_event_steps_for_traversable,
 };
 use crate::js::Engine;
+use crate::js::downcast::try_with_event_target_mut;
 use crate::js::platform_objects::with_global_scope;
 use crate::ui_event::deserialize_ui_event;
 #[cfg(all(boa_backend, feature = "wasm"))]
@@ -38,7 +39,7 @@ use blitz_traits::net::{Body, Bytes, NetHandler, NetProvider, Request};
 use blitz_traits::shell::{ClipboardError, ColorScheme, ShellProvider, Viewport};
 use data_url::DataUrl;
 use html5ever::local_name;
-use js_engine::ExecutionContext;
+use js_engine::{EcmascriptHost, ExecutionContext, JsTypes};
 
 use ipc_messages::content::Command::{
     ClickElement, CompleteDocumentFetch, ContentBootstrap, CreateEmptyDocument,
@@ -1146,6 +1147,14 @@ impl ContentProcess {
     fn destroy_document(&mut self, document_id: DocumentId) -> Result<(), String> {
         run_dom_removing_steps_for_document(self, document_id)?;
         if let Some(mut content_document) = self.documents.remove(&document_id) {
+            // Release every event listener and event handler callback on the
+            // document's EventTargets (window, document, cached node
+            // wrappers): the callbacks are strong JS handles that would
+            // otherwise root the realm's objects and keep the whole context
+            // alive after the document is gone.
+            if let Err(error) = Self::clear_document_event_listeners(&mut content_document) {
+                error!("failed to clear event listeners during document teardown: {error}");
+            }
             if self
                 .active_documents_by_traversable
                 .get(&content_document.traversable_id)
@@ -1157,6 +1166,7 @@ impl ContentProcess {
             if let Err(error) = content_document.settings.clear_all_window_timers() {
                 error!("failed to clear window timers during document teardown: {error}");
             }
+            drop(content_document);
         }
         #[cfg(all(boa_backend, feature = "wasm"))]
         {
@@ -1188,7 +1198,54 @@ impl ContentProcess {
                     ..
                 } => *pending_document_id != document_id,
             });
+        drop(local_state);
+
+        // Reclaim the destroyed document's realm: release the behaviour
+        // closures of callbacks whose creation realm died with it (their
+        // captured JS handles would keep rooting the dead realm), drain the
+        // shared microtask queue, then run a full V8 + cppgc collection so
+        // the dead context is reclaimed instead of waiting for allocation
+        // pressure that a fresh page may never generate.
+        #[cfg(v8_backend)]
+        self.realm_parent.prune_dead_realm_callbacks();
+        if let Err(error) = self.realm_parent.perform_a_microtask_checkpoint() {
+            log::debug!("microtask checkpoint during document teardown failed: {error:?}");
+        }
+        self.realm_parent.gc();
         Ok(())
+    }
+
+    /// Release every event listener and event handler callback held by the
+    /// document's EventTargets (the Window, the Document, and every cached
+    /// node wrapper). Called during document teardown: the callbacks are
+    /// strong JS handles, and a listener whose bound function references its
+    /// own platform wrapper would otherwise root the realm's objects and
+    /// keep the whole context alive after the document is gone.
+    fn clear_document_event_listeners(
+        content_document: &mut ContentDocument,
+    ) -> Result<(), String> {
+        with_global_scope(content_document.settings.ec(), |global_scope, ec| {
+            let window_value = crate::js::Types::value_from_object(ec.realm_global_object());
+            let mut cleared = 0usize;
+            let _ = try_with_event_target_mut(&window_value, ec, |target, ec| {
+                cleared += target.clear_all_listeners_and_handlers(ec);
+            });
+            if let Some(document_object) = global_scope.document_object(ec) {
+                let value = crate::js::Types::value_from_object(document_object);
+                let _ = try_with_event_target_mut(&value, ec, |target, ec| {
+                    cleared += target.clear_all_listeners_and_handlers(ec);
+                });
+            }
+            for object in global_scope.cached_node_objects(ec) {
+                let value = crate::js::Types::value_from_object(object);
+                let _ = try_with_event_target_mut(&value, ec, |target, ec| {
+                    cleared += target.clear_all_listeners_and_handlers(ec);
+                });
+            }
+            let _ = cleared;
+            Ok(())
+        })
+        .map_err(|error| format!("failed to clear document event listeners: {error:?}"))
     }
 
     fn dispatch_events(&mut self, events: Vec<DispatchEventEntry>) -> Result<(), String> {

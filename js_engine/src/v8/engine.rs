@@ -68,7 +68,12 @@ enum WrapperKind {
 struct CallbackRecord {
     isolate_id: u64,
     creation_realm: RcWeak<V8RealmState>,
-    behaviour: StoredBehaviour,
+    // `None` after the record's creation realm has been dropped: the
+    // behaviour closure may capture strong JS handles that would keep the
+    // dead realm's objects (and thus the realm itself) alive, so teardown
+    // clears it to release those captures. The record memory stays valid so
+    // a stale `External` data pointer is never dereferenced after a free.
+    behaviour: RefCell<Option<StoredBehaviour>>,
 }
 
 /// A registered native-function weak handle paired with the callback record
@@ -809,7 +814,13 @@ fn native_callback(
                     wrap_local_value(scope, record.isolate_id, arguments.this().into())
                 };
                 match catch_unwind(AssertUnwindSafe(|| {
-                    (record.behaviour)(&callback_arguments, this_value, engine)
+                    let behaviour = record.behaviour.borrow();
+                    let Some(behaviour) = behaviour.as_ref() else {
+                        return Err(engine.new_type_error(
+                            "native callback behaviour released after its realm was destroyed",
+                        ));
+                    };
+                    (behaviour)(&callback_arguments, this_value, engine)
                 })) {
                     Ok(completion) => completion,
                     Err(_) => Err(engine.new_type_error("Rust panic in native callback")),
@@ -975,6 +986,32 @@ fn resolve_module_import<'scope>(
 impl V8Engine {
     pub fn new() -> Self {
         Self::new_with_shared_isolate(SharedIsolate::new())
+    }
+
+    /// Clear the behaviour closures of callback records whose creation realm
+    /// has been dropped. Those closures capture strong JS handles (interface
+    /// prototypes, promise resolvers, ...) that would root the dead realm's
+    /// objects and keep the whole realm alive after navigation; clearing
+    /// them breaks the cycle so the context becomes collectable.
+    pub fn prune_dead_realm_callbacks(&self) {
+        let mut callback_handles = self.shared_isolate.callback_handles.borrow_mut();
+        callback_handles.retain(|handle| {
+            let mut record_slot = handle.record.borrow_mut();
+            let Some(record) = record_slot.as_mut() else {
+                return false;
+            };
+            if record.creation_realm.strong_count() == 0 {
+                // The function's creation realm is gone: no queued job, timer,
+                // or event can invoke it anymore, and any JS handles its
+                // behaviour captured must stop rooting the dead realm.
+                if let Some(behaviour) = record.behaviour.get_mut().take() {
+                    drop(behaviour);
+                }
+                false
+            } else {
+                true
+            }
+        });
     }
 
     fn new_with_shared_isolate(shared_isolate: Rc<SharedIsolate>) -> Self {
@@ -1289,7 +1326,7 @@ impl V8Engine {
         let record = Box::new(CallbackRecord {
             isolate_id: self.isolate_id,
             creation_realm: Rc::downgrade(&self.realm_state),
-            behaviour,
+            behaviour: RefCell::new(Some(behaviour)),
         });
         // The record lives in a shared slot owned by both the guaranteed
         // finalizer and the callback-handle registry entry; whichever drops
@@ -1672,11 +1709,47 @@ where
         std::mem::forget(name);
         destination.assume_init()
     };
+
+    // Move the captures into a cppgc-traced platform object instead of
+    // leaving them as strong roots inside the callback record: the platform
+    // traces the captures during unified-heap marking (keeping their GcCell
+    // members and JS edges alive while the function is reachable), and the
+    // wrapper is rooted by the record's behaviour closure, so the captures
+    // are released exactly when the function dies. Rooted handles inside the
+    // captures are converted to edges first so they participate in cycle
+    // collection.
+    let mut captures = captures;
+    Trace::store(&mut captures, engine);
+    let intrinsics = engine.realm_intrinsics(&engine.current_realm());
+    let captures_wrapper = engine.create_object_with_any(
+        intrinsics.object_prototype,
+        Box::new(V8PlatformData::new(captures)),
+    );
+
     let stored = Box::new(
         move |arguments: &[V8Value],
               this_value,
               execution_context: &mut dyn ExecutionContext<V8Types>| {
-            behaviour(arguments, this_value, &captures, execution_context)
+            // The captures live in a cppgc-traced platform object rooted by
+            // this closure: they are visited during unified-heap marking, so
+            // their cells and JS edges stay alive exactly while the function
+            // is reachable, and are released when the record (and thus this
+            // closure) is freed.
+            let engine = execution_context
+                .as_any_mut()
+                .downcast_mut::<V8Engine>()
+                .expect("native callback execution context is not the V8 engine");
+            // SAFETY: The captures platform is rooted by the wrapper handle
+            // captured in this closure, and cppgc is non-moving, so the
+            // pointer stays valid while the function is callable. The raw
+            // re-borrow avoids aliasing `execution_context` for the callback.
+            let captures_ptr = engine
+                .with_object_any(&captures_wrapper)
+                .and_then(|data| data.downcast_ref::<C>())
+                .expect("captures platform data type mismatch")
+                as *const C;
+            let captures = unsafe { &*captures_ptr };
+            behaviour(arguments, this_value, captures, execution_context)
         },
     );
     let result = engine.make_builtin_function(stored, length, name, is_constructor);
@@ -3818,9 +3891,9 @@ mod tests {
     use super::super::{V8AsyncGenerator, V8PlatformData, V8WeakMap, V8WeakRef, V8WeakSet};
     use super::{
         CALLBACK_HANDLE_COMPACTION_THRESHOLD, CURRENT_CALLBACK_ISOLATE_ID, CURRENT_CALLBACK_SCOPE,
-        StoredBehaviour, V8ArrayBuffer, V8Constructor, V8DataView, V8Engine, V8Function,
-        V8Generator, V8Map, V8Object, V8Promise, V8Set, V8SharedArrayBuffer, V8TypedArray, V8Types,
-        local_object,
+        HOST_OBJECT_TAG, StoredBehaviour, V8ArrayBuffer, V8Constructor, V8DataView, V8Engine,
+        V8Function, V8Generator, V8Map, V8Object, V8Promise, V8Set, V8SharedArrayBuffer,
+        V8TypedArray, V8Types, create_builtin_fn_with_captures, local_object,
     };
 
     pub(crate) struct DropFlag(pub(crate) Rc<Cell<bool>>);
@@ -5191,5 +5264,55 @@ mod tests {
             "the associated platform cell must survive gc"
         );
         drop(payload_weak);
+    }
+
+    #[test]
+    fn traced_captures_keep_payload_alive_and_follow_function_lifetime() {
+        struct Payload(Rc<Cell<bool>>);
+        impl Finalize for Payload {}
+        unsafe impl Trace for Payload {
+            unsafe fn trace(&self, _visitor: &mut Visitor) {}
+            fn store(&mut self, _ec: &mut dyn ExecutionContext<V8Types>) {}
+        }
+        impl Drop for Payload {
+            fn drop(&mut self) {
+                self.0.set(true);
+            }
+        }
+
+        let mut engine = V8Engine::new();
+        let finalized = Rc::new(Cell::new(false));
+        let function_name = engine.property_key_from_str("tracedCapturesFn");
+
+        let function: V8Function = create_builtin_fn_with_captures::<V8Types, Payload>(
+            &mut engine,
+            Payload(Rc::clone(&finalized)),
+            |_arguments,
+             _this_value,
+             _captures: &Payload,
+             ec: &mut dyn ExecutionContext<V8Types>| Ok(ec.value_undefined()),
+            0,
+            function_name,
+            false,
+        );
+
+        // The function handle is rooted: the traced captures must survive a
+        // full collection (their platform is traced from the wrapper, which
+        // is rooted by the record's behaviour closure).
+        engine.gc();
+        assert!(
+            !finalized.get(),
+            "captures of a rooted function must survive gc"
+        );
+
+        // Dropping the function handle frees the record, which drops the
+        // closure's root on the captures wrapper; the wrapper and its
+        // captures platform are then collectable.
+        drop(function);
+        engine.gc();
+        assert!(
+            finalized.get(),
+            "captures must be released once the function is collected"
+        );
     }
 }
