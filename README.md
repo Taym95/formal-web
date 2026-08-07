@@ -8,7 +8,18 @@ The project has only been run on macOS; all build commands assume macOS. The
 Rust toolchain is pinned to 1.94.0 (`rustup toolchain install 1.94.0`); if it
 is not your default toolchain, prefix the commands below with `rustup run 1.94.0`.
 
-The feature flags configure:
+Just build and run:
+
+```bash
+cargo build --release
+cargo run --release
+```
+
+This is the default configuration: **V8** as the JS engine and **AVFoundation**
+(via the `media` feature) for video/audio playback. The WPT suite runs with
+`cargo run --release -- wpt`.
+
+For other configurations, the feature flags configure:
 
 - **JS engine** — exactly one of `v8` (default), `boa`, or `jsc` must be
   enabled; enabling none (`--no-default-features` alone) or more than one
@@ -19,16 +30,6 @@ The feature flags configure:
   implementation for the Boa engine (which has no native WebAssembly).
   V8 and JSC implement WebAssembly natively, so no feature is needed
   there.
-
-### Default: V8 + AVFoundation media
-
-```bash
-cargo build --release
-cargo run --release
-```
-
-V8 is the default JS engine. On macOS, media defaults to the AVFoundation
-backend. The WPT suite runs with `cargo run --release -- wpt`.
 
 ### No media (no video/audio)
 
@@ -50,10 +51,8 @@ cargo run --release --no-default-features --features boa,media
 cargo build --release --no-default-features --features boa,wasm,media
 ```
 
-The `wasm` feature wires the Wasmtime-based WebAssembly implementation,
-which only exists for the Boa engine (Boa has no native WebAssembly);
-V8 and JSC provide WebAssembly natively, so the feature is not needed
-there.
+Wasmtime-based WebAssembly for the Boa engine (V8 and JSC have native
+WebAssembly — no feature needed).
 
 ### JSC engine (experimental, macOS only)
 
