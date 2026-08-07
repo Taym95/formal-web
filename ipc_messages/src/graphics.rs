@@ -129,6 +129,10 @@ pub enum GraphicsEvent {
         /// that requires the UA to re-note a rendering opportunity even
         /// without user input.
         animating: bool,
+        /// The composed frames (the top-level frame and embedded child
+        /// frames) that carry the animating flag; the UA notes rendering
+        /// opportunities for these navigables.
+        animating_frame_ids: Vec<FrameId>,
         width: u32,
         height: u32,
         generation: u64,

@@ -91,6 +91,7 @@ impl SurfaceRenderer for IosurfaceRenderer {
             child_viewports,
             child_frame_to_webview,
             animating,
+            animating_frame_ids,
         } = composed;
         let (width, height) = render_size(&frame_hit_info);
         info!(
@@ -135,6 +136,7 @@ impl SurfaceRenderer for IosurfaceRenderer {
             child_viewports,
             child_frame_to_webview,
             animating,
+            animating_frame_ids,
         );
 
         // The shared target texture comes from the webview's IOSurface ring,
@@ -210,6 +212,7 @@ impl SurfaceRenderer for IosurfaceRenderer {
             webview_id,
             payload: SurfacePayload::SharedTexture { texture_id, port },
             animating: metadata.animating,
+            animating_frame_ids: metadata.animating_frame_ids,
             width,
             height,
             generation,

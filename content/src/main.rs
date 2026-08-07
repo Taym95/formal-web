@@ -1265,6 +1265,10 @@ impl ContentProcess {
         };
         if let Some(navigable_id) = navigable_id {
             let outcome = if canceled { "Aborted" } else { "Approved" };
+            info!(
+                "[nav] beforeunload result document={} check={} navigable={} outcome={}",
+                document_id, check_id, navigable_id, outcome
+            );
             verification::tla_log!(
                 self.tla_tracer,
                 "RunBeforeUnload",
@@ -1369,24 +1373,27 @@ impl ContentProcess {
                     "emit paint navigable={} document={} size=({}, {})",
                     navigable_id, document_id, width, height,
                 ));
-                // Set animating=true when this document has video elements.
-                // Graphics forwards this to the UA which keeps re-noting
-                // rendering opportunities to drive video animation.
+                // Set animating=true when this document has animated content:
+                // video elements still producing frames, or blitz is animating
+                // (CSS animations/transitions, same-origin subdocuments,
+                // scroll animations). Graphics forwards this to the UA which
+                // keeps re-noting rendering opportunities to drive animation.
                 let has_video = video_paint_registry
                     .borrow()
                     .keys()
                     .any(|(doc_id, node_id)| {
                         let ended = self.ended_video_nodes.contains(&(*doc_id, *node_id));
-                        if ended {}
                         *doc_id == document_id && !ended
                     });
+                let animating = has_video || document_guard.is_animating();
                 info!(
-                    "[render-pipe] Content paint_frame ready navigable={} frame={} size=({},{}) has_video={} embed_sites={}",
+                    "[render-pipe] Content paint_frame ready navigable={} frame={} size=({},{}) has_video={} animating={} embed_sites={}",
                     navigable_id,
                     document.frame_id.0,
                     width,
                     height,
                     has_video,
+                    animating,
                     composition.embed_sites.len()
                 );
                 let (paint_frame, shmem_data) = PaintFrame::new(
@@ -1397,7 +1404,7 @@ impl ContentProcess {
                     composition,
                     scene,
                     &mut next_shmem_key,
-                    has_video,
+                    animating,
                 )?;
                 (paint_frame, shmem_data)
             };

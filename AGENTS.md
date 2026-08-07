@@ -482,6 +482,13 @@ feature never worked, instead of checking whether it did.
   comments like "now comes from X instead of Y" or "previously maintained by Z."
   Those document a migration that is already complete. Delete stale comments and
   the dead code paths they reference.
+- **No state-change framing or counterfactual prose in comments.** Name runtime
+  entities as they are at the point of the code ("the outgoing document", not
+  "the previous document"), and state the behavior directly without justifying it
+  by what would happen if the code did something else ("reporting a child id
+  would make the embedder request a redraw..."). The comment documents what the
+  code does; why-not reasoning and design rationale belong in the README chain,
+  not in comments.
 
 # Error Logging
 
