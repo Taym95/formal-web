@@ -17,7 +17,7 @@ vars == <<live, parent, pending, rendering_updated, composed, op_count,
 
 Base == INSTANCE RenderingOpportunity WITH
     Frame <- TraceFrame,
-    NONE <- TraceNone,
+    NoParent <- TraceNoParent,
     BufferCount <- TraceBufferCount,
     live <- live,
     parent <- parent,
@@ -54,7 +54,7 @@ CreateFrameTrace ==
     /\ trace_index \in 1..TraceLength
     /\ CurrentEvent = "CreateFrame"
     /\ LET f == EventArg(1)
-           parentArg == IF Len(CurrentArgs) = 2 THEN EventArg(2) ELSE TraceNone
+           parentArg == IF Len(CurrentArgs) = 2 THEN EventArg(2) ELSE TraceNoParent
        IN
        /\ Base!CreateFrame(f, parentArg)
        /\ Advance

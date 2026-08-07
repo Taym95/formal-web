@@ -29,7 +29,7 @@ together), mirroring `queue_update_the_rendering`/`queue_update_the_rendering_fo
 in the user agent.
 
 Frames are created dynamically by the `CreateFrame` action: the initial
-top-level traversable (parent `NONE`) and iframes (parent is an existing frame)
+top-level traversable (parent `NoParent`) and iframes (parent is an existing frame)
 can be born at any time. The navigation path's graphics-relevant part —
 `CreateNavigable`/`CreateChildNavigable` — is therefore traced for this spec
 too as `CreateFrame`, so the model's frame set grows from the trace alone.

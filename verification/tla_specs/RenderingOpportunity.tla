@@ -3,7 +3,7 @@ EXTENDS Naturals, FiniteSets, TLC
 
 (* Validates the FrameNeeded-gated render cycle and its double-buffer bound.
    Frames are created dynamically by the CreateFrame action: the initial
-   top-level traversable is created with parent NONE, and child frames
+   top-level traversable is created with parent NoParent, and child frames
    (iframes) are created at any time with their parent. The embedder paints
    top-level traversables only, so FrameNeeded and GraphicsComputed are
    traced for top-level frames, while NoteRenderingOpportunity and
@@ -19,18 +19,18 @@ EXTENDS Naturals, FiniteSets, TLC
    temporal formulas can quantify over Frame without special-casing. *)
 
 CONSTANTS
-  Frame,     \* the universe of frame ids the trace can reference
-  NONE,      \* no parent (top-level frame)
+  Frame,       \* the universe of frame ids the trace can reference
+  NoParent,    \* no parent (top-level frame)
   BufferCount
 
 ASSUME
   /\ Frame # {}
-  /\ NONE \notin Frame
+  /\ NoParent \notin Frame
   /\ BufferCount > 0
 
 VARIABLES
   live,              \* created frames (the navigable hierarchy grows)
-  parent,            \* parent navigable of f (NONE at the top level)
+  parent,            \* parent navigable of f (NoParent at the top level)
   pending,           \* queued update the rendering for f (UA pending_update_the_rendering)
   rendering_updated, \* content completed the update (UpdateTheRendering)
   composed,          \* graphics sent the pixels (PixelFrameReady)
@@ -44,27 +44,27 @@ vars == <<live, parent, pending, rendering_updated, composed, op_count,
 \* ---- Helper operators ----
 
 RECURSIVE Ancestors(_)
-Ancestors(f) == {f} \cup IF parent[f] = NONE THEN {} ELSE Ancestors(parent[f])
+Ancestors(f) == {f} \cup IF parent[f] = NoParent THEN {} ELSE Ancestors(parent[f])
 
-TopLevel(f) == CHOOSE t \in Ancestors(f): parent[t] = NONE
+TopLevel(f) == CHOOSE t \in Ancestors(f): parent[t] = NoParent
 
-IsTopLevel(f) == parent[f] = NONE
+IsTopLevel(f) == parent[f] = NoParent
 
 TopLevelFrames(top) == {f \in live: TopLevel(f) = top}
 
 \* ---- Type correctness ----
 
 \* Counters are relative to the last paint; the pipeline depth is bounded
-\* by BufferCount. Non-live frames keep default values (parent NONE, zero
+\* by BufferCount. Non-live frames keep default values (parent NoParent, zero
 \* counters, no frame needed); the live set and parent relation carry the
 \* actual hierarchy.
 TypeOK ==
   /\ live \subseteq Frame
-  /\ parent \in [Frame -> Frame \cup {NONE}]
-  /\ \A f \in Frame \ live: parent[f] = NONE
-  /\ \A f \in live: parent[f] # NONE => parent[f] \in live
+  /\ parent \in [Frame -> Frame \cup {NoParent}]
+  /\ \A f \in Frame \ live: parent[f] = NoParent
+  /\ \A f \in live: parent[f] # NoParent => parent[f] \in live
   /\ \A f \in live: parent[f] # f
-  /\ \A f \in live: parent[f] # NONE => f \notin Ancestors(parent[f])
+  /\ \A f \in live: parent[f] # NoParent => f \notin Ancestors(parent[f])
   /\ pending \in [Frame -> 0..BufferCount]
   /\ \A f \in Frame \ live: pending[f] = 0
   /\ rendering_updated \in [Frame -> 0..BufferCount]
@@ -77,7 +77,7 @@ TypeOK ==
 
 Init ==
   /\ live = {}
-  /\ parent = [f \in Frame |-> NONE]
+  /\ parent = [f \in Frame |-> NoParent]
   /\ pending = [f \in Frame |-> 0]
   /\ rendering_updated = [f \in Frame |-> 0]
   /\ composed = [f \in Frame |-> 0]
@@ -87,12 +87,12 @@ Init ==
 
 \* ---- Actions ----
 
-\* A navigable is born: the initial top-level traversable (parent NONE) or
+\* A navigable is born: the initial top-level traversable (parent NoParent) or
 \* an iframe (parent is an existing frame). New frames start with an empty
 \* pipeline and no frame needed.
 CreateFrame(f, p) ==
   /\ f \in Frame \ live
-  /\ p \in live \cup {NONE}
+  /\ p \in live \cup {NoParent}
   /\ live' = live \cup {f}
   /\ parent' = [parent EXCEPT ![f] = p]
   /\ UNCHANGED <<pending, rendering_updated, composed, op_count, animating,
@@ -214,7 +214,7 @@ GraphicsComputed(top) ==
 \* ---- Next-state relation ----
 
 Next ==
-  \/ \E f \in Frame, p \in live \cup {NONE}: CreateFrame(f, p)
+  \/ \E f \in Frame, p \in live \cup {NoParent}: CreateFrame(f, p)
   \/ \E f \in live: NoteRenderingOpportunity(f)
   \/ \E f \in live: IsTopLevel(f) /\ FrameNeeded(f)
   \/ \E f \in live: UpdateTheRendering(f)
