@@ -3,6 +3,14 @@ use js_engine::{Completion, ExecutionContext, JsTypes, JsTypesWithRealm};
 /// Create a builtin function with GC-traceable captures.
 /// Generic over `T` so Web IDL infrastructure (operation.rs, attribute.rs)
 /// can call it with their own type parameter.
+///
+/// The captures are stored in a cppgc-traced platform object (V8) or the
+/// engine's traced-capture storage (Boa/JSC), so their cells and JS edges
+/// stay alive exactly while the function is reachable. Do NOT close over JS
+/// handles in a bare closure passed to the engine's `make_builtin_function`:
+/// a Rust closure's captures cannot be traced, so such handles are untraced
+/// roots (realm pinning) or leave cells collectable mid-flight (streams
+/// liveness). See `content/src/js/bindings/README.md`.
 #[cfg(boa_backend)]
 pub(crate) fn create_builtin_fn_with_traced_captures<T, C>(
     ec: &mut dyn ExecutionContext<T>,

@@ -302,3 +302,18 @@ JS bindings glue                 content/src/js/bindings/wasm/interfaces.rs
 - `content/README.md` — Content-crate overview
 - `content/src/webidl/README.md` — Web IDL bindings infrastructure, platform object pattern
 - `content/src/<domain>/README.md` — Domain-specific README (e.g. `content/src/wasm/README.md`)
+
+## Native-function captures and the `make_builtin_function` limitation
+
+Reaction/continuation callbacks (streams, promises, async iteration) must be
+created with `create_builtin_fn_with_traced_captures` (`content/src/js/builtin_fn.rs`),
+which keeps the captures in a cppgc-traced platform object: the captures' cells
+and JS edges stay alive exactly while the function is reachable, and are
+released when the function dies. **Do not** hand a bare closure to the engine's
+`make_builtin_function` with JS handles captured inside it — a Rust closure's
+captures cannot be walked by cppgc, so such handles are untraced strong roots.
+An untraced captured `GcCell` member can be collected while the function is
+still live (the streams empty-queue panic the teardown GC surfaced), and an
+untraced strong root pins the realm (the navigation memory leak). Use
+`create_builtin_fn_with_traced_captures`; if a callback needs no JS captures,
+pass an empty capture type instead of closing over handles.

@@ -292,6 +292,21 @@ impl EventTarget {
         listeners.retain(|listener| !listener.removed);
     }
 
+    /// Release every listener callback and event handler on this target.
+    /// Called during document teardown so the callbacks' strong JS handles
+    /// stop rooting the realm once the document is gone. Returns how many
+    /// callbacks were released.
+    pub(crate) fn clear_all_listeners_and_handlers(
+        &self,
+        ec: &mut dyn ExecutionContext<Types>,
+    ) -> usize {
+        let listeners = self.event_listener_list.borrow_mut(ec).len();
+        let handlers = self.event_handlers.borrow_mut(ec).len();
+        self.event_listener_list.borrow_mut(ec).clear();
+        self.event_handlers.borrow_mut(ec).clear();
+        listeners + handlers
+    }
+
     // Note: Defined by the spec but not yet used by the current dispatch code.
     // <https://dom.spec.whatwg.org/#concept-event-listener>
     #[allow(dead_code)]
