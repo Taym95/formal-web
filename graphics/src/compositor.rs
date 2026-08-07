@@ -108,16 +108,49 @@ pub struct Compositor {
     /// PaintFrames, resolved when recorded scenes are turned into render
     /// scenes.
     font_receiver: FontTransportReceiver,
+    /// Child frame ids whose navigable has been removed (the iframe was torn
+    /// down): a deferred composition must not wait for a frame from these,
+    /// since one will never arrive. Populated from UnregisterWebview for
+    /// child navigables.
+    removed_child_frames: HashSet<FrameId>,
 }
 
 impl Compositor {
     pub fn note_navigation_finalized(&mut self) {
+        info!(
+            "[render-pipe] Compositor navigation finalized reset root={:?} committed={} pending={} videos={}",
+            self.root_frame_id.map(|id| id.0),
+            self.committed_frames.len(),
+            self.pending_frames.len(),
+            self.video_frames.len(),
+        );
+        // The previous document is gone; every frame it produced (the
+        // top-level plus all embedded child frames) and every video frame is
+        // dropped so a deferred composition can never wait on a frame that
+        // will not arrive. The next top-level frame from the new document
+        // starts a fresh pipeline: replace_root_on_next_paint makes it the
+        // sole committed frame. The webview and traversable are unchanged.
         self.pending_frames.clear();
+        self.committed_frames.clear();
         self.video_frames.clear();
+        self.root_frame_id = None;
         self.replace_root_on_next_paint = true;
         self.resolved_tree_dirty = true;
-        // The new document's top-level frame will re-mark the composition pending.
         self.composition_pending = false;
+    }
+
+    /// Mark a child frame id as gone: its navigable was removed, so a
+    /// deferred composition must not wait for a frame from it. Also drops
+    /// any stored frame with that id.
+    pub fn mark_child_frame_removed(&mut self, frame_id: FrameId) {
+        info!(
+            "[render-pipe] Compositor mark child frame removed id={}",
+            frame_id.0
+        );
+        self.removed_child_frames.insert(frame_id);
+        self.committed_frames.remove(&frame_id);
+        self.pending_frames.remove(&frame_id);
+        self.resolved_tree_dirty = true;
     }
 
     /// Insert a decoded video frame. Returns `true` when this is the first
@@ -142,6 +175,11 @@ impl Compositor {
         let mut stale_frame_ids = HashSet::new();
         let mut stack = HashSet::from([frame_id]);
         self.collect_scene_descendant_frames(frame_id, &mut stale_frame_ids, &mut stack);
+        info!(
+            "[render-pipe] Compositor child navigation finalized frame={} clearing={:?}",
+            frame_id.0,
+            stale_frame_ids.iter().map(|id| id.0).collect::<Vec<_>>(),
+        );
         for stale_frame_id in stale_frame_ids {
             self.committed_frames.remove(&stale_frame_id);
             self.pending_frames.remove(&stale_frame_id);
@@ -183,11 +221,23 @@ impl Compositor {
         };
 
         if self.replace_root_on_next_paint {
+            info!(
+                "[render-pipe] Compositor store frame id={} root_candidate={} -> pending (replace next paint)",
+                frame_id.0, is_root_candidate
+            );
             self.pending_frames.insert(frame_id, frame);
             if is_root_candidate {
                 self.root_frame_id = Some(frame_id);
                 self.committed_frames = std::mem::take(&mut self.pending_frames);
                 self.replace_root_on_next_paint = false;
+                info!(
+                    "[render-pipe] Compositor replace committed with pending root={} committed={:?}",
+                    frame_id.0,
+                    self.committed_frames
+                        .keys()
+                        .map(|id| id.0)
+                        .collect::<Vec<_>>(),
+                );
             }
             self.resolved_tree_dirty = true;
             return;
@@ -248,6 +298,14 @@ impl Compositor {
         self.root_frame_id
     }
 
+    /// The frame ids currently committed (top-level plus embedded children),
+    /// for diagnostics.
+    pub fn committed_frame_ids(&self) -> Vec<FrameId> {
+        let mut ids = self.committed_frames.keys().copied().collect::<Vec<_>>();
+        ids.sort_by_key(|id| id.0);
+        ids
+    }
+
     /// Whether every embedded frame the latest top-level frame references has
     /// arrived: child frames must be in the committed set, and video frames
     /// must be present or not expected (no live pipeline for the paint id,
@@ -262,9 +320,15 @@ impl Compositor {
         for site in &top_level_frame.composition.embed_sites {
             match site {
                 EmbedSite::Frame(iframe_site) => {
+                    // A removed child (its navigable was torn down) is
+                    // treated as satisfied: no frame from it will ever
+                    // arrive, so waiting would block composition forever.
                     if !self
                         .committed_frames
                         .contains_key(&iframe_site.child_frame_id)
+                        && !self
+                            .removed_child_frames
+                            .contains(&iframe_site.child_frame_id)
                     {
                         return false;
                     }
@@ -279,6 +343,47 @@ impl Compositor {
             }
         }
         true
+    }
+
+    /// The embedded frames the latest top-level frame still waits for:
+    /// child frame ids absent from the committed set and video paint ids
+    /// that are expected but have no stored frame. Used by the caller to
+    /// log exactly what a deferred composition is missing.
+    pub fn missing_embedded_frames(
+        &self,
+        expected_videos: &HashSet<VideoPaintId>,
+    ) -> (Vec<FrameId>, Vec<VideoPaintId>) {
+        let Some(top_level_frame_id) = self.root_frame_id else {
+            return (Vec::new(), Vec::new());
+        };
+        let Some(top_level_frame) = self.committed_frames.get(&top_level_frame_id) else {
+            return (Vec::new(), Vec::new());
+        };
+        let mut missing_child_ids = Vec::new();
+        let mut missing_video_ids = Vec::new();
+        for site in &top_level_frame.composition.embed_sites {
+            match site {
+                EmbedSite::Frame(iframe_site) => {
+                    if !self
+                        .committed_frames
+                        .contains_key(&iframe_site.child_frame_id)
+                        && !self
+                            .removed_child_frames
+                            .contains(&iframe_site.child_frame_id)
+                    {
+                        missing_child_ids.push(iframe_site.child_frame_id);
+                    }
+                }
+                EmbedSite::Video(video_data) => {
+                    if expected_videos.contains(&video_data.paint_id)
+                        && !self.video_frames.contains_key(&video_data.paint_id)
+                    {
+                        missing_video_ids.push(video_data.paint_id);
+                    }
+                }
+            }
+        }
+        (missing_child_ids, missing_video_ids)
     }
 
     /// Compose the final scene for this compositor and return it with

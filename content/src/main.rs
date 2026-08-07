@@ -1265,6 +1265,10 @@ impl ContentProcess {
         };
         if let Some(navigable_id) = navigable_id {
             let outcome = if canceled { "Aborted" } else { "Approved" };
+            info!(
+                "[nav] beforeunload result document={} check={} navigable={} outcome={}",
+                document_id, check_id, navigable_id, outcome
+            );
             verification::tla_log!(
                 self.tla_tracer,
                 "RunBeforeUnload",

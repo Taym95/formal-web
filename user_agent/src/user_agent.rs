@@ -1736,6 +1736,15 @@ impl UserAgentWorker {
             },
         );
         verification::tla_log!(self.tla_tracer, "CreateNavigable", traversable_id);
+        // The frame is the graphics-side effect of the navigable's creation;
+        // traced for the RenderingOpportunity spec too so the model's frame
+        // set can grow from the trace alone (top-level frame: no parent).
+        verification::tla_log!(
+            self.tla_tracer,
+            -> "RenderingOpportunity",
+            "CreateFrame",
+            traversable_id
+        );
         if target_name_keeps_browser_ui_focus(&target_name) {
             self.state.set_active_top_level_traversable(traversable_id);
         }
@@ -1890,6 +1899,17 @@ impl UserAgentWorker {
         verification::tla_log!(
             self.tla_tracer,
             "CreateChildNavigable",
+            traversable_id,
+            parent_navigable_id
+        );
+        // The child frame is the graphics-side effect of the child
+        // navigable's creation; traced for the RenderingOpportunity spec
+        // too (child frame with its parent) so the model's frame set can
+        // grow from the trace alone.
+        verification::tla_log!(
+            self.tla_tracer,
+            -> "RenderingOpportunity",
+            "CreateFrame",
             traversable_id,
             parent_navigable_id
         );
@@ -2528,6 +2548,15 @@ impl UserAgentWorker {
         );
 
         verification::tla_log!(self.tla_tracer, "CreateNavigable", traversable_id);
+        // The frame is the graphics-side effect of the navigable's creation;
+        // traced for the RenderingOpportunity spec too (top-level frame: no
+        // parent).
+        verification::tla_log!(
+            self.tla_tracer,
+            -> "RenderingOpportunity",
+            "CreateFrame",
+            traversable_id
+        );
 
         if target_name_keeps_browser_ui_focus(target_name) {
             self.state.set_active_top_level_traversable(traversable_id);
@@ -2636,6 +2665,14 @@ impl UserAgentWorker {
 
     /// <https://html.spec.whatwg.org/multipage/#navigate>
     fn handle_navigate(&mut self, event_loop_id: Option<EventLoopId>, request: NavigateRequest) {
+        info!(
+            "[nav] navigate request source={} url={} target={:?} new_child={} new_traversable={}",
+            request.source_navigable_id,
+            request.destination_url,
+            request.target,
+            request.new_child_navigable.is_some(),
+            request.new_traversable_info.is_some(),
+        );
         let result: Result<(), String> = (|| {
             let is_window_open = request.features_json.is_some();
 
@@ -2884,12 +2921,12 @@ impl UserAgentWorker {
                     self.state
                         .set_navigable_ongoing_navigation(traversable_id, None);
                 }
-                self.host.navigation_completed(NavigationCompleted {
-                    webview_id: WebviewId(pending.navigable_id),
-                    status: NavigationCompletion::Aborted {
+                self.report_navigation_completed(
+                    pending.navigable_id,
+                    NavigationCompletion::Aborted {
                         message: String::from("navigation was canceled by beforeunload"),
                     },
-                })
+                )
             } else {
                 self.continue_navigation_after_before_unload(pending)
             }
@@ -2900,6 +2937,10 @@ impl UserAgentWorker {
 
     /// <https://html.spec.whatwg.org/multipage/#checking-if-unloading-is-canceled>
     fn handle_complete_before_unload(&mut self, result: BeforeUnloadResult) {
+        info!(
+            "[nav] beforeunload completed document={} check={} canceled={}",
+            result.document_id, result.check_id, result.canceled
+        );
         if let Err(error) = self.handle_complete_before_unload_result(result) {
             error!("failed to complete beforeunload: {error}");
         }
@@ -2910,6 +2951,10 @@ impl UserAgentWorker {
         &mut self,
         finalized: ContentFinalizeNavigation,
     ) -> Result<(), String> {
+        info!(
+            "[nav] finalize cross-document navigation document={} url={}",
+            finalized.document_id, finalized.url
+        );
         // Step 1: "Assert: this is running on navigable's traversable navigable's session
         // history traversal queue."
         // Note: The user-agent thread serializes all IPC events; there is no separate
@@ -3016,12 +3061,12 @@ impl UserAgentWorker {
                 log::error!("failed to notify graphics of navigation finalization: {error}");
             }
         }
-        let notify_result = self.host.navigation_completed(NavigationCompleted {
-            webview_id: WebviewId(pending.traversable_id),
-            status: NavigationCompletion::Committed {
+        let notify_result = self.report_navigation_completed(
+            pending.traversable_id,
+            NavigationCompletion::Committed {
                 url: finalized.url.clone(),
             },
-        });
+        );
 
         if let Some(previous_document_id) = pending.previous_document_id {
             if previous_document_id != finalized.document_id {
@@ -3211,6 +3256,32 @@ impl UserAgentWorker {
         self.note_rendering_opportunity(traversable_id);
     }
 
+    /// Report a navigation completion to the host. The embedder's webviews
+    /// correspond to top-level traversables, so completions for child
+    /// navigables (iframes) are not reported: the embedder has no webview
+    /// for them, and the child's rendering is driven by the rendering
+    /// opportunity noted at finalize. Reporting a child id would make the
+    /// embedder request a redraw for a webview it never paints, which
+    /// would surface as a child-level FrameNeeded.
+    fn report_navigation_completed(
+        &self,
+        navigable_id: NavigableId,
+        status: NavigationCompletion,
+    ) -> Result<(), String> {
+        let is_top_level = self
+            .state
+            .navigables
+            .get(&navigable_id)
+            .is_some_and(|navigable| navigable.parent_navigable_id.is_none());
+        if !is_top_level {
+            return Ok(());
+        }
+        self.host.navigation_completed(NavigationCompleted {
+            webview_id: WebviewId(navigable_id),
+            status,
+        })
+    }
+
     /// The embedder is about to paint a frame for the top-level traversable
     /// `webview_id`. Update the rendering is queued when a frame is needed
     /// AND a rendering opportunity was noted; the flag stays set until then.
@@ -3312,6 +3383,19 @@ impl UserAgentWorker {
 
         let (target_webview_id, routed_event, composed_frame_ids) =
             self.route_ui_event(webview_id, event.clone());
+        debug!(
+            "[input-debug][user-agent] send_ui_event webview={} routed={} composed_frames={:?} child_map={:?}",
+            webview_id.0,
+            target_webview_id.0,
+            composed_frame_ids
+                .iter()
+                .map(|frame_id| frame_id.0)
+                .collect::<Vec<_>>(),
+            self.state
+                .child_frame_to_webview
+                .get(&webview_id)
+                .map(|m| m.iter().map(|(k, v)| (k.0, v.0)).collect::<Vec<_>>()),
+        );
 
         if let Ok(routed_message) = crate::ui_event::serialize_ui_event(&routed_event) {
             self.handle_dispatch_event_for(target_webview_id.0, routed_message);
@@ -3585,6 +3669,10 @@ impl UserAgentWorker {
         fetch_id: NavigationFetchId,
         response: ContentFetchResponse,
     ) {
+        info!(
+            "[nav] navigation fetch completed fetch={} url={} status={}",
+            fetch_id, response.final_url, response.status
+        );
         let Some(pending) = self
             .state
             .take_pending_navigation_fetch_by_fetch_id(fetch_id)
@@ -3621,10 +3709,10 @@ impl UserAgentWorker {
                 Err(error) => {
                     self.state
                         .set_navigable_ongoing_navigation(pending.traversable_id, None);
-                    if let Err(error) = self.host.navigation_completed(NavigationCompleted {
-                        webview_id: WebviewId(pending.traversable_id),
-                        status: NavigationCompletion::Aborted { message: error },
-                    }) {
+                    if let Err(error) = self.report_navigation_completed(
+                        pending.traversable_id,
+                        NavigationCompletion::Aborted { message: error },
+                    ) {
                         error!(
                             "[user-agent] failed to report navigation completed (init doc): {error}"
                         );
@@ -3641,10 +3729,10 @@ impl UserAgentWorker {
             Err(error) => {
                 self.state
                     .set_navigable_ongoing_navigation(pending.traversable_id, None);
-                if let Err(error) = self.host.navigation_completed(NavigationCompleted {
-                    webview_id: WebviewId(pending.traversable_id),
-                    status: NavigationCompletion::Aborted { message: error },
-                }) {
+                if let Err(error) = self.report_navigation_completed(
+                    pending.traversable_id,
+                    NavigationCompletion::Aborted { message: error },
+                ) {
                     error!(
                         "[user-agent] failed to report navigation completed (command sender): {error}"
                     );
@@ -3727,10 +3815,10 @@ impl UserAgentWorker {
                 );
                 self.state
                     .set_navigable_ongoing_navigation(pending.traversable_id, None);
-                if let Err(error) = self.host.navigation_completed(NavigationCompleted {
-                    webview_id: WebviewId(pending.traversable_id),
-                    status: NavigationCompletion::Aborted { message: error },
-                }) {
+                if let Err(error) = self.report_navigation_completed(
+                    pending.traversable_id,
+                    NavigationCompletion::Aborted { message: error },
+                ) {
                     error!("[user-agent] failed to report navigation completed (send): {error}");
                 }
             }
@@ -3747,12 +3835,12 @@ impl UserAgentWorker {
         };
         self.state
             .set_navigable_ongoing_navigation(pending.traversable_id, None);
-        if let Err(error) = self.host.navigation_completed(NavigationCompleted {
-            webview_id: WebviewId(pending.traversable_id),
-            status: NavigationCompletion::Aborted {
+        if let Err(error) = self.report_navigation_completed(
+            pending.traversable_id,
+            NavigationCompletion::Aborted {
                 message: format!("navigation fetch failed for {}", pending.request.url),
             },
-        }) {
+        ) {
             error!("[user-agent] failed to report navigation completed (fetch failed): {error}");
         }
     }
@@ -3790,6 +3878,10 @@ impl UserAgentWorker {
         content_frame_id: FrameId,
         reply: Sender<Result<(), String>>,
     ) {
+        info!(
+            "[nav] iframe traversable removed parent={} child={} frame={}",
+            parent_traversable_id, content_navigable_id, content_frame_id.0
+        );
         let target_name = iframe_target_name(
             parent_traversable_id,
             content_navigable_id,
@@ -4026,10 +4118,13 @@ impl UserAgentWorker {
                 // When the top-level traversable's composed scene completes,
                 // all child frames included in the composition have also been
                 // rendered and composed.  Clear their pending state so they
-                // can receive new rendering opportunities.
+                // can receive new rendering opportunities.  Queued
+                // opportunities are kept: they are requests for a new render
+                // (e.g. a hover state change in the child) that were batched
+                // while no frame was needed and must survive this
+                // composition, or the child never repaints.
                 for (_child_frame_id, child_wv) in child_frame_to_webview.iter() {
                     self.pending_update_the_rendering.remove(&child_wv.0);
-                    self.queued_rendering_opportunities.remove(&child_wv.0);
                 }
 
                 // The frame was produced; the update for the top-level

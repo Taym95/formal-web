@@ -402,6 +402,30 @@ fn handle_command<B: MediaBackend + 'static, R: SurfaceRenderer>(
         GraphicsCommand::UnregisterWebview { webview_id } => {
             debug!("[graphics] unregistering webview {:?}", webview_id);
             webviews.remove(&webview_id);
+            // If the webview is a child navigable, its frames were composed
+            // into the parent's compositor. Mark the child frame removed so
+            // a deferred composition of the parent never waits for a frame
+            // that will not arrive (the iframe was torn down), and release
+            // any composition already pending on it.
+            if let Some((parent_webview_id, content_frame_id)) =
+                child_webview_to_parent.remove(&webview_id)
+            {
+                info!(
+                    "[render-pipe] Graphics unregister child webview={:?} parent={:?} frame={}",
+                    webview_id, parent_webview_id, content_frame_id.0
+                );
+                if let Some(parent_slot) = webviews.get_mut(&parent_webview_id) {
+                    parent_slot
+                        .compositor
+                        .mark_child_frame_removed(content_frame_id);
+                }
+                maybe_compose(
+                    webviews,
+                    parent_webview_id,
+                    &expected_videos(pipeline_webview_map, finished_videos),
+                    child_webview_to_parent,
+                );
+            }
         }
         GraphicsCommand::PaintFrame { frame } => {
             // Remap child PaintFrames into the parent's compositor slot.
@@ -422,6 +446,16 @@ fn handle_command<B: MediaBackend + 'static, R: SurfaceRenderer>(
             let viewport_height = frame.viewport_height;
             let frame_id = actual_frame_id;
             let animating = frame.animating;
+            info!(
+                "[render-pipe] Graphics store frame id={} traversable={} webview={} root_candidate={} viewport={}x{} children={}",
+                frame_id.0,
+                frame.traversable_id.0,
+                webview_id.0,
+                is_root_candidate,
+                viewport_width,
+                viewport_height,
+                composition.embed_sites.len()
+            );
             let recorded_scene = match slot.compositor.decode_frame(frame, shmem_regions) {
                 Ok(scene) => scene,
                 Err(error) => {
@@ -429,15 +463,6 @@ fn handle_command<B: MediaBackend + 'static, R: SurfaceRenderer>(
                     return false;
                 }
             };
-            info!(
-                "[render-pipe] Graphics store frame id={} webview={} root_candidate={} viewport={}x{} children={}",
-                frame_id.0,
-                webview_id.0,
-                is_root_candidate,
-                viewport_width,
-                viewport_height,
-                composition.embed_sites.len()
-            );
             slot.compositor.store_frame(
                 frame_id,
                 viewport_width,
@@ -482,6 +507,10 @@ fn handle_command<B: MediaBackend + 'static, R: SurfaceRenderer>(
             parent_traversable_id,
             content_frame_id,
         } => {
+            info!(
+                "[render-pipe] Graphics register child host child={:?} parent={:?} frame={}",
+                child_webview_id, parent_traversable_id, content_frame_id.0
+            );
             child_webview_to_parent
                 .insert(child_webview_id, (parent_traversable_id, content_frame_id));
         }
@@ -489,12 +518,20 @@ fn handle_command<B: MediaBackend + 'static, R: SurfaceRenderer>(
             parent_traversable_id,
             content_frame_id,
         } => {
+            info!(
+                "[render-pipe] Graphics child navigation finalized parent={:?} frame={}",
+                parent_traversable_id, content_frame_id.0
+            );
             if let Some(slot) = webviews.get_mut(&parent_traversable_id) {
                 slot.compositor
                     .note_child_navigation_finalized(content_frame_id);
             }
         }
         GraphicsCommand::NavigationFinalized { webview_id } => {
+            info!(
+                "[render-pipe] Graphics navigation finalized webview={:?}",
+                webview_id
+            );
             if let Some(slot) = webviews.get_mut(&webview_id) {
                 slot.compositor.note_navigation_finalized();
             }
@@ -602,9 +639,15 @@ fn maybe_compose<R: SurfaceRenderer>(
         return;
     }
     if !slot.compositor.composition_ready(expected_videos) {
+        let (missing_child_ids, missing_video_ids) =
+            slot.compositor.missing_embedded_frames(expected_videos);
         debug!(
-            "[render-pipe] Graphics defer composition webview={} (waiting for embedded frames)",
-            webview_id.0
+            "[render-pipe] Graphics defer composition webview={} waiting children={:?} videos={:?} root={:?} committed={:?}",
+            webview_id.0,
+            missing_child_ids,
+            missing_video_ids,
+            slot.compositor.top_level_frame_id().map(|id| id.0),
+            slot.compositor.committed_frame_ids(),
         );
         return;
     }

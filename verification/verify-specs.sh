@@ -165,8 +165,13 @@ if [[ -z "$SESSION_ID" ]]; then
     exit 1
 fi
 
-# Navigate to about:blank to trigger initial rendering events and navigation tracing.
-webdriver_request POST "/session/${SESSION_ID}/url" '{"url":"about:blank"}' >/dev/null
+# Navigate to a page embedding an iframe to trigger initial rendering events
+# for both the top-level frame and a child frame (cross-site file:// URLs run
+# the child in its own content process), plus navigation tracing. The child
+# frame's rendering side effects (note/frame-needed/update/computed) are
+# traced from the UA so the RenderingOpportunity model validates them.
+TRACE_PAGE_URL="file://$ROOT/verification/iframe-trace-page.html"
+webdriver_request POST "/session/${SESSION_ID}/url" "{\"url\":\"${TRACE_PAGE_URL}\"}" >/dev/null
 
 echo "waiting for initial page load..."
 for i in {1..100}; do

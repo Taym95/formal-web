@@ -13,36 +13,29 @@ The verification crate owns trace recording, TLA+ validation, and the shutdown w
 | Spec | Events traced (producer) | Validates |
 |---|---|---|
 | `Navigation` | UA navigation lifecycle | navigable/navigation state machine |
-| `RenderingOpportunity` | UA `NoteRenderingOpportunity`/`FrameNeeded`, content `UpdateTheRendering`, graphics `GraphicsComputed` (traced when the pixels are actually sent) | FrameNeeded-gated render cycle with double buffering: a render starts only when the embedder needs a frame (paced by vsync) AND a rendering opportunity was noted; the paint consumes the composed frames, and the pipeline never holds more than `BufferCount` (2) renders in flight (one displayed, one being rendered) |
+| `RenderingOpportunity` | UA `CreateFrame` (the navigable-creation part of the navigation path, traced from `CreateNavigable`/`CreateChildNavigable`) /`NoteRenderingOpportunity`/`FrameNeeded`, content `UpdateTheRendering`, graphics `GraphicsComputed` (traced when the pixels are actually sent) | FrameNeeded-gated render cycle with double buffering: a render starts only when the embedder needs a frame (paced by vsync) AND a rendering opportunity was noted; the paint consumes the composed frames, and the pipeline never holds more than `BufferCount` (2) renders in flight (one displayed, one being rendered) |
 | `MessagePort*` | (not written yet) | — |
 
 ### RenderingOpportunity scope
 
-The model tracks the frame-production cycle at the **top-level traversable** only.
-`FrameNeeded` and `GraphicsComputed` only ever fire for top-levels (the embedder
-sends `frame_needed` for webviews; graphics only computes when the root frame
-arrives), and child navigables' rendering updates
-(`NoteRenderingOpportunity`/`UpdateTheRendering` for child ids) are content that
-is composed into the parent's frame — they change no counter the model's
-invariants constrain.
+The model tracks the frame-production cycle per **top-level traversable** and
+its **child frames** (iframes). `FrameNeeded` and `GraphicsComputed` only ever
+fire for top-levels (the embedder sends `frame_needed` for webviews; graphics
+only computes when the root frame arrives), while
+`NoteRenderingOpportunity`/`UpdateTheRendering` are traced for every frame. A
+top-level paint services the batched opportunities of its whole hierarchy, and
+a child's update also starts the top-level's update (their frames compose
+together), mirroring `queue_update_the_rendering`/`queue_update_the_rendering_for_navigables`
+in the user agent.
 
-The verification session (`verify-specs.sh`) navigates only to `about:blank`, so
-no child-navigable events ever enter the trace and the child path is untested.
-Observed when a local page with an `<iframe>` was loaded instead: the trace
-contained child `NoteRenderingOpportunity`/`UpdateTheRendering` entries, which
-the model as written cannot replay — a child's `pending` counter can never rise
-because `FrameNeeded`/`GraphicsComputed` are top-level-only and no model action
-drains a child's batched opportunity (in the code this is the UA's
-`queue_update_the_rendering_for_navigables`, called when the top-level's
-`FrameNeeded` arrives). Child rendering updates are therefore deliberately out
-of the model's scope.
-
-Not investigated: because the UA clears a composed child's pending state at
-`PixelFrameReady`, a child whose `PaintFrame` reaches graphics after the
-parent's composition is stored but not composed until the parent's next frame,
-and its next update depends on a new rendering opportunity being noted. Whether
-child content can consequently lag one frame behind (staleness) has not been
-investigated.
+Frames are created dynamically by the `CreateFrame` action: the initial
+top-level traversable (parent `NONE`) and iframes (parent is an existing frame)
+can be born at any time. The navigation path's graphics-relevant part —
+`CreateNavigable`/`CreateChildNavigable` — is therefore traced for this spec
+too as `CreateFrame`, so the model's frame set grows from the trace alone.
+The verification session (`verify-specs.sh`) navigates to
+`verification/iframe-trace-page.html`, which embeds a cross-site `file://`
+iframe, so the child rendering path is actually traced and validated.
 
 ### Adding a spec
 
@@ -57,3 +50,30 @@ investigated.
   reason the spec exists. The model's definitions, action names, and invariants
   are the documentation — explanatory paragraphs about the modeled system live in
   this README and the owning feature's README, not in the spec.
+
+### TLA+/TLC gotchas (all confirmed with the bundled tla2tools.jar)
+
+- The TLC **config parser** accepts only simple constant values: numbers,
+  identifiers, strings, and sets. It rejects function-constructor `|->` syntax,
+  tuples `<<>>`, and a trailing `====` line. To give the model a function-valued
+  configuration (e.g. a hierarchy), make the universe a plain set constant and
+  derive the function as an operator in the module, or make it a variable that
+  the actions grow.
+- TLC's `EXCEPT` does **not** add new domain elements: `[f EXCEPT ![x] = v]`
+  with `x \notin DOMAIN f` warns and leaves `f` unchanged. When an action grows
+  a function's domain, rebuild the function explicitly over the new domain
+  (e.g. `[g \in live' |-> IF g = f THEN ... ELSE f[g]]`).
+- TLC cannot quantify **temporal formulas** over a variable set
+  (`\A f \in live: WF_vars(...)` fails at parse/evaluation time). Quantify over
+  a constant universe with a live guard, and keep the per-frame state total
+  over that universe (default values for not-yet-created elements) — applying
+  a function outside its domain is a hard TLC error, not a disabled action.
+- TLC2 resolves operator definitions in order of appearance — no forward
+  references (relevant when generating trace-data modules: define the
+  referenced operators before the operators that use them).
+- Every action must list every variable it does not assign in `UNCHANGED`,
+  including ones it only reads; TLC errors on a successor state it cannot
+  fully specify.
+- The `f \in live` guard also protects the trace consumer: a trace event
+  referencing a frame that was never created fails the validation at that
+  entry (deadlock at that state) instead of crashing TLC.

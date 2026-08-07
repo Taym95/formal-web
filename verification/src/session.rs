@@ -12,6 +12,10 @@ const DEFAULT_TLC_WORKERS: usize = 8;
 const TLA2TOOLS_JAR_ENV: &str = "FORMAL_WEB_TLA2TOOLS_JAR";
 const TLC_WORKERS_ENV: &str = "FORMAL_WEB_TLC_WORKERS";
 const VERIFICATION_TEMP_ROOT_NAME: &str = "formal-web-verification";
+/// When set, the verification session directory (with the per-spec NDJSON
+/// trace files) is kept after validation instead of removed, so the traces
+/// can be re-validated against model changes without re-running the browser.
+const KEEP_TRACES_ENV: &str = "FORMAL_WEB_VERIFY_KEEP_TRACES";
 
 pub struct VerificationRun {
     repo_root: PathBuf,
@@ -69,6 +73,14 @@ impl VerificationRun {
             errors.push(error);
         }
 
+        // When FORMAL_WEB_VERIFY_KEEP_TRACES is set the session directory
+        // (including the per-spec trace files) is kept for re-validation;
+        // its path is printed so the caller can find it.
+        let keep_traces = std::env::var_os(KEEP_TRACES_ENV).is_some();
+        if keep_traces {
+            println!("keeping verification traces: {}", session_dir.display());
+        }
+
         match validate_and_print(&ValidationOptions {
             logs: log_dir,
             specs: specs_dir,
@@ -83,12 +95,13 @@ impl VerificationRun {
             Err(error) => errors.push(error),
         }
 
-        if let Err(error) = remove_dir_all_if_exists(&session_dir) {
-            errors.push(error);
-        }
-
-        if let Err(error) = cleanup_temp_verification_artifacts() {
-            errors.push(error);
+        if !keep_traces {
+            if let Err(error) = remove_dir_all_if_exists(&session_dir) {
+                errors.push(error);
+            }
+            if let Err(error) = cleanup_temp_verification_artifacts() {
+                errors.push(error);
+            }
         }
 
         if let Err(error) = cleanup_repo_verification_artifacts(&repo_root) {
