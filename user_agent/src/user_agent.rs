@@ -3256,13 +3256,9 @@ impl UserAgentWorker {
         self.note_rendering_opportunity(traversable_id);
     }
 
-    /// Report a navigation completion to the host. The embedder's webviews
-    /// correspond to top-level traversables, so completions for child
-    /// navigables (iframes) are not reported: the embedder has no webview
-    /// for them, and the child's rendering is driven by the rendering
-    /// opportunity noted at finalize. Reporting a child id would make the
-    /// embedder request a redraw for a webview it never paints, which
-    /// would surface as a child-level FrameNeeded.
+    /// Report a navigation completion to the host for a top-level
+    /// traversable only; child navigable (iframe) completions are not
+    /// reported.
     fn report_navigation_completed(
         &self,
         navigable_id: NavigableId,

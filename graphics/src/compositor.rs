@@ -124,12 +124,13 @@ impl Compositor {
             self.pending_frames.len(),
             self.video_frames.len(),
         );
-        // The previous document is gone; every frame it produced (the
-        // top-level plus all embedded child frames) and every video frame is
-        // dropped so a deferred composition can never wait on a frame that
-        // will not arrive. The next top-level frame from the new document
-        // starts a fresh pipeline: replace_root_on_next_paint makes it the
-        // sole committed frame. The webview and traversable are unchanged.
+        // A navigation finalized: the stored frames belong to the outgoing
+        // document. Every frame this compositor holds (the top-level frame
+        // plus all embedded child frames) and every video frame is dropped
+        // so a deferred composition can never wait on a frame that will not
+        // arrive. The next top-level frame starts a fresh pipeline:
+        // replace_root_on_next_paint makes it the sole committed frame. The
+        // webview and traversable are unchanged.
         self.pending_frames.clear();
         self.committed_frames.clear();
         self.video_frames.clear();
