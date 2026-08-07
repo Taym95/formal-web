@@ -211,7 +211,7 @@ pub struct GlobalScope {
 
     /// Consolidated wasm state (pending requests, resolvers, counter).
     #[cfg(all(boa_backend, feature = "wasm"))]
-    wasm_state: GcCell<Option<crate::wasm::WasmState>>,
+    wasm_state: Option<crate::wasm::WasmState>,
 }
 
 impl GlobalScope {
@@ -244,7 +244,7 @@ impl GlobalScope {
 
             creation_url: Rc::new(RefCell::new(None)),
             #[cfg(all(boa_backend, feature = "wasm"))]
-            wasm_state: gc_cell_new(Some(crate::wasm::WasmState::new()), ec),
+            wasm_state: Some(crate::wasm::WasmState::new(ec)),
         }
     }
 
@@ -777,21 +777,24 @@ impl GlobalScope {
         taken
     }
 
-    /// Access the consolidated wasm state (read-only, interior mutability).
-    #[cfg(all(boa_backend, feature = "wasm"))]
-    fn with_wasm_state<R>(&self, f: impl FnOnce(&crate::wasm::WasmState) -> R) -> Option<R> {
-        self.wasm_state.borrow().as_ref().map(|state| f(state))
-    }
-
-    /// Delegation methods to WasmState for backward compatibility.
+    /// Delegation methods to WasmState.
     #[cfg(all(boa_backend, feature = "wasm"))]
     pub(crate) fn next_wasm_request_id(&self) -> u64 {
-        self.with_wasm_state(|s| s.next_request_id()).unwrap_or(0)
+        self.wasm_state
+            .as_ref()
+            .map(|state| state.next_request_id())
+            .unwrap_or(0)
     }
 
     #[cfg(all(boa_backend, feature = "wasm"))]
-    pub(crate) fn push_pending_request(&self, request: crate::wasm::PendingRequest) {
-        self.with_wasm_state(|s| s.push_pending_request(request));
+    pub(crate) fn push_pending_request(
+        &self,
+        request: crate::wasm::PendingRequest,
+        ec: &mut dyn ExecutionContext<Types>,
+    ) {
+        if let Some(state) = &self.wasm_state {
+            state.push_pending_request(request, ec);
+        }
     }
 
     #[cfg(all(boa_backend, feature = "wasm"))]
@@ -800,19 +803,32 @@ impl GlobalScope {
         request_id: u64,
         promise: JsObject,
         resolvers: js_engine::records::PromiseResolvers<Types>,
+        ec: &mut dyn ExecutionContext<Types>,
     ) {
-        self.with_wasm_state(|s| s.store_wasm_resolver(request_id, promise, resolvers));
+        if let Some(state) = &self.wasm_state {
+            state.store_wasm_resolver(request_id, promise, resolvers, ec);
+        }
     }
 
     #[cfg(all(boa_backend, feature = "wasm"))]
-    pub(crate) fn take_pending_wasm_batches(&self) -> Vec<(u64, Vec<u8>)> {
-        self.with_wasm_state(|s| s.take_pending_wasm_batches())
+    pub(crate) fn take_pending_wasm_batches(
+        &self,
+        ec: &mut dyn ExecutionContext<Types>,
+    ) -> Vec<(u64, Vec<u8>)> {
+        self.wasm_state
+            .as_ref()
+            .map(|state| state.take_pending_wasm_batches(ec))
             .unwrap_or_default()
     }
 
     #[cfg(all(boa_backend, feature = "wasm"))]
-    pub(crate) fn take_pending_wasm_instantiates(&self) -> Vec<(u64, wasmtime::Module)> {
-        self.with_wasm_state(|s| s.take_pending_wasm_instantiates())
+    pub(crate) fn take_pending_wasm_instantiates(
+        &self,
+        ec: &mut dyn ExecutionContext<Types>,
+    ) -> Vec<(u64, wasmtime::Module)> {
+        self.wasm_state
+            .as_ref()
+            .map(|state| state.take_pending_wasm_instantiates(ec))
             .unwrap_or_default()
     }
 
@@ -820,8 +836,10 @@ impl GlobalScope {
     pub(crate) fn consume_wasm_request(
         &self,
         request_id: u64,
+        ec: &mut dyn ExecutionContext<Types>,
     ) -> Option<(JsObject, js_engine::records::PromiseResolvers<Types>)> {
-        self.with_wasm_state(|s| s.consume_wasm_request(request_id))
-            .flatten()
+        self.wasm_state
+            .as_ref()
+            .and_then(|state| state.consume_wasm_request(request_id, ec))
     }
 }

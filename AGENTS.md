@@ -185,7 +185,7 @@ shared dependency resolution and incremental compilation.
   - `formal-web-graphics` owns per-webview compositors and video/audio playback (media backend).
     It receives `PaintFrame` and `VideoFrame` payloads and sends back composed scenes with
     `FrameHitInfo` for hit-testing.
-- **`js_engine` crate**: a generic JS engine trait and ECMA-262 abstract operations. Three backends: V8 (default, runs WPT), Boa (opt-in, required for WebAssembly), and JSC (macOS opt-in). WebAssembly is a separate feature (`wasm`). See `js_engine/README.md`.
+- **`js_engine` crate**: a generic JS engine trait and ECMA-262 abstract operations. Three backends: V8 (default, runs WPT), Boa (opt-in), and JSC (macOS opt-in). The `wasm` feature is the Wasmtime-based WebAssembly implementation for the Boa engine only (V8 and JSC implement WebAssembly natively). See `js_engine/README.md`.
 - **`js_engine_macros` crate**: proc-macro companion providing `#[gc_struct]` for GC-traced platform objects.
 
 ### Feature flags
@@ -193,20 +193,19 @@ shared dependency resolution and incremental compilation.
 | Flag | Effect | Default |
 |---|---|---|
 | `v8` | V8 backend via `rusty_v8` (macOS arm64, runs WPT) | **yes** |
-| `boa` | Boa JS engine backend (opt-in; required for `wasm`) | no |
+| `boa` | Boa JS engine backend (opt-in; hosts the `wasm` feature) | no |
 | `jsc` | JavaScriptCore backend (macOS only, experimental) | no |
-| `wasm` | WebAssembly support via wasmtime (opt-in, Boa only) | no |
+| `wasm` | Wasmtime-based WebAssembly implementation (opt-in, Boa only) | no |
 | `media` | Video/audio playback support | yes |
 
 V8 is the default backend for running WPT tests.  Wasm is a separate feature
 (and Boa-only) to avoid pulling in wasmtime when not needed.  JSC is
-macOS-only and experimental (see `js_engine/README.md` for known issues).
-
-### Three verbs
+macOS-only and experimental (see `js_engine/src/jsc/README.md` for known
+issues).
 
 ## Build commands
 
-### Default build (V8, no WebAssembly)
+### Default build (V8)
 
 ```bash
 # Check all — type-check every package
@@ -222,7 +221,7 @@ rustup run 1.94.0 cargo run --release
 rustup run 1.94.0 cargo run --release -- wpt
 ```
 
-### Boa (opt-in; required for WebAssembly)
+### Boa (opt-in)
 
 ```bash
 rustup run 1.94.0 cargo build --release --no-default-features --features boa,media
@@ -231,8 +230,11 @@ rustup run 1.94.0 cargo run --release --no-default-features --features boa,media
 
 ### With WebAssembly (opt-in, Boa only)
 
+The `wasm` feature is the Wasmtime-based WebAssembly implementation for the
+Boa engine (V8 and JSC implement WebAssembly natively — no feature needed).
+
 ```bash
-rustup run 1.94.0 cargo build --release --features boa,wasm,media
+rustup run 1.94.0 cargo build --release --no-default-features --features boa,wasm,media
 ```
 
 ### JSC backend (macOS only)
@@ -248,7 +250,8 @@ RUST_LOG=error target/release/formal-web wpt <test-path>
 ### Without media (no video playback)
 
 ```bash
-rustup run 1.94.0 cargo build --release --no-default-features
+rustup run 1.94.0 cargo build --release --no-default-features --features v8
+rustup run 1.94.0 cargo run --release --no-default-features --features v8
 ```
 
 ### Individual packages
@@ -429,7 +432,7 @@ operations allocate. The approved patterns are:
 
 Do not write new code that hands `ec` to a closure while a cell borrow is
 live (e.g. `with_..._mut(|data, ec| ...)` patterns). See
-`js_engine/README.md` ("GcCell borrow discipline") for the mechanism and the
+`content/README.md` ("GcCell borrow discipline") for the mechanism and the
 remaining exception class.
 
 # Never Assume Test Failures Are Pre-Existing
@@ -556,10 +559,10 @@ At the end of each task, run the following steps **in order**:
    this repository's scope and should not be linted or modified.
 
 4. **Run `cargo fmt`** — Format the project's code before committing. Run
-   from the project root: `cargo fmt`. This only formats the root package
-   (there is no workspace defined, so `vendor/` sub-crates are not affected).
-   Never run `cargo fmt` with `--all` or from inside a `vendor/` directory,
-   as vendored formatting changes must not be committed.
+   from the project root: `cargo fmt`. This formats the workspace's own
+   packages only — `vendor/` sub-crates are not workspace members and are
+   never reformatted. Never run `cargo fmt` with `--all` or from inside a
+   `vendor/` directory, as vendored formatting changes must not be committed.
 
 5. **Spec-mapping review** — First, **re-read the documentation chain**
    (`content/src/js/bindings/README.md`, `AGENTS.md` Algorithm Implementation
@@ -625,7 +628,7 @@ At the end of each task, run the following steps **in order**:
      ./verification/verify-specs.sh
      ```
 
-     The script starts the embedder headless with TLA+ tracing, runs a minimal WebDriver session, collects trace events, and validates them against TLA+ models.  It replaces the older `cargo run -- --verify` command which required manual window interaction.
+     The script starts the embedder headless with TLA+ tracing, runs a minimal WebDriver session, collects trace events, and validates them against TLA+ models.
 
 9. **Suggest a commit message** — Whenever asked for a commit message (whether at end-of-task or any other time), propose a message for the current `git diff HEAD` (the uncommitted changes), not for the entire session's work.  Run `git diff --stat HEAD` to see what changed, and `git diff HEAD` to read the diff before writing the message.
 

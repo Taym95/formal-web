@@ -121,8 +121,10 @@ promises, and implements `WebIdlInterface`.
   the content-process-level state (background worker + pending request
   maps).  `PendingState` lifecycle: `Pending → Processing → removed on
   completion`.
-- **WPT test**: `wasm/jsapi/constructor/compile.any.js` enabled in
-  `tests/wpt/include.ini`.
+- **Formal test**: `tests/formal/tests/wasm-compile-instantiate.html` covers
+  compile, instantiate (module + bytes), exports, and validate. It requires
+  the `wasm` feature and is enabled by uncommenting its entry in
+  `tests/formal/include.ini`.
 
 ### Scaffolded but not wired
 
@@ -170,11 +172,11 @@ JS: WebAssembly.compile(buffer)
   ├─ [bindings] compile_fn() extracts bytes value from args,
   │   converts JsValue → Vec<u8> via get_stable_bytes() (webidl)
   │
-  ├─ [domain] namespace::compile_fn(stable_bytes, context):
-  │   ├─ a_new_promise()  (via crate::webidl)
-  │   ├─ store resolvers in GlobalScope.pending_wasm_resolvers
+  ├─ [domain] namespace::asynchronously_compile_a_webassembly_module(stable_bytes, ec):
+  │   ├─ create a promise (a_new_promise_boa)
+  │   ├─ store resolvers in WasmState.pending_resolvers
   │   ├─ push PendingRequest::WasmCompile { bytes, request_id }
-  │   │  onto GlobalScope.pending_requests
+  │   │  onto WasmState.pending_requests
   │   └─ return promise JsValue
   └─ returns promise to JS
 

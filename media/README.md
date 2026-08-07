@@ -61,8 +61,8 @@ cargo run --release
 ### Without media (no video playback)
 
 ```bash
-cargo build --release --no-default-features
-cargo run --release
+cargo build --release --no-default-features --features v8
+cargo run --release --no-default-features --features v8
 ```
 
 ## Module layout
@@ -145,18 +145,23 @@ pub trait MediaBackend: Send + 'static {
 
 ```toml
 [features]
-default = ["backend-gstreamer"]
+default = []
 backend-gstreamer    = ["dep:gstreamer", "dep:gstreamer-app"]
-backend-avfoundation = [
-    "dep:objc2",
-    "dep:objc2-foundation",
-    "dep:objc2-av-foundation",
-    "dep:objc2-core-media",
-    "dep:objc2-core-video",
-]
+backend-avfoundation = []
+ipc-channel-backend  = ["ipc/ipc-channel-backend"]
 ```
 
-A compile-time guard in `backend/mod.rs` ensures exactly one backend is active.
+`backend-avfoundation` is macOS/iOS only and just gates the code module — the
+objc2 dependencies are always present on Apple platforms. `backend-gstreamer`
+acts as a marker on Apple (it enables the optional GStreamer deps); on non-Apple
+platforms GStreamer is always compiled and the flag only enables the code
+module. When no backend feature is selected, `build.rs` emits `avf_default` on
+Apple (AVFoundation is the default there) and GStreamer is the only backend off
+Apple.
+
+There is no compile-time mutual-exclusion guard: the library compiles with 0,
+1, or 2 backends. Backend selection happens at runtime in
+`run_media_process_from_args` via cfg-based priority (see `lib.rs`).
 
 ## GStreamer backend
 

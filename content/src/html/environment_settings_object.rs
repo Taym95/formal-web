@@ -395,44 +395,36 @@ impl EnvironmentSettingsObject {
     /// <https://html.spec.whatwg.org/#perform-a-microtask-checkpoint>
     /// Bridge methods to GlobalScope wasm state (delegates to WasmState).
     #[cfg(all(boa_backend, feature = "wasm"))]
-    pub(crate) fn take_pending_wasm_batches(&self) -> Vec<(u64, Vec<u8>)> {
-        let global = self.realm_execution_context.realm_global_object();
-        if let Some(window) = self
-            .realm_execution_context
-            .with_object_any(&global)
-            .and_then(|data| data.downcast_ref::<Window>())
-        {
-            window.global_scope.take_pending_wasm_batches()
-        } else {
-            Vec::new()
+    pub(crate) fn take_pending_wasm_batches(&mut self) -> Vec<(u64, Vec<u8>)> {
+        match with_global_scope(self.ec(), |global_scope, ec| {
+            Ok(global_scope.take_pending_wasm_batches(ec))
+        }) {
+            Ok(batches) => batches,
+            Err(_) => Vec::new(),
         }
     }
 
     #[cfg(all(boa_backend, feature = "wasm"))]
-    pub(crate) fn take_pending_wasm_instantiates(&self) -> Vec<(u64, wasmtime::Module)> {
-        let global = self.realm_execution_context.realm_global_object();
-        if let Some(window) = self
-            .realm_execution_context
-            .with_object_any(&global)
-            .and_then(|data| data.downcast_ref::<Window>())
-        {
-            window.global_scope.take_pending_wasm_instantiates()
-        } else {
-            Vec::new()
+    pub(crate) fn take_pending_wasm_instantiates(&mut self) -> Vec<(u64, wasmtime::Module)> {
+        match with_global_scope(self.ec(), |global_scope, ec| {
+            Ok(global_scope.take_pending_wasm_instantiates(ec))
+        }) {
+            Ok(instantiates) => instantiates,
+            Err(_) => Vec::new(),
         }
     }
 
     #[cfg(all(boa_backend, feature = "wasm"))]
     pub(crate) fn consume_wasm_request(
-        &self,
+        &mut self,
         request_id: u64,
     ) -> Option<(JsObject, js_engine::records::PromiseResolvers<Types>)> {
-        let global = self.realm_execution_context.realm_global_object();
-        let window = self
-            .realm_execution_context
-            .with_object_any(&global)
-            .and_then(|data| data.downcast_ref::<Window>())?;
-        window.global_scope.consume_wasm_request(request_id)
+        match with_global_scope(self.ec(), |global_scope, ec| {
+            Ok(global_scope.consume_wasm_request(request_id, ec))
+        }) {
+            Ok(resolvers) => resolvers,
+            Err(_) => None,
+        }
     }
 
     pub fn perform_a_microtask_checkpoint(&mut self) -> Result<(), String> {

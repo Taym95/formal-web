@@ -29,8 +29,8 @@ state.  Content code only sees the generic traits from the `js_engine` crate.
   - **Namespaces must use `WebIdlNamespace` + `register_namespace_spec`**,
     not manual `create_plain_object`/`create_builtin_fn`.  See
     `content/src/js/bindings/testutils/mod.rs` for a correct example.
-    (`console_generic.rs` and `css_generic.rs` use the old manual pattern
-    and should be migrated to `WebIdlNamespace`.)
+    (`console_generic.rs` and `css_generic.rs` use the manual pattern and
+    should be migrated to `WebIdlNamespace`.)
 - **Domain logic belongs in the domain directory; JS-interop code belongs
   in the bindings.**  Pure Rust/wasmtime logic goes in the owning domain
   directory (`content/src/dom/`, `content/src/html/`, `content/src/streams/`,
