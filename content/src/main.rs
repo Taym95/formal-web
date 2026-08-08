@@ -64,7 +64,7 @@ use std::{
     env,
     rc::Rc,
     sync::{Arc, Mutex},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 use url::Url;
 use verification::{TLATracer, TraceSender};
@@ -108,6 +108,16 @@ fn new_font_namespace() -> u64 {
         .map(|duration| duration.as_nanos() as u64)
         .unwrap_or(0);
     pid.rotate_left(32) ^ start_nanos
+}
+
+/// Milliseconds since the Unix epoch of `instant`, measured on the
+/// monotonic clock shared with the user agent process.
+fn epoch_millis(epoch_anchor: Instant, epoch_anchor_wall_ms: f64, instant: Instant) -> f64 {
+    epoch_anchor_wall_ms
+        + instant
+            .saturating_duration_since(epoch_anchor)
+            .as_secs_f64()
+            * 1000.0
 }
 
 enum PendingNetworkHandler {
@@ -371,6 +381,14 @@ pub(crate) struct ContentProcess {
     graphics_sender: Option<ipc::IpcSender<ipc_messages::graphics::GraphicsCommand>>,
     /// This content process's own command sender, used by net for direct response routing.
     content_command_sender: ipc::IpcSender<Command>,
+    /// Monotonic-clock reading captured at the same moment as
+    /// `epoch_anchor_wall_ms`; together they convert monotonic readings to
+    /// epoch-relative milliseconds on the clock shared with the user agent
+    /// (HR Time "estimated monotonic time of the Unix epoch").
+    epoch_anchor: Instant,
+    /// Wall-clock milliseconds since the Unix epoch at the moment
+    /// `epoch_anchor` was captured.
+    epoch_anchor_wall_ms: f64,
     realm_parent: Engine,
 }
 
@@ -385,6 +403,15 @@ impl ContentProcess {
         trace_sender: Option<TraceSender>,
     ) -> Self {
         let clipboard_cache = new_clipboard_cache();
+        // HR Time "estimated monotonic time of the Unix epoch": simultaneous
+        // wall-clock and monotonic readings at process start, so epoch
+        // timestamps sent by the user agent (e.g. the rendering opportunity
+        // time in UpdateTheRendering) map onto this process's monotonic clock.
+        let epoch_anchor = Instant::now();
+        let epoch_anchor_wall_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_secs_f64() * 1000.0)
+            .unwrap_or(0.0);
         Self {
             event_sender,
             event_loop_id,
@@ -407,6 +434,8 @@ impl ContentProcess {
             network_extension_sender,
             graphics_sender,
             content_command_sender,
+            epoch_anchor,
+            epoch_anchor_wall_ms,
             realm_parent: Engine::new(),
         }
     }
@@ -1345,24 +1374,20 @@ impl ContentProcess {
             .map_err(|error| format!("failed to send beforeunload completion: {error}"))
     }
 
+    /// <https://html.spec.whatwg.org/#update-the-rendering>
     fn update_the_rendering(
         &mut self,
         navigable_id: NavigableId,
         document_id: DocumentId,
+        frame_timestamp_epoch_ms: f64,
     ) -> Result<(), String> {
+        // This is where the update-the-rendering steps run: the rendering
+        // opportunity arrives from the user agent as an UpdateTheRendering
+        // command carrying the event loop's last render opportunity time.
         log_render_state_debug(format!(
             "process update-the-rendering navigable={} document={}",
             navigable_id, document_id,
         ));
-        self.continue_updating_the_rendering(navigable_id, document_id)
-    }
-
-    /// <https://html.spec.whatwg.org/#update-the-rendering>
-    fn continue_updating_the_rendering(
-        &mut self,
-        navigable_id: NavigableId,
-        document_id: DocumentId,
-    ) -> Result<(), String> {
         let video_paint_registry = Rc::clone(&self.video_paint_registry);
         let paint_frame = {
             let document = self
@@ -1372,12 +1397,20 @@ impl ContentProcess {
 
             document.document.borrow_mut().handle_messages();
 
-            let frame_timestamp_ms = document.settings.current_time_millis();
-
             // Step 1: "Let `frameTimestamp` be `eventLoop`'s last render opportunity time."
-            // Note: The content process currently derives a monotonic frame timestamp from the document's environment settings object time origin instead of the HTML event loop's shared render-opportunity clock.
+            // The user agent stamps the opportunity time on the browser-wide monotonic
+            // clock when it notes the opportunity and passes it in the UpdateTheRendering
+            // command; convert it to a duration from this document's time origin (HR Time
+            // "relative high resolution time") for the animation frame callbacks below.
+            let frame_timestamp_ms = frame_timestamp_epoch_ms
+                - epoch_millis(
+                    self.epoch_anchor,
+                    self.epoch_anchor_wall_ms,
+                    document.settings.time_origin,
+                );
+
             // Step 14: "For each `doc` of `docs`, run the animation frame callbacks for `doc`, passing in the relative high resolution time given `frameTimestamp` and `doc`'s relevant global object as the timestamp."
-            // Note: The content process collapses `docs` to the single active document for this content process and uses the same environment-relative time as both the HTML frame timestamp and the callback timestamp.
+            // Note: The content process collapses `docs` to the single active document for this content process.
             document
                 .settings
                 .run_animation_frame_callbacks(frame_timestamp_ms)?;
@@ -2200,8 +2233,9 @@ impl ContentProcess {
             UpdateTheRendering {
                 traversable_id,
                 document_id,
+                frame_timestamp_epoch_ms,
             } => {
-                self.update_the_rendering(traversable_id, document_id)?;
+                self.update_the_rendering(traversable_id, document_id, frame_timestamp_epoch_ms)?;
                 Ok(true)
             }
             RunWindowTimer {

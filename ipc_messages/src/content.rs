@@ -858,6 +858,11 @@ pub enum Command {
     UpdateTheRendering {
         traversable_id: NavigableId,
         document_id: DocumentId,
+        /// Milliseconds since the Unix epoch on the browser-wide monotonic
+        /// clock, captured when the user agent noted the rendering
+        /// opportunity (the HTML event loop's "last render opportunity
+        /// time").
+        frame_timestamp_epoch_ms: f64,
     },
     RunWindowTimer {
         document_id: DocumentId,
