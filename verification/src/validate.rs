@@ -3,6 +3,7 @@ use log::error;
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::env;
 use std::ffi::OsStr;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, ErrorKind};
@@ -483,6 +484,18 @@ fn validate_spec(
     Ok(report)
 }
 
+/// The `java` binary used to run TLC: `$JAVA_HOME/bin/java` when
+/// `JAVA_HOME` is set and points at an executable, otherwise `java` on PATH.
+fn java_command() -> Command {
+    if let Some(java_home) = env::var_os("JAVA_HOME") {
+        let java_binary = PathBuf::from(java_home).join("bin").join("java");
+        if java_binary.is_file() {
+            return Command::new(java_binary);
+        }
+    }
+    Command::new("java")
+}
+
 fn run_tlc(
     spec: &SpecLayout,
     trace_file: &Path,
@@ -492,7 +505,7 @@ fn run_tlc(
 ) -> Result<TlcRun, String> {
     let spec_run_dir = prepare_spec_run_dir(spec, workspace_root)?;
     let generated_trace_data_path = write_trace_data_module(spec, trace_file, &spec_run_dir)?;
-    let mut command = Command::new("java");
+    let mut command = java_command();
     command
         .arg("-XX:+UseParallelGC")
         .arg("-jar")

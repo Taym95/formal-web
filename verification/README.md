@@ -54,6 +54,11 @@ iframe, so the child rendering path is actually traced and validated.
 
 ### TLA+/TLC gotchas (all confirmed with the bundled tla2tools.jar)
 
+- The macOS `/usr/bin/java` stub may fail to locate an installed JVM (e.g. under a
+  restrictive sandbox). The verifier resolves `$JAVA_HOME/bin/java` when `JAVA_HOME`
+  is set, so point it at a JDK home (e.g. `/Library/Java/JavaVirtualMachines/temurin-21.jdk/Contents/Home`)
+  instead of relying on launch-services discovery.
+
 - The TLC **config parser** accepts only simple constant values: numbers,
   identifiers, strings, and sets. It rejects function-constructor `|->` syntax,
   tuples `<<>>`, and a trailing `====` line. To give the model a function-valued
