@@ -18,7 +18,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use url::Url;
 use verification::{TLATracer, TraceSender};
 
@@ -1302,13 +1302,23 @@ struct UserAgentWorker {
     host: Arc<dyn Embedder>,
     /// Trace logger for the Navigation TLA+ spec.
     tla_tracer: TLATracer,
+    /// Monotonic-clock reading captured at the same moment as
+    /// `epoch_anchor_wall_ms`; together they convert monotonic readings to
+    /// epoch-relative milliseconds on the clock shared with the content
+    /// processes (HR Time "estimated monotonic time of the Unix epoch").
+    epoch_anchor: Instant,
+    /// Wall-clock milliseconds since the Unix epoch at the moment
+    /// `epoch_anchor` was captured.
+    epoch_anchor_wall_ms: f64,
     /// Tracks which navigables have a queued update the rendering in
     /// flight (TLA spec: pending[f] > composed[f]).
     pending_update_the_rendering: HashSet<NavigableId>,
     /// Batched rendering opportunities noted while an update was pending
-    /// or no frame was needed yet (TLA spec op_count). Set semantics:
-    /// multiple notes while pending collapse to one re-render.
-    queued_rendering_opportunities: HashSet<NavigableId>,
+    /// or no frame was needed yet (TLA spec op_count), with the epoch
+    /// millisecond time the opportunity was noted (the event loop's "last
+    /// render opportunity time"). Set semantics: multiple notes while
+    /// pending collapse to one re-render; the latest note's timestamp wins.
+    queued_rendering_opportunities: HashMap<NavigableId, f64>,
     /// Top-level traversables for which the embedder needs a frame
     /// (FrameNeeded, sent at each paint). Update the rendering is queued
     /// only when a frame is needed AND a rendering opportunity was noted.
@@ -1369,6 +1379,16 @@ impl UserAgentWorker {
             }
         };
 
+        // HR Time "estimated monotonic time of the Unix epoch": simultaneous
+        // wall-clock and monotonic readings at process start, so monotonic
+        // instants can be converted to epoch-relative milliseconds
+        // consistently across the user-agent and content processes.
+        let epoch_anchor = Instant::now();
+        let epoch_anchor_wall_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_secs_f64() * 1000.0)
+            .unwrap_or(0.0);
+
         Self {
             state: UserAgentState::default(),
             command_sender: user_agent_command_sender.clone(),
@@ -1382,8 +1402,10 @@ impl UserAgentWorker {
             graphics_child,
             host,
             tla_tracer: TLATracer::new("Navigation", "formal-web:user-agent", trace_sender.clone()),
+            epoch_anchor,
+            epoch_anchor_wall_ms,
             pending_update_the_rendering: HashSet::new(),
-            queued_rendering_opportunities: HashSet::new(),
+            queued_rendering_opportunities: HashMap::new(),
             frame_needed: HashSet::new(),
             trace_sender,
             next_automation_request_id: 1,
@@ -3315,7 +3337,7 @@ impl UserAgentWorker {
         }
         for candidate in self
             .queued_rendering_opportunities
-            .iter()
+            .keys()
             .copied()
             .collect::<Vec<_>>()
         {
@@ -3549,6 +3571,16 @@ impl UserAgentWorker {
             .send(EventLoopCommand::FireAndForget { command });
     }
 
+    /// Milliseconds since the Unix epoch of `instant`, measured on the
+    /// monotonic clock shared with the content processes.
+    fn epoch_millis(&self, instant: Instant) -> f64 {
+        self.epoch_anchor_wall_ms
+            + instant
+                .saturating_duration_since(self.epoch_anchor)
+                .as_secs_f64()
+                * 1000.0
+    }
+
     /// <https://html.spec.whatwg.org/#rendering-opportunity>
     /// Update the rendering is queued only when the embedder needs a frame
     /// (FrameNeeded) AND there is something to render.
@@ -3561,8 +3593,13 @@ impl UserAgentWorker {
             "NoteRenderingOpportunity",
             navigable_id
         );
+        // Stamp the opportunity time once; the queued update-the-rendering
+        // command carries it as the event loop's "last render opportunity
+        // time" (HTML Step 1 of update-the-rendering).
+        let frame_timestamp_epoch_ms = self.epoch_millis(Instant::now());
         if self.pending_update_the_rendering.contains(&navigable_id) {
-            self.queued_rendering_opportunities.insert(navigable_id);
+            self.queued_rendering_opportunities
+                .insert(navigable_id, frame_timestamp_epoch_ms);
             info!(
                 "[render-pipe] UA queue navigable={} (already pending, queued)",
                 navigable_id
@@ -3570,7 +3607,8 @@ impl UserAgentWorker {
             return;
         }
         if !self.traversable_frame_needed(navigable_id) {
-            self.queued_rendering_opportunities.insert(navigable_id);
+            self.queued_rendering_opportunities
+                .insert(navigable_id, frame_timestamp_epoch_ms);
             info!(
                 "[render-pipe] UA queue navigable={} (no frame needed, queued)",
                 navigable_id
@@ -3582,6 +3620,8 @@ impl UserAgentWorker {
             }
             return;
         }
+        self.queued_rendering_opportunities
+            .insert(navigable_id, frame_timestamp_epoch_ms);
         self.queue_update_the_rendering(navigable_id);
     }
 
@@ -3595,7 +3635,12 @@ impl UserAgentWorker {
             return;
         }
         self.pending_update_the_rendering.insert(navigable_id);
-        self.queued_rendering_opportunities.remove(&navigable_id);
+        // Drain the opportunity stamp; the latest note for this navigable
+        // wins (the event loop's "last render opportunity time").
+        let frame_timestamp_epoch_ms = self
+            .queued_rendering_opportunities
+            .remove(&navigable_id)
+            .unwrap_or_else(|| self.epoch_millis(Instant::now()));
         if let Some(traversable_id) = self.state.top_level_traversable_id(navigable_id) {
             self.frame_needed.remove(&traversable_id);
         }
@@ -3642,6 +3687,7 @@ impl UserAgentWorker {
         let command = ContentCommand::UpdateTheRendering {
             traversable_id: navigable_id,
             document_id: *document_id,
+            frame_timestamp_epoch_ms,
         };
         let _ = entry
             .command_sender
@@ -4140,10 +4186,16 @@ impl UserAgentWorker {
                 // frames are noted; static composing siblings are not
                 // re-rendered.
                 if *animating {
-                    self.queued_rendering_opportunities.insert(webview_id.0);
+                    // All animating frames share one opportunity time, so
+                    // their update-the-rendering commands carry the same
+                    // event-loop "last render opportunity time".
+                    let frame_timestamp_epoch_ms = self.epoch_millis(Instant::now());
+                    self.queued_rendering_opportunities
+                        .insert(webview_id.0, frame_timestamp_epoch_ms);
                     for frame_id in animating_frame_ids {
                         if let Some(child_wv) = child_frame_to_webview.get(frame_id) {
-                            self.queued_rendering_opportunities.insert(child_wv.0);
+                            self.queued_rendering_opportunities
+                                .insert(child_wv.0, frame_timestamp_epoch_ms);
                         }
                         // Frame ids not in the child map belong to the
                         // top-level frame itself, already noted above.
