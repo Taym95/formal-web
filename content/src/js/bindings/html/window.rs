@@ -165,16 +165,16 @@ fn structured_clone_method(
     let value = args.first().cloned().unwrap_or_else(|| undefined.clone());
     let options = parse_structured_clone_options(args.get(1), ec);
 
-    let mut result = Err(ec.new_type_error("receiver is not a Window"));
-    ec.with_object_any_mut_with(
-        &window_object,
-        Box::new(|data, ec2| {
-            if let Some(window) = data.downcast_ref::<Window>() {
-                result = window.structured_clone(value, options, ec2);
-            }
-        }),
-    );
-    result
+    // Clone the Window out of the object registry so no borrow on the global
+    // object is live while the structured-clone algorithm runs: on the Boa
+    // backend the window is the realm global object, and a mutable borrow held
+    // across engine calls panics when the algorithm touches the global (e.g.
+    // construct_typed_array_view looks up the typed-array constructor on it).
+    let window = ec
+        .with_object_any(&window_object)
+        .and_then(|data| data.downcast_ref::<Window>().cloned())
+        .ok_or_else(|| ec.new_type_error("receiver is not a Window"))?;
+    window.structured_clone(value, options, ec)
 }
 
 fn parse_structured_clone_options(
@@ -235,16 +235,11 @@ fn open_method(
     let features = ec.to_rust_string(args.get(2).cloned().unwrap_or_else(|| undefined))?;
 
     let window_object = current_window_object_from(this, ec);
-    let mut result = Err(ec.new_type_error("receiver is not a Window"));
-    ec.with_object_any_mut_with(
-        &window_object,
-        Box::new(|data, ec2| {
-            if let Some(window) = data.downcast_ref::<Window>() {
-                result = window.open(&url, &target, &features, ec2);
-            }
-        }),
-    );
-    result
+    let window = ec
+        .with_object_any(&window_object)
+        .and_then(|data| data.downcast_ref::<Window>().cloned())
+        .ok_or_else(|| ec.new_type_error("receiver is not a Window"))?;
+    window.open(&url, &target, &features, ec)
 }
 
 fn request_animation_frame_method(
@@ -255,15 +250,11 @@ fn request_animation_frame_method(
     let undefined = ec.value_undefined();
     let callback = callback_function_value(args.first().unwrap_or(&undefined), ec)?;
     let window_object = current_window_object_from(this, ec);
-    let mut handle = 0u32;
-    ec.with_object_any_mut_with(
-        &window_object,
-        Box::new(|data, ec| {
-            if let Some(window) = data.downcast_ref::<Window>() {
-                handle = window.global_scope.request_animation_frame(callback, ec);
-            }
-        }),
-    );
+    let window = ec
+        .with_object_any(&window_object)
+        .and_then(|data| data.downcast_ref::<Window>().cloned())
+        .ok_or_else(|| ec.new_type_error("receiver is not a Window"))?;
+    let handle = window.global_scope.request_animation_frame(callback, ec);
     Ok(ec.value_from_number(handle as f64))
 }
 
@@ -304,14 +295,11 @@ fn cancel_animation_frame_method(
     let undefined = ec.value_undefined();
     let handle = ec.to_uint32(args.first().cloned().unwrap_or_else(|| undefined))?;
     let window_object = current_window_object_from(this, ec);
-    ec.with_object_any_mut_with(
-        &window_object,
-        Box::new(|data, ec| {
-            if let Some(window) = data.downcast_mut::<Window>() {
-                window.global_scope.cancel_animation_frame(handle, ec);
-            }
-        }),
-    );
+    let window = ec
+        .with_object_any(&window_object)
+        .and_then(|data| data.downcast_ref::<Window>().cloned())
+        .ok_or_else(|| ec.new_type_error("receiver is not a Window"))?;
+    window.global_scope.cancel_animation_frame(handle, ec);
     Ok(ec.value_undefined())
 }
 
@@ -325,18 +313,13 @@ fn set_timeout_method(
     let handler = args.first().cloned().unwrap_or_else(|| undefined.clone());
     let delay = args.get(1).cloned().unwrap_or_else(|| undefined);
     let extra_args: Vec<JsValue> = args.iter().skip(2).cloned().collect();
-    let mut result = Err(ec.new_type_error("receiver is not a Window"));
-    ec.with_object_any_mut_with(
-        &window_object,
-        Box::new(|data, ec2| {
-            if let Some(window) = data.downcast_ref::<Window>() {
-                result = window
-                    .set_timeout(&handler, &delay, extra_args.clone(), ec2)
-                    .map(|id| ec2.value_from_number(id as f64));
-            }
-        }),
-    );
-    result
+    let window = ec
+        .with_object_any(&window_object)
+        .and_then(|data| data.downcast_ref::<Window>().cloned())
+        .ok_or_else(|| ec.new_type_error("receiver is not a Window"))?;
+    window
+        .set_timeout(&handler, &delay, extra_args, ec)
+        .map(|id| ec.value_from_number(id as f64))
 }
 
 fn clear_timeout_method(
@@ -347,14 +330,11 @@ fn clear_timeout_method(
     let undefined = ec.value_undefined();
     let timer_id = ec.to_uint32(args.first().cloned().unwrap_or_else(|| undefined))?;
     let window_object = current_window_object_from(this, ec);
-    ec.with_object_any_mut_with(
-        &window_object,
-        Box::new(|data, ec| {
-            if let Some(window) = data.downcast_mut::<Window>() {
-                window.clear_timeout(timer_id, ec);
-            }
-        }),
-    );
+    let window = ec
+        .with_object_any(&window_object)
+        .and_then(|data| data.downcast_ref::<Window>().cloned())
+        .ok_or_else(|| ec.new_type_error("receiver is not a Window"))?;
+    window.clear_timeout(timer_id, ec);
     Ok(ec.value_undefined())
 }
 
@@ -368,18 +348,13 @@ fn set_interval_method(
     let handler = args.first().cloned().unwrap_or_else(|| undefined.clone());
     let delay = args.get(1).cloned().unwrap_or_else(|| undefined);
     let extra_args: Vec<JsValue> = args.iter().skip(2).cloned().collect();
-    let mut result = Err(ec.new_type_error("receiver is not a Window"));
-    ec.with_object_any_mut_with(
-        &window_object,
-        Box::new(|data, ec2| {
-            if let Some(window) = data.downcast_ref::<Window>() {
-                result = window
-                    .set_interval(&handler, &delay, extra_args.clone(), ec2)
-                    .map(|id| ec2.value_from_number(id as f64));
-            }
-        }),
-    );
-    result
+    let window = ec
+        .with_object_any(&window_object)
+        .and_then(|data| data.downcast_ref::<Window>().cloned())
+        .ok_or_else(|| ec.new_type_error("receiver is not a Window"))?;
+    window
+        .set_interval(&handler, &delay, extra_args, ec)
+        .map(|id| ec.value_from_number(id as f64))
 }
 
 fn clear_interval_method(
@@ -390,14 +365,11 @@ fn clear_interval_method(
     let undefined = ec.value_undefined();
     let timer_id = ec.to_uint32(args.first().cloned().unwrap_or_else(|| undefined))?;
     let window_object = current_window_object_from(this, ec);
-    ec.with_object_any_mut_with(
-        &window_object,
-        Box::new(|data, ec| {
-            if let Some(window) = data.downcast_mut::<Window>() {
-                window.clear_interval(timer_id, ec);
-            }
-        }),
-    );
+    let window = ec
+        .with_object_any(&window_object)
+        .and_then(|data| data.downcast_ref::<Window>().cloned())
+        .ok_or_else(|| ec.new_type_error("receiver is not a Window"))?;
+    window.clear_interval(timer_id, ec);
     Ok(ec.value_undefined())
 }
 

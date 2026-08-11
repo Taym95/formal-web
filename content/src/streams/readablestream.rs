@@ -3988,7 +3988,10 @@ fn pipe_to_on_promise_settled(
                         state.set_shutdown_error(Some(value), ec);
                     }
                 }
-                None => {}
+                // The action promise has not been stored yet (perform_action is
+                // still running its action).  Wait for the reaction on the
+                // action promise instead of finalizing with the stale error.
+                None => return Ok(()),
             }
 
             state.finalize(ec)?;

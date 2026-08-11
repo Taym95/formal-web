@@ -2865,6 +2865,54 @@ impl ExecutionContext<V8Types> for V8Engine {
             .is_some_and(|state| !state.resizable)
     }
 
+    fn array_buffer_byte_length(&self, array_buffer: &V8ArrayBuffer) -> u64 {
+        let Some(state) = array_buffer
+            .0
+            .0
+            .object_profile
+            .as_ref()
+            .and_then(|profile| profile.array_buffer_state.as_ref())
+        else {
+            return 0;
+        };
+        if state.detached.get() {
+            return 0;
+        }
+        let isolate_id = self.isolate_id;
+        let live_detached =
+            v8_engine_scope_with_context!(scope, self, &self.realm_state.realm.context, {
+                let local =
+                    match local_typed_object(scope, isolate_id, &array_buffer.0, &array_buffer.1) {
+                        Ok(local) => local,
+                        Err(_) => return 0,
+                    };
+                local.was_detached()
+            });
+        if live_detached {
+            return 0;
+        }
+        state.backing_store.byte_length() as u64
+    }
+
+    fn can_transfer_array_buffer(&self, array_buffer: &V8ArrayBuffer) -> bool {
+        let state = array_buffer
+            .0
+            .0
+            .object_profile
+            .as_ref()
+            .and_then(|profile| profile.array_buffer_state.as_ref());
+        if state.is_some_and(|state| state.detached.get()) {
+            return false;
+        }
+        let isolate_id = self.isolate_id;
+        v8_engine_scope_with_context!(scope, self, &self.realm_state.realm.context, {
+            match local_typed_object(scope, isolate_id, &array_buffer.0, &array_buffer.1) {
+                Ok(local) => local.is_detachable(),
+                Err(_) => false,
+            }
+        })
+    }
+
     fn allocate_array_buffer(
         &mut self,
         constructor: V8Constructor,
@@ -3220,6 +3268,19 @@ impl ExecutionContext<V8Types> for V8Engine {
             .array_buffer_state
             .as_ref()?;
         if state.detached.get() {
+            return None;
+        }
+        // A JavaScript-initiated `ArrayBuffer.prototype.transfer()` detaches the
+        // buffer without updating the cached `state.detached` cell, so check the
+        // live V8 buffer state as well.
+        let isolate_id = self.isolate_id;
+        let live_detached =
+            v8_engine_scope_with_context!(scope, self, &self.realm_state.realm.context, {
+                let local =
+                    local_typed_object(scope, isolate_id, &array_buffer.0, &array_buffer.1).ok()?;
+                local.was_detached()
+            });
+        if live_detached {
             return None;
         }
         Some(state.backing_store.iter().map(Cell::get).collect())

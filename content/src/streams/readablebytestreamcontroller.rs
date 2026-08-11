@@ -94,6 +94,9 @@ pub(crate) struct ArrayBufferViewDescriptor {
     byte_offset: usize,
     #[ignore_trace]
     byte_length: usize,
+    /// <https://tc39.es/ecma262/#sec-arraybufferbytelength>
+    #[ignore_trace]
+    buffer_byte_length: usize,
 }
 
 impl ArrayBufferViewDescriptor {
@@ -109,11 +112,15 @@ impl ArrayBufferViewDescriptor {
             if ec.array_buffer_data(&buffer).is_none() {
                 return Err(ec.new_type_error("ArrayBufferView buffer is detached"));
             }
+            let byte_offset = ec.data_view_byte_offset(&data_view)? as usize;
+            let byte_length = ec.data_view_byte_length(&data_view)? as usize;
+            let buffer_byte_length = ec.array_buffer_byte_length(&buffer) as usize;
             return Ok(Self {
                 buffer,
                 kind: ArrayBufferViewKind::DataView,
-                byte_offset: ec.data_view_byte_offset(&data_view)? as usize,
-                byte_length: ec.data_view_byte_length(&data_view)? as usize,
+                byte_offset,
+                byte_length,
+                buffer_byte_length,
             });
         }
 
@@ -125,11 +132,15 @@ impl ArrayBufferViewDescriptor {
             if ec.array_buffer_data(&buffer).is_none() {
                 return Err(ec.new_type_error("ArrayBufferView buffer is detached"));
             }
+            let byte_offset = ec.typed_array_byte_offset(&typed_array)? as usize;
+            let byte_length = ec.typed_array_byte_length(&typed_array)? as usize;
+            let buffer_byte_length = ec.array_buffer_byte_length(&buffer) as usize;
             Ok(Self {
                 buffer,
                 kind: ArrayBufferViewKind::from_element_type(element_type),
-                byte_offset: ec.typed_array_byte_offset(&typed_array)? as usize,
-                byte_length: ec.typed_array_byte_length(&typed_array)? as usize,
+                byte_offset,
+                byte_length,
+                buffer_byte_length,
             })
         } else {
             Err(ec.new_type_error("Expected an ArrayBufferView object"))
@@ -137,16 +148,26 @@ impl ArrayBufferViewDescriptor {
     }
 
     pub(crate) fn new_uint8(buffer: ArrayBuffer, byte_offset: usize, byte_length: usize) -> Self {
+        let buffer_byte_length = byte_offset + byte_length;
         Self {
             buffer,
             kind: ArrayBufferViewKind::Uint8Array,
             byte_offset,
             byte_length,
+            buffer_byte_length,
         }
     }
 
     pub(crate) fn byte_length(&self) -> usize {
         self.byte_length
+    }
+
+    pub(crate) fn buffer_byte_length(&self) -> usize {
+        self.buffer_byte_length
+    }
+
+    pub(crate) fn buffer(&self) -> &ArrayBuffer {
+        &self.buffer
     }
 
     pub(crate) fn byte_offset(&self) -> usize {
@@ -179,6 +200,18 @@ impl ArrayBufferViewDescriptor {
         )
     }
 
+    /// Creates a result view over a specific (already transferred) buffer.
+    /// Used by ConvertPullIntoDescriptor, which transfers the descriptor's
+    /// buffer before constructing the view.
+    pub(crate) fn create_result_view_on(
+        &self,
+        buffer: ArrayBuffer,
+        byte_length: usize,
+        ec: &mut dyn ExecutionContext<crate::js::Types>,
+    ) -> Completion<JsObject, crate::js::Types> {
+        create_view_object(&self.kind, buffer, self.byte_offset, byte_length, ec)
+    }
+
     pub(crate) fn create_remaining_view(
         &self,
         bytes_filled: usize,
@@ -196,18 +229,20 @@ impl ArrayBufferViewDescriptor {
     fn replace_with(&mut self, other: Self) {
         *self = other;
     }
-
-    /// Spec step: `firstDescriptor.[[buffer]] = TransferArrayBuffer(view.[[ViewedArrayBuffer]])`.
-    /// Updates only the backing buffer; `byte_offset` and `byte_length` are unchanged.
-    fn transfer_buffer_from(&mut self, other: &Self) {
-        self.buffer = other.buffer.clone();
-    }
 }
 
 #[gc_struct]
 enum PullRequest {
-    Default(ReadRequest),
+    /// Reader type "default" — an auto-allocated pull-into descriptor whose
+    /// read request lives on the stream's default reader.
+    Default,
+    /// Reader type "byob" — a BYOB read whose read-into request is attached
+    /// to the descriptor.
     Byob(ReadIntoRequest),
+    /// Reader type "none" — set by [[ReleaseSteps]] when a reader is released
+    /// with a pending pull-into; respond()/enqueue() then feed the descriptor's
+    /// filled bytes into the queue instead of resolving a reader.
+    None,
 }
 
 /// <https://streams.spec.whatwg.org/#pull-into-descriptor>
@@ -230,39 +265,28 @@ impl PullIntoDescriptor {
         self.view.byte_length().saturating_sub(self.bytes_filled)
     }
 
-    fn can_commit(&self) -> bool {
-        self.bytes_filled >= self.minimum_fill && self.bytes_filled % self.view.element_size() == 0
-    }
-
+    /// <https://streams.spec.whatwg.org/#readable-byte-stream-controller-convert-pull-into-descriptor>
     fn filled_view(
         &self,
         ec: &mut dyn ExecutionContext<crate::js::Types>,
     ) -> Completion<JsObject, crate::js::Types> {
-        self.view.create_result_view(self.bytes_filled, ec)
+        // Step 5: Let buffer be ! TransferArrayBuffer(pullIntoDescriptor's buffer).
+        let buffer = transfer_array_buffer(self.view.buffer.clone(), ec)?;
+        // Step 6: Return ! Construct(view constructor, « buffer, byte offset, bytesFilled ÷ elementSize »).
+        self.view
+            .create_result_view_on(buffer, self.bytes_filled, ec)
     }
 
-    fn close(
+    fn close_with_value(
         self,
+        value: JsValue,
         ec: &mut dyn ExecutionContext<crate::js::Types>,
     ) -> Completion<(), crate::js::Types> {
         match &self.request {
-            PullRequest::Default(read_request) => {
-                let value = if self.bytes_filled == 0 {
-                    None
-                } else {
-                    Some(JsValue::from(self.filled_view(ec)?))
-                };
-                let read_request = read_request.clone();
-                if let Some(value) = value {
-                    read_request.chunk_steps(value, ec)
-                } else {
-                    read_request.close_steps(ec)
-                }
-            }
             PullRequest::Byob(read_into_request) => {
-                let value = <Types as JsTypes>::value_from_object(self.filled_view(ec)?);
                 read_into_request.clone().close_steps(Some(value), ec)
             }
+            PullRequest::Default | PullRequest::None => Ok(()),
         }
     }
 
@@ -271,43 +295,10 @@ impl PullIntoDescriptor {
         ec: &mut dyn ExecutionContext<crate::js::Types>,
     ) -> Completion<(), crate::js::Types> {
         match &self.request {
-            PullRequest::Default(read_request) => read_request.clone().close_steps(ec),
             PullRequest::Byob(read_into_request) => read_into_request.clone().close_steps(None, ec),
-        }
-    }
-
-    fn commit(
-        self,
-        done: bool,
-        ec: &mut dyn ExecutionContext<crate::js::Types>,
-    ) -> Completion<(), crate::js::Types> {
-        let value = JsValue::from(self.filled_view(ec)?);
-        self.commit_with_value(value, done, ec)
-    }
-
-    fn commit_with_value(
-        self,
-        value: JsValue,
-        done: bool,
-        ec: &mut dyn ExecutionContext<crate::js::Types>,
-    ) -> Completion<(), crate::js::Types> {
-        match &self.request {
-            PullRequest::Default(read_request) => {
-                let read_request = read_request.clone();
-                if done {
-                    read_request.chunk_steps(value, ec)
-                } else {
-                    read_request.chunk_steps(value, ec)
-                }
-            }
-            PullRequest::Byob(read_into_request) => {
-                let read_into_request = read_into_request.clone();
-                if done {
-                    read_into_request.close_steps(Some(value), ec)
-                } else {
-                    read_into_request.chunk_steps(value, ec)
-                }
-            }
+            // Default-reader requests live on the stream and are resolved by
+            // ReadableStreamClose during cancel.
+            PullRequest::Default | PullRequest::None => Ok(()),
         }
     }
 
@@ -317,10 +308,12 @@ impl PullIntoDescriptor {
         ec: &mut dyn ExecutionContext<crate::js::Types>,
     ) -> Completion<(), crate::js::Types> {
         match &self.request {
-            PullRequest::Default(read_request) => read_request.clone().error_steps(error, ec),
             PullRequest::Byob(read_into_request) => {
                 read_into_request.clone().error_steps(error, ec)
             }
+            // Default-reader requests live on the stream and are resolved by
+            // ReadableStreamError during erroring.
+            PullRequest::Default | PullRequest::None => Ok(()),
         }
     }
 }
@@ -337,15 +330,6 @@ struct ByteQueueEntry {
 }
 
 impl ByteQueueEntry {
-    fn new(view: ArrayBufferViewDescriptor) -> Self {
-        Self {
-            buffer: view.buffer.clone(),
-            byte_offset: view.byte_offset(),
-            byte_length: view.byte_length(),
-            offset: 0,
-        }
-    }
-
     fn remaining_len(&self) -> usize {
         self.byte_length.saturating_sub(self.offset)
     }
@@ -412,7 +396,18 @@ impl ReadableStreamBYOBRequest {
         bytes_written: usize,
         ec: &mut dyn ExecutionContext<crate::js::Types>,
     ) -> Completion<(), crate::js::Types> {
+        // Step 1: If this.[[controller]] is undefined, throw a TypeError exception.
         let controller = self.controller_slot(ec)?;
+        // Step 2: If ! IsDetachedBuffer(this.[[view]].[[ArrayBuffer]]) is true, throw a TypeError exception.
+        if let Some(view) = self.view.borrow(ec).clone()
+            && let Some(buffer) = view_buffer_of_js_object(&view, ec)?
+            && ec.array_buffer_data(&buffer).is_none()
+        {
+            return Err(ec.new_type_error(
+                "ReadableStreamBYOBRequest.respond() requires a non-detached view buffer",
+            ));
+        }
+        // Step 5: Perform ? ReadableByteStreamControllerRespond(this.[[controller]], bytesWritten).
         controller.respond(bytes_written, ec)
     }
 
@@ -425,8 +420,16 @@ impl ReadableStreamBYOBRequest {
         let view_object = view.as_object().ok_or_else(|| {
             ec.new_type_error("respondWithNewView() requires an ArrayBufferView object")
         })?;
+        // Step 1: If this.[[controller]] is undefined, throw a TypeError exception.
         let controller = self.controller_slot(ec)?;
         let view_descriptor = ArrayBufferViewDescriptor::from_value(view, ec)?;
+        // Step 2: If ! IsDetachedBuffer(view.[[ViewedArrayBuffer]]) is true, throw a TypeError exception.
+        if ec.array_buffer_data(&view_descriptor.buffer).is_none() {
+            return Err(ec.new_type_error(
+                "ReadableStreamBYOBRequest.respondWithNewView() requires a non-detached view buffer",
+            ));
+        }
+        // Step 3: Return ? ReadableByteStreamControllerRespondWithNewView(this.[[controller]], view).
         controller.respond_with_new_view(view_descriptor, view_object, ec)
     }
 }
@@ -687,11 +690,16 @@ impl ReadableByteStreamController {
         ec: &mut dyn ExecutionContext<crate::js::Types>,
     ) -> Completion<(), crate::js::Types> {
         let stream = self.stream_slot(ec)?;
+
+        // Step 3: If this.[[queueTotalSize]] > 0,
         if self.queue_total_size.get() > 0 {
-            return self.fill_read_request_from_queue(stream, read_request, ec);
+            // Step 3.2: Perform ! ReadableByteStreamControllerFillReadRequestFromQueue(this, readRequest).
+            return self.fill_read_request_from_queue(read_request, ec);
         }
 
+        // Step 5: If autoAllocateChunkSize is not undefined,
         if let Some(auto_allocate_chunk_size) = self.auto_allocate_chunk_size.get() {
+            // Step 5.1: Let buffer be Construct(%ArrayBuffer%, « autoAllocateChunkSize »).
             let realm = ec.current_realm();
             let intrinsics = ec.realm_intrinsics(&realm);
             let buffer = ec.allocate_array_buffer(
@@ -699,18 +707,21 @@ impl ReadableByteStreamController {
                 auto_allocate_chunk_size as u64,
                 None,
             )?;
+            // Step 5.3: Let pullIntoDescriptor be a new pull-into descriptor with reader type "default".
             let descriptor = PullIntoDescriptor {
                 view: ArrayBufferViewDescriptor::new_uint8(buffer, 0, auto_allocate_chunk_size),
                 bytes_filled: 0,
                 minimum_fill: 1,
-                request: PullRequest::Default(read_request),
+                request: PullRequest::Default,
             };
+            // Step 5.4: Append pullIntoDescriptor to this.[[pendingPullIntos]].
             self.pending_pull_intos.borrow_mut(ec).push_back(descriptor);
-            let _ = self.byob_request(ec)?;
-            return self.call_pull_if_needed(ec);
         }
 
+        // Step 6: Perform ! ReadableStreamAddReadRequest(stream, readRequest).
         readable_stream_add_read_request(stream, read_request, ec)?;
+
+        // Step 7: Perform ! ReadableByteStreamControllerCallPullIfNeeded(this).
         self.call_pull_if_needed(ec)
     }
 
@@ -723,39 +734,118 @@ impl ReadableByteStreamController {
         ec: &mut dyn ExecutionContext<crate::js::Types>,
     ) -> Completion<(), crate::js::Types> {
         let stream = self.stream_slot(ec)?;
+
+        // Steps 2-7: Let elementSize be 1; ctor = %DataView%; if the view is a
+        // typed array use its element size and constructor.  Let minimumFill be
+        // min × elementSize.
+        let element_size = view.element_size();
+        let minimum_fill = min * element_size;
+        let byte_offset = view.byte_offset();
+        let byte_length = view.byte_length();
+
+        // Step 10: Let bufferResult be TransferArrayBuffer(view.[[ViewedArrayBuffer]]).
+        let buffer = match transfer_array_buffer(view.buffer.clone(), ec) {
+            Ok(buffer) => buffer,
+            // Step 11: If bufferResult is an abrupt completion,
+            Err(error) => {
+                // Step 11.1: Perform readIntoRequest's error steps, given bufferResult.[[Value]].
+                read_into_request.error_steps(error, ec)?;
+                // Step 11.2: Return.
+                return Ok(());
+            }
+        };
+
+        // Step 13: Let pullIntoDescriptor be a new pull-into descriptor with
+        // reader type "byob".
         let mut descriptor = PullIntoDescriptor {
-            minimum_fill: min * view.element_size(),
-            view,
+            minimum_fill,
+            view: ArrayBufferViewDescriptor {
+                buffer,
+                kind: view.kind.clone(),
+                byte_offset,
+                byte_length,
+                buffer_byte_length: view.buffer_byte_length(),
+            },
             bytes_filled: 0,
             request: PullRequest::Byob(read_into_request),
         };
 
-        self.fill_pull_into_from_queue(&mut descriptor, ec)?;
-        if descriptor.can_commit() {
-            return descriptor.commit(false, ec);
-        }
-
-        if self.close_requested.get() && self.queue_total_size.get() == 0 {
-            if descriptor.bytes_filled % descriptor.view.element_size() != 0 {
-                let error = type_error_value(
-                    "Cannot close a byte stream with a partially filled typed array element",
-                    ec,
-                )?;
-                descriptor.error(error.clone(), ec)?;
-                self.clear_algorithms(ec);
-                readable_stream_error(stream, error, ec)?;
-                return Ok(());
-            }
-
-            self.clear_algorithms(ec);
-            descriptor.close(ec)?;
-            readable_stream_close(stream, ec)?;
+        // Step 14: If controller.[[pendingPullIntos]] is not empty,
+        if !self.pending_pull_intos.borrow(ec).is_empty() {
+            // Step 14.1: Append pullIntoDescriptor to controller.[[pendingPullIntos]].
+            self.pending_pull_intos.borrow_mut(ec).push_back(descriptor);
+            // Step 14.2: Perform ! ReadableStreamAddReadIntoRequest(stream, readIntoRequest).
+            // Note: read-into requests live inside the descriptors in this
+            // implementation, so the request is already attached.
+            // Step 14.3: Return.
             return Ok(());
         }
 
+        // Step 15: If stream.[[state]] is "closed",
+        if stream.state() == ReadableStreamState::Closed {
+            // Step 15.1: Let emptyView be ! Construct(ctor, « buffer, byte offset, 0 »).
+            let empty_view = descriptor.view.create_result_view(0, ec)?;
+            // Step 15.2: Perform readIntoRequest's close steps, given emptyView.
+            descriptor.close_with_value(JsValue::from(empty_view), ec)?;
+            return Ok(());
+        }
+
+        // Step 16: If controller.[[queueTotalSize]] > 0,
+        if self.queue_total_size.get() > 0 {
+            // Step 16.1: If ! FillPullIntoDescriptorFromQueue(controller, pullIntoDescriptor) is true,
+            if self.fill_pull_into_from_queue(&mut descriptor, ec)? {
+                // Step 16.1.1: Let filledView be ! ConvertPullIntoDescriptor(pullIntoDescriptor).
+                // Step 16.1.2: Perform ! HandleQueueDrain(controller).
+                self.handle_queue_drain(ec)?;
+                // Step 16.1.3: Perform readIntoRequest's chunk steps, given filledView.
+                // Note: done is always false here; the descriptor was never
+                // committed through CommitPullIntoDescriptor.
+                let filled_view = descriptor.filled_view(ec)?;
+                if let PullRequest::Byob(read_into_request) = &descriptor.request {
+                    read_into_request
+                        .clone()
+                        .chunk_steps(JsValue::from(filled_view), ec)?;
+                }
+                return Ok(());
+            }
+
+            // Step 16.2: If controller.[[closeRequested]] is true,
+            if self.close_requested.get() {
+                // Step 16.2.1: Let e be a TypeError exception.
+                let error = type_error_value(
+                    "Cannot fulfill a read request when the stream is closing",
+                    ec,
+                )?;
+                // Step 16.2.2: Perform ! ReadableByteStreamControllerError(controller, e).
+                self.error_steps(error.clone(), ec)?;
+                // Step 16.2.3: Perform readIntoRequest's error steps, given e.
+                descriptor.error(error, ec)?;
+                return Ok(());
+            }
+        }
+
+        // Step 17: Append pullIntoDescriptor to controller.[[pendingPullIntos]].
         self.pending_pull_intos.borrow_mut(ec).push_back(descriptor);
-        let _ = self.byob_request(ec)?;
+        // Step 19: Perform ! ReadableByteStreamControllerCallPullIfNeeded(controller).
         self.call_pull_if_needed(ec)
+    }
+
+    /// Errors all pending "byob" read-into requests with the given error.
+    /// Corresponds to ! ReadableStreamBYOBReaderErrorReadIntoRequests in a
+    /// model where the requests live inside the descriptors.  The descriptors
+    /// themselves are left in [[pendingPullIntos]].
+    pub(crate) fn error_pending_read_into_requests(
+        &self,
+        error: JsValue,
+        ec: &mut dyn ExecutionContext<crate::js::Types>,
+    ) -> Completion<(), crate::js::Types> {
+        let pending = self.pending_pull_intos.borrow(ec).clone();
+        for descriptor in pending {
+            if matches!(descriptor.request, PullRequest::Byob(_)) {
+                descriptor.error(error.clone(), ec)?;
+            }
+        }
+        Ok(())
     }
 
     /// <https://streams.spec.whatwg.org/#abstract-opdef-readablebytestreamcontroller-releasesteps>
@@ -763,12 +853,21 @@ impl ReadableByteStreamController {
         &self,
         ec: &mut dyn ExecutionContext<crate::js::Types>,
     ) -> Completion<(), crate::js::Types> {
-        let pending = std::mem::take(&mut *self.pending_pull_intos.borrow_mut(ec));
-        self.invalidate_byob_request(ec)?;
-        let release_error = type_error_value("Reader was released", ec)?;
-        for descriptor in pending {
-            descriptor.error(release_error.clone(), ec)?;
+        // Step 1: If this.[[pendingPullIntos]] is not empty,
+        if !self.pending_pull_intos.borrow(ec).is_empty() {
+            // Step 1.1: Let firstPendingPullInto be this.[[pendingPullIntos]][0].
+            let mut pending = std::mem::take(&mut *self.pending_pull_intos.borrow_mut(ec));
+            let mut first = pending.pop_front().expect("pending pull intos not empty");
+            // Step 1.2: Set firstPendingPullInto's reader type to "none".
+            first.request = PullRequest::None;
+            // Step 1.3: Set this.[[pendingPullIntos]] to the list « firstPendingPullInto ».
+            pending.clear();
+            pending.push_front(first);
+            *self.pending_pull_intos.borrow_mut(ec) = pending;
         }
+        // Note: [[ReleaseSteps]] does not invalidate the BYOB request; the
+        // pending request keeps its view so the underlying source can keep
+        // filling the released reader's buffer.
         Ok(())
     }
 
@@ -778,41 +877,48 @@ impl ReadableByteStreamController {
         ec: &mut dyn ExecutionContext<crate::js::Types>,
     ) -> Completion<(), crate::js::Types> {
         let stream = self.stream_slot(ec)?;
+
+        // Step 2: If controller.[[closeRequested]] is true or stream.[[state]] is not "readable", return.
         if self.close_requested.get() || stream.state() != ReadableStreamState::Readable {
             return Ok(());
         }
 
+        // Step 3: If controller.[[queueTotalSize]] > 0,
         if self.queue_total_size.get() > 0 {
+            // Step 3.1: Set controller.[[closeRequested]] to true.
             self.close_requested.set(true);
             return Ok(());
         }
 
+        // Step 4: If controller.[[pendingPullIntos]] is not empty,
         if !self.pending_pull_intos.borrow(ec).is_empty() {
-            let has_misaligned_pending = {
+            // Step 4.1: Let firstPendingPullInto be controller.[[pendingPullIntos]][0].
+            let misaligned = {
                 let pending_pull_intos = self.pending_pull_intos.borrow(ec);
                 pending_pull_intos.front().is_some_and(|descriptor| {
-                    descriptor.bytes_filled > 0
-                        && descriptor.bytes_filled % descriptor.view.element_size() != 0
+                    descriptor.bytes_filled % descriptor.view.element_size() != 0
                 })
             };
-
-            if has_misaligned_pending {
-                let ec: &mut dyn ExecutionContext<crate::js::Types> = ec;
+            // Step 4.2: If the remainder after dividing firstPendingPullInto's
+            // bytes filled by firstPendingPullInto's element size is not 0,
+            if misaligned {
+                // Step 4.2.1: Let e be a new TypeError exception.
                 let error = type_error_value(
                     "Cannot close a byte stream with a partially filled typed array element",
                     ec,
                 )?;
+                // Step 4.2.2: Perform ! ReadableByteStreamControllerError(controller, e).
                 self.error_steps(error.clone(), ec)?;
+                // Step 4.2.3: Throw e.
                 return Err(ec.new_type_error(
                     "Cannot close a byte stream with a partially filled typed array element",
                 ));
             }
-
-            self.close_requested.set(true);
-            return Ok(());
         }
 
+        // Step 5: Perform ! ReadableByteStreamControllerClearAlgorithms(controller).
         self.clear_algorithms(ec);
+        // Step 6: Perform ! ReadableStreamClose(stream).
         readable_stream_close(stream, ec)
     }
 
@@ -822,74 +928,127 @@ impl ReadableByteStreamController {
         chunk: JsValue,
         ec: &mut dyn ExecutionContext<crate::js::Types>,
     ) -> Completion<(), crate::js::Types> {
-        // Step 3-5: Extract buffer info from chunk
+        let stream = self.stream_slot(ec)?;
+
+        // Step 2: If controller.[[closeRequested]] is true or stream.[[state]] is not "readable", return.
+        if self.close_requested.get() || stream.state() != ReadableStreamState::Readable {
+            return Ok(());
+        }
+
+        // Steps 3-5: Let buffer be chunk.[[ViewedArrayBuffer]]; byteOffset; byteLength.
         let view = ArrayBufferViewDescriptor::from_value(chunk, ec)?;
-        if view.byte_length() == 0 {
+        let byte_offset = view.byte_offset();
+        let byte_length = view.byte_length();
+
+        // Step 6: If ! IsDetachedBuffer(buffer) is true, throw a TypeError exception.
+        // (from_value above already rejects detached buffers.)
+
+        // Zero-length chunks cannot be enqueued into a byte stream.
+        if byte_length == 0 {
             return Err(ec.new_type_error(
                 "ReadableByteStreamController.enqueue() requires a non-empty view",
             ));
         }
 
-        // Step 6: IsDetachedBuffer check — already done by from_value above.
         // Step 7: Let transferredBuffer be ? TransferArrayBuffer(buffer).
-        let realm = ec.current_realm();
-        let intrinsics = ec.realm_intrinsics(&realm);
-        let array_buffer_ctor = intrinsics.array_buffer.clone();
-        let byte_offset = view.byte_offset();
-        let byte_length = view.byte_length();
-        let transferred_buffer = ec.clone_array_buffer(
-            view.buffer.clone(),
-            byte_offset as u64,
-            byte_length as u64,
-            array_buffer_ctor,
-        )?;
-        // Note: detach_array_buffer is on JsEngine, not ExecutionContext.
-        // The original chunk buffer is NOT detached (only cloned). This does
-        // not affect the test outcome for the detached-buffer check below.
+        let transferred_buffer = transfer_array_buffer(view.buffer.clone(), ec)?;
 
-        // Create a new view descriptor pointing into the transferred buffer.
-        let transferred_view =
-            ArrayBufferViewDescriptor::new_uint8(transferred_buffer, 0, byte_length);
+        // Step 8: If controller.[[pendingPullIntos]] is not empty,
+        if !self.pending_pull_intos.borrow(ec).is_empty() {
+            // Clone the first descriptor's buffer and reader type out of the
+            // cell so no borrow is live across the engine calls below.
+            let (first_buffer, first_is_none) = {
+                let pending = self.pending_pull_intos.borrow(ec);
+                let first_pending = pending.front().expect("pending pull intos not empty");
+                (
+                    first_pending.view.buffer.clone(),
+                    matches!(first_pending.request, PullRequest::None),
+                )
+            };
 
-        // Step 8: If controller.[[pendingPullIntos]] is not empty:
-        let has_pending_pull_into = {
-            let pending = self.pending_pull_intos.borrow(ec);
-            if let Some(first_pending) = pending.front() {
-                // Step 8.2: If ! IsDetachedBuffer(firstPendingPullInto's buffer) is true,
-                //           throw a TypeError exception.
-                if ec.array_buffer_data(&first_pending.view.buffer).is_none() {
-                    return Err(
-                        ec.new_type_error("Cannot enqueue with a detached BYOB request buffer")
-                    );
-                }
-                true
-            } else {
-                false
+            // Step 8.2: If ! IsDetachedBuffer(firstPendingPullInto's buffer) is true,
+            //           throw a TypeError exception.
+            if ec.array_buffer_data(&first_buffer).is_none() {
+                return Err(ec.new_type_error("Cannot enqueue with a detached BYOB request buffer"));
             }
-        };
 
-        // Step 8.3-8.4: Invalidate BYOB request and transfer first pending pull-into's buffer.
-        if has_pending_pull_into {
+            // Step 8.3: Perform ! ReadableByteStreamControllerInvalidateBYOBRequest(controller).
             self.invalidate_byob_request(ec)?;
-            {
+
+            // Step 8.4: Set firstPendingPullInto's buffer to ! TransferArrayBuffer(firstPendingPullInto's buffer).
+            let new_buffer = transfer_array_buffer(first_buffer, ec)?;
+            let descriptor = {
                 let mut pending = self.pending_pull_intos.borrow_mut(ec);
-                if let Some(first_pending) = pending.front_mut() {
-                    let new_buffer = ec.clone_array_buffer(
-                        first_pending.view.buffer.clone(),
-                        0,
-                        first_pending.view.byte_length() as u64,
-                        intrinsics.array_buffer,
-                    )?;
-                    // Note: detach not available — see note above.
-                    first_pending.view.buffer = new_buffer;
+                let first_pending = pending.front_mut().expect("pending pull intos not empty");
+                first_pending.view.buffer = new_buffer;
+                if first_is_none {
+                    // Step 8.5: If firstPendingPullInto's reader type is "none",
+                    //           perform ? EnqueueDetachedPullIntoToQueue(controller, firstPendingPullInto).
+                    Some(pending.pop_front().expect("pending pull intos not empty"))
+                } else {
+                    None
                 }
+            };
+            if let Some(descriptor) = descriptor {
+                self.enqueue_detached_pull_into_to_queue(descriptor, ec)?;
             }
         }
 
-        // Step 9-11: Route based on reader type — reuse existing helpers.
-        self.enqueue_chunk(transferred_view, ec);
-        self.process_pending_pull_intos_using_queue(ec)?;
-        self.process_read_requests_using_queue(ec)?;
+        // Step 9: If ! ReadableStreamHasDefaultReader(stream) is true,
+        if stream
+            .reader_slot(ec)
+            .and_then(|reader| reader.as_default_reader())
+            .is_some()
+        {
+            // Step 9.1: Perform ! ReadableByteStreamControllerProcessReadRequestsUsingQueue(controller).
+            self.process_read_requests_using_queue(ec)?;
+
+            // Step 9.2: If ! ReadableStreamGetNumReadRequests(stream) is 0,
+            if readable_stream_get_num_read_requests(stream.clone(), ec) == 0 {
+                // Step 9.2.2: Perform ! EnqueueChunkToQueue(controller, transferredBuffer, byteOffset, byteLength).
+                self.enqueue_chunk_to_queue(transferred_buffer, byte_offset, byte_length, ec);
+            } else {
+                // Step 9.3: Otherwise,
+                // Step 9.3.2: If controller.[[pendingPullIntos]] is not empty,
+                if !self.pending_pull_intos.borrow(ec).is_empty() {
+                    // Step 9.3.2.2: Perform ! ShiftPendingPullInto(controller).
+                    let descriptor = self.shift_pending_pull_into(ec);
+                    let _ = descriptor;
+                }
+                // Step 9.3.3: Let transferredView be ! Construct(%Uint8Array%, « transferredBuffer, byteOffset, byteLength »).
+                let transferred_view =
+                    create_uint8_view_object(transferred_buffer, byte_offset, byte_length, ec)?;
+                // Step 9.3.4: Perform ! ReadableStreamFulfillReadRequest(stream, transferredView, false).
+                readable_stream_fulfill_read_request(
+                    stream,
+                    JsValue::from(transferred_view),
+                    false,
+                    ec,
+                )?;
+            }
+        } else if stream
+            .reader_slot(ec)
+            .and_then(|reader| reader.as_byob_reader())
+            .is_some()
+        {
+            // Step 10: Otherwise, if ! ReadableStreamHasBYOBReader(stream) is true,
+            // Step 10.1: Perform ! EnqueueChunkToQueue(controller, transferredBuffer, byteOffset, byteLength).
+            self.enqueue_chunk_to_queue(transferred_buffer, byte_offset, byte_length, ec);
+
+            // Step 10.2: Let filledPullIntos be the result of performing
+            //            ! ProcessPullIntoDescriptorsUsingQueue(controller).
+            let filled_pull_intos = self.process_pending_pull_intos_using_queue(ec)?;
+
+            // Step 10.3: For each filledPullInto of filledPullIntos,
+            //            perform ! CommitPullIntoDescriptor(stream, filledPullInto).
+            for descriptor in filled_pull_intos {
+                self.commit_pull_into_descriptor(descriptor, ec)?;
+            }
+        } else {
+            // Step 11: Otherwise,
+            // Step 11.2: Perform ! EnqueueChunkToQueue(controller, transferredBuffer, byteOffset, byteLength).
+            self.enqueue_chunk_to_queue(transferred_buffer, byte_offset, byte_length, ec);
+        }
 
         // Step 12: Perform ! ReadableByteStreamControllerCallPullIfNeeded(controller).
         self.call_pull_if_needed(ec)
@@ -923,65 +1082,214 @@ impl ReadableByteStreamController {
         bytes_written: usize,
         ec: &mut dyn ExecutionContext<crate::js::Types>,
     ) -> Completion<(), crate::js::Types> {
-        let err_no_pending = ec.new_type_error("There is no pending BYOB request to respond to");
-        let err_too_large = ec.new_range_error("bytesWritten exceeds the available view size");
-        let descriptor = {
-            let mut pending = self.pending_pull_intos.borrow_mut(ec);
-            let descriptor = match pending.front_mut() {
-                Some(desc) => desc,
-                None => {
-                    return Err(err_no_pending);
-                }
-            };
-
-            if bytes_written > descriptor.remaining_byte_length() {
-                return Err(err_too_large);
-            }
-
-            descriptor.bytes_filled += bytes_written;
-
-            let should_commit = if self.close_requested.get() {
-                true
-            } else {
-                descriptor.can_commit()
-            };
-
-            if should_commit {
-                pending.pop_front().expect("front descriptor must exist")
-            } else {
-                drop(pending);
-                self.update_byob_request_view(ec)?;
-                self.call_pull_if_needed(ec)?;
-                return Ok(());
-            }
-        };
-
-        self.invalidate_byob_request(ec)?;
-        let stream = self.stream_slot(ec)?;
-        if self.close_requested.get() {
-            if descriptor.bytes_filled % descriptor.view.element_size() != 0 {
-                let error = type_error_value(
-                    "Cannot close a byte stream with a partially filled typed array element",
-                    ec,
-                )?;
-                self.error_steps(error, ec)?;
-                return Ok(());
-            }
-            descriptor.close(ec)?;
-        } else {
-            descriptor.commit(false, ec)?;
+        // Step 1: Assert: controller.[[pendingPullIntos]] is not empty.
+        if self.pending_pull_intos.borrow(ec).is_empty() {
+            return Err(ec.new_type_error("There is no pending BYOB request to respond to"));
         }
 
-        if self.close_requested.get()
-            && self.queue_total_size.get() == 0
-            && self.pending_pull_intos.borrow(ec).is_empty()
+        // Step 2: Let firstDescriptor be controller.[[pendingPullIntos]][0].
+        let (state, first_view) = {
+            let pending = self.pending_pull_intos.borrow(ec);
+            let first = pending.front().expect("pending pull intos not empty");
+            (self.stream_slot(ec)?.state(), first.view.clone())
+        };
+
+        // Step 4: If state is "closed",
+        if state == ReadableStreamState::Closed {
+            // Step 4.1: If bytesWritten is not 0, throw a TypeError exception.
+            if bytes_written != 0 {
+                return Err(
+                    ec.new_type_error("Cannot respond with a non-zero value to a closed stream")
+                );
+            }
+        } else {
+            // Step 5.2: If bytesWritten is 0, throw a TypeError exception.
+            if bytes_written == 0 {
+                return Err(ec.new_type_error("bytesWritten must be a positive integer"));
+            }
+            // Step 5.3: If firstDescriptor's bytes filled + bytesWritten >
+            //           firstDescriptor's byte length, throw a RangeError exception.
+            let bytes_filled = {
+                let pending = self.pending_pull_intos.borrow(ec);
+                pending
+                    .front()
+                    .expect("pending pull intos not empty")
+                    .bytes_filled
+            };
+            if bytes_filled + bytes_written > first_view.byte_length() {
+                return Err(ec.new_range_error("bytesWritten exceeds the available view size"));
+            }
+        }
+
+        // Step 6: Set firstDescriptor's buffer to ! TransferArrayBuffer(firstDescriptor's buffer).
+        let new_buffer = transfer_array_buffer(first_view.buffer.clone(), ec)?;
         {
-            self.clear_algorithms(ec);
-            readable_stream_close(stream, ec)?;
+            let mut pending = self.pending_pull_intos.borrow_mut(ec);
+            pending
+                .front_mut()
+                .expect("pending pull intos not empty")
+                .view
+                .buffer = new_buffer;
+        }
+
+        // Step 7: Perform ? ReadableByteStreamControllerRespondInternal(controller, bytesWritten).
+        self.respond_internal(bytes_written, ec)
+    }
+
+    /// <https://streams.spec.whatwg.org/#readable-byte-stream-controller-respond-internal>
+    fn respond_internal(
+        &self,
+        bytes_written: usize,
+        ec: &mut dyn ExecutionContext<crate::js::Types>,
+    ) -> Completion<(), crate::js::Types> {
+        // Step 1: Let firstDescriptor be controller.[[pendingPullIntos]][0].
+        let (first_descriptor, state) = {
+            let pending = self.pending_pull_intos.borrow(ec);
+            let first = pending.front().expect("pending pull intos not empty");
+            (first.clone(), self.stream_slot(ec)?.state())
+        };
+
+        // Step 3: Perform ! ReadableByteStreamControllerInvalidateBYOBRequest(controller).
+        self.invalidate_byob_request(ec)?;
+
+        // Step 5: If state is "closed",
+        if state == ReadableStreamState::Closed {
+            // Step 5.2: Perform ! ReadableByteStreamControllerRespondInClosedState(controller, firstDescriptor).
+            self.respond_in_closed_state(first_descriptor, ec)?;
+        } else {
+            // Step 6.3: Perform ? ReadableByteStreamControllerRespondInReadableState(controller, bytesWritten, firstDescriptor).
+            self.respond_in_readable_state(bytes_written, first_descriptor, ec)?;
+        }
+
+        // Step 7: Perform ! ReadableByteStreamControllerCallPullIfNeeded(controller).
+        self.call_pull_if_needed(ec)
+    }
+
+    /// <https://streams.spec.whatwg.org/#readable-byte-stream-controller-respond-in-closed-state>
+    fn respond_in_closed_state(
+        &self,
+        first_descriptor: PullIntoDescriptor,
+        ec: &mut dyn ExecutionContext<crate::js::Types>,
+    ) -> Completion<(), crate::js::Types> {
+        // Step 2: If firstDescriptor's reader type is "none",
+        //         perform ! ReadableByteStreamControllerShiftPendingPullInto(controller).
+        if matches!(first_descriptor.request, PullRequest::None) {
+            let _ = self.shift_pending_pull_into(ec);
+        }
+
+        // Step 3: Let stream be controller.[[stream]].
+        let stream = self.stream_slot(ec)?;
+
+        // Step 4: If ! ReadableStreamHasBYOBReader(stream) is true,
+        let has_byob_reader = stream
+            .reader_slot(ec)
+            .and_then(|reader| reader.as_byob_reader())
+            .is_some();
+        if has_byob_reader {
+            // Step 4.1: Let filledPullIntos be a new empty list.
+            // Step 4.2: While filledPullIntos's size < ! ReadableStreamGetNumReadIntoRequests(stream),
+            let num_read_into_requests = self.num_byob_pending_descriptors(ec);
+            let mut filled_pull_intos = Vec::new();
+            while filled_pull_intos.len() < num_read_into_requests {
+                // Step 4.2.1: Let pullIntoDescriptor be ! ShiftPendingPullInto(controller).
+                let descriptor = self.shift_pending_pull_into(ec);
+                // Step 4.2.2: Append pullIntoDescriptor to filledPullIntos.
+                filled_pull_intos.push(descriptor);
+            }
+
+            // Step 4.3: For each filledPullInto of filledPullIntos,
+            //           perform ! CommitPullIntoDescriptor(stream, filledPullInto).
+            for descriptor in filled_pull_intos {
+                self.commit_pull_into_descriptor(descriptor, ec)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// <https://streams.spec.whatwg.org/#readable-byte-stream-controller-respond-in-readable-state>
+    fn respond_in_readable_state(
+        &self,
+        bytes_written: usize,
+        pull_into_descriptor: PullIntoDescriptor,
+        ec: &mut dyn ExecutionContext<crate::js::Types>,
+    ) -> Completion<(), crate::js::Types> {
+        // Step 2: Perform ! ReadableByteStreamControllerFillHeadPullIntoDescriptor(controller, bytesWritten, pullIntoDescriptor).
+        let mut pull_into_descriptor = pull_into_descriptor;
+        pull_into_descriptor.bytes_filled += bytes_written;
+        {
+            let mut pending = self.pending_pull_intos.borrow_mut(ec);
+            let head = pending.front_mut().expect("pending pull intos not empty");
+            head.bytes_filled = pull_into_descriptor.bytes_filled;
+        }
+
+        // Step 3: If pullIntoDescriptor's reader type is "none",
+        if matches!(pull_into_descriptor.request, PullRequest::None) {
+            // Step 3.1: Perform ? EnqueueDetachedPullIntoToQueue(controller, pullIntoDescriptor).
+            // Note: the spec's algorithm shifts the descriptor first; it is at
+            // the head of [[pendingPullIntos]] here.
+            let _ = self.shift_pending_pull_into(ec);
+            self.enqueue_detached_pull_into_to_queue(pull_into_descriptor, ec)?;
+            // Step 3.2: Let filledPullIntos be the result of performing
+            //           ! ProcessPullIntoDescriptorsUsingQueue(controller).
+            let filled_pull_intos = self.process_pending_pull_intos_using_queue(ec)?;
+            // Step 3.3: For each filledPullInto of filledPullIntos,
+            //           perform ! CommitPullIntoDescriptor(controller.[[stream]], filledPullInto).
+            for descriptor in filled_pull_intos {
+                self.commit_pull_into_descriptor(descriptor, ec)?;
+            }
+            // Step 3.4: Return.
             return Ok(());
         }
 
-        self.call_pull_if_needed(ec)
+        // Step 4: If pullIntoDescriptor's bytes filled < pullIntoDescriptor's minimum fill, return.
+        let (bytes_filled, minimum_fill, byte_offset, element_size, buffer) = {
+            let pending = self.pending_pull_intos.borrow(ec);
+            let head = pending.front().expect("pending pull intos not empty");
+            (
+                head.bytes_filled,
+                head.minimum_fill,
+                head.view.byte_offset(),
+                head.view.element_size(),
+                head.view.buffer.clone(),
+            )
+        };
+        if bytes_filled < minimum_fill {
+            return Ok(());
+        }
+
+        // Step 5: Perform ! ReadableByteStreamControllerShiftPendingPullInto(controller).
+        let descriptor = self.shift_pending_pull_into(ec);
+
+        // Step 6: Let remainderSize be the remainder after dividing pullIntoDescriptor's
+        //         bytes filled by pullIntoDescriptor's element size.
+        let bytes_filled = descriptor.bytes_filled;
+        let remainder_size = bytes_filled % element_size;
+
+        // Step 7: If remainderSize > 0,
+        if remainder_size > 0 {
+            // Step 7.1: Let end be pullIntoDescriptor's byte offset + pullIntoDescriptor's bytes filled.
+            let end = byte_offset + bytes_filled;
+            // Step 7.2: Perform ? EnqueueClonedChunkToQueue(controller, buffer, end − remainderSize, remainderSize).
+            self.enqueue_cloned_chunk_to_queue(buffer, end - remainder_size, remainder_size, ec)?;
+        }
+
+        // Step 8: Set pullIntoDescriptor's bytes filled to pullIntoDescriptor's bytes filled − remainderSize.
+        let mut descriptor = descriptor;
+        descriptor.bytes_filled = bytes_filled - remainder_size;
+
+        // Step 9: Let filledPullIntos be the result of performing
+        //         ! ProcessPullIntoDescriptorsUsingQueue(controller).
+        let filled_pull_intos = self.process_pending_pull_intos_using_queue(ec)?;
+
+        // Step 10: Perform ! CommitPullIntoDescriptor(controller.[[stream]], pullIntoDescriptor).
+        self.commit_pull_into_descriptor(descriptor, ec)?;
+
+        // Step 11: For each filledPullInto of filledPullIntos,
+        //          perform ! CommitPullIntoDescriptor(controller.[[stream]], filledPullInto).
+        for filled in filled_pull_intos {
+            self.commit_pull_into_descriptor(filled, ec)?;
+        }
+        Ok(())
     }
 
     /// <https://streams.spec.whatwg.org/#readable-byte-stream-controller-respond-with-new-view>
@@ -991,82 +1299,212 @@ impl ReadableByteStreamController {
         _view_object: JsObject,
         ec: &mut dyn ExecutionContext<crate::js::Types>,
     ) -> Completion<(), crate::js::Types> {
-        let bytes_written = view.byte_length();
-        let err_no_pending = ec.new_type_error("There is no pending BYOB request to respond to");
-        let err_offset =
-            ec.new_range_error("respondWithNewView() must preserve the current byte offset");
-        let err_large =
-            ec.new_range_error("respondWithNewView() view is larger than the remaining request");
-        let descriptor_to_commit = {
-            let mut pending = self.pending_pull_intos.borrow_mut(ec);
-            let descriptor = match pending.front_mut() {
-                Some(desc) => desc,
-                None => {
-                    return Err(err_no_pending);
-                }
-            };
-            if view.byte_offset() != descriptor.view.byte_offset() + descriptor.bytes_filled {
-                return Err(err_offset);
+        // Step 2: Assert: ! IsDetachedBuffer(view.[[ViewedArrayBuffer]]) is false.
+        if ec.array_buffer_data(&view.buffer).is_none() {
+            return Err(ec.new_type_error(
+                "ReadableStreamBYOBRequest.respondWithNewView() requires a non-detached view buffer",
+            ));
+        }
+
+        // Step 3: Let firstDescriptor be controller.[[pendingPullIntos]][0].
+        if self.pending_pull_intos.borrow(ec).is_empty() {
+            return Err(ec.new_type_error("There is no pending BYOB request to respond to"));
+        }
+
+        // Step 4: Let state be controller.[[stream]].[[state]].
+        let state = self.stream_slot(ec)?.state();
+
+        // Step 5: If state is "closed",
+        if state == ReadableStreamState::Closed {
+            // Step 5.1: If view.[[ByteLength]] is not 0, throw a TypeError exception.
+            if view.byte_length() != 0 {
+                return Err(ec.new_type_error(
+                    "Cannot respondWithNewView() with a non-empty view to a closed stream",
+                ));
             }
-            if view.byte_length() > descriptor.remaining_byte_length() {
-                return Err(err_large);
-            }
-
-            descriptor.bytes_filled += bytes_written;
-            descriptor.view.transfer_buffer_from(&view);
-
-            let should_commit = if self.close_requested.get() {
-                true
-            } else {
-                descriptor.can_commit()
-            };
-
-            if should_commit {
-                Some(pending.pop_front().expect("front descriptor must exist"))
-            } else {
-                None
-            }
-        };
-
-        let Some(descriptor) = descriptor_to_commit else {
-            self.update_byob_request_view(ec)?;
-            self.call_pull_if_needed(ec)?;
-            return Ok(());
-        };
-
-        self.invalidate_byob_request(ec)?;
-        let stream = self.stream_slot(ec)?;
-        let close_requested = self.close_requested.get();
-        // Compute the result view before ec_to_ctx since create_result_view now takes ec.
-        let result_view = descriptor
-            .view
-            .create_result_view(descriptor.bytes_filled, ec)?;
-        let result_view_val = JsValue::from(result_view);
-        if close_requested {
-            if descriptor.bytes_filled % descriptor.view.element_size() != 0 {
-                let error = type_error_value(
-                    "Cannot close a byte stream with a partially filled typed array element",
-                    ec,
-                )?;
-                self.error_steps(error, ec)?;
-                return Ok(());
-            }
-            descriptor.commit_with_value(result_view_val, true, ec)?;
         } else {
-            descriptor.commit_with_value(result_view_val, false, ec)?;
+            // Step 6.2: If view.[[ByteLength]] is 0, throw a TypeError exception.
+            if view.byte_length() == 0 {
+                return Err(ec.new_type_error("respondWithNewView() requires a non-empty view"));
+            }
         }
 
-        if self.close_requested.get()
-            && self.queue_total_size.get() == 0
-            && self.pending_pull_intos.borrow(ec).is_empty()
+        let (byte_offset, bytes_filled, byte_length, buffer_byte_length) = {
+            let pending = self.pending_pull_intos.borrow(ec);
+            let first = pending.front().expect("pending pull intos not empty");
+            (
+                first.view.byte_offset(),
+                first.bytes_filled,
+                first.view.byte_length(),
+                first.view.buffer_byte_length(),
+            )
+        };
+
+        // Step 7: If firstDescriptor's byte offset + firstDescriptor's bytes filled
+        //         is not view.[[ByteOffset]], throw a RangeError exception.
+        if byte_offset + bytes_filled != view.byte_offset() {
+            return Err(
+                ec.new_range_error("respondWithNewView() must preserve the current byte offset")
+            );
+        }
+
+        // Step 8: If firstDescriptor's buffer byte length is not
+        //         view.[[ViewedArrayBuffer]].[[ByteLength]], throw a RangeError exception.
+        if buffer_byte_length != view.buffer_byte_length() {
+            return Err(
+                ec.new_range_error("respondWithNewView() must preserve the buffer byte length")
+            );
+        }
+
+        // Step 9: If firstDescriptor's bytes filled + view.[[ByteLength]] >
+        //         firstDescriptor's byte length, throw a RangeError exception.
+        if bytes_filled + view.byte_length() > byte_length {
+            return Err(ec.new_range_error(
+                "respondWithNewView() view is larger than the remaining request",
+            ));
+        }
+
+        // Step 10: Let viewByteLength be view.[[ByteLength]].
+        let view_byte_length = view.byte_length();
+
+        // Step 11: Set firstDescriptor's buffer to ? TransferArrayBuffer(view.[[ViewedArrayBuffer]]).
+        let new_buffer = transfer_array_buffer(view.buffer.clone(), ec)?;
+        let new_buffer_byte_length = view.buffer_byte_length();
         {
-            self.clear_algorithms(ec);
-            readable_stream_close(stream, ec)?;
-            return Ok(());
+            let mut pending = self.pending_pull_intos.borrow_mut(ec);
+            let first = pending.front_mut().expect("pending pull intos not empty");
+            first.view.buffer = new_buffer;
+            first.view.buffer_byte_length = new_buffer_byte_length;
         }
 
-        let ec: &mut dyn ExecutionContext<crate::js::Types> = ec;
-        self.call_pull_if_needed(ec)
+        // Step 12: Perform ? ReadableByteStreamControllerRespondInternal(controller, viewByteLength).
+        self.respond_internal(view_byte_length, ec)
+    }
+
+    /// <https://streams.spec.whatwg.org/#readable-byte-stream-controller-shift-pending-pull-into>
+    fn shift_pending_pull_into(
+        &self,
+        ec: &mut dyn ExecutionContext<crate::js::Types>,
+    ) -> PullIntoDescriptor {
+        self.pending_pull_intos
+            .borrow_mut(ec)
+            .pop_front()
+            .expect("pending pull intos must not be empty")
+    }
+
+    /// <https://streams.spec.whatwg.org/#readable-byte-stream-controller-commit-pull-into-descriptor>
+    fn commit_pull_into_descriptor(
+        &self,
+        descriptor: PullIntoDescriptor,
+        ec: &mut dyn ExecutionContext<crate::js::Types>,
+    ) -> Completion<(), crate::js::Types> {
+        let stream = self.stream_slot(ec)?;
+
+        // Step 3: Let done be false.
+        // Step 4: If stream.[[state]] is "closed", set done to true.
+        let done = stream.state() == ReadableStreamState::Closed;
+
+        // Step 5: Let filledView be ! ConvertPullIntoDescriptor(pullIntoDescriptor).
+        let filled_view = descriptor.filled_view(ec)?;
+
+        match &descriptor.request {
+            // Step 6: If reader type is "default",
+            //         perform ! ReadableStreamFulfillReadRequest(stream, filledView, done).
+            PullRequest::Default => {
+                readable_stream_fulfill_read_request(stream, JsValue::from(filled_view), done, ec)
+            }
+            // Step 7: Otherwise (byob), perform ! ReadableStreamFulfillReadIntoRequest(stream, filledView, done).
+            PullRequest::Byob(read_into_request) => {
+                let read_into_request = read_into_request.clone();
+                let value = JsValue::from(filled_view);
+                if done {
+                    read_into_request.close_steps(Some(value), ec)
+                } else {
+                    read_into_request.chunk_steps(value, ec)
+                }
+            }
+            PullRequest::None => Ok(()),
+        }
+    }
+
+    /// <https://streams.spec.whatwg.org/#readable-byte-stream-controller-enqueue-detached-pull-into-to-queue>
+    ///
+    /// Note: the spec's algorithm shifts the descriptor from
+    /// [[pendingPullIntos]]; the caller performs that shift (the descriptor
+    /// arrives here already removed), so the borrow never spans the engine
+    /// calls inside EnqueueClonedChunkToQueue.
+    fn enqueue_detached_pull_into_to_queue(
+        &self,
+        pull_into_descriptor: PullIntoDescriptor,
+        ec: &mut dyn ExecutionContext<crate::js::Types>,
+    ) -> Completion<(), crate::js::Types> {
+        // Step 2: If pullIntoDescriptor's bytes filled > 0, perform ?
+        //         EnqueueClonedChunkToQueue(controller, buffer, byte offset, bytes filled).
+        if pull_into_descriptor.bytes_filled > 0 {
+            self.enqueue_cloned_chunk_to_queue(
+                pull_into_descriptor.view.buffer.clone(),
+                pull_into_descriptor.view.byte_offset(),
+                pull_into_descriptor.bytes_filled,
+                ec,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// <https://streams.spec.whatwg.org/#readable-byte-stream-controller-enqueue-cloned-chunk-to-queue>
+    fn enqueue_cloned_chunk_to_queue(
+        &self,
+        buffer: ArrayBuffer,
+        byte_offset: usize,
+        byte_length: usize,
+        ec: &mut dyn ExecutionContext<crate::js::Types>,
+    ) -> Completion<(), crate::js::Types> {
+        // Step 1: Let cloneResult be CloneArrayBuffer(buffer, byteOffset, byteLength, %ArrayBuffer%).
+        let realm = ec.current_realm();
+        let intrinsics = ec.realm_intrinsics(&realm);
+        let cloned = ec.clone_array_buffer(
+            buffer,
+            byte_offset as u64,
+            byte_length as u64,
+            intrinsics.array_buffer,
+        )?;
+
+        // Step 3: Perform ! EnqueueChunkToQueue(controller, cloneResult.[[Value]], 0, byteLength).
+        self.enqueue_chunk_to_queue(cloned, 0, byte_length, ec);
+        Ok(())
+    }
+
+    /// <https://streams.spec.whatwg.org/#readable-byte-stream-controller-handle-queue-drain>
+    fn handle_queue_drain(
+        &self,
+        ec: &mut dyn ExecutionContext<crate::js::Types>,
+    ) -> Completion<(), crate::js::Types> {
+        // Step 2: If controller.[[queueTotalSize]] is 0 and controller.[[closeRequested]] is true,
+        if self.queue_total_size.get() == 0 && self.close_requested.get() {
+            // Step 2.1: Perform ! ReadableByteStreamControllerClearAlgorithms(controller).
+            self.clear_algorithms(ec);
+            // Step 2.2: Perform ! ReadableStreamClose(controller.[[stream]]).
+            let stream = self.stream_slot(ec)?;
+            readable_stream_close(stream, ec)?;
+        } else {
+            // Step 3.1: Perform ! ReadableByteStreamControllerCallPullIfNeeded(controller).
+            self.call_pull_if_needed(ec)?;
+        }
+        Ok(())
+    }
+
+    /// Number of pending pull-into descriptors with a "byob" read-into request.
+    /// Corresponds to ! ReadableStreamGetNumReadIntoRequests(stream) in a
+    /// model where the requests live inside the descriptors.
+    fn num_byob_pending_descriptors(
+        &self,
+        ec: &mut dyn ExecutionContext<crate::js::Types>,
+    ) -> usize {
+        self.pending_pull_intos
+            .borrow(ec)
+            .iter()
+            .filter(|descriptor| matches!(descriptor.request, PullRequest::Byob(_)))
+            .count()
     }
 
     /// <https://streams.spec.whatwg.org/#readable-byte-stream-controller-call-pull-if-needed>
@@ -1127,6 +1565,10 @@ impl ReadableByteStreamController {
         ec: &mut dyn ExecutionContext<crate::js::Types>,
     ) -> Completion<bool, crate::js::Types> {
         let stream = self.stream_slot(ec)?;
+
+        // Step 1: If stream.[[state]] is not "readable", return false.
+        // Step 2: If controller.[[closeRequested]] is true, return false.
+        // Step 3: If controller.[[started]] is false, return false.
         if !self.started.get()
             || self.close_requested.get()
             || stream.state() != ReadableStreamState::Readable
@@ -1134,33 +1576,48 @@ impl ReadableByteStreamController {
             return Ok(false);
         }
 
-        if !self.pending_pull_intos.borrow(ec).is_empty() {
-            return Ok(true);
-        }
-
+        // Step 4: If ! ReadableStreamHasDefaultReader(stream) is true and
+        //         ! ReadableStreamGetNumReadRequests(stream) > 0, return true.
         if stream
             .reader_slot(ec)
             .and_then(|reader| reader.as_default_reader())
             .is_some()
             && readable_stream_get_num_read_requests(stream.clone(), ec) > 0
         {
-            return Ok(self.queue_total_size.get() == 0);
+            return Ok(true);
         }
 
+        // Step 5: If ! ReadableStreamHasBYOBReader(stream) is true and
+        //         ! ReadableStreamGetNumReadIntoRequests(stream) > 0, return true.
+        if stream
+            .reader_slot(ec)
+            .and_then(|reader| reader.as_byob_reader())
+            .is_some()
+            && self.num_byob_pending_descriptors(ec) > 0
+        {
+            return Ok(true);
+        }
+
+        // Steps 6-8: If desiredSize > 0, return true.
         Ok(self.desired_size(ec)?.is_some_and(|size| size > 0.0))
     }
 
     /// <https://streams.spec.whatwg.org/#readable-byte-stream-controller-enqueue-chunk-to-queue>
-    fn enqueue_chunk(
+    fn enqueue_chunk_to_queue(
         &self,
-        view: ArrayBufferViewDescriptor,
+        buffer: ArrayBuffer,
+        byte_offset: usize,
+        byte_length: usize,
         ec: &mut dyn ExecutionContext<crate::js::Types>,
     ) {
         self.queue_total_size
-            .set(self.queue_total_size.get() + view.byte_length());
-        self.queue
-            .borrow_mut(ec)
-            .push_back(ByteQueueEntry::new(view));
+            .set(self.queue_total_size.get() + byte_length);
+        self.queue.borrow_mut(ec).push_back(ByteQueueEntry {
+            buffer,
+            byte_offset,
+            byte_length,
+            offset: 0,
+        });
     }
 
     fn dequeue_chunk_as_value(
@@ -1182,18 +1639,12 @@ impl ReadableByteStreamController {
 
     fn fill_read_request_from_queue(
         &self,
-        stream: ReadableStream,
         read_request: ReadRequest,
         ec: &mut dyn ExecutionContext<crate::js::Types>,
     ) -> Completion<(), crate::js::Types> {
-        // Use ec directly (no ec_to_ctx bridge needed)
         let chunk = self.dequeue_chunk_as_value(ec)?;
-        read_request.chunk_steps(chunk, ec)?;
-        if self.close_requested.get() && self.queue_total_size.get() == 0 {
-            self.clear_algorithms(ec);
-            readable_stream_close(stream, ec)?;
-        }
-        Ok(())
+        self.handle_queue_drain(ec)?;
+        read_request.chunk_steps(chunk, ec)
     }
 
     fn process_read_requests_using_queue(
@@ -1201,7 +1652,6 @@ impl ReadableByteStreamController {
         ec: &mut dyn ExecutionContext<crate::js::Types>,
     ) -> Completion<(), crate::js::Types> {
         let stream = self.stream_slot(ec)?;
-        // readable_stream_fulfill_read_request and readable_stream_close still require &mut Context.
         while self.queue_total_size.get() > 0
             && stream
                 .reader_slot(ec)
@@ -1213,14 +1663,10 @@ impl ReadableByteStreamController {
             readable_stream_fulfill_read_request(stream.clone(), chunk, false, ec)?;
         }
 
-        if self.close_requested.get()
-            && self.queue_total_size.get() == 0
-            && self.pending_pull_intos.borrow(ec).is_empty()
-        {
-            self.clear_algorithms(ec);
-            readable_stream_close(stream, ec)?;
-        }
-
+        // Note: unlike HandleQueueDrain, this algorithm must not trigger a new
+        // pull while a read request is still pending; the caller (Enqueue)
+        // fulfils pending requests immediately after this returns and then
+        // performs CallPullIfNeeded itself.
         Ok(())
     }
 
@@ -1229,17 +1675,32 @@ impl ReadableByteStreamController {
         &self,
         descriptor: &mut PullIntoDescriptor,
         ec: &mut dyn ExecutionContext<crate::js::Types>,
-    ) -> Completion<(), crate::js::Types> {
-        let total_to_copy = descriptor
+    ) -> Completion<bool, crate::js::Types> {
+        // Step 1: Let maxBytesToCopy be min(queueTotalSize, byte length − bytes filled).
+        let max_bytes_to_copy = descriptor
             .remaining_byte_length()
             .min(self.queue_total_size.get());
-        if total_to_copy == 0 {
-            return Ok(());
+        // Step 2: Let maxBytesFilled be bytes filled + maxBytesToCopy.
+        let max_bytes_filled = descriptor.bytes_filled + max_bytes_to_copy;
+        // Step 3: Let totalBytesToCopyRemaining be maxBytesToCopy.
+        let mut total_bytes_to_copy_remaining = max_bytes_to_copy;
+        // Step 4: Let ready be false.
+        let mut ready = false;
+        // Step 7: Let remainderBytes be maxBytesFilled % element size.
+        let remainder_bytes = max_bytes_filled % descriptor.view.element_size();
+        // Step 8: Let maxAlignedBytes be maxBytesFilled − remainderBytes.
+        let max_aligned_bytes = max_bytes_filled - remainder_bytes;
+        // Step 9: If maxAlignedBytes ≥ minimum fill,
+        if max_aligned_bytes >= descriptor.minimum_fill {
+            // Step 9.1: Set totalBytesToCopyRemaining to maxAlignedBytes − bytes filled.
+            total_bytes_to_copy_remaining = max_aligned_bytes - descriptor.bytes_filled;
+            // Step 9.2: Set ready to true.
+            ready = true;
         }
 
-        let mut copied = Vec::with_capacity(total_to_copy);
-        let mut remaining = total_to_copy;
-        while remaining > 0 {
+        // Step 11: While totalBytesToCopyRemaining > 0,
+        let mut copied_total = 0;
+        while total_bytes_to_copy_remaining > 0 {
             // Pop one entry with the borrow held, then release it before any
             // engine call below: domain code must not depend on which engine
             // operations allocate (an allocating call can trigger a cppgc
@@ -1255,7 +1716,9 @@ impl ReadableByteStreamController {
                     }
                 }
             };
-            let to_take = remaining.min(entry.remaining_len());
+            // Step 11.2: Let bytesToCopy be min(totalBytesToCopyRemaining, headOfQueue's byte length).
+            let to_take = total_bytes_to_copy_remaining.min(entry.remaining_len());
+            // Step 11.8: Perform ! CopyDataBlockBytes(descriptorBuffer, destStart, queueBuffer, queueByteOffset, bytesToCopy).
             let start = entry.remaining_byte_offset();
             let bytes = match ec.array_buffer_data(&entry.buffer) {
                 Some(data) => data[start..start + to_take].to_vec(),
@@ -1265,59 +1728,62 @@ impl ReadableByteStreamController {
                     );
                 }
             };
-            copied.extend_from_slice(&bytes);
             entry.offset += to_take;
             if entry.remaining_len() > 0 {
                 self.queue.borrow_mut(ec).push_front(entry);
             }
-            remaining -= to_take;
+            total_bytes_to_copy_remaining -= to_take;
+
+            let dest_start = descriptor.view.byte_offset() + descriptor.bytes_filled;
+            for (relative_index, byte) in bytes.iter().copied().enumerate() {
+                let value = ec.value_from_number(f64::from(byte));
+                ec.set_value_in_buffer(
+                    &descriptor.view.buffer,
+                    (dest_start + relative_index) as u64,
+                    TypedArrayElementType::Uint8,
+                    value,
+                    true,
+                    SharedMemoryOrder::Unordered,
+                )?;
+            }
+            // Step 11.12: Perform ! FillHeadPullIntoDescriptor(controller, bytesToCopy, pullIntoDescriptor).
+            descriptor.bytes_filled += to_take;
+            copied_total += to_take;
         }
 
+        // Step 11.11: Set controller.[[queueTotalSize]] to controller.[[queueTotalSize]] − bytesToCopy.
         self.queue_total_size
-            .set(self.queue_total_size.get().saturating_sub(copied.len()));
-        let start = descriptor.view.byte_offset() + descriptor.bytes_filled;
-        for (relative_index, byte) in copied.iter().copied().enumerate() {
-            let value = ec.value_from_number(f64::from(byte));
-            ec.set_value_in_buffer(
-                &descriptor.view.buffer,
-                (start + relative_index) as u64,
-                TypedArrayElementType::Uint8,
-                value,
-                true,
-                SharedMemoryOrder::Unordered,
-            )?;
-        }
-        descriptor.bytes_filled += copied.len();
-        Ok(())
+            .set(self.queue_total_size.get().saturating_sub(copied_total));
+
+        // Step 13: Return ready.
+        Ok(ready)
     }
 
     /// <https://streams.spec.whatwg.org/#readable-byte-stream-controller-process-pull-into-descriptors-using-queue>
-    ///
-    /// The spec algorithm fills all descriptors that can be satisfied from the queue,
-    /// then commits each filled descriptor outside the queue-processing loop.
-    /// This ensures that promise resolution (triggered by commit) happens after
-    /// ALL descriptors have been filled, so byobRequest is null when .then() is
-    /// accessed during promise resolution.
     fn process_pending_pull_intos_using_queue(
         &self,
         ec: &mut dyn ExecutionContext<crate::js::Types>,
-    ) -> Completion<(), crate::js::Types> {
-        // Collect filled descriptors first, then commit them all at once.
-        let mut filled_descriptors: Vec<PullIntoDescriptor> = Vec::new();
+    ) -> Completion<Vec<PullIntoDescriptor>, crate::js::Types> {
+        // Step 2: Let filledPullIntos be a new empty list.
+        let mut filled_pull_intos: Vec<PullIntoDescriptor> = Vec::new();
         loop {
+            // Step 3.1: If controller.[[queueTotalSize]] is 0, break.
             if self.queue_total_size.get() == 0 {
                 break;
             }
+            // Step 3.2: Let pullIntoDescriptor be controller.[[pendingPullIntos]][0].
             let mut popped = self.pending_pull_intos.borrow_mut(ec).pop_front();
-            let Some(mut descriptor) = popped.as_mut() else {
+            let Some(descriptor) = popped.as_mut() else {
                 break;
             };
-            self.fill_pull_into_from_queue(&mut descriptor, ec)?;
-            if descriptor.can_commit() {
-                filled_descriptors.push(popped.take().unwrap());
+            // Step 3.3: If ! FillPullIntoDescriptorFromQueue(controller, pullIntoDescriptor) is true,
+            if self.fill_pull_into_from_queue(descriptor, ec)? {
+                // Step 3.3.1: Perform ! ShiftPendingPullInto(controller).
+                // Step 3.3.2: Append pullIntoDescriptor to filledPullIntos.
+                filled_pull_intos.push(popped.take().unwrap());
                 continue;
             }
-            // Cannot commit — push back and stop.
+            // Not ready — push back and stop.
             self.pending_pull_intos
                 .borrow_mut(ec)
                 .push_front(popped.take().unwrap());
@@ -1325,14 +1791,8 @@ impl ReadableByteStreamController {
             break;
         }
 
-        // Now commit all filled descriptors, one at a time.
-        if !filled_descriptors.is_empty() {
-            self.invalidate_byob_request(ec)?;
-        }
-        for descriptor in filled_descriptors {
-            descriptor.commit(false, ec)?;
-        }
-        Ok(())
+        // Step 4: Return filledPullIntos.
+        Ok(filled_pull_intos)
     }
 }
 
@@ -1503,6 +1963,49 @@ pub(crate) fn extract_auto_allocate_chunk_size(
     }
 
     Ok(Some(number as usize))
+}
+
+/// <https://tc39.es/ecma262/#sec-transferarraybuffer>
+pub(crate) fn transfer_array_buffer(
+    buffer: ArrayBuffer,
+    ec: &mut dyn ExecutionContext<crate::js::Types>,
+) -> Completion<ArrayBuffer, crate::js::Types> {
+    // Step 1: Assert: IsDetachedBuffer(arrayBuffer) is false.
+    // Step 2: If IsSharedArrayBuffer(arrayBuffer) is true, throw a TypeError exception.
+    // Step 4: If IsFixedLengthArrayBuffer(arrayBuffer) is false, throw a TypeError exception.
+    if !ec.can_transfer_array_buffer(&buffer) {
+        return Err(ec.new_type_error(
+            "ArrayBuffer cannot be transferred (it may be shared, detached, or backed by WebAssembly memory)",
+        ));
+    }
+    // Step 5: Let newBuffer be ? AllocateArrayBuffer(%ArrayBuffer%, arrayBuffer.[[ArrayBufferByteLength]]).
+    // Steps 6-7: Copy the source data block into newBuffer.
+    // Step 8: Perform ! DetachArrayBuffer(arrayBuffer, key).
+    // Step 9: Return newBuffer.
+    let byte_length = ec.array_buffer_byte_length(&buffer);
+    let realm = ec.current_realm();
+    let intrinsics = ec.realm_intrinsics(&realm);
+    let new_buffer =
+        ec.clone_array_buffer(buffer.clone(), 0, byte_length, intrinsics.array_buffer)?;
+    ec.detach_array_buffer(buffer, None)?;
+    Ok(new_buffer)
+}
+
+/// Returns the backing ArrayBuffer of a typed array or DataView JS object,
+/// or None if the object is neither.  Unlike `ArrayBufferViewDescriptor::from_value`
+/// this does not reject detached buffers, so callers can run IsDetachedBuffer
+/// themselves.
+fn view_buffer_of_js_object(
+    view: &JsObject,
+    ec: &mut dyn ExecutionContext<crate::js::Types>,
+) -> Completion<Option<ArrayBuffer>, crate::js::Types> {
+    if let Some(typed_array) = <crate::js::Types as JsTypes>::object_as_typed_array(view) {
+        return Ok(Some(ec.typed_array_buffer(&typed_array)?));
+    }
+    if let Some(data_view) = <crate::js::Types as JsTypes>::object_as_data_view(view) {
+        return Ok(Some(ec.data_view_buffer(&data_view)?));
+    }
+    Ok(None)
 }
 
 fn create_view_object(

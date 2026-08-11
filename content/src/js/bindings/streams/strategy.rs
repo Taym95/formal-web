@@ -8,7 +8,6 @@ use crate::webidl::bindings::{AttributeDef, InterfaceDefinition, WebIdlInterface
 
 use crate::streams::{
     ByteLengthQueuingStrategy, CountQueuingStrategy, byte_length_size, count_size,
-    validate_and_normalize_high_water_mark,
 };
 
 impl WebIdlInterface<Types> for ByteLengthQueuingStrategy {
@@ -19,6 +18,7 @@ impl WebIdlInterface<Types> for ByteLengthQueuingStrategy {
         args: &[JsValue],
         ec: &mut dyn ExecutionContext<Types>,
     ) -> Completion<Self, Types> {
+        // Step 1: Set this.[[highWaterMark]] to init["highWaterMark"].
         let init_value = args
             .first()
             .cloned()
@@ -26,7 +26,16 @@ impl WebIdlInterface<Types> for ByteLengthQueuingStrategy {
         let init = ec.to_object(init_value)?;
         let high_water_mark =
             ExecutionContext::get(ec, init, ec.property_key_from_str("highWaterMark"))?;
-        let high_water_mark = validate_and_normalize_high_water_mark(&high_water_mark, ec)?;
+        // QueuingStrategyInit.highWaterMark is a required unrestricted double:
+        // a missing member throws a TypeError and no non-negativity validation
+        // applies here (the stream constructors validate later).
+        let undefined_value = ec.value_undefined();
+        if ec.same_value(&high_water_mark, &undefined_value) {
+            return Err(
+                ec.new_type_error("ByteLengthQueuingStrategy requires a highWaterMark member")
+            );
+        }
+        let high_water_mark = ec.to_number(high_water_mark)?;
         Ok(ByteLengthQueuingStrategy::new(high_water_mark))
     }
 
@@ -75,7 +84,14 @@ impl WebIdlInterface<Types> for CountQueuingStrategy {
         let init = ec.to_object(init_value)?;
         let high_water_mark =
             ExecutionContext::get(ec, init, ec.property_key_from_str("highWaterMark"))?;
-        let high_water_mark = validate_and_normalize_high_water_mark(&high_water_mark, ec)?;
+        // QueuingStrategyInit.highWaterMark is a required unrestricted double:
+        // a missing member throws a TypeError and no non-negativity validation
+        // applies here (the stream constructors validate later).
+        let undefined_value = ec.value_undefined();
+        if ec.same_value(&high_water_mark, &undefined_value) {
+            return Err(ec.new_type_error("CountQueuingStrategy requires a highWaterMark member"));
+        }
+        let high_water_mark = ec.to_number(high_water_mark)?;
         Ok(CountQueuingStrategy::new(high_water_mark))
     }
 
@@ -116,10 +132,11 @@ fn get_byte_length_high_water_mark(
 ) -> Completion<JsValue, Types> {
     let obj = Types::value_as_object(this)
         .ok_or_else(|| ec.new_type_error("ByteLengthQueuingStrategy receiver is not an object"))?;
-    if let Some(data) = ec.with_object_any(&obj) {
-        if let Some(strategy) = data.downcast_ref::<ByteLengthQueuingStrategy>() {
-            return Ok(ec.value_from_number(strategy.high_water_mark()));
-        }
+    if let Some(strategy) = ec
+        .with_object_any(&obj)
+        .and_then(|data| data.downcast_ref::<ByteLengthQueuingStrategy>())
+    {
+        return Ok(ec.value_from_number(strategy.high_water_mark()));
     }
     Err(ec.new_type_error("receiver is not a ByteLengthQueuingStrategy"))
 }
@@ -131,10 +148,11 @@ fn get_count_high_water_mark(
 ) -> Completion<JsValue, Types> {
     let obj = Types::value_as_object(this)
         .ok_or_else(|| ec.new_type_error("CountQueuingStrategy receiver is not an object"))?;
-    if let Some(data) = ec.with_object_any(&obj) {
-        if let Some(strategy) = data.downcast_ref::<CountQueuingStrategy>() {
-            return Ok(ec.value_from_number(strategy.high_water_mark()));
-        }
+    if let Some(strategy) = ec
+        .with_object_any(&obj)
+        .and_then(|data| data.downcast_ref::<CountQueuingStrategy>())
+    {
+        return Ok(ec.value_from_number(strategy.high_water_mark()));
     }
     Err(ec.new_type_error("receiver is not a CountQueuingStrategy"))
 }
@@ -155,11 +173,63 @@ fn get_byte_length_size(
     _: &[JsValue],
     ec: &mut dyn ExecutionContext<Types>,
 ) -> Completion<JsValue, Types> {
-    let function =
-        ec.create_builtin_fn_static(byte_length_size_fn, 1, ec.property_key_from_str("size"));
-    Ok(Types::value_from_object(Types::object_from_function(
-        function,
-    )))
+    // Step 1: Return this's relevant global object's byte length queuing
+    //         strategy size function.
+    global_size_function(
+        ec,
+        byte_length_size_fn,
+        1,
+        "\u{0}byte-length-queuing-strategy-size",
+    )
+}
+
+fn get_count_size(
+    _: &JsValue,
+    _: &[JsValue],
+    ec: &mut dyn ExecutionContext<Types>,
+) -> Completion<JsValue, Types> {
+    // Step 1: Return this's relevant global object's count queuing strategy
+    //         size function.
+    global_size_function(ec, count_size_fn, 0, "\u{0}count-queuing-strategy-size")
+}
+
+/// <https://streams.spec.whatwg.org/#blqs-size>
+///
+/// Returns the per-global size function, creating it on first access and
+/// caching it on the global object so every access returns the same function.
+/// The cache key is an internal null-prefixed property that user code cannot
+/// realistically collide with.
+type SizeSteps =
+    fn(&[JsValue], JsValue, &mut dyn ExecutionContext<Types>) -> Completion<JsValue, Types>;
+
+fn global_size_function(
+    ec: &mut dyn ExecutionContext<Types>,
+    steps: SizeSteps,
+    length: u32,
+    cache_key: &'static str,
+) -> Completion<JsValue, Types> {
+    let global = ec.realm_global_object();
+    let key = ec.property_key_from_str(cache_key);
+    let existing = ExecutionContext::get(ec, global.clone(), key.clone())?;
+    let undefined_value = ec.value_undefined();
+    if !ec.same_value(&existing, &undefined_value) {
+        return Ok(existing);
+    }
+    let function = ec.create_builtin_fn_static(steps, length, ec.property_key_from_str("size"));
+    let value = Types::value_from_object(Types::object_from_function(function));
+    ec.define_property_or_throw(
+        global,
+        key,
+        js_engine::PropertyDescriptor {
+            value: Some(value.clone()),
+            writable: Some(false),
+            enumerable: Some(false),
+            configurable: Some(true),
+            get: None,
+            set: None,
+        },
+    )?;
+    Ok(value)
 }
 
 fn count_size_fn(
@@ -171,15 +241,4 @@ fn count_size_fn(
         &args.first().cloned().unwrap_or(inner_ec.value_undefined()),
         inner_ec,
     )
-}
-
-fn get_count_size(
-    _: &JsValue,
-    _: &[JsValue],
-    ec: &mut dyn ExecutionContext<Types>,
-) -> Completion<JsValue, Types> {
-    let function = ec.create_builtin_fn_static(count_size_fn, 1, ec.property_key_from_str("size"));
-    Ok(Types::value_from_object(Types::object_from_function(
-        function,
-    )))
 }

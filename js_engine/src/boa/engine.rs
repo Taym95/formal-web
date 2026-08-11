@@ -46,8 +46,8 @@ use boa_engine::{
     object::{
         FunctionObjectBuilder, JsObject,
         builtins::{
-            JsArrayBuffer, JsDataView, JsFunction, JsGenerator, JsPromise, JsSharedArrayBuffer,
-            JsTypedArray,
+            JsArray, JsArrayBuffer, JsDataView, JsFunction, JsGenerator, JsPromise,
+            JsSharedArrayBuffer, JsTypedArray, JsUint8Array,
         },
         builtins::{JsDate, JsMap, JsRegExp, JsSet},
     },
@@ -1593,25 +1593,48 @@ impl ExecutionContext<BoaTypes> for BoaContext {
 
     fn get_value_from_buffer(
         &mut self,
-        _array_buffer: &JsArrayBuffer,
-        _byte_index: u64,
+        array_buffer: &JsArrayBuffer,
+        byte_index: u64,
         _element_type: TypedArrayElementType,
         _is_typed_array: bool,
         _order: SharedMemoryOrder,
     ) -> JsValue {
-        JsValue::undefined()
+        match JsUint8Array::from_array_buffer(array_buffer.clone(), &mut self.context) {
+            Ok(uint8) => uint8
+                .at(byte_index as i64, &mut self.context)
+                .unwrap_or_default(),
+            Err(_) => JsValue::undefined(),
+        }
     }
 
     fn set_value_in_buffer(
         &mut self,
-        _array_buffer: &JsArrayBuffer,
-        _byte_index: u64,
+        array_buffer: &JsArrayBuffer,
+        byte_index: u64,
         _element_type: TypedArrayElementType,
-        _value: JsValue,
+        value: JsValue,
         _is_typed_array: bool,
         _order: SharedMemoryOrder,
     ) -> Completion<(), BoaTypes> {
-        Ok(())
+        // Write the value through a Uint8Array view over the buffer using
+        // TypedArray.prototype.set, which performs the byte write.
+        let uint8 = match JsUint8Array::from_array_buffer(array_buffer.clone(), &mut self.context) {
+            Ok(uint8) => uint8,
+            Err(error) => {
+                return Err(error
+                    .into_opaque(&mut self.context)
+                    .unwrap_or(JsValue::undefined()));
+            }
+        };
+        let source = JsArray::from_iter([value], &mut self.context);
+        uint8
+            .set_values(JsValue::from(source), Some(byte_index), &mut self.context)
+            .map(|_| ())
+            .map_err(|error| {
+                error
+                    .into_opaque(&mut self.context)
+                    .unwrap_or(JsValue::undefined())
+            })
     }
 
     // ── §23.2 TypedArray Objects ──────────────────────────────────────────
