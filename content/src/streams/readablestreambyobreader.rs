@@ -8,7 +8,7 @@ use js_engine::gc_struct;
 
 use super::{
     ArrayBufferViewDescriptor, ReadIntoRequest, ReadableStream, ReadableStreamGenericReader,
-    ReadableStreamReader, ReadableStreamState, rejected_type_error_promise,
+    ReadableStreamReader, ReadableStreamState, rejected_type_error_promise, type_error_value,
     with_readable_stream_ref,
 };
 
@@ -72,11 +72,14 @@ impl ReadableStreamBYOBReader {
         options: &JsValue,
         ec: &mut dyn ExecutionContext<Types>,
     ) -> Completion<JsObject, Types> {
-        if self.stream_slot_value(ec).is_none() {
-            return rejected_type_error_promise("Cannot read from a released reader", ec);
-        }
+        let view = match ArrayBufferViewDescriptor::from_value(view.clone(), ec) {
+            Ok(view) => view,
+            // The spec checks the detached-buffer and zero-length cases below
+            // and returns a rejected promise for them, not a synchronous throw.
+            Err(_) => return rejected_type_error_promise("Invalid ArrayBufferView", ec),
+        };
 
-        let view = ArrayBufferViewDescriptor::from_value(view.clone(), ec)?;
+        // Step 1: If view.[[ByteLength]] is 0, return a promise rejected with a TypeError exception.
         if view.byte_length() == 0 {
             return rejected_type_error_promise(
                 "ReadableStreamBYOBReader.read() requires a non-empty view",
@@ -84,9 +87,41 @@ impl ReadableStreamBYOBReader {
             );
         }
 
+        // Step 2: If view.[[ViewedArrayBuffer]].[[ByteLength]] is 0, return a promise rejected with a TypeError exception.
+        if view.buffer_byte_length() == 0 {
+            return rejected_type_error_promise(
+                "ReadableStreamBYOBReader.read() requires a non-zero-length buffer",
+                ec,
+            );
+        }
+
+        // Step 3: If ! IsDetachedBuffer(view.[[ViewedArrayBuffer]]) is true, return a promise rejected with a TypeError exception.
+        if ec.array_buffer_data(view.buffer()).is_none() {
+            return rejected_type_error_promise(
+                "ReadableStreamBYOBReader.read() requires a non-detached view buffer",
+                ec,
+            );
+        }
+
+        // Step 4: If options["min"] is 0, return a promise rejected with a TypeError exception.
+        // Steps 5-6: If min > view length, return a promise rejected with a RangeError exception.
+        let min = match normalize_min(options, &view, ec) {
+            Ok(min) => min,
+            Err(error) => return crate::webidl::rejected_promise(error, ec),
+        };
+
+        // Step 7: If this.[[stream]] is undefined, return a promise rejected with a TypeError exception.
+        if self.stream_slot_value(ec).is_none() {
+            return rejected_type_error_promise("Cannot read from a released reader", ec);
+        }
+
+        // Step 8: Let promise be a new promise.
         let (read_into_request, promise) = ReadIntoRequest::new(ec)?;
-        let min = normalize_min(options, &view, ec)?;
+
+        // Step 10: Perform ! ReadableStreamBYOBReaderRead(this, view, options["min"], readIntoRequest).
         self.read_steps(view, min, read_into_request, ec)?;
+
+        // Step 11: Return promise.
         Ok(promise)
     }
 
@@ -100,15 +135,27 @@ impl ReadableStreamBYOBReader {
         let not_attached = ec.new_type_error("reader is not attached to a stream");
         let stream = self.stream_slot_value(ec).ok_or_else(|| not_attached)?;
 
+        // Step 3: Set stream.[[disturbed]] to true.
         stream.set_disturbed(true);
 
-        if stream.state() == ReadableStreamState::Closed {
-            let result_view = view.create_result_view(0, ec)?;
-            return read_into_request.close_steps(Some(JsValue::from(result_view)), ec);
+        // Step 4: If stream.[[state]] is "errored",
+        if stream.state() == ReadableStreamState::Errored {
+            // perform readIntoRequest's error steps, given stream.[[storedError]], and return.
+            return read_into_request.error_steps(stream.stored_error(ec), ec);
         }
 
-        if stream.state() == ReadableStreamState::Errored {
-            return read_into_request.error_steps(stream.stored_error(ec), ec);
+        // Step 6: If stream.[[state]] is "closed",
+        if stream.state() == ReadableStreamState::Closed {
+            // Step 6.1: Let emptyView be ! ConstructEmptyArrayBufferView(view.[[ArrayBufferByteLength]],
+            //           view.[[ByteOffset]], view.[[ViewedArrayBuffer]]).
+            let transferred_buffer =
+                crate::streams::readablebytestreamcontroller::transfer_array_buffer(
+                    view.buffer().clone(),
+                    ec,
+                )?;
+            let result_view = view.create_result_view_on(transferred_buffer, 0, ec)?;
+            // Step 6.2: Perform readIntoRequest's close steps, given emptyView.
+            return read_into_request.close_steps(Some(JsValue::from(result_view)), ec);
         }
 
         let no_ctrl = ec.new_type_error("ReadableStream is missing its controller");
@@ -125,7 +172,8 @@ impl ReadableStreamBYOBReader {
         if self.stream_slot_value(ec).is_none() {
             return Ok(());
         }
-        self.readable_stream_reader_generic_release(ec)
+        // <https://streams.spec.whatwg.org/#abstract-opdef-readablestreambyobreaderrelease>
+        readable_stream_byob_reader_release(self.clone(), ec)
     }
 }
 
@@ -235,16 +283,22 @@ pub(crate) fn readable_stream_byob_reader_release(
     reader: ReadableStreamBYOBReader,
     ec: &mut dyn ExecutionContext<Types>,
 ) -> Completion<(), Types> {
-    // Step 1: "Perform ! ReadableStreamReaderGenericRelease(reader)."
-    reader.readable_stream_reader_generic_release(ec)?;
+    // Steps 2-3: Let e be a new TypeError exception.  Perform !
+    //            ReadableStreamBYOBReaderErrorReadIntoRequests(reader, e).
+    // Note: In this implementation the read-into requests live inside the
+    // pending pull-into descriptors, so they are errored before generic
+    // release marks the first descriptor's reader type as "none".
+    let release_error = type_error_value("Reader was released", ec)?;
+    if let Some(controller) = reader
+        .stream_slot_value(ec)
+        .and_then(|stream| stream.controller_slot(ec))
+        .and_then(|controller| controller.as_byte_controller())
+    {
+        controller.error_pending_read_into_requests(release_error, ec)?;
+    }
 
-    // Step 2–3: Error any remaining [[readIntoRequests]].
-    // Note: In tee() usage the spec asserts [[readIntoRequests]] is empty before
-    // calling this, so no requests need to be errored here.  When invoked from a
-    // non-tee path this is conservative but safe because pull-into descriptors are
-    // owned by the byte controller and will be cleaned up when the controller is
-    // released from the stream.
-    Ok(())
+    // Step 1: "Perform ! ReadableStreamReaderGenericRelease(reader)."
+    reader.readable_stream_reader_generic_release(ec)
 }
 
 pub(crate) fn with_readable_stream_byob_reader_ref<R>(

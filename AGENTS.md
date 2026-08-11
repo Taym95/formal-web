@@ -607,7 +607,22 @@ At the end of each task, run the following steps **in order**:
    dead-end investigations for currently-unfixed issues (see "README pruning"
    above).
 
-8. **Run all verification steps** — Every end-of-task run executes ALL verification steps unconditionally. Do not skip any step based on a subjective assessment of "relevance" — changes to seemingly unrelated files (test pages, configuration, documentation) routinely break downstream steps in this multi-process system. Running everything catches regressions the agent cannot predict.
+8. **Promote newly-passing WPT tests to the default selection** — When a
+   WPT test was previously disabled or unselected and now passes, make that
+   permanent so it runs as a standard from now on:
+   - Remove its `disabled:` entry from `tests/wpt/meta/` (the metadata
+     `disabled` reason is what keeps a test out of the default run — stale
+     `disabled` entries silently hide new passes).
+   - If the test lives in a directory that `tests/wpt/include.ini` does not
+     select, add a `[path/to/test]` / `skip: false` entry so it is collected.
+   - If a test cannot pass on every supported engine (V8 and Boa are the
+     two that must pass; JSC is ignored) or on every feature build, keep it
+     disabled and update its `disabled` reason to state exactly which
+     dependency is missing — never leave a stale reason describing the old
+     failure.
+   - Update any README "known failures" entry for the fixed test (step 7).
+
+9. **Run all verification steps** — Every end-of-task run executes ALL verification steps unconditionally. Do not skip any step based on a subjective assessment of "relevance" — changes to seemingly unrelated files (test pages, configuration, documentation) routinely break downstream steps in this multi-process system. Running everything catches regressions the agent cannot predict.
 
    Two engines run WPT: V8 (default) and Boa (opt-in). JSC is experimental
    (content crate compiles but `run_content_process` returns an error at
@@ -630,9 +645,9 @@ At the end of each task, run the following steps **in order**:
 
      The script starts the embedder headless with TLA+ tracing, runs a minimal WebDriver session, collects trace events, and validates them against TLA+ models.
 
-9. **Suggest a commit message** — Whenever asked for a commit message (whether at end-of-task or any other time), propose a message for the current `git diff HEAD` (the uncommitted changes), not for the entire session's work.  Run `git diff --stat HEAD` to see what changed, and `git diff HEAD` to read the diff before writing the message.
+10. **Suggest a commit message** — Whenever asked for a commit message (whether at end-of-task or any other time), propose a message for the current `git diff HEAD` (the uncommitted changes), not for the entire session's work.  Run `git diff --stat HEAD` to see what changed, and `git diff HEAD` to read the diff before writing the message.
 
-10. Review the entire session (your entire context window) and make sure that Rule Number One was respected (see top of file), and if not alert the user.
+11. Review the entire session (your entire context window) and make sure that Rule Number One was respected (see top of file), and if not alert the user.
 
 
 # Forbidden commands

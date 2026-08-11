@@ -18,26 +18,19 @@
 - Model shared mixins and abstract operations with Rust traits or receiver-owned methods when the spec describes reusable behavior.
 - Use the `web_standards` extension (`spec_lookup`) with `https://streams.spec.whatwg.org/` to read the Streams spec, and `vendor/wpt/streams` as the test reference.
 
-## Known failures
+## Remaining failures
 
-### readable-byte-streams pull-into data content
+The remaining `streams/` tests that are not expected to pass are disabled in
+`tests/wpt/meta/streams/`:
 
-`streams/readable-byte-streams/patched-global.any.js` and
-`respond-after-enqueue.any.js` fail deterministically (identical failure across
-three runs) with `assert_array_equals: result1.value contents expected property
-0 to be 66 but got 0` — a BYOB pull-into descriptor content bug. All other
-default-suite tests pass. Ruled out: renderer/compositor separation (the
-failing assertion is pure byte-stream JS data semantics in `content/src/streams`;
-the graphics process does not produce byte-stream data). The pull-into
-descriptor bug itself is not yet fixed.
-
-### enqueue-with-detached-buffer does not throw
-
-`streams/readable-byte-streams/enqueue-with-detached-buffer.any.js` fails
-deterministically (identical failure across two runs, full suite and
-single-test) with `assert_throws_js: function "() =>
-controller.enqueue(new Uint8Array([42]))" did not throw` — enqueueing after
-detaching `byobRequest.view.buffer` should throw. Baseline verified: the same
-single test fails identically with unrelated working-tree changes stashed.
-Whether enqueue-after-detach enforcement is missing in `content/src/streams`
-is not yet investigated.
+- **Cross-realm tests** (`readable-streams/cross-realm-crash.window.js`,
+  `readable-streams/global.html`, `transform-streams/invalid-realm.tentative.window.js`,
+  `queuing-strategies-size-function-per-global.window.js`) — require iframe
+  `contentWindow` realms exposing Streams interfaces; iframe realm support is
+  not implemented.
+- **Transferable streams** (`streams/transferable/`, `owning-type-*.any.js`) —
+  structured transfer of streams, values, and `MessagePort`/`VideoFrame`
+  objects is not implemented.
+- **`readable-byte-streams/non-transferable-buffers.any.js`** — requires
+  `WebAssembly.Memory` buffers (WebAssembly memory is not implemented).
+- **`idlharness.any.js`** — not selected by `tests/wpt/include.ini`.

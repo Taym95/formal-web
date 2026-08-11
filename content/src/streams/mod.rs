@@ -51,7 +51,6 @@ pub(crate) use strategy::SizeAlgorithm;
 pub use strategy::{ByteLengthQueuingStrategy, CountQueuingStrategy};
 pub(crate) use strategy::{
     byte_length_size, count_size, extract_high_water_mark, extract_size_algorithm,
-    validate_and_normalize_high_water_mark,
 };
 pub use transformstream::{TransformStream, TransformStreamDefaultController};
 pub(crate) use transformstream::{

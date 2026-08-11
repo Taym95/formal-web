@@ -401,6 +401,25 @@ pub trait ExecutionContext<T: JsTypes + JsTypesWithRealm>: EcmascriptHost<T> {
     /// <https://tc39.es/ecma262/#sec-isfixedlengtharraybuffer>
     fn is_fixed_length_array_buffer(&self, array_buffer: &T::ArrayBuffer) -> bool;
 
+    /// <https://tc39.es/ecma262/#sec-cantransferarraybuffer>
+    ///
+    /// Whether the ArrayBuffer can be transferred (i.e. is not shared, not
+    /// detached, and fixed-length).  WebAssembly memory buffers are not
+    /// transferable.
+    fn can_transfer_array_buffer(&self, array_buffer: &T::ArrayBuffer) -> bool {
+        !self.is_detached_buffer(array_buffer) && self.is_fixed_length_array_buffer(array_buffer)
+    }
+
+    /// <https://tc39.es/ecma262/#sec-arraybufferbytelength>
+    ///
+    /// Returns the [[ArrayBufferByteLength]] of a non-detached ArrayBuffer, or 0
+    /// for a detached one.  The default implementation copies the buffer data to
+    /// measure it; backends with a cheap length accessor override this.
+    fn array_buffer_byte_length(&self, array_buffer: &T::ArrayBuffer) -> u64 {
+        self.array_buffer_data(array_buffer)
+            .map_or(0, |data| data.len() as u64)
+    }
+
     /// <https://tc39.es/ecma262/#sec-allocatearraybuffer>
     fn allocate_array_buffer(
         &mut self,
