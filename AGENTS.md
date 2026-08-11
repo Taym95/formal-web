@@ -512,6 +512,7 @@ The project uses the standard `log` crate with `env_logger` for structured loggi
 ## Rules
 
 - Errors must always be logged before being discarded. A `Result` value must never be silently dropped anywhere in the codebase — every `Result<_, E>` carries diagnostic information that can help debug failures in this multi-process system.
+- **Remove development-time tracing when the work lands.** Toggle-gated `debug!`/`trace!` logs added to trace a feature being implemented (e.g. per-message routing traces) must be removed once the feature works; they are not durable instrumentation.  Keep only toggles that serve ongoing diagnostics of a subsystem (e.g. `render-state`, `timer-debug`, `input-debug`).
 - **Never use `let _ = ...`** to silence a `Result`. Every `Result` carries diagnostic
   information; silent discarding makes multi-process failures impossible to debug.
   Always use `if let Err(error) = fallible_operation() { error!("...: {error}"); }`.

@@ -177,6 +177,12 @@ struct SharedIsolate {
     callback_handles: RefCell<Vec<CallbackHandle>>,
     isolate: RefCell<v8::OwnedIsolate>,
     microtask_queue: v8::UniqueRef<v8::MicrotaskQueue>,
+    /// Shared security token installed on every context created in this
+    /// isolate.  V8 gates cross-context access to another context's global
+    /// object on security-token equality; each `Context::new` otherwise gets
+    /// its own token, so same-origin same-process window access (the
+    /// WindowProxy same-origin path) would throw `TypeError: no access`.
+    security_token: RefCell<Option<v8::Global<v8::Value>>>,
 }
 
 impl SharedIsolate {
@@ -201,14 +207,42 @@ impl SharedIsolate {
         let mut isolate = v8::Isolate::new(v8::CreateParams::default().cpp_heap(heap));
         isolate.set_microtasks_policy(v8::MicrotasksPolicy::Explicit);
         let microtask_queue = v8::MicrotaskQueue::new(&mut isolate, v8::MicrotasksPolicy::Explicit);
-        Rc::new(Self {
+        let shared = Rc::new(Self {
             isolate_id: NEXT_ISOLATE_ID.fetch_add(1, Ordering::Relaxed),
             realm_states: RefCell::new(Vec::new()),
             queued_jobs: RefCell::new(VecDeque::new()),
             callback_handles: RefCell::new(Vec::new()),
             isolate: RefCell::new(isolate),
             microtask_queue,
-        })
+            security_token: RefCell::new(None),
+        });
+        // Create the shared security token once, inside a scope on the
+        // isolate.  The same Local is installed on every context below.
+        {
+            let mut isolate_for_scope = shared.isolate.borrow_mut();
+            v8::scope!(let scope, &mut *isolate_for_scope);
+            let token: v8::Local<v8::Value> =
+                v8::String::new(scope, "formal-web-isolate-security-token")
+                    .expect("create security token string")
+                    .into();
+            *shared.security_token.borrow_mut() = Some(v8::Global::<v8::Value>::new(scope, token));
+        }
+        shared
+    }
+
+    /// Install the isolate's shared security token on `context`.
+    fn install_security_token<'s, 'i>(
+        &self,
+        scope: &mut v8::PinScope<'s, 'i, ()>,
+        context: &v8::Context,
+    ) {
+        let token = self
+            .security_token
+            .borrow()
+            .clone()
+            .expect("security token must be initialized in SharedIsolate::new");
+        let token = v8::Local::new(scope, &token);
+        context.set_security_token(token);
     }
 
     fn borrow(&self, expected_isolate_id: u64) -> RefMut<'_, v8::OwnedIsolate> {
@@ -1026,6 +1060,10 @@ impl V8Engine {
                     ..v8::ContextOptions::default()
                 },
             );
+            // Same-origin windows in one agent cluster must be able to access
+            // each other's globals (the WindowProxy same-origin path); share
+            // the isolate-wide security token across every context.
+            shared_isolate.install_security_token(scope, &context);
             let context_handle = v8::Global::new(scope, context);
             let context_scope = &mut v8::ContextScope::new(scope, context);
             let global = context.global(context_scope);
@@ -1431,6 +1469,10 @@ impl JsEngine<V8Types> for V8Engine {
                         ..v8::ContextOptions::default()
                     },
                 );
+                // Same-origin windows in one agent cluster must be able to
+                // access each other's globals (the WindowProxy same-origin
+                // path); share the isolate-wide security token.
+                self.shared_isolate.install_security_token(scope, &context);
                 let context_handle = v8::Global::new(scope, context);
                 let context_scope = &mut v8::ContextScope::new(scope, context);
                 let global = context.global(context_scope);

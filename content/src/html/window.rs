@@ -1,4 +1,4 @@
-use log::{debug, error};
+use log::error;
 use std::collections::{BTreeMap, HashMap};
 
 use ipc::IpcSender;
@@ -11,11 +11,9 @@ use crate::js::{Engine, Types};
 
 type JsValue = <Types as JsTypes>::JsValue;
 
-use crate::dom::DOMException;
 use crate::dom::Element;
 use crate::dom::event::{EventTarget, EventTargetAccess};
 use crate::js::platform_objects::with_global_scope;
-use crate::webidl::bindings::create_interface_instance;
 
 use super::resolved_style_properties_for_element;
 use super::safe_passing_of_structured_data::structured_serialize_with_transfer;
@@ -117,10 +115,6 @@ pub(crate) struct PostMessageOptions {
     pub transfer: Vec<JsValue>,
 }
 
-fn message_debug_enabled() -> bool {
-    std::env::var_os("FORMAL_WEB_DEBUG_MESSAGES").is_some()
-}
-
 /// <https://html.spec.whatwg.org/#window-post-message-steps>
 pub(crate) fn window_post_message_steps(
     target_navigable_id: NavigableId,
@@ -179,7 +173,8 @@ pub(crate) fn window_post_message_steps(
         //           targetOrigin.
         // Step 5.2: If parsedURL is failure, then throw a "SyntaxError"
         //           DOMException.
-        let parsed_url = url::Url::parse(&target_origin).map_err(|_| syntax_error(ec))?;
+        let parsed_url =
+            url::Url::parse(&target_origin).map_err(|_| crate::webidl::syntax_error_value(ec))?;
 
         // Step 5.3: Set targetOrigin to parsedURL's origin.
         target_origin = parsed_url.origin().unicode_serialization();
@@ -192,17 +187,6 @@ pub(crate) fn window_post_message_steps(
     //         StructuredSerializeWithTransfer(message, transfer). Rethrow
     //         any exceptions.
     let serialize_result = structured_serialize_with_transfer(&message, transfer, ec)?;
-
-    if message_debug_enabled() {
-        debug!(
-            "[message-debug][source] postMessage target_navigable={} target_origin={} source_navigable={} source_origin={} transfer_holders={}",
-            target_navigable_id,
-            target_origin,
-            source_navigable_id,
-            source_origin,
-            serialize_result.transfer_data_holders.len()
-        );
-    }
 
     // Step 8: Queue a global task on the posted message task source given
     //         targetWindow to run the following steps.
@@ -219,13 +203,6 @@ pub(crate) fn window_post_message_steps(
             transfer_data_holders: serialize_result.transfer_data_holders,
         }))
         .map_err(|error| ec.new_type_error(&format!("postMessage: {error}")))
-}
-
-/// <https://webidl.spec.whatwg.org/#syntaxerror>
-fn syntax_error(ec: &mut dyn ExecutionContext<crate::js::Types>) -> JsValue {
-    let obj = create_interface_instance::<Types, DOMException>(DOMException::syntax_error(), ec)
-        .expect("DOMException construction should not fail");
-    Types::value_from_object(obj)
 }
 
 /// <https://html.spec.whatwg.org/#window-open-steps>
@@ -396,13 +373,13 @@ pub(crate) fn window_open_steps(
 
     // Step 18: Return targetNavigable's active WindowProxy.
     // <https://html.spec.whatwg.org/#the-windowproxy-exotic-object>
+    // Note: window.open creates an auxiliary browsing context in the same
+    // agent cluster (same content process), so the V8 Proxy WindowProxy is
+    // returned; it delegates property access to the local Window.
     let window = result
         .return_window
         .expect("window_open_steps: all navigable branches set a return window");
-    let target_navigable_id = result
-        .chosen_navigable_id
-        .expect("window_open_steps: a return window implies a chosen navigable");
-    create_window_proxy(target_navigable_id, Some(window), ec)
+    create_window_proxy(&window, ec)
 }
 
 /// <https://html.spec.whatwg.org/#get-noopener-for-window-open>

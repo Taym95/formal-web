@@ -54,30 +54,27 @@ pub struct CachedNodeObject {
 /// A cached WindowProxy shim for a navigable, keyed by navigable id.
 /// The cache lives on the realm's GlobalScope so the same shim object is
 /// returned for `event.source`, `iframe.contentWindow`, and `window.open`
-/// results referring to the same navigable.
+/// results referring to the same navigable.  The same entry also records the
+/// iframe node whose content navigable the shim backs (the `contentWindow`
+/// binding resolves the navigable from the element's node id).
 /// <https://html.spec.whatwg.org/#the-windowproxy-exotic-object>
 #[gc_struct]
 pub struct CachedWindowProxy {
-    /// <https://html.spec.whatwg.org/#navigable-id>
+    /// <https://html.spec.whatwg.org/#navigable>
     #[ignore_trace]
     pub navigable_id: ipc_messages::content::NavigableId,
 
     /// <https://html.spec.whatwg.org/#the-windowproxy-exotic-object>
-    pub object: JsObject,
-}
+    /// The WindowProxy shim for the navigable; `None` until the realm first
+    /// accesses the window (the iframe mapping is recorded before any
+    /// `contentWindow` access).
+    pub object: Option<JsObject>,
 
-/// An iframe element's content navigable id, keyed by the iframe's node id in
-/// the parent document.
-/// <https://html.spec.whatwg.org/#dom-htmliframeelement-contentwindow>
-#[gc_struct]
-pub struct CachedIframeNavigable {
-    /// <https://dom.spec.whatwg.org/#concept-node-identifier>
+    /// <https://html.spec.whatwg.org/#content-navigable>
+    /// The iframe element's node id in this realm's document when the
+    /// navigable is that element's content navigable.
     #[ignore_trace]
-    pub node_id: usize,
-
-    /// <https://html.spec.whatwg.org/#navigable-id>
-    #[ignore_trace]
-    pub navigable_id: ipc_messages::content::NavigableId,
+    pub iframe_node_id: Option<usize>,
 }
 
 /// <https://html.spec.whatwg.org/#list-of-animation-frame-callbacks>
@@ -154,13 +151,10 @@ pub struct GlobalScope {
     /// <https://html.spec.whatwg.org/#dom-location>
     location_object: GcCell<Option<JsObject>>,
 
-    /// WindowProxy shims for navigables, keyed by navigable id.
+    /// WindowProxy shims for navigables (and the iframe node each shim's
+    /// navigable is the content navigable of), keyed by navigable id.
     /// <https://html.spec.whatwg.org/#the-windowproxy-exotic-object>
     window_proxies: GcCell<Vec<CachedWindowProxy>>,
-
-    /// Ifframe content navigable ids keyed by the iframe's node id.
-    /// <https://html.spec.whatwg.org/#dom-htmliframeelement-contentwindow>
-    iframe_content_navigables: GcCell<Vec<CachedIframeNavigable>>,
 
     /// <https://webidl.spec.whatwg.org/#dfn-platform-object>
     node_objects: GcCell<Vec<CachedNodeObject>>,
@@ -263,7 +257,6 @@ impl GlobalScope {
             document_object: gc_cell_new(None, ec),
             location_object: gc_cell_new(None, ec),
             window_proxies: gc_cell_new(Vec::new(), ec),
-            iframe_content_navigables: gc_cell_new(Vec::new(), ec),
             node_objects: gc_cell_new(Vec::new(), ec),
             animation_frame_callback_identifier: Cell::new(0),
             animation_frame_callbacks: gc_cell_new(Vec::new(), ec),
@@ -405,7 +398,7 @@ impl GlobalScope {
         let mut cached = None;
         for entry in self.window_proxies.borrow(ec).iter() {
             if entry.navigable_id == navigable_id {
-                cached = Some(entry.object.clone());
+                cached = entry.object.clone();
             }
         }
         cached
@@ -418,51 +411,80 @@ impl GlobalScope {
         object: JsObject,
         ec: &mut dyn ExecutionContext<Types>,
     ) {
-        if self.cached_window_proxy(navigable_id, ec).is_none() {
-            self.window_proxies.borrow_mut(ec).push(CachedWindowProxy {
+        let mut entries = self.window_proxies.borrow_mut(ec);
+        match entries
+            .iter_mut()
+            .find(|entry| entry.navigable_id == navigable_id)
+        {
+            Some(entry) => {
+                if entry.object.is_none() {
+                    entry.object = Some(object);
+                }
+            }
+            None => entries.push(CachedWindowProxy {
                 navigable_id,
-                object,
-            });
+                object: Some(object),
+                iframe_node_id: None,
+            }),
         }
     }
 
-    /// <https://html.spec.whatwg.org/#dom-htmliframeelement-contentwindow>
+    /// <https://html.spec.whatwg.org/#content-navigable>
     pub(crate) fn iframe_content_navigable(
         &self,
         node_id: usize,
         ec: &mut dyn ExecutionContext<Types>,
     ) -> Option<ipc_messages::content::NavigableId> {
-        self.iframe_content_navigables
+        self.window_proxies
             .borrow(ec)
             .iter()
-            .find(|entry| entry.node_id == node_id)
+            .find(|entry| entry.iframe_node_id == Some(node_id))
             .map(|entry| entry.navigable_id)
     }
 
-    /// <https://html.spec.whatwg.org/#dom-htmliframeelement-contentwindow>
+    /// <https://html.spec.whatwg.org/#create-a-new-child-navigable>
+    /// Records the iframe node -> content navigable mapping used by the
+    /// `contentWindow` getter; the shim entry may not exist yet.
     pub(crate) fn set_iframe_content_navigable(
         &self,
         node_id: usize,
         navigable_id: ipc_messages::content::NavigableId,
         ec: &mut dyn ExecutionContext<Types>,
     ) {
-        let mut entries = self.iframe_content_navigables.borrow_mut(ec);
-        entries.retain(|entry| entry.node_id != node_id);
-        entries.push(CachedIframeNavigable {
-            node_id,
-            navigable_id,
-        });
+        let mut entries = self.window_proxies.borrow_mut(ec);
+        // A node can only be the content navigable of one element.
+        for entry in entries.iter_mut() {
+            if entry.iframe_node_id == Some(node_id) {
+                entry.iframe_node_id = None;
+            }
+        }
+        match entries
+            .iter_mut()
+            .find(|entry| entry.navigable_id == navigable_id)
+        {
+            Some(entry) => {
+                entry.iframe_node_id = Some(node_id);
+            }
+            None => entries.push(CachedWindowProxy {
+                navigable_id,
+                object: None,
+                iframe_node_id: Some(node_id),
+            }),
+        }
     }
 
-    /// <https://html.spec.whatwg.org/#dom-htmliframeelement-contentwindow>
+    /// <https://html.spec.whatwg.org/#destroy-a-child-navigable>
     pub(crate) fn clear_iframe_content_navigable(
         &self,
         node_id: usize,
         ec: &mut dyn ExecutionContext<Types>,
     ) {
-        self.iframe_content_navigables
-            .borrow_mut(ec)
-            .retain(|entry| entry.node_id != node_id);
+        let mut entries = self.window_proxies.borrow_mut(ec);
+        for entry in entries.iter_mut() {
+            if entry.iframe_node_id == Some(node_id) {
+                entry.iframe_node_id = None;
+            }
+        }
     }
 
     pub(crate) fn cached_node_object(

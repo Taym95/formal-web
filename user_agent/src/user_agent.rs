@@ -1160,10 +1160,6 @@ fn input_debug_enabled() -> bool {
     std::env::var_os("FORMAL_WEB_DEBUG_INPUT").is_some()
 }
 
-fn message_debug_enabled() -> bool {
-    std::env::var_os("FORMAL_WEB_DEBUG_MESSAGES").is_some()
-}
-
 /// <https://html.spec.whatwg.org/multipage/#the-rules-for-choosing-a-navigable>
 fn normalize_navigation_target_name(target_name: &str) -> String {
     if target_name.eq_ignore_ascii_case("_self") {
@@ -3599,12 +3595,6 @@ impl UserAgentWorker {
             );
             return;
         };
-        if message_debug_enabled() {
-            debug!(
-                "[message-debug][user-agent] route postMessage target_navigable={} source_navigable={}",
-                request.target_navigable_id, request.source_navigable_id
-            );
-        }
         if let Err(error) = command_sender.send(EventLoopCommand::FireAndForget {
             command: ContentCommand::PostMessage(request),
         }) {

@@ -292,7 +292,7 @@ fn get_name(
     _args: &[JsValue],
     ec: &mut dyn ExecutionContext<crate::js::Types>,
 ) -> Completion<JsValue, crate::js::Types> {
-    // <https://html.spec.whatwg.org/#dom-window-name>
+    // <https://html.spec.whatwg.org/#the-window-object>
     // Note: The navigable target name lives in the user agent; the local
     // window's GlobalScope does not yet track it, so the getter returns the
     // empty string.
@@ -314,7 +314,7 @@ fn get_length(
     _args: &[JsValue],
     ec: &mut dyn ExecutionContext<crate::js::Types>,
 ) -> Completion<JsValue, crate::js::Types> {
-    // <https://html.spec.whatwg.org/#dom-window-length>
+    // <https://html.spec.whatwg.org/#the-window-object>
     // Note: Document-tree child navigable tracking is not yet implemented.
     Ok(ec.value_from_number(0.0))
 }
@@ -324,7 +324,7 @@ fn get_top(
     _args: &[JsValue],
     _ec: &mut dyn ExecutionContext<crate::js::Types>,
 ) -> Completion<JsValue, crate::js::Types> {
-    // <https://html.spec.whatwg.org/#dom-window-top>
+    // <https://html.spec.whatwg.org/#the-window-object>
     // Note: Resolving the top traversable's WindowProxy requires the
     // navigable hierarchy; return the proxy itself for now.
     Ok(this.clone())
@@ -335,7 +335,7 @@ fn get_parent(
     _args: &[JsValue],
     _ec: &mut dyn ExecutionContext<crate::js::Types>,
 ) -> Completion<JsValue, crate::js::Types> {
-    // <https://html.spec.whatwg.org/#dom-window-parent>
+    // <https://html.spec.whatwg.org/#the-window-object>
     // Note: Resolving the parent navigable's WindowProxy requires the
     // navigable hierarchy; return the proxy itself for now.
     Ok(this.clone())
@@ -346,7 +346,7 @@ fn get_opener(
     _args: &[JsValue],
     ec: &mut dyn ExecutionContext<crate::js::Types>,
 ) -> Completion<JsValue, crate::js::Types> {
-    // <https://html.spec.whatwg.org/#dom-window-opener>
+    // <https://html.spec.whatwg.org/#the-window-object>
     // Note: Opener tracking is user-agent state and is not yet wired.
     Ok(ec.value_null())
 }
@@ -356,7 +356,7 @@ fn get_document(
     _args: &[JsValue],
     ec: &mut dyn ExecutionContext<crate::js::Types>,
 ) -> Completion<JsValue, crate::js::Types> {
-    // <https://html.spec.whatwg.org/#dom-window-document>
+    // <https://html.spec.whatwg.org/#the-window-object>
     // Note: Resolves the target window's document when the target navigable
     // lives in this content process; cross-realm property reads on the
     // returned object are subject to V8's context isolation.
@@ -377,7 +377,7 @@ fn get_location(
     _args: &[JsValue],
     ec: &mut dyn ExecutionContext<crate::js::Types>,
 ) -> Completion<JsValue, crate::js::Types> {
-    // <https://html.spec.whatwg.org/#dom-window-location>
+    // <https://html.spec.whatwg.org/#the-window-object>
     // Note: Resolves the target window's location when the target navigable
     // lives in this content process.
     if let Some(local_window) = local_window_for(this, ec) {

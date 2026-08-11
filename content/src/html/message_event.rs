@@ -30,23 +30,40 @@ pub struct MessageEvent {
     pub source: GcCell<Option<JsObject>>,
 
     /// <https://html.spec.whatwg.org/#dom-messageevent-ports>
+    // Note: Holds raw JS objects until MessagePort is implemented; the ports
+    // must then be domain MessagePort objects, not JS handles.
     pub ports: GcCell<Vec<JsObject>>,
 
-    /// <https://webidl.spec.whatwg.org/#dfn-frozen-array-type>
-    /// The frozen array returned by the `ports` getter, created lazily so the
+    /// <https://html.spec.whatwg.org/#dom-messageevent-ports>
+    /// The frozen array backing the `ports` getter, created lazily so the
     /// attribute returns the same object on every access.
     pub ports_array: GcCell<Option<JsObject>>,
 }
 
-/// <https://html.spec.whatwg.org/#dictdef-messageeventinit>
+/// <https://html.spec.whatwg.org/#messageeventinit>
 pub(crate) struct MessageEventInit {
+    /// <https://dom.spec.whatwg.org/#dom-eventinit-bubbles>
     pub bubbles: bool,
+
+    /// <https://dom.spec.whatwg.org/#dom-eventinit-cancelable>
     pub cancelable: bool,
+
+    /// <https://dom.spec.whatwg.org/#dom-eventinit-composed>
     pub composed: bool,
+
+    /// <https://html.spec.whatwg.org/#dom-messageeventinit-data>
     pub data: JsValue,
+
+    /// <https://html.spec.whatwg.org/#dom-messageeventinit-origin>
     pub origin: String,
+
+    /// <https://html.spec.whatwg.org/#dom-messageeventinit-lasteventid>
     pub last_event_id: String,
+
+    /// <https://html.spec.whatwg.org/#dom-messageeventinit-source>
     pub source: Option<JsObject>,
+
+    /// <https://html.spec.whatwg.org/#dom-messageeventinit-ports>
     pub ports: Vec<JsObject>,
 }
 
@@ -61,7 +78,7 @@ impl HasEvent for MessageEvent {
 }
 
 impl MessageEvent {
-    /// <https://html.spec.whatwg.org/#dom-messageevent-messageevent>
+    /// <https://html.spec.whatwg.org/#messageevent>
     pub(crate) fn new(
         type_: String,
         init: MessageEventInit,
@@ -115,8 +132,9 @@ impl MessageEvent {
         self.ports.borrow(ec).clone()
     }
 
-    /// <https://webidl.spec.whatwg.org/#dfn-frozen-array-type>
-    /// Return the frozen array backing the `ports` attribute, creating it on
+    /// <https://html.spec.whatwg.org/#dom-messageevent-ports>
+    /// The `ports` getter must return the value it was initialized to; the
+    /// binding delivers this as a single frozen array object, created here on
     /// first access so every getter call returns the same object.
     pub(crate) fn ports_value_frozen(
         &self,

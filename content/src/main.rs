@@ -1407,16 +1407,8 @@ impl ContentProcess {
             .map(|document| document.settings.origin.serialized.clone())
             .ok_or_else(|| format!("postMessage: unknown target document {target_document_id}"))?;
         if request.target_origin != "*" && request.target_origin != target_origin {
-            log_message_debug(format!(
-                "[message-debug][target] drop postMessage target_navigable={} target_origin={} document_origin={}",
-                request.target_navigable_id, request.target_origin, target_origin
-            ));
             return Ok(());
         }
-        log_message_debug(format!(
-            "[message-debug][target] deliver postMessage target_navigable={} source_navigable={} origin={}",
-            request.target_navigable_id, request.source_navigable_id, request.source_origin
-        ));
 
         // Set up the shared registry so window.open calls made while the
         // message handlers run can register new documents.
@@ -1487,13 +1479,14 @@ impl ContentProcess {
                     let ec = &mut document.settings.realm_execution_context;
                     ec.value_null()
                 };
-                fire_message_event(
+                let message_event = build_message_event(
                     &mut document.settings,
                     "messageerror",
                     origin,
                     Some(source),
                     data,
                 )?;
+                fire_event_at_window(&mut document.settings, &message_event.event)?;
                 return Ok(());
             }
         };
@@ -1512,13 +1505,14 @@ impl ContentProcess {
         //           source attribute initialized to source, the data attribute
         //           initialized to messageClone, and the ports attribute
         //           initialized to newPorts.
-        fire_message_event(
+        let message_event = build_message_event(
             &mut document.settings,
             "message",
             origin,
             Some(source),
             message_clone,
         )?;
+        fire_event_at_window(&mut document.settings, &message_event.event)?;
 
         if let Some(traversable_id) = traversable_id {
             if let Err(error) = self.tear_down_new_document_registry(traversable_id) {
@@ -2495,12 +2489,6 @@ impl ContentProcess {
     }
 }
 
-fn log_message_debug(message: impl AsRef<str>) {
-    if std::env::var_os("FORMAL_WEB_DEBUG_MESSAGES").is_some() {
-        debug!("{}", message.as_ref());
-    }
-}
-
 fn content_token_from_args() -> Result<Option<String>, String> {
     let mut args = env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -2644,17 +2632,17 @@ pub fn run_content_process_from_args() -> Result<(), String> {
     // Otherwise, use the native XPC backend (process launched by launchd).
     run_content_process(token.unwrap_or_default())
 }
-
-/// <https://html.spec.whatwg.org/#concept-event-fire>
-/// Fire a `message`/`messageerror` event at the realm's Window using
-/// MessageEvent, with the given origin, source, and data.
-fn fire_message_event(
+/// Build the MessageEvent for the `message`/`messageerror` event fired by
+/// the window post message steps (steps 8.4 and 8.7), with the message
+/// attributes and the trusted flag + timestamp of a user-agent-fired event.
+/// The caller fires it via <https://dom.spec.whatwg.org/#concept-event-fire>.
+fn build_message_event(
     settings: &mut EnvironmentSettingsObject,
     event_type: &str,
     origin: String,
     source: Option<JsObject>,
     data: JsValue,
-) -> Result<(), String> {
+) -> Result<MessageEvent, String> {
     let time_millis = settings.current_time_millis();
     let ec = &mut settings.realm_execution_context;
     let message_event = crate::html::MessageEvent::new(
@@ -2682,13 +2670,25 @@ fn fire_message_event(
     // Events fired by the user agent are trusted and carry the current time.
     *message_event.event.is_trusted.borrow_mut(ec) = true;
     *message_event.event.time_stamp.borrow_mut(ec) = time_millis;
+    Ok(message_event)
+}
+
+/// <https://dom.spec.whatwg.org/#concept-event-fire>
+/// Fire a pre-built event at the realm's Window: build the event path and
+/// dispatch (the fire-event algorithm with the event already created and
+/// initialized).
+fn fire_event_at_window(
+    settings: &mut EnvironmentSettingsObject,
+    event: &crate::dom::Event,
+) -> Result<(), String> {
+    let ec = &mut settings.realm_execution_context;
     let window_target = ec
         .with_object_any(&ec.realm_global_object())
         .and_then(|data| data.downcast_ref::<crate::html::Window>().cloned())
         .map(|window| window.get_event_target(ec))
         .ok_or_else(|| String::from("target window not found"))?;
     let path = simple_path(&window_target, ec);
-    dispatch_with_path(ec, &path, &message_event.event)
+    dispatch_with_path(ec, &path, event)
         .map(|_| ())
-        .map_err(|error| format!("failed to dispatch message event: {error:?}"))
+        .map_err(|error| format!("failed to dispatch event: {error:?}"))
 }

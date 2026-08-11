@@ -17,9 +17,6 @@
 
 use std::collections::HashMap;
 
-use crate::dom::DOMException;
-use crate::webidl::bindings::create_interface_instance;
-
 use ipc_messages::safe_passing_of_structured_data::{
     PrimitiveValue, SerializedRecord, TransferDataHolder,
 };
@@ -128,20 +125,6 @@ impl MemoryMap {
     }
 }
 
-// DataCloneError helper
-
-fn data_clone_error(ec: &mut dyn ExecutionContext<Types>) -> JsValue {
-    let obj = create_interface_instance::<Types, DOMException>(
-        DOMException::new(
-            String::from("The object could not be cloned."),
-            String::from("DataCloneError"),
-        ),
-        ec,
-    )
-    .expect("DOMException construction should not fail");
-    Types::value_from_object(obj)
-}
-
 // Bridge: JsValue → PrimitiveValue
 
 /// Convert a JsValue to its portable PrimitiveValue representation.
@@ -188,7 +171,7 @@ fn property_key_to_string(
     let key_str = ec.property_key_to_rust_string(key);
     // If the key string starts with "Symbol(", it's a Symbol key → DataCloneError.
     if key_str.starts_with("Symbol(") {
-        return Err(data_clone_error(ec));
+        return Err(crate::webidl::data_clone_error_value(ec));
     }
     Ok(key_str.encode_utf16().collect())
 }
@@ -223,7 +206,7 @@ fn structured_serialize_internal(
 
     // Step 5: If value is a Symbol, then throw a "DataCloneError" DOMException.
     if Types::value_as_symbol(value).is_some() {
-        return Err(data_clone_error(ec));
+        return Err(crate::webidl::data_clone_error_value(ec));
     }
 
     // Step 6: Let serialized be an uninitialized value.
@@ -326,7 +309,7 @@ fn structured_serialize_internal(
 
     // Step 21: Otherwise, if IsCallable(value) is true, then throw a "DataCloneError" DOMException.
     if ec.is_callable(value) {
-        return Err(data_clone_error(ec));
+        return Err(crate::webidl::data_clone_error_value(ec));
     }
 
     // Step 22: Otherwise, if value has any internal slot other than [[Prototype]], [[Extensible]],
@@ -392,7 +375,7 @@ fn serialize_array_buffer(
     // Step 13.2.1: If IsDetachedBuffer(value) is true, then throw a "DataCloneError" DOMException.
     let data = ec
         .array_buffer_data(buffer)
-        .ok_or_else(|| data_clone_error(ec))?;
+        .ok_or_else(|| crate::webidl::data_clone_error_value(ec))?;
 
     // Step 13.2.2: Let size be value.[[ArrayBufferByteLength]].
     let size = data.len() as u64;
@@ -427,7 +410,7 @@ fn serialize_shared_array_buffer(
     // TODO: Check cross-origin isolated capability.
     // Step 13.1.2: If forStorage is true, then throw a "DataCloneError" DOMException.
     if for_storage {
-        return Err(data_clone_error(ec));
+        return Err(crate::webidl::data_clone_error_value(ec));
     }
 
     // Step 13.1.3: If value has an [[ArrayBufferMaxByteLength]] internal slot, then
@@ -826,7 +809,7 @@ pub fn structured_serialize_with_transfer(
         let Some(object) = Types::value_as_object(transferable) else {
             // If transferable has neither an [[ArrayBufferData]] internal slot nor a
             // [[Detached]] internal slot, then throw a "DataCloneError" DOMException.
-            return Err(data_clone_error(ec));
+            return Err(crate::webidl::data_clone_error_value(ec));
         };
         let has_ab = Types::object_as_array_buffer(&object).is_some();
         let has_sab = Types::object_as_shared_array_buffer(&object).is_some();
@@ -834,18 +817,18 @@ pub fn structured_serialize_with_transfer(
         // Step 2.1: If transferable has neither an [[ArrayBufferData]] internal slot nor a
         //             [[Detached]] internal slot, then throw.
         if !has_ab && !has_sab && !is_transferable_platform_object(&object) {
-            return Err(data_clone_error(ec));
+            return Err(crate::webidl::data_clone_error_value(ec));
         }
 
         // Step 2.2: If transferable has an [[ArrayBufferData]] internal slot and
         //             IsSharedArrayBuffer(transferable) is true, then throw.
         if has_sab {
-            return Err(data_clone_error(ec));
+            return Err(crate::webidl::data_clone_error_value(ec));
         }
 
         // Step 2.3: If memory[transferable] exists, then throw.
         if memory.get_serialized(&object).is_some() {
-            return Err(data_clone_error(ec));
+            return Err(crate::webidl::data_clone_error_value(ec));
         }
 
         // Step 2.4: Set memory[transferable] to { [[Type]]: an uninitialized value }.
@@ -863,13 +846,14 @@ pub fn structured_serialize_with_transfer(
 
     // Step 5: For each transferable of transferList:
     for transferable in &transfer_list {
-        let object = Types::value_as_object(transferable).ok_or_else(|| data_clone_error(ec))?;
+        let object = Types::value_as_object(transferable)
+            .ok_or_else(|| crate::webidl::data_clone_error_value(ec))?;
         if let Some(buffer) = Types::object_as_array_buffer(&object) {
             // Step 5.1: If transferable has an [[ArrayBufferData]] internal slot:
             //   Step 5.1.1: If IsDetachedBuffer(transferable) is true, then throw.
             let data = ec
                 .array_buffer_data(&buffer)
-                .ok_or_else(|| data_clone_error(ec))?;
+                .ok_or_else(|| crate::webidl::data_clone_error_value(ec))?;
             let byte_length = data.len() as u64;
 
             // TODO: Check for [[ArrayBufferMaxByteLength]] (ResizableArrayBuffer case).
@@ -879,7 +863,7 @@ pub fn structured_serialize_with_transfer(
 
             // Step 5.1.4: Perform ? DetachArrayBuffer(transferable).
             ec.detach_array_buffer(buffer, None)
-                .map_err(|_| data_clone_error(ec))?;
+                .map_err(|_| crate::webidl::data_clone_error_value(ec))?;
 
             transfer_data_holders.push(TransferDataHolder::ArrayBuffer {
                 data: data_copy,
@@ -889,7 +873,7 @@ pub fn structured_serialize_with_transfer(
         } else {
             // Step 5.2: Otherwise (platform object with [[Detached]] internal slot).
             // TODO: platform object transfer.
-            return Err(data_clone_error(ec));
+            return Err(crate::webidl::data_clone_error_value(ec));
         }
     }
 
@@ -1044,7 +1028,7 @@ fn structured_deserialize(
                     data_copy.len() as u64,
                     None,
                 )
-                .map_err(|_| data_clone_error(ec))?;
+                .map_err(|_| crate::webidl::data_clone_error_value(ec))?;
             // Write data byte by byte using set_value_in_buffer with Uint8.
             for (i, byte) in data_copy.iter().enumerate() {
                 let byte_val = ec.value_from_number(*byte as f64);
@@ -1137,7 +1121,7 @@ fn structured_deserialize(
 
         // Step 22: Otherwise (platform object):
         SerializedRecord::PlatformObject { .. } => {
-            return Err(data_clone_error(ec));
+            return Err(crate::webidl::data_clone_error_value(ec));
         }
     }
 
@@ -1334,7 +1318,7 @@ pub fn structured_deserialize_with_transfer(
                 let intrinsics = ec.realm_intrinsics(&realm);
                 let buf = ec
                     .allocate_array_buffer(intrinsics.array_buffer.clone(), data.len() as u64, None)
-                    .map_err(|_| data_clone_error(ec))?;
+                    .map_err(|_| crate::webidl::data_clone_error_value(ec))?;
                 // Write data into the buffer byte by byte.
                 for (i, byte) in data.iter().enumerate() {
                     let byte_val = ec.value_from_number(*byte as f64);
