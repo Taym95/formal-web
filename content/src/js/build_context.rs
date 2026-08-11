@@ -92,7 +92,7 @@ fn setup_realm(engine: &mut Engine, _document: Rc<RefCell<BaseDocument>>) -> Res
     use crate::html::GlobalScope;
     use crate::html::{
         HTMLAnchorElement, HTMLElement, HTMLIFrameElement, HTMLInputElement, HTMLMediaElement,
-        HTMLVideoElement, Location, Window,
+        HTMLVideoElement, Location, MessageEvent, Window,
     };
     use crate::streams::{
         ByteLengthQueuingStrategy, CountQueuingStrategy, ReadableByteStreamController,
@@ -162,6 +162,7 @@ fn setup_realm(engine: &mut Engine, _document: Rc<RefCell<BaseDocument>>) -> Res
     reg!(EventTarget);
     reg!(DOMException);
     reg!(Event);
+    reg!(MessageEvent);
     reg!(UIEvent);
     reg!(MouseEvent);
     reg!(AbortSignal);
@@ -193,6 +194,7 @@ fn setup_realm(engine: &mut Engine, _document: Rc<RefCell<BaseDocument>>) -> Res
 
     // Step 6: Wire prototype chains.
     wire_registry_prototype::<crate::js::Types, UIEvent, Event>(engine);
+    wire_registry_prototype::<crate::js::Types, MessageEvent, Event>(engine);
     wire_registry_prototype::<crate::js::Types, MouseEvent, UIEvent>(engine);
     wire_registry_prototype::<crate::js::Types, AbortSignal, EventTarget>(engine);
     wire_registry_prototype::<crate::js::Types, Node, EventTarget>(engine);

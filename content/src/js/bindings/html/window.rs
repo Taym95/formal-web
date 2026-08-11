@@ -3,9 +3,9 @@ type JsObject = <crate::js::Types as JsTypes>::JsObject;
 
 use crate::html::windowproxy::resolve_window;
 use crate::html::{
-    Location, Window, WindowOrWorkerGlobalScope,
+    Location, PostMessageOptions, Window, WindowOrWorkerGlobalScope,
     safe_passing_of_structured_data::StructuredCloneOptions,
-    window_computed_style_properties_for_element,
+    window_computed_style_properties_for_element, window_post_message_steps,
 };
 use crate::js::bindings::html::global_event_handlers::define_global_event_handlers;
 use crate::js::platform_objects;
@@ -144,6 +144,15 @@ impl WebIdlInterface<crate::js::Types> for Window {
             exposed: None,
         });
         def.add_operation(OperationDef {
+            id: "postMessage",
+            length: 1,
+            method: post_message_method,
+            static_: false,
+            unforgeable: false,
+            promise_type: false,
+            exposed: None,
+        });
+        def.add_operation(OperationDef {
             id: "structuredClone",
             length: 1,
             method: structured_clone_method,
@@ -222,6 +231,105 @@ fn parse_structured_clone_options(
     Some(StructuredCloneOptions {
         transfer: Some(transfer),
     })
+}
+
+fn post_message_method(
+    this: &JsValue,
+    args: &[JsValue],
+    ec: &mut dyn ExecutionContext<crate::js::Types>,
+) -> Completion<JsValue, crate::js::Types> {
+    let undefined = ec.value_undefined();
+    let message = args.first().cloned().unwrap_or_else(|| undefined.clone());
+
+    // <https://html.spec.whatwg.org/#dom-window-postmessage-options>
+    // The `postMessage(message, options)` form takes a dictionary as its
+    // second argument; the legacy `postMessage(message, targetOrigin,
+    // transfer)` form takes a string.  Web IDL overload resolution picks the
+    // legacy form when the second argument is a string, and the options form
+    // otherwise (including `undefined`).
+    let is_legacy_form = args
+        .get(1)
+        .is_some_and(|second| crate::js::Types::value_as_string(second).is_some());
+    let options = if is_legacy_form {
+        let second = args.get(1).cloned().unwrap_or_else(|| undefined.clone());
+        let target_origin = ec.to_rust_string(second)?;
+        let transfer = parse_transfer_sequence(args.get(2), ec)?;
+        PostMessageOptions {
+            target_origin,
+            transfer,
+        }
+    } else {
+        let options_value = args.get(1).cloned().unwrap_or_else(|| undefined.clone());
+        PostMessageOptions {
+            target_origin: options_dict_string(&options_value, ec, "targetOrigin", "/")?,
+            transfer: options_dict_transfer(&options_value, ec)?,
+        }
+    };
+
+    let window_object = current_window_object_from(this, ec);
+    let window = ec
+        .with_object_any(&window_object)
+        .and_then(|data| data.downcast_ref::<Window>().cloned())
+        .ok_or_else(|| ec.new_type_error("receiver is not a Window"))?;
+    window_post_message_steps(&window, message, options, ec)?;
+    Ok(ec.value_undefined())
+}
+
+/// Read a string dictionary member, applying the Web IDL default when the
+/// member is absent or `undefined`.
+fn options_dict_string(
+    dict: &JsValue,
+    ec: &mut dyn ExecutionContext<crate::js::Types>,
+    key: &str,
+    default: &str,
+) -> Completion<String, crate::js::Types> {
+    let Some(object) = crate::js::Types::value_as_object(dict) else {
+        return Ok(default.to_owned());
+    };
+    let key_pk = ec.property_key_from_str(key);
+    let value = ExecutionContext::get(ec, object, key_pk)?;
+    if crate::js::Types::value_is_undefined(&value) {
+        return Ok(default.to_owned());
+    }
+    ec.to_rust_string(value)
+}
+
+/// Read the `transfer` member (a `sequence<object>`) from the options
+/// dictionary.
+fn options_dict_transfer(
+    dict: &JsValue,
+    ec: &mut dyn ExecutionContext<crate::js::Types>,
+) -> Completion<Vec<JsValue>, crate::js::Types> {
+    let Some(object) = crate::js::Types::value_as_object(dict) else {
+        return Ok(Vec::new());
+    };
+    let key_pk = ec.property_key_from_str("transfer");
+    let value = ExecutionContext::get(ec, object, key_pk)?;
+    parse_transfer_sequence(Some(&value), ec)
+}
+
+/// Convert the `transfer` argument (a `sequence<object>`) to a list of
+/// values.
+fn parse_transfer_sequence(
+    transfer_value: Option<&JsValue>,
+    ec: &mut dyn ExecutionContext<crate::js::Types>,
+) -> Completion<Vec<JsValue>, crate::js::Types> {
+    let Some(transfer_value) = transfer_value else {
+        return Ok(Vec::new());
+    };
+    let Some(transfer_object) = crate::js::Types::value_as_object(transfer_value) else {
+        return Ok(Vec::new());
+    };
+    let length_key = ec.property_key_from_str("length");
+    let length_value = ExecutionContext::get(ec, transfer_object.clone(), length_key)?;
+    let length = ec.to_length(length_value)?;
+    let mut transfer = Vec::with_capacity(length as usize);
+    for i in 0..length {
+        let index_key = ec.property_key_from_str(&i.to_string());
+        let item = ExecutionContext::get(ec, transfer_object.clone(), index_key)?;
+        transfer.push(item);
+    }
+    Ok(transfer)
 }
 
 fn open_method(

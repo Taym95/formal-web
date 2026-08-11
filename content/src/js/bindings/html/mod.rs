@@ -7,6 +7,7 @@ pub(crate) mod html_media_element;
 pub(crate) mod html_video_element;
 pub(crate) mod hyperlink_element_utils;
 mod location;
+pub(crate) mod message_event;
 mod window;
 
 pub(crate) use html_element::style_declaration_object;

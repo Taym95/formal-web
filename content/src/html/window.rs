@@ -1,8 +1,9 @@
-use log::error;
+use log::{debug, error};
 use std::collections::{BTreeMap, HashMap};
 
 use ipc::IpcSender;
-use ipc_messages::content::{Event as ContentEvent, UserNavigationInvolvement};
+use ipc_messages::content::{Event as ContentEvent, NavigableId, UserNavigationInvolvement};
+use ipc_messages::structured_clone::PostMessageRequest;
 
 use js_engine::{Completion, ExecutionContext, JsTypes};
 
@@ -10,10 +11,14 @@ use crate::js::{Engine, Types};
 
 type JsValue = <Types as JsTypes>::JsValue;
 
+use crate::dom::DOMException;
 use crate::dom::Element;
 use crate::dom::event::{EventTarget, EventTargetAccess};
+use crate::js::platform_objects::with_global_scope;
+use crate::webidl::bindings::create_interface_instance;
 
 use super::resolved_style_properties_for_element;
+use super::safe_passing_of_structured_data::structured_serialize_with_transfer;
 use super::windowproxy::create_window_proxy;
 use super::{GlobalScope, the_rules_for_choosing_a_navigable};
 use js_engine::gc_struct;
@@ -102,6 +107,129 @@ pub(crate) fn window_computed_style_properties_for_element(
 
 // Window open steps
 // https://html.spec.whatwg.org/#window-open-steps
+
+/// <https://html.spec.whatwg.org/#dictdef-windowpostmessageoptions>
+#[derive(Default)]
+pub(crate) struct PostMessageOptions {
+    /// <https://html.spec.whatwg.org/#dom-windowpostmessageoptions-targetorigin>
+    pub target_origin: String,
+    /// <https://html.spec.whatwg.org/#dom-windowpostmessageoptions-transfer>
+    pub transfer: Vec<JsValue>,
+}
+
+fn message_debug_enabled() -> bool {
+    std::env::var_os("FORMAL_WEB_DEBUG_MESSAGES").is_some()
+}
+
+/// <https://html.spec.whatwg.org/#window-post-message-steps>
+pub(crate) fn window_post_message_steps(
+    target_window: &Window,
+    message: JsValue,
+    options: PostMessageOptions,
+    ec: &mut dyn ExecutionContext<crate::js::Types>,
+) -> Completion<(), crate::js::Types> {
+    // Step 1: Let targetRealm be targetWindow's realm.
+    // Note: The target realm is resolved in the target content process, which
+    // owns the targetWindow's realm; the deserialization of step 8.4 runs
+    // there.  The message therefore carries only the serialized data.
+
+    // Step 2: Let incumbentSettings be the incumbent settings object.
+    let (source_navigable_id, source_origin, event_sender) = with_global_scope(
+        ec,
+        |global_scope,
+         _ec|
+         -> Completion<
+            (
+                Option<NavigableId>,
+                Option<String>,
+                Option<IpcSender<ContentEvent>>,
+            ),
+            crate::js::Types,
+        > {
+            Ok((
+                global_scope.source_navigable_id(),
+                global_scope
+                    .creation_url()
+                    .map(|url| url.origin().unicode_serialization()),
+                global_scope.event_sender(),
+            ))
+        },
+    )?;
+    let Some(source_navigable_id) = source_navigable_id else {
+        return Err(ec.new_type_error("postMessage: no source navigable"));
+    };
+    let Some(source_origin) = source_origin else {
+        return Err(ec.new_type_error("postMessage: no source origin"));
+    };
+    let Some(event_sender) = event_sender else {
+        return Err(ec.new_type_error("postMessage: no event sender"));
+    };
+    let Some(target_navigable_id) = target_window.global_scope.source_navigable_id() else {
+        return Err(ec.new_type_error("postMessage: no target navigable"));
+    };
+
+    // Step 3: Let targetOrigin be options["targetOrigin"].
+    let mut target_origin = options.target_origin;
+
+    // Step 4: If targetOrigin is a single U+002F SOLIDUS character (/), then
+    //         set targetOrigin to incumbentSettings's origin.
+    if target_origin == "/" {
+        target_origin = source_origin.clone();
+    } else if target_origin != "*" {
+        // Step 5: Otherwise, if targetOrigin is not a single U+002A ASTERISK
+        //         character (*):
+        // Step 5.1: Let parsedURL be the result of running the URL parser on
+        //           targetOrigin.
+        // Step 5.2: If parsedURL is failure, then throw a "SyntaxError"
+        //           DOMException.
+        let parsed_url = url::Url::parse(&target_origin).map_err(|_| syntax_error(ec))?;
+
+        // Step 5.3: Set targetOrigin to parsedURL's origin.
+        target_origin = parsed_url.origin().unicode_serialization();
+    }
+
+    // Step 6: Let transfer be options["transfer"].
+    let transfer = options.transfer;
+
+    // Step 7: Let serializeWithTransferResult be
+    //         StructuredSerializeWithTransfer(message, transfer). Rethrow
+    //         any exceptions.
+    let serialize_result = structured_serialize_with_transfer(&message, transfer, ec)?;
+
+    if message_debug_enabled() {
+        debug!(
+            "[message-debug][source] postMessage target_navigable={} target_origin={} source_navigable={} source_origin={} transfer_holders={}",
+            target_navigable_id,
+            target_origin,
+            source_navigable_id,
+            source_origin,
+            serialize_result.transfer_data_holders.len()
+        );
+    }
+
+    // Step 8: Queue a global task on the posted message task source given
+    //         targetWindow to run the following steps.
+    // Note: The content process runs steps 1–7; the user agent runs step 8
+    // (routing the message to the target window's event loop), and the target
+    // content process runs the substeps of step 8.
+    event_sender
+        .send(ContentEvent::PostMessageRequested(PostMessageRequest {
+            target_navigable_id,
+            target_origin,
+            source_navigable_id,
+            source_origin,
+            serialized: serialize_result.serialized,
+            transfer_data_holders: serialize_result.transfer_data_holders,
+        }))
+        .map_err(|error| ec.new_type_error(&format!("postMessage: {error}")))
+}
+
+/// <https://webidl.spec.whatwg.org/#syntaxerror>
+fn syntax_error(ec: &mut dyn ExecutionContext<crate::js::Types>) -> JsValue {
+    let obj = create_interface_instance::<Types, DOMException>(DOMException::syntax_error(), ec)
+        .expect("DOMException construction should not fail");
+    Types::value_from_object(obj)
+}
 
 /// <https://html.spec.whatwg.org/#window-open-steps>
 pub(crate) fn window_open_steps(

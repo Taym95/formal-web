@@ -121,6 +121,32 @@ Documents can be created either by the user agent (for startup, iframes, UA-orig
 
 Both paths converge to the same final state.
 
+## Posting messages (`window_post_message_steps`)
+
+Implements <https://html.spec.whatwg.org/#window-post-message-steps>, split
+across all three sides:
+
+| Side | Runs |
+|------|------|
+| **Source content** | Steps 1–7: resolve the incumbent origin and the target navigable, process `targetOrigin`, run `StructuredSerializeWithTransfer` (`window.rs:window_post_message_steps`) |
+| **User agent** | Step 8: queue a global task on the posted message task source given targetWindow by routing `ContentCommand::PostMessage` to the target navigable's event loop (`user_agent.rs:handle_post_message`), even when the target window lives in the same event loop |
+| **Target content** | Substeps 8.1–8.7: origin check, deserialize with the target realm, fire `message`/`messageerror` via `MessageEvent` (`main.rs:dispatch_post_message`) |
+
+The wire payload is `PostMessageRequest` (`ipc_messages::structured_clone`):
+the serialized record, the transfer data holders, the processed target origin,
+and the source navigable + origin.  The serialized record and holders are
+pure data so the same payload crosses content→UA and UA→content.
+
+Transfer identity: `StructuredSerializeWithTransfer` places
+`SerializedRecord::TransferredValue(index)` records in the serialized graph in
+place of each transferable; the holders list at `index` carries the data, and
+`StructuredDeserializeWithTransfer` rebuilds the values and resolves the
+records by index.  Record identity cannot cross an IPC boundary, which is why
+the implementation does not follow the spec's shared-record identity model.
+
+The source Window (step 8.3) is resolved in the target process from the
+source navigable id; a cross-process source currently leaves `source` null.
+
 ## The rules for choosing a navigable (`the_rules_for_choosing_a_navigable`)
 
 Implements <https://html.spec.whatwg.org/#the-rules-for-choosing-a-navigable>.
@@ -266,7 +292,17 @@ unreachable because `is_platform_object_same_origin` is hardcoded to `true`.
 
 ### Remaining gaps
 
-**1. Child navigable properties (array-index and named).**
+**1. Cross-context WindowProxy access throws in V8.**
+Accessing a property on a window opened via `window.open` from the opener's
+realm throws `TypeError: no access` in V8: the WindowProxy is a plain Proxy
+whose target is the child context's global object, and V8 rejects property
+gets on another context's global from a different context.  Verified by a
+realm-level test (`get_v` on a child-realm global from the parent realm).
+Cross-window APIs (postMessage to an opened window, `contentWindow`) are
+blocked by this until the proxy resolves properties through the target
+realm's context.
+
+**2. Child navigable properties (array-index and named).**
 The spec requires WindowProxy to expose child browsing contexts by numeric
 index (`window[0]`, `window[1]`) and by name.  This requires tracking the
 document-tree child navigables on the Document, which is not yet implemented.

@@ -4,8 +4,9 @@
 //! deserialization of JavaScript values across realm boundaries, and support
 //! for transferable and serializable platform objects.
 //!
-//! The `SerializedRecord` and `PrimitiveValue` types are pure data (serde-serializable)
-//! so they can cross IPC boundaries.
+//! The `SerializedRecord`, `PrimitiveValue`, and `TransferDataHolder` types
+//! are pure data (serde-serializable) so they can cross IPC boundaries; they
+//! live in `ipc_messages::structured_clone`.
 
 // The traits, variants, and fields below that trigger dead_code warnings
 // are intentionally defined as the spec-required extension points for
@@ -18,6 +19,8 @@ use std::collections::HashMap;
 
 use crate::dom::DOMException;
 use crate::webidl::bindings::create_interface_instance;
+
+use ipc_messages::structured_clone::{PrimitiveValue, SerializedRecord, TransferDataHolder};
 
 use js_engine::{
     Completion, EcmascriptHost, ExecutionContext, JsTypes, enums::TypedArrayElementType,
@@ -77,93 +80,10 @@ pub trait Transferable: std::fmt::Debug {
 }
 
 // Pure-data types (IPC-safe)
-
-/// A primitive JavaScript value in a portable, serializable form.
-#[derive(Debug, Clone)]
-pub enum PrimitiveValue {
-    /// The `undefined` value.
-    Undefined,
-    /// The `null` value.
-    Null,
-    /// A boolean.
-    Boolean(bool),
-    /// A 64-bit floating point number.
-    Number(f64),
-    /// A string, stored as UTF-16 code units to preserve unpaired surrogates.
-    String(Vec<u16>),
-    /// A BigInt, represented as its decimal string.
-    BigInt(String),
-}
-
-/// <https://html.spec.whatwg.org/#structuredserializeinternal>
-///
-/// A serialized representation of a JavaScript value (corresponds to a Record
-/// in the spec). All fields are plain Rust types so the enum can cross IPC
-/// boundaries.
-#[derive(Debug, Clone)]
-pub enum SerializedRecord {
-    /// { [[Type]]: "primitive", [[Value]]: value }
-    Primitive(PrimitiveValue),
-    /// { [[Type]]: "Boolean", [[BooleanData]]: bool }
-    Boolean(bool),
-    /// { [[Type]]: "Number", [[NumberData]]: f64 }
-    Number(f64),
-    /// { [[Type]]: "BigInt", [[BigIntData]]: string }
-    BigInt(String),
-    /// { [[Type]]: "String", [[StringData]]: string (as UTF-16 code units) }
-    String(Vec<u16>),
-    /// { [[Type]]: "Date", [[DateValue]]: f64 }
-    Date(f64),
-    /// { [[Type]]: "RegExp", [[OriginalSource]], [[OriginalFlags]] }
-    RegExp { source: String, flags: String },
-    /// { [[Type]]: "SharedArrayBuffer" }  — raw bytes + metadata
-    SharedArrayBuffer {
-        data: Vec<u8>,
-        agent_cluster: String,
-    },
-    /// { [[Type]]: "ArrayBuffer", [[ArrayBufferData]]: dataCopy, [[ArrayBufferByteLength]]: size }
-    ArrayBuffer {
-        data: Vec<u8>,
-        byte_length: u64,
-        max_byte_length: Option<u64>,
-    },
-    /// { [[Type]]: "ArrayBufferView" }
-    /// When [[Constructor]] is "DataView":
-    ///   { [[ArrayBufferSerialized]]: bufferSerialized, [[ByteLength]]: byteLength, [[ByteOffset]]: byteOffset }
-    /// Otherwise (typed array):
-    ///   { [[Constructor]]: constructor, [[ArrayBufferSerialized]]: bufferSerialized,
-    ///     [[ByteLength]]: byteLength, [[ByteOffset]]: byteOffset, [[ArrayLength]]: arrayLength }
-    ArrayBufferView {
-        constructor: String,
-        buffer_serialized: Box<SerializedRecord>,
-        byte_length: u64,
-        byte_offset: u64,
-        array_length: Option<u64>,
-    },
-    /// { [[Type]]: "Map" }
-    Map(Vec<(SerializedRecord, SerializedRecord)>),
-    /// { [[Type]]: "Set" }
-    Set(Vec<SerializedRecord>),
-    /// { [[Type]]: "Error" }
-    Error {
-        name: String,
-        message: Option<String>,
-        stack: String,
-        cause: Option<Box<SerializedRecord>>,
-    },
-    /// { [[Type]]: "Array" }
-    Array {
-        length: u64,
-        properties: Vec<(Vec<u16>, SerializedRecord)>,
-    },
-    /// Platform object implementing [Serializable].
-    PlatformObject {
-        interface_name: String,
-        fields: HashMap<String, SerializedRecord>,
-    },
-    /// { [[Type]]: "Object" }
-    Object(Vec<(Vec<u16>, SerializedRecord)>),
-}
+//
+// `PrimitiveValue`, `SerializedRecord`, and `TransferDataHolder` live in
+// `ipc_messages::structured_clone`; they are the wire format for the
+// structured clone algorithm across the content/user-agent IPC boundary.
 
 // Memory map (for cycle/duplicate detection)
 
@@ -174,6 +94,11 @@ pub enum SerializedRecord {
 pub struct MemoryMap {
     serialized: HashMap<usize, SerializedRecord>,
     deserialized: HashMap<usize, JsObject>,
+    /// Values rebuilt from the transfer data holders by
+    /// StructuredDeserializeWithTransfer step 3, indexed by transfer-list
+    /// position; `SerializedRecord::TransferredValue(index)` resolves here.
+    /// <https://html.spec.whatwg.org/#structureddeserializewithtransfer>
+    transferred_values: Vec<JsValue>,
 }
 
 impl MemoryMap {
@@ -195,6 +120,9 @@ impl MemoryMap {
     fn insert_deserialized(&mut self, record: &SerializedRecord, object: JsObject) {
         let addr = std::ptr::from_ref(record).addr();
         self.deserialized.insert(addr, object);
+    }
+    fn transferred_value(&self, index: usize) -> Option<JsValue> {
+        self.transferred_values.get(index).cloned()
     }
 }
 
@@ -882,27 +810,6 @@ pub struct SerializeWithTransferResult {
     pub transfer_data_holders: Vec<TransferDataHolder>,
 }
 
-/// A data holder for a transferred value (pure data, IPC-safe).
-///
-/// Corresponds to a Record from StructuredSerializeWithTransfer step 5.
-#[derive(Debug, Clone)]
-pub enum TransferDataHolder {
-    /// { [[Type]]: "ArrayBuffer", [[ArrayBufferData]]: dataCopy,
-    ///   [[ArrayBufferByteLength]]: byteLength }
-    /// or { [[Type]]: "ResizableArrayBuffer", [[ArrayBufferData]]: dataCopy,
-    ///   [[ArrayBufferByteLength]]: byteLength, [[ArrayBufferMaxByteLength]]: maxByteLength }
-    ArrayBuffer {
-        data: Vec<u8>,
-        byte_length: u64,
-        max_byte_length: Option<u64>,
-    },
-    /// A platform object implementing [Transferable].
-    PlatformObject {
-        interface_name: String,
-        fields: HashMap<String, JsValue>,
-    },
-}
-
 /// <https://html.spec.whatwg.org/#structuredserializewithtransfer>
 pub fn structured_serialize_with_transfer(
     value: &JsValue,
@@ -913,7 +820,7 @@ pub fn structured_serialize_with_transfer(
     let mut memory = MemoryMap::default();
 
     // Step 2: For each transferable of transferList:
-    for transferable in &transfer_list {
+    for (index, transferable) in transfer_list.iter().enumerate() {
         let Some(object) = Types::value_as_object(transferable) else {
             // If transferable has neither an [[ArrayBufferData]] internal slot nor a
             // [[Detached]] internal slot, then throw a "DataCloneError" DOMException.
@@ -940,11 +847,10 @@ pub fn structured_serialize_with_transfer(
         }
 
         // Step 2.4: Set memory[transferable] to { [[Type]]: an uninitialized value }.
-        let placeholder_addr = std::ptr::from_ref(&object).addr();
-        memory.serialized.insert(
-            placeholder_addr,
-            SerializedRecord::Primitive(PrimitiveValue::Undefined),
-        );
+        // Note: The spec's "uninitialized" dataHolder record is represented by a
+        // transfer-list index so the graph stays IPC-serializable (see the
+        // `TransferredValue` variant).  Step 5 fills the actual holder list.
+        memory.insert_serialized(&object, SerializedRecord::TransferredValue(index));
     }
 
     // Step 3: Let serialized be ? StructuredSerializeInternal(value, false, memory).
@@ -959,30 +865,19 @@ pub fn structured_serialize_with_transfer(
         if let Some(buffer) = Types::object_as_array_buffer(&object) {
             // Step 5.1: If transferable has an [[ArrayBufferData]] internal slot:
             //   Step 5.1.1: If IsDetachedBuffer(transferable) is true, then throw.
-            if ec.array_buffer_data(&buffer).is_none() {
-                return Err(data_clone_error(ec));
-            }
-
-            // TODO: Check for [[ArrayBufferMaxByteLength]] (ResizableArrayBuffer case).
-
-            // Step 5.1.4: Perform ? DetachArrayBuffer(transferable).
             let data = ec
                 .array_buffer_data(&buffer)
                 .ok_or_else(|| data_clone_error(ec))?;
             let byte_length = data.len() as u64;
+
+            // TODO: Check for [[ArrayBufferMaxByteLength]] (ResizableArrayBuffer case).
+            // Step 5.1.x: Set dataHolder.[[ArrayBufferData]] to transferable.[[ArrayBufferData]]
+            //             and [[ArrayBufferByteLength]] to transferable.[[ArrayBufferByteLength]].
             let data_copy = data.to_vec();
 
             // Step 5.1.4: Perform ? DetachArrayBuffer(transferable).
-            // Wrap in a closure to catch panics from Boa's GcRefCell borrow.
-            let detach_fn = |ec: &mut dyn ExecutionContext<Types>| -> Completion<(), Types> {
-                ec.detach_array_buffer(buffer, None)
-            };
-            let _ = detach_fn(ec);
-            // Note: detach errors are ignored — most structuredClone tests don't
-            // need the buffer to be detached, and Boa's detach may panic on buffers
-            // shared with TypedArray views.  The enqueue-with-detached-buffer test
-            // DOES need the buffer detached; when this is called from that test's
-            // pull handler the buffer is not shared, so detach succeeds.
+            ec.detach_array_buffer(buffer, None)
+                .map_err(|_| data_clone_error(ec))?;
 
             transfer_data_holders.push(TransferDataHolder::ArrayBuffer {
                 data: data_copy,
@@ -1037,6 +932,15 @@ fn structured_deserialize(
         // Step 5: If serialized.[[Type]] is "primitive", then set value to serialized.[[Value]].
         SerializedRecord::Primitive(p) => {
             value = deserialize_primitive_value(p, ec)?;
+        }
+
+        // The transfer-list reference resolves to the value rebuilt from the
+        // corresponding transfer data holder (StructuredDeserializeWithTransfer
+        // step 3).
+        SerializedRecord::TransferredValue(index) => {
+            value = memory
+                .transferred_value(*index)
+                .ok_or_else(|| ec.new_type_error("missing transferred value"))?;
         }
 
         // Step 6: Otherwise, if serialized.[[Type]] is "Boolean", then set value to a new Boolean
@@ -1444,23 +1348,17 @@ pub fn structured_deserialize_with_transfer(
                 let buf_obj = Types::object_from_array_buffer(buf);
                 Types::value_from_object(buf_obj)
             }
-
-            // Step 3.3: Otherwise (platform object).
-            TransferDataHolder::PlatformObject { .. } => {
-                // TODO: platform object transfer-receiving.
-                return Err(data_clone_error(ec));
-            }
         };
 
         // Step 3.4: Set memory[transferDataHolder] to value.
-        if let Some(obj) = Types::value_as_object(&value) {
-            memory
-                .insert_deserialized(&SerializedRecord::Primitive(PrimitiveValue::Undefined), obj);
-        }
-
-        // Step 3.5: Append value to transferredValues.
+        // Note: The spec keys the memory map by the dataHolder record itself.
+        // Record identity cannot cross an IPC boundary, so the transferred
+        // values are kept in a list indexed by transfer-list position; the
+        // `TransferredValue(index)` records in the serialized graph resolve
+        // here.
         transferred_values.push(value);
     }
+    memory.transferred_values = transferred_values.clone();
 
     // Step 4: Let deserialized be ? StructuredDeserialize(
     //           serializeWithTransferResult.[[Serialized]], targetRealm, memory).

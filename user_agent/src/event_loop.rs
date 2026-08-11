@@ -186,6 +186,7 @@ fn requires_command_completed_wakeup(command: &ContentCommand) -> bool {
             | ContentCommand::RunWindowTimer { .. }
             | ContentCommand::CompleteDocumentFetch { .. }
             | ContentCommand::FailDocumentFetch { .. }
+            | ContentCommand::PostMessage { .. }
     )
 }
 
@@ -436,6 +437,16 @@ impl EventLoopWorker {
                         request,
                     })
                     .map_err(|error| format!("failed to send navigation request: {error}"))?;
+            }
+
+            ContentEvent::PostMessageRequested(request) => {
+                // <https://html.spec.whatwg.org/#window-post-message-steps> step 8:
+                // the user agent queues a global task on the posted message task
+                // source given targetWindow and routes it to the target window's
+                // event loop.
+                self.user_agent_command_sender
+                    .send(UserAgentCommand::PostMessage { request })
+                    .map_err(|error| format!("failed to send postMessage request: {error}"))?;
             }
 
             ContentEvent::BeforeUnloadCompleted(result) => {

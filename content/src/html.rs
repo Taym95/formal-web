@@ -20,6 +20,7 @@ mod html_parser;
 pub(crate) mod html_video_element;
 mod hyperlink_element_utils;
 mod location;
+pub(crate) mod message_event;
 pub(crate) mod safe_passing_of_structured_data;
 pub(crate) mod ui_events;
 mod window;
@@ -57,8 +58,10 @@ pub use html_video_element::HTMLVideoElement;
 pub(crate) use hyperlink_element_utils::HyperlinkElementUtils;
 pub use location::Location;
 pub(crate) use location::LocationError;
+pub(crate) use message_event::{MessageEvent, MessageEventInit};
 pub use window::Window;
 pub(crate) use window::window_computed_style_properties_for_element;
+pub(crate) use window::{PostMessageOptions, window_post_message_steps};
 pub(crate) use window_or_worker_global_scope::WindowOrWorkerGlobalScope;
 
 use blitz_dom::{BaseDocument, DocumentConfig};

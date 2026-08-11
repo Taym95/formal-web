@@ -13,6 +13,7 @@ use ipc_messages::content::{
     FrameId, LoadedDocumentResponse, NavigableId, NavigateRequest, NavigationFetchId, NavigationId,
     NewTraversableInfo, UserNavigationInvolvement, WebviewId, WindowTimerKey, iframe_target_name,
 };
+use ipc_messages::structured_clone::PostMessageRequest;
 use log::{debug, error, info, trace};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -876,6 +877,12 @@ pub enum UserAgentCommand {
         event_loop_id: Option<EventLoopId>,
         request: NavigateRequest,
     },
+    /// <https://html.spec.whatwg.org/#window-post-message-steps> step 8: the
+    /// user agent queues a global task on the posted message task source given
+    /// targetWindow and routes the message to the target window's event loop.
+    PostMessage {
+        request: PostMessageRequest,
+    },
     CompleteBeforeUnload {
         result: BeforeUnloadResult,
     },
@@ -1153,6 +1160,10 @@ fn input_debug_enabled() -> bool {
     std::env::var_os("FORMAL_WEB_DEBUG_INPUT").is_some()
 }
 
+fn message_debug_enabled() -> bool {
+    std::env::var_os("FORMAL_WEB_DEBUG_MESSAGES").is_some()
+}
+
 /// <https://html.spec.whatwg.org/multipage/#the-rules-for-choosing-a-navigable>
 fn normalize_navigation_target_name(target_name: &str) -> String {
     if target_name.eq_ignore_ascii_case("_self") {
@@ -1428,6 +1439,9 @@ impl UserAgentWorker {
                         request,
                     } => {
                         self.handle_navigate(event_loop_id, request);
+                    }
+                    UserAgentCommand::PostMessage { request } => {
+                        self.handle_post_message(request);
                     }
                     UserAgentCommand::CompleteBeforeUnload { result } => {
                         self.handle_complete_before_unload(result);
@@ -3569,6 +3583,33 @@ impl UserAgentWorker {
         let _ = entry
             .command_sender
             .send(EventLoopCommand::FireAndForget { command });
+    }
+
+    /// <https://html.spec.whatwg.org/#window-post-message-steps> step 8:
+    /// queue a global task on the posted message task source given targetWindow
+    /// by routing the message to the target window's event loop, even when the
+    /// target window lives in the same event loop as the source (no
+    /// same-process optimization at this stage).
+    fn handle_post_message(&mut self, request: PostMessageRequest) {
+        let Ok(command_sender) = self.command_sender_for_traversable(request.target_navigable_id)
+        else {
+            error!(
+                "postMessage: no event loop for target navigable {}",
+                request.target_navigable_id
+            );
+            return;
+        };
+        if message_debug_enabled() {
+            debug!(
+                "[message-debug][user-agent] route postMessage target_navigable={} source_navigable={}",
+                request.target_navigable_id, request.source_navigable_id
+            );
+        }
+        if let Err(error) = command_sender.send(EventLoopCommand::FireAndForget {
+            command: ContentCommand::PostMessage(request),
+        }) {
+            error!("postMessage: failed to queue message task: {error}");
+        }
     }
 
     /// Milliseconds since the Unix epoch of `instant`, measured on the
