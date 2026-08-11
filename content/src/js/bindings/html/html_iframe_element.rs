@@ -1,4 +1,5 @@
 use crate::html::HTMLIFrameElement;
+use crate::html::windowproxy::create_window_proxy;
 use crate::js::try_with_event_target_mut;
 use crate::webidl::bindings::{AttributeDef, InterfaceDefinition, WebIdlInterface};
 use crate::webidl::{callback_function_value, nullable_value};
@@ -378,6 +379,17 @@ fn get_content_window(
     _: &[JsValue],
     ec: &mut dyn ExecutionContext<Types>,
 ) -> Completion<JsValue, Types> {
-    let _ = try_with_html_iframe_element_ref(this, ec, |_iframe| ())?;
-    Ok(ec.value_null())
+    let node_id = try_with_html_iframe_element_ref(this, ec, |iframe| {
+        iframe.html_element.element.node.node_id
+    })?;
+    // <https://html.spec.whatwg.org/#dom-htmliframeelement-contentwindow>
+    // Resolve the content navigable from the realm's registry and hand out
+    // its WindowProxy shim (created in this realm, cached per navigable).
+    let navigable_id = crate::js::platform_objects::with_global_scope(ec, |global_scope, ec| {
+        Ok(global_scope.iframe_content_navigable(node_id, ec))
+    })?;
+    let Some(navigable_id) = navigable_id else {
+        return Ok(ec.value_null());
+    };
+    create_window_proxy(navigable_id, None, ec)
 }

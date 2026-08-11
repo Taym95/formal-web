@@ -92,7 +92,7 @@ fn setup_realm(engine: &mut Engine, _document: Rc<RefCell<BaseDocument>>) -> Res
     use crate::html::GlobalScope;
     use crate::html::{
         HTMLAnchorElement, HTMLElement, HTMLIFrameElement, HTMLInputElement, HTMLMediaElement,
-        HTMLVideoElement, Location, MessageEvent, Window,
+        HTMLVideoElement, Location, MessageEvent, Window, WindowProxy,
     };
     use crate::streams::{
         ByteLengthQueuingStrategy, CountQueuingStrategy, ReadableByteStreamController,
@@ -177,6 +177,7 @@ fn setup_realm(engine: &mut Engine, _document: Rc<RefCell<BaseDocument>>) -> Res
     reg!(HTMLMediaElement);
     reg!(HTMLVideoElement);
     reg!(Window);
+    reg!(WindowProxy);
     reg!(Location);
     reg!(ByteLengthQueuingStrategy);
     reg!(CountQueuingStrategy);

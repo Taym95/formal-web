@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use ipc::IpcSender;
 use ipc_messages::content::{Event as ContentEvent, NavigableId, UserNavigationInvolvement};
-use ipc_messages::structured_clone::PostMessageRequest;
+use ipc_messages::safe_passing_of_structured_data::PostMessageRequest;
 
 use js_engine::{Completion, ExecutionContext, JsTypes};
 
@@ -108,7 +108,7 @@ pub(crate) fn window_computed_style_properties_for_element(
 // Window open steps
 // https://html.spec.whatwg.org/#window-open-steps
 
-/// <https://html.spec.whatwg.org/#dictdef-windowpostmessageoptions>
+/// <https://html.spec.whatwg.org/#windowpostmessageoptions>
 #[derive(Default)]
 pub(crate) struct PostMessageOptions {
     /// <https://html.spec.whatwg.org/#dom-windowpostmessageoptions-targetorigin>
@@ -123,7 +123,7 @@ fn message_debug_enabled() -> bool {
 
 /// <https://html.spec.whatwg.org/#window-post-message-steps>
 pub(crate) fn window_post_message_steps(
-    target_window: &Window,
+    target_navigable_id: NavigableId,
     message: JsValue,
     options: PostMessageOptions,
     ec: &mut dyn ExecutionContext<crate::js::Types>,
@@ -163,9 +163,6 @@ pub(crate) fn window_post_message_steps(
     };
     let Some(event_sender) = event_sender else {
         return Err(ec.new_type_error("postMessage: no event sender"));
-    };
-    let Some(target_navigable_id) = target_window.global_scope.source_navigable_id() else {
-        return Err(ec.new_type_error("postMessage: no target navigable"));
     };
 
     // Step 3: Let targetOrigin be options["targetOrigin"].
@@ -402,7 +399,10 @@ pub(crate) fn window_open_steps(
     let window = result
         .return_window
         .expect("window_open_steps: all navigable branches set a return window");
-    create_window_proxy(&window, ec)
+    let target_navigable_id = result
+        .chosen_navigable_id
+        .expect("window_open_steps: a return window implies a chosen navigable");
+    create_window_proxy(target_navigable_id, Some(window), ec)
 }
 
 /// <https://html.spec.whatwg.org/#get-noopener-for-window-open>

@@ -63,6 +63,7 @@ pub use window::Window;
 pub(crate) use window::window_computed_style_properties_for_element;
 pub(crate) use window::{PostMessageOptions, window_post_message_steps};
 pub(crate) use window_or_worker_global_scope::WindowOrWorkerGlobalScope;
+pub(crate) use windowproxy::WindowProxy;
 
 use blitz_dom::{BaseDocument, DocumentConfig};
 use std::{cell::RefCell, rc::Rc};

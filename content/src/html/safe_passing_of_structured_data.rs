@@ -6,7 +6,7 @@
 //!
 //! The `SerializedRecord`, `PrimitiveValue`, and `TransferDataHolder` types
 //! are pure data (serde-serializable) so they can cross IPC boundaries; they
-//! live in `ipc_messages::structured_clone`.
+//! live in `ipc_messages::safe_passing_of_structured_data`.
 
 // The traits, variants, and fields below that trigger dead_code warnings
 // are intentionally defined as the spec-required extension points for
@@ -20,7 +20,9 @@ use std::collections::HashMap;
 use crate::dom::DOMException;
 use crate::webidl::bindings::create_interface_instance;
 
-use ipc_messages::structured_clone::{PrimitiveValue, SerializedRecord, TransferDataHolder};
+use ipc_messages::safe_passing_of_structured_data::{
+    PrimitiveValue, SerializedRecord, TransferDataHolder,
+};
 
 use js_engine::{
     Completion, EcmascriptHost, ExecutionContext, JsTypes, enums::TypedArrayElementType,
@@ -82,7 +84,7 @@ pub trait Transferable: std::fmt::Debug {
 // Pure-data types (IPC-safe)
 //
 // `PrimitiveValue`, `SerializedRecord`, and `TransferDataHolder` live in
-// `ipc_messages::structured_clone`; they are the wire format for the
+// `ipc_messages::safe_passing_of_structured_data`; they are the wire format for the
 // structured clone algorithm across the content/user-agent IPC boundary.
 
 // Memory map (for cycle/duplicate detection)

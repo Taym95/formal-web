@@ -1,5 +1,6 @@
-//! Wire types for the structured clone algorithm
-//! (<https://html.spec.whatwg.org/#safe-passing-of-structured-data>).
+//! Wire types for the safe passing of structured data
+//! (<https://html.spec.whatwg.org/#safe-passing-of-structured-data>), the
+//! spec section that defines the structured serialization algorithms.
 //!
 //! [`SerializedRecord`] is the IPC-safe serialized representation of a
 //! JavaScript value produced by StructuredSerializeInternal

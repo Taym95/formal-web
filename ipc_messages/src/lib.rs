@@ -3,4 +3,4 @@ pub mod graphics;
 pub mod network;
 
 pub mod media;
-pub mod structured_clone;
+pub mod safe_passing_of_structured_data;

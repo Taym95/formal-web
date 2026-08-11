@@ -51,6 +51,35 @@ pub struct CachedNodeObject {
     pub object: JsObject,
 }
 
+/// A cached WindowProxy shim for a navigable, keyed by navigable id.
+/// The cache lives on the realm's GlobalScope so the same shim object is
+/// returned for `event.source`, `iframe.contentWindow`, and `window.open`
+/// results referring to the same navigable.
+/// <https://html.spec.whatwg.org/#the-windowproxy-exotic-object>
+#[gc_struct]
+pub struct CachedWindowProxy {
+    /// <https://html.spec.whatwg.org/#navigable-id>
+    #[ignore_trace]
+    pub navigable_id: ipc_messages::content::NavigableId,
+
+    /// <https://html.spec.whatwg.org/#the-windowproxy-exotic-object>
+    pub object: JsObject,
+}
+
+/// An iframe element's content navigable id, keyed by the iframe's node id in
+/// the parent document.
+/// <https://html.spec.whatwg.org/#dom-htmliframeelement-contentwindow>
+#[gc_struct]
+pub struct CachedIframeNavigable {
+    /// <https://dom.spec.whatwg.org/#concept-node-identifier>
+    #[ignore_trace]
+    pub node_id: usize,
+
+    /// <https://html.spec.whatwg.org/#navigable-id>
+    #[ignore_trace]
+    pub navigable_id: ipc_messages::content::NavigableId,
+}
+
 /// <https://html.spec.whatwg.org/#list-of-animation-frame-callbacks>
 #[gc_struct]
 pub struct AnimationFrameCallback {
@@ -124,6 +153,14 @@ pub struct GlobalScope {
 
     /// <https://html.spec.whatwg.org/#dom-location>
     location_object: GcCell<Option<JsObject>>,
+
+    /// WindowProxy shims for navigables, keyed by navigable id.
+    /// <https://html.spec.whatwg.org/#the-windowproxy-exotic-object>
+    window_proxies: GcCell<Vec<CachedWindowProxy>>,
+
+    /// Ifframe content navigable ids keyed by the iframe's node id.
+    /// <https://html.spec.whatwg.org/#dom-htmliframeelement-contentwindow>
+    iframe_content_navigables: GcCell<Vec<CachedIframeNavigable>>,
 
     /// <https://webidl.spec.whatwg.org/#dfn-platform-object>
     node_objects: GcCell<Vec<CachedNodeObject>>,
@@ -225,6 +262,8 @@ impl GlobalScope {
             document,
             document_object: gc_cell_new(None, ec),
             location_object: gc_cell_new(None, ec),
+            window_proxies: gc_cell_new(Vec::new(), ec),
+            iframe_content_navigables: gc_cell_new(Vec::new(), ec),
             node_objects: gc_cell_new(Vec::new(), ec),
             animation_frame_callback_identifier: Cell::new(0),
             animation_frame_callbacks: gc_cell_new(Vec::new(), ec),
@@ -355,6 +394,75 @@ impl GlobalScope {
         ec: &mut dyn ExecutionContext<Types>,
     ) {
         self.location_object.borrow_mut(ec).replace(object);
+    }
+
+    /// <https://html.spec.whatwg.org/#the-windowproxy-exotic-object>
+    pub(crate) fn cached_window_proxy(
+        &self,
+        navigable_id: ipc_messages::content::NavigableId,
+        ec: &mut dyn ExecutionContext<Types>,
+    ) -> Option<JsObject> {
+        let mut cached = None;
+        for entry in self.window_proxies.borrow(ec).iter() {
+            if entry.navigable_id == navigable_id {
+                cached = Some(entry.object.clone());
+            }
+        }
+        cached
+    }
+
+    /// <https://html.spec.whatwg.org/#the-windowproxy-exotic-object>
+    pub(crate) fn cache_window_proxy(
+        &self,
+        navigable_id: ipc_messages::content::NavigableId,
+        object: JsObject,
+        ec: &mut dyn ExecutionContext<Types>,
+    ) {
+        if self.cached_window_proxy(navigable_id, ec).is_none() {
+            self.window_proxies.borrow_mut(ec).push(CachedWindowProxy {
+                navigable_id,
+                object,
+            });
+        }
+    }
+
+    /// <https://html.spec.whatwg.org/#dom-htmliframeelement-contentwindow>
+    pub(crate) fn iframe_content_navigable(
+        &self,
+        node_id: usize,
+        ec: &mut dyn ExecutionContext<Types>,
+    ) -> Option<ipc_messages::content::NavigableId> {
+        self.iframe_content_navigables
+            .borrow(ec)
+            .iter()
+            .find(|entry| entry.node_id == node_id)
+            .map(|entry| entry.navigable_id)
+    }
+
+    /// <https://html.spec.whatwg.org/#dom-htmliframeelement-contentwindow>
+    pub(crate) fn set_iframe_content_navigable(
+        &self,
+        node_id: usize,
+        navigable_id: ipc_messages::content::NavigableId,
+        ec: &mut dyn ExecutionContext<Types>,
+    ) {
+        let mut entries = self.iframe_content_navigables.borrow_mut(ec);
+        entries.retain(|entry| entry.node_id != node_id);
+        entries.push(CachedIframeNavigable {
+            node_id,
+            navigable_id,
+        });
+    }
+
+    /// <https://html.spec.whatwg.org/#dom-htmliframeelement-contentwindow>
+    pub(crate) fn clear_iframe_content_navigable(
+        &self,
+        node_id: usize,
+        ec: &mut dyn ExecutionContext<Types>,
+    ) {
+        self.iframe_content_navigables
+            .borrow_mut(ec)
+            .retain(|entry| entry.node_id != node_id);
     }
 
     pub(crate) fn cached_node_object(

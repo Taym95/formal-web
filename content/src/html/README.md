@@ -132,10 +132,11 @@ across all three sides:
 | **User agent** | Step 8: queue a global task on the posted message task source given targetWindow by routing `ContentCommand::PostMessage` to the target navigable's event loop (`user_agent.rs:handle_post_message`), even when the target window lives in the same event loop |
 | **Target content** | Substeps 8.1–8.7: origin check, deserialize with the target realm, fire `message`/`messageerror` via `MessageEvent` (`main.rs:dispatch_post_message`) |
 
-The wire payload is `PostMessageRequest` (`ipc_messages::structured_clone`):
-the serialized record, the transfer data holders, the processed target origin,
-and the source navigable + origin.  The serialized record and holders are
-pure data so the same payload crosses content→UA and UA→content.
+The wire payload is `PostMessageRequest`
+(`ipc_messages::safe_passing_of_structured_data`): the serialized record, the
+transfer data holders, the processed target origin, and the source navigable +
+origin.  The serialized record and holders are pure data so the same payload
+crosses content→UA and UA→content.
 
 Transfer identity: `StructuredSerializeWithTransfer` places
 `SerializedRecord::TransferredValue(index)` records in the serialized graph in
@@ -254,83 +255,57 @@ UA-side state. The opener is only used for:
 
 <https://html.spec.whatwg.org/#the-windowproxy-exotic-object>
 
-`WindowProxy` is an ECMAScript Proxy exotic object (created via
-`JsProxyBuilder`) wrapping the active Window.  The proxy uses native-function
-traps for all 10 overridden internal methods specified by HTML §7.2.3.
+### Current implementation: navigable-backed shim platform object
 
-### Current implementation (`JsProxyBuilder` + native-function traps)
+The WindowProxy is a business-logic shim tied to a navigable rather than to a
+document: it carries the target navigable's id and outlives document swaps.  A
+window created by `window.open`, an iframe's `contentWindow`, and a message
+event's `source` are all WindowProxy shims for their navigable.
 
-The WindowProxy is implemented using `JsProxyBuilder` from
-`boa_engine::object::builtins`, which is Boa's public API for creating Proxy
-objects with native Rust trap functions.  Each of the 10 overridden internal
-methods (`[[GetPrototypeOf]]`, `[[SetPrototypeOf]]`, `[[IsExtensible]]`,
-`[[PreventExtensions]]`, `[[GetOwnProperty]]`, `[[DefineOwnProperty]]`,
-`[[Get]]`, `[[Set]]`, `[[Delete]]`, `[[OwnPropertyKeys]]`) is a plain
-`NativeFunctionPointer` — no captures, no custom handler struct, no access
-to `pub(crate)` Boa internals.
-
-For the same-origin fast path (always active in the current single-origin
-content process):
-- `[[GetOwnProperty]]` delegates to `OrdinaryGetOwnProperty(W, P)` on the
-  inner Window object, so Window own properties are correctly visible.
-- `[[DefineOwnProperty]]`, `[[Delete]]`, and `[[Set]]` delegate to the
-  corresponding operations on the Window via public `JsObject` methods.
-- `[[Get]]` delegates to `JsObject::get(key, context)` on the Window,
-  covering both proxy own properties and the Window.prototype prototype chain.
-- `[[OwnPropertyKeys]]` concatenates array-index keys (empty until child
-  navigable tracking is added) with the Window's own property keys.
-- `[[SetPrototypeOf]]` implements `SetImmutablePrototype`.
-
-Each trap receives the proxy **target** (the Window) as `args[0]`, per the
-ECMAScript Proxy internal method specification (10.5).  The target is obtained
-from the trap arguments rather than from captures or custom handler fields.
-
-Cross-origin paths (`CrossOriginGetOwnPropertyHelper`,
-`CrossOriginPropertyFallback`, `CrossOriginGet`, `CrossOriginSet`,
-`CrossOriginOwnPropertyKeys`) are structurally present as helper code but
-unreachable because `is_platform_object_same_origin` is hardcoded to `true`.
+- The shim is a platform object created in the realm that needs it, so its
+  methods run in the caller's realm (the incumbent settings object of any
+  `postMessage` it forwards).  `postMessage` runs the window post message
+  steps steps 1–7 locally and hands the serialized message to the user agent,
+  which routes it to the target navigable's event loop (see "Posting
+  messages" above).  No cross-context V8 access is involved.
+- The same shim object is reused per (realm, navigable) through a cache on the
+  realm's GlobalScope, so `event.source === iframe.contentWindow` holds.
+- `window.open` returns the shim for the chosen navigable; `iframe.contentWindow`
+  returns the shim for the iframe's content navigable (resolved through a
+  node-id → navigable-id registry on the parent realm's GlobalScope); the
+  message event's `source` attribute is the shim for the sender's navigable.
+- The shim exposes the Window members the current features need: `postMessage`,
+  `close`/`focus`/`blur`, `closed`, `self`/`window`/`frames`, `name`, `length`,
+  `top`/`parent`, `opener`, `document`, and `location`.  Members that require
+  the target window's realm (e.g. `document`) resolve the local window when the
+  target navigable lives in this content process; cross-realm property reads on
+  the returned object remain subject to V8's context isolation.
 
 ### Remaining gaps
 
-**1. Cross-context WindowProxy access throws in V8.**
-Accessing a property on a window opened via `window.open` from the opener's
-realm throws `TypeError: no access` in V8: the WindowProxy is a plain Proxy
-whose target is the child context's global object, and V8 rejects property
-gets on another context's global from a different context.  Verified by a
-realm-level test (`get_v` on a child-realm global from the parent realm).
-Cross-window APIs (postMessage to an opened window, `contentWindow`) are
-blocked by this until the proxy resolves properties through the target
-realm's context.
+**1. Arbitrary property delegation is not implemented.**  The spec's
+WindowProxy delegates every property access to the target Window (its own
+properties plus Window.prototype members).  The shim exposes a fixed member
+set instead; members not listed above (e.g. `setTimeout`, `onmessage`, or
+script-defined globals on the target window) are absent.  Delegation needs
+per-realm cross-context access or IPC forwarding, neither of which is wired.
 
-**2. Child navigable properties (array-index and named).**
-The spec requires WindowProxy to expose child browsing contexts by numeric
-index (`window[0]`, `window[1]`) and by name.  This requires tracking the
-document-tree child navigables on the Document, which is not yet implemented.
-The array-index branch in `[[GetOwnProperty]]` and `[[OwnPropertyKeys]]` is
-stubbed (returns undefined / empty).
+**2. Child navigable properties (array-index and named).**  The spec requires
+WindowProxy to expose child browsing contexts by numeric index (`window[0]`,
+`window[1]`) and by name.  This requires tracking the document-tree child
+navigables on the Document, which is not yet implemented.
 
-**2. `is_platform_object_same_origin` is hardcoded to `true`.**
-The content process currently runs a single origin, so cross-origin access
-does not arise during testing.  When multi-origin support is added, the
-WindowProxy will silently leak all cross-origin properties instead of applying
-the restricted CrossOriginProperties table (HTML §7.2.3).
+**3. `top`/`parent` return the proxy itself.**  Resolving the top/parent
+navigable's WindowProxy requires the navigable hierarchy, which the shim does
+not yet consult.
 
-**3. Navigation window swapping is untested and unused.**
-The WindowProxy wraps a fixed Window; there is no mechanism to swap the
-active Window behind the same proxy identity.  Cross-document navigation
-does not update the proxy.
+**4. `name`, `opener`, `closed`, `focus` are stubs.**  The navigable target
+name, opener relationship, and closed state are user-agent state that the
+shim does not yet track or forward.
 
-### Implementation notes
-
-The WindowProxy uses `JsProxyBuilder` — Boa's public API for constructing
-Proxy objects from native Rust function pointers.  This avoids any access to
-`pub(crate)` internals (`Proxy::create`, `Proxy::try_data`, etc.) and works
-with Boa as an external dependency from the `boa-dev/boa` repository.  See
-`content/src/js/README.md` ("Working with Boa's public API: use spec links,
-not `pub(crate)` internals") for the general methodology.
-
-See also:
-- `content/src/webidl/README.md` for the exotic-object pattern with JsData.
+**5. Navigation window swapping.**  The shim's `local_window` is seeded at
+creation (window.open) or left `None` (contentWindow, message source); it is
+not refreshed when the target navigable's active document changes.
 
 ## Related documentation
 

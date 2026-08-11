@@ -60,7 +60,7 @@ use ipc_messages::content::{
     TraversableViewport, ViewportSnapshot, WebviewId, WindowTimerKey,
 };
 use ipc_messages::media::{VideoEmbedData, VideoPaintId};
-use ipc_messages::structured_clone::PostMessageRequest;
+use ipc_messages::safe_passing_of_structured_data::PostMessageRequest;
 use log::{debug, error, info, warn};
 use std::{
     cell::RefCell,
@@ -1430,15 +1430,31 @@ impl ContentProcess {
             }
         }
 
-        // Step 8.3: Let source be the WindowProxy object corresponding to
-        //           incumbentSettings's global object (a Window object).
-        // Note: The source Window is resolved in this process when the source
-        // navigable lives here (the current single-event-loop deployment
-        // always satisfies this); a cross-process source leaves `source` null.
-        let source = self.resolve_source_window(request.source_navigable_id);
-
         // Step 8.2: Let origin be incumbentSettings's origin.
         let origin = request.source_origin.clone();
+
+        // Step 8.3: Let source be the WindowProxy object corresponding to
+        //           incumbentSettings's global object (a Window object).
+        // The WindowProxy is a shim for the source navigable, created in the
+        // target realm so its methods (postMessage) run in a realm that can
+        // reach the user agent.
+        let source = {
+            let ec = &mut self
+                .documents
+                .get_mut(&target_document_id)
+                .ok_or_else(|| {
+                    format!("postMessage: unknown target document {target_document_id}")
+                })?
+                .settings
+                .realm_execution_context;
+            crate::html::windowproxy::window_proxy_object(request.source_navigable_id, ec).map_err(
+                |error| {
+                    ec.to_rust_string(error).unwrap_or_else(|_| {
+                        String::from("postMessage: failed to create source WindowProxy")
+                    })
+                },
+            )?
+        };
 
         let document = self
             .documents
@@ -1448,6 +1464,10 @@ impl ContentProcess {
         // Step 8.4: Let deserializeRecord be
         //           StructuredDeserializeWithTransfer(serializeWithTransferResult,
         //           targetRealm).
+        // Note: The deserialization runs in the target window's realm (the
+        // target document's execution context), so `targetRealm` is the
+        // current realm; the targetRealm argument is unused by the
+        // deserializer, which constructs objects in the current realm.
         let serialize_result = SerializeWithTransferResult {
             serialized: request.serialized,
             transfer_data_holders: request.transfer_data_holders,
@@ -1467,7 +1487,13 @@ impl ContentProcess {
                     let ec = &mut document.settings.realm_execution_context;
                     ec.value_null()
                 };
-                fire_message_event(&mut document.settings, "messageerror", origin, source, data)?;
+                fire_message_event(
+                    &mut document.settings,
+                    "messageerror",
+                    origin,
+                    Some(source),
+                    data,
+                )?;
                 return Ok(());
             }
         };
@@ -1490,7 +1516,7 @@ impl ContentProcess {
             &mut document.settings,
             "message",
             origin,
-            source,
+            Some(source),
             message_clone,
         )?;
 
@@ -1504,19 +1530,6 @@ impl ContentProcess {
         }
 
         Ok(())
-    }
-
-    /// Resolve the Window object backing a navigable that lives in this
-    /// content process.
-    fn resolve_source_window(&self, navigable_id: NavigableId) -> Option<JsObject> {
-        let document_id = self.active_documents_by_traversable.get(&navigable_id)?;
-        let document = self.documents.get(document_id)?;
-        Some(
-            document
-                .settings
-                .realm_execution_context
-                .realm_global_object(),
-        )
     }
 
     fn run_before_unload(
@@ -2642,6 +2655,7 @@ fn fire_message_event(
     source: Option<JsObject>,
     data: JsValue,
 ) -> Result<(), String> {
+    let time_millis = settings.current_time_millis();
     let ec = &mut settings.realm_execution_context;
     let message_event = crate::html::MessageEvent::new(
         event_type.to_owned(),
@@ -2664,6 +2678,10 @@ fn fire_message_event(
         .with_object_any(&event_object)
         .and_then(|data| data.downcast_ref::<MessageEvent>().cloned())
         .ok_or_else(|| String::from("event_object is not a MessageEvent"))?;
+    // <https://dom.spec.whatwg.org/#concept-event-fire>
+    // Events fired by the user agent are trusted and carry the current time.
+    *message_event.event.is_trusted.borrow_mut(ec) = true;
+    *message_event.event.time_stamp.borrow_mut(ec) = time_millis;
     let window_target = ec
         .with_object_any(&ec.realm_global_object())
         .and_then(|data| data.downcast_ref::<crate::html::Window>().cloned())

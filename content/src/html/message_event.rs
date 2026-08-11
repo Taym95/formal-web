@@ -3,7 +3,7 @@ use crate::dom::event::HasEvent;
 use crate::js::Types;
 use js_engine::gc::{GcCell, gc_cell_new};
 use js_engine::gc_struct;
-use js_engine::{ExecutionContext, JsTypes};
+use js_engine::{Completion, ExecutionContext, JsTypes};
 
 type JsValue = <Types as JsTypes>::JsValue;
 type JsObject = <Types as JsTypes>::JsObject;
@@ -31,6 +31,11 @@ pub struct MessageEvent {
 
     /// <https://html.spec.whatwg.org/#dom-messageevent-ports>
     pub ports: GcCell<Vec<JsObject>>,
+
+    /// <https://webidl.spec.whatwg.org/#dfn-frozen-array-type>
+    /// The frozen array returned by the `ports` getter, created lazily so the
+    /// attribute returns the same object on every access.
+    pub ports_array: GcCell<Option<JsObject>>,
 }
 
 /// <https://html.spec.whatwg.org/#dictdef-messageeventinit>
@@ -81,6 +86,7 @@ impl MessageEvent {
             last_event_id: gc_cell_new(init.last_event_id, ec),
             source: gc_cell_new(init.source, ec),
             ports: gc_cell_new(init.ports, ec),
+            ports_array: gc_cell_new(None, ec),
         }
     }
 
@@ -107,5 +113,31 @@ impl MessageEvent {
     /// <https://html.spec.whatwg.org/#dom-messageevent-ports>
     pub(crate) fn ports_value(&self, ec: &mut dyn ExecutionContext<Types>) -> Vec<JsObject> {
         self.ports.borrow(ec).clone()
+    }
+
+    /// <https://webidl.spec.whatwg.org/#dfn-frozen-array-type>
+    /// Return the frozen array backing the `ports` attribute, creating it on
+    /// first access so every getter call returns the same object.
+    pub(crate) fn ports_value_frozen(
+        &self,
+        ec: &mut dyn ExecutionContext<Types>,
+    ) -> Completion<JsObject, Types> {
+        if let Some(array) = self.ports_array.borrow(ec).clone() {
+            return Ok(array);
+        }
+        let ports = self.ports.borrow(ec).clone();
+        let array = ec.create_empty_array();
+        for (index, port) in ports.iter().enumerate() {
+            let index_key = ec.property_key_from_str(&index.to_string());
+            ec.set(
+                array.clone(),
+                index_key,
+                <Types as JsTypes>::value_from_object(port.clone()),
+                true,
+            )?;
+        }
+        ec.set_integrity_level(array.clone(), js_engine::IntegrityLevel::Frozen)?;
+        self.ports_array.borrow_mut(ec).replace(array.clone());
+        Ok(array)
     }
 }

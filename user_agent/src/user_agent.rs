@@ -13,7 +13,7 @@ use ipc_messages::content::{
     FrameId, LoadedDocumentResponse, NavigableId, NavigateRequest, NavigationFetchId, NavigationId,
     NewTraversableInfo, UserNavigationInvolvement, WebviewId, WindowTimerKey, iframe_target_name,
 };
-use ipc_messages::structured_clone::PostMessageRequest;
+use ipc_messages::safe_passing_of_structured_data::PostMessageRequest;
 use log::{debug, error, info, trace};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};

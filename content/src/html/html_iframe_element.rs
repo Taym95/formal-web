@@ -480,6 +480,22 @@ fn create_a_new_child_navigable(
                 cross_origin: false,
             },
         );
+        // Register the iframe node -> content navigable mapping on the
+        // parent realm's GlobalScope so the contentWindow binding can hand
+        // out the child navigable's WindowProxy shim.
+        crate::js::platform_objects::with_global_scope(
+            &mut content_document.settings.realm_execution_context,
+            |global_scope, ec| {
+                global_scope.set_iframe_content_navigable(iframe_node_id, content_navigable, ec);
+                Ok(())
+            },
+        )
+        .map_err(|error| {
+            format!(
+                "failed to register iframe content navigable: {}",
+                error.display()
+            )
+        })?;
     }
 
     // Step 10: "Let historyEntry be navigable's active session history entry."
@@ -758,6 +774,20 @@ fn run_iframe_removing_steps(
     retire_iframe_traversable(process, parent_traversable_id, &iframe_state)?;
     remove_iframe_subdocument(process, parent_document_id, iframe_node_id);
     if let Some(content_document) = process.documents.get_mut(&parent_document_id) {
+        // Unregister the iframe node -> content navigable mapping.
+        crate::js::platform_objects::with_global_scope(
+            &mut content_document.settings.realm_execution_context,
+            |global_scope, ec| {
+                global_scope.clear_iframe_content_navigable(iframe_node_id, ec);
+                Ok(())
+            },
+        )
+        .map_err(|error| {
+            format!(
+                "failed to clear iframe content navigable: {}",
+                error.display()
+            )
+        })?;
         content_document
             .navigable_container_states
             .remove(&iframe_node_id);

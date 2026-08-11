@@ -1,5 +1,5 @@
 use crate::media::{VideoEmbedData, VideoPaintId};
-use crate::structured_clone::PostMessageRequest;
+use crate::safe_passing_of_structured_data::PostMessageRequest;
 use anyrender::{
     Scene,
     recording::{GlyphRunCommand, RenderCommand},

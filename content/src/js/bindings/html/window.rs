@@ -240,6 +240,27 @@ fn post_message_method(
 ) -> Completion<JsValue, crate::js::Types> {
     let undefined = ec.value_undefined();
     let message = args.first().cloned().unwrap_or_else(|| undefined.clone());
+    let options = parse_post_message_options(args, ec)?;
+
+    let window_object = current_window_object_from(this, ec);
+    let window = ec
+        .with_object_any(&window_object)
+        .and_then(|data| data.downcast_ref::<Window>().cloned())
+        .ok_or_else(|| ec.new_type_error("receiver is not a Window"))?;
+    let target_navigable_id = window
+        .global_scope
+        .source_navigable_id()
+        .ok_or_else(|| ec.new_type_error("postMessage: no target navigable"))?;
+    window_post_message_steps(target_navigable_id, message, options, ec)?;
+    Ok(ec.value_undefined())
+}
+
+/// <https://html.spec.whatwg.org/#dom-window-postmessage-options>
+pub(crate) fn parse_post_message_options(
+    args: &[JsValue],
+    ec: &mut dyn ExecutionContext<crate::js::Types>,
+) -> Completion<PostMessageOptions, crate::js::Types> {
+    let undefined = ec.value_undefined();
 
     // <https://html.spec.whatwg.org/#dom-window-postmessage-options>
     // The `postMessage(message, options)` form takes a dictionary as its
@@ -250,29 +271,21 @@ fn post_message_method(
     let is_legacy_form = args
         .get(1)
         .is_some_and(|second| crate::js::Types::value_as_string(second).is_some());
-    let options = if is_legacy_form {
+    if is_legacy_form {
         let second = args.get(1).cloned().unwrap_or_else(|| undefined.clone());
         let target_origin = ec.to_rust_string(second)?;
         let transfer = parse_transfer_sequence(args.get(2), ec)?;
-        PostMessageOptions {
+        Ok(PostMessageOptions {
             target_origin,
             transfer,
-        }
+        })
     } else {
         let options_value = args.get(1).cloned().unwrap_or_else(|| undefined.clone());
-        PostMessageOptions {
+        Ok(PostMessageOptions {
             target_origin: options_dict_string(&options_value, ec, "targetOrigin", "/")?,
             transfer: options_dict_transfer(&options_value, ec)?,
-        }
-    };
-
-    let window_object = current_window_object_from(this, ec);
-    let window = ec
-        .with_object_any(&window_object)
-        .and_then(|data| data.downcast_ref::<Window>().cloned())
-        .ok_or_else(|| ec.new_type_error("receiver is not a Window"))?;
-    window_post_message_steps(&window, message, options, ec)?;
-    Ok(ec.value_undefined())
+        })
+    }
 }
 
 /// Read a string dictionary member, applying the Web IDL default when the

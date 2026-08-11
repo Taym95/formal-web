@@ -9,5 +9,6 @@ pub(crate) mod hyperlink_element_utils;
 mod location;
 pub(crate) mod message_event;
 mod window;
+pub(crate) mod windowproxy;
 
 pub(crate) use html_element::style_declaration_object;

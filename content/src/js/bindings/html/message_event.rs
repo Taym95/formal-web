@@ -263,19 +263,9 @@ fn get_ports(
     ec: &mut dyn ExecutionContext<crate::js::Types>,
 ) -> Completion<JsValue, crate::js::Types> {
     with_message_event_ref(this, ec, |message_event, ec| {
-        let ports = message_event.ports_value(ec);
-        let array = ec.create_empty_array();
-        for (index, port) in ports.iter().enumerate() {
-            let index_key = ec.property_key_from_str(&index.to_string());
-            ec.set(
-                array.clone(),
-                index_key,
-                crate::js::Types::value_from_object(port.clone()),
-                true,
-            )?;
-        }
-        ec.set_integrity_level(array.clone(), js_engine::IntegrityLevel::Frozen)?;
-        Ok(crate::js::Types::value_from_object(array))
+        Ok(crate::js::Types::value_from_object(
+            message_event.ports_value_frozen(ec)?,
+        ))
     })
 }
 
@@ -352,6 +342,9 @@ fn init_message_event_method(
                 message_event.last_event_id.set(last_event_id, ec);
                 message_event.source.set(source, ec);
                 message_event.ports.set(ports, ec);
+                // Invalidate the cached frozen array so the next `ports`
+                // getter builds one from the new ports sequence.
+                message_event.ports_array.set(None, ec);
                 result = Ok(ec.value_undefined());
             }
         }),
