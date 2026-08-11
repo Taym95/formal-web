@@ -278,8 +278,48 @@ event's `source` are all WindowProxy shims for their navigable.
   `close`/`focus`/`blur`, `closed`, `self`/`window`/`frames`, `name`, `length`,
   `top`/`parent`, `opener`, `document`, and `location`.  Members that require
   the target window's realm (e.g. `document`) resolve the local window when the
-  target navigable lives in this content process; cross-realm property reads on
-  the returned object remain subject to V8's context isolation.
+  target navigable lives in this content process; reading properties on the
+  returned object from the caller's realm is subject to V8's cross-context
+  isolation (see below).
+
+### Agents, processes, and realms
+
+The taxonomy comes from the spec's agent model, not from our process
+layout.  Windows are placed into agents by <https://html.spec.whatwg.org/#obtain-a-similar-origin-window-agent>
+(defined in §8.1.2.2, used at §7.3.2.1 "creating browsing contexts" step 9
+and §7.5.1 "shared document creation infrastructure" step 7.4):
+
+- **Agent cluster** — the spec's idealized "process boundary" (§8.1.2.2:
+  *"the agent cluster concept is an architecture-independent, idealized
+  process boundary"*).  An agent cluster holds one similar-origin window
+  agent.  Windows in the same cluster: a Window and a same-origin-domain
+  iframe it created, and a Window and a same-origin-domain Window that
+  opened it (opener/opened).  Windows with no opener or ancestor
+  relationship are in **different** clusters *even when same-origin*.
+- **Similar-origin window agent** — the spec unit our content process is
+  the concrete realization of: one content process hosts one agent cluster
+  with one similar-origin window agent (`AgentCluster.similar_origin_window_agent`
+  and `AgentClusterKey` in `user_agent/src/user_agent.rs`).  Same-cluster
+  windows are same-process; different-cluster windows are cross-process.
+  In particular, cross-origin windows are always cross-process, and an
+  auxiliary browsing context (`window.open`) is same-origin-domain-related
+  to its opener, so it shares the opener's cluster and process.
+- **Realm** (V8 context) — an engine detail, orthogonal to the agent
+  model: every Window is its own realm even within the same agent, and V8
+  gates property access on another context's global object on
+  security-token equality.  The engine does not install a shared token, so
+  same-cluster (same-process) window access throws `TypeError: no access`
+  today.  Fixing this for the basic same-origin case (a shared security
+  token, or an access-check callback) is the prerequisite for delegating
+  shim members to the local window's realm.
+
+What a WindowProxy access involves therefore splits as:
+
+- **Same cluster (same process)**: resolve the target window's realm
+  locally — requires the V8 cross-realm fix above.
+- **Cross cluster (cross process)**: forward to the target process via the
+  user agent — requires the shim's selective-access forwarding (gap 2
+  below).
 
 ### Remaining gaps
 
@@ -288,22 +328,32 @@ WindowProxy delegates every property access to the target Window (its own
 properties plus Window.prototype members).  The shim exposes a fixed member
 set instead; members not listed above (e.g. `setTimeout`, `onmessage`, or
 script-defined globals on the target window) are absent.  Delegation needs
-per-realm cross-context access or IPC forwarding, neither of which is wired.
+per-realm cross-context access for same-cluster targets (the V8 cross-realm
+fix above) or IPC forwarding for cross-cluster targets.
 
-**2. Child navigable properties (array-index and named).**  The spec requires
+**2. Cross-cluster selective access is not wired.**  When the target
+navigable lives in another agent cluster (another content process), the
+shim must give selective access to the remote window: `postMessage` already
+routes through the user agent (see "Posting messages" above), and the
+remaining members (`document`, `location`, `name`, …) must be forwarded to
+the target process the same way.  The shim's business-logic design is what
+makes this possible — the proxy is just a navigable id plus a forwarding
+policy, so it can hand any member off to the user agent.
+
+**3. Child navigable properties (array-index and named).**  The spec requires
 WindowProxy to expose child browsing contexts by numeric index (`window[0]`,
 `window[1]`) and by name.  This requires tracking the document-tree child
 navigables on the Document, which is not yet implemented.
 
-**3. `top`/`parent` return the proxy itself.**  Resolving the top/parent
+**4. `top`/`parent` return the proxy itself.**  Resolving the top/parent
 navigable's WindowProxy requires the navigable hierarchy, which the shim does
 not yet consult.
 
-**4. `name`, `opener`, `closed`, `focus` are stubs.**  The navigable target
+**5. `name`, `opener`, `closed`, `focus` are stubs.**  The navigable target
 name, opener relationship, and closed state are user-agent state that the
 shim does not yet track or forward.
 
-**5. Navigation window swapping.**  The shim's `local_window` is seeded at
+**6. Navigation window swapping.**  The shim's `local_window` is seeded at
 creation (window.open) or left `None` (contentWindow, message source); it is
 not refreshed when the target navigable's active document changes.
 
@@ -312,7 +362,7 @@ not refreshed when the target navigable's active document changes.
 - `content/src/webidl/README.md` — Boa platform object integration, exotic object pattern
 - `content/src/js/README.md` — Boa integration specifics (Context ownership, bindings)
 - `content/README.md` — Content-crate overview
-- `user_agent/src/user_agent.rs` — `create_new_top_level_traversable_from_content`, `create_new_top_level_traversable`, `the_rules_for_choosing_a_navigable` (UA side), `setup_opener_for_window_open`
+- `user_agent/src/user_agent.rs` — `create_new_top_level_traversable_from_content`, `create_new_top_level_traversable`, `the_rules_for_choosing_a_navigable` (UA side), `setup_opener_for_window_open`, and the agent model (`AgentCluster`, `AgentClusterKey`, `similar_origin_window_agent`)
 - `ipc_messages/src/content.rs` — `NewTraversableInfo`, `CreateEmptyDocument`, `NavigateRequest`
 - `content/src/html.rs` — `the_rules_for_choosing_a_navigable` (content side), `navigate`, `ChosenNavigable`
 - `content/src/html/window.rs` — `Window::open`, `window_open_steps`
