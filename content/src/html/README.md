@@ -255,56 +255,81 @@ UA-side state. The opener is only used for:
 
 <https://html.spec.whatwg.org/#the-windowproxy-exotic-object>
 
-### Current implementation: two mechanisms
+### Current implementation: one WindowProxy mechanism
 
-**The V8 Proxy** (`create_window_proxy`) wraps the target Window in a real
-ECMAScript Proxy whose traps delegate property access to it.  It is the
-mechanism for windows in the **same content process** (same agent cluster,
-cross realm): `window.open` returns it, and property gets/sets (e.g.
-`w.location = url`) resolve against the local Window.  Cross-realm property
-access in V8 is gated by the context security token; the engine installs a
-shared token on every context so same-origin windows can reach each other's
-globals (see "Agents, processes, and realms" below for the remaining gap:
-invoking the target realm's native bindings from the caller's realm is not
-yet safe).
+There is a single WindowProxy mechanism.  The identity handed to JavaScript
+is an ECMAScript Proxy whose target is a [`WindowProxy`](windowproxy.rs)
+shim platform object tied to the navigable (one per (realm, navigable),
+cached on the realm's GlobalScope), so `event.source === iframe.contentWindow`
+holds.  The shim's `local_window` field carries the navigable's active Window
+when it lives in this content process (same agent cluster); the proxy traps
+then delegate property access to that Window — the local behavior
+(`window.open` results, `iframe.contentWindow`, and the message event's
+`source` all resolve property gets/sets against the local Window, e.g.
+`w.location = url` reaches the target's Location binding).  When the
+navigable's document was created in another content process, `local_window`
+is `None` and the traps resolve the shim's cross-origin member set instead
+— `postMessage` runs in the caller's realm (steps 1–7 locally, user-agent
+routing for step 8), and the remaining members are the shim's fixed set.
 
-**The shim** (`WindowProxy`, `create_window_proxy_shim`) is a business-logic
-platform object tied to the navigable rather than to a document.  It is the
-mechanism for windows in another content process (different agent cluster):
-it carries the target navigable's id and forwards operations through the
-user agent.  `iframe.contentWindow` and the message event's `source`
-attribute are shims for their navigable; the same shim object is reused per
-(realm, navigable) through a cache on the realm's GlobalScope, so
-`event.source === iframe.contentWindow` holds.  The shim runs `postMessage`
-in the caller's realm (steps 1–7 locally, user-agent routing for step 8) and
-exposes a fixed Window member set.
+Cross-realm property access in V8 is gated by the context security token;
+the engine installs a shared token on every context so same-origin windows
+can reach each other's globals, and native callbacks run in their creation
+realm (the callback machinery switches the engine's realm state), so
+invoking the target window's methods through the proxy — `w.location = url`
+via the `[PutForwards=href]` Location attribute, `w.open(...)`, timers, and
+gets/sets on the target's globals — runs in the target realm and works.
+
+The `local_window` handle is a rooted (non-traced) `JsObject`, not a
+`GcCell` edge: the WindowProxy's backing must stay usable across the
+navigation-commit garbage collection that runs when the old document is
+destroyed, and a cppgc-traced edge held in a cell is not reliably usable
+after a full collection on the V8 backend (the materialized handle can
+point at a swept object — reproducible in `js_engine`'s own
+`associated_platform_cells_survive_forced_gc` when the cell value is read
+back and used after the forced gc).  The root keeps the window alive for
+exactly as long as the proxy references it, and the navigation-commit
+severing clears it (releasing the root) once the navigable's document is
+created in another content process.
 
 ### Lifecycle: navigation commit is the proxy transition
 
 Per the spec, a browsing context (navigable) has **one** WindowProxy
 identity, and *"when the browsing context is navigated, the Window object
 wrapped by the browsing context's associated WindowProxy object is
-changed"* (§7.2.3).  Combined with the agent model, the correct lifecycle
-is:
+changed"* (§7.2.3).  The shim's `local_window` field is exactly that
+wrapped Window, and navigation commit updates it:
 
 1. **Local backing** — while the navigable's active document is in this
    content process (same agent cluster), the proxy is backed by that
-   document's Window: the V8 Proxy wraps it (property delegation), or the
-   shim's `local_window` is set.
-2. **Navigation commit (the old document unloads)** — this is the
-   transition point.  The proxy's backing is severed from the outgoing
-   document:
-   - if the new document is also local (same process), the backing is
-     re-pointed at the new Window (cross-realm proxy — §7.5.1 step 6
-     reuses the initial about:blank Window for same-origin navigations);
-   - if the new document is in another process, the old window is gone and
-     the proxy becomes a pure remote shim (cross-process forwarding via
-     the user agent).
+   document's Window: `local_window` is set and the traps delegate property
+   access to it.
+2. **Navigation commit (the old document unloads)** — when the old
+   document is destroyed in this process (`destroy_document`), every cached
+   WindowProxy for that navigable is updated:
+   - if a new document for the navigable is already active in this process
+     (same-process navigation), the backing is re-pointed at the new
+     document's Window (cross-realm proxy — §7.5.1 step 6 reuses the
+     initial about:blank Window for same-origin navigations);
+   - if the navigable's document was created in another content process
+     (cross-origin navigation), `local_window` is cleared and the proxy
+     becomes a remote shim (cross-process forwarding via the user agent)
+     while keeping its identity.
 
-Neither mechanism implements this lifecycle yet: the V8 Proxy is created
-fresh per `window.open` call wrapping the window at that moment and is
-never updated, and the shim's `local_window` is seeded at creation or left
-`None` without a commit-time transition (see gap 7).
+The user agent routes `DestroyDocument` to the event loop that owns the
+document (`command_sender_for_document`), not the traversable's current
+event loop: after a cross-process navigation the traversable has moved to a
+new event loop, and routing by traversable would send the destroy to the
+wrong content process — leaving the old document (and the WindowProxy's
+local backing) alive in the old process forever.
+
+Note: the user agent keeps a traversable whose active document is initial
+about:blank on the opener's event loop for its first URL navigation
+(`initialise_the_document_object`), so the first navigation of a
+`window.open`'d popup stays in the same process and re-points the backing;
+the window is created in another content process (and the proxy becomes a
+remote shim) on later cross-origin navigations and for child navigables
+whose parent document is cross-origin.
 
 ### Agents, processes, and realms
 
@@ -333,32 +358,25 @@ and §7.5.1 "shared document creation infrastructure" step 7.4):
   gates property access on another context's global object on
   security-token equality.  The engine installs a shared security token on
   every context, so same-cluster (same-process) property gets/sets through
-  the V8 Proxy resolve against the local Window.  **Follow-up:** invoking
-  the target realm's native bindings from the caller's realm (a method call
-  through the proxy, e.g. `w.location = url` reaching the Location
-  binding's navigation) is still not safe in V8; the shim's caller-realm
-  `postMessage` is the working cross-window path until that is resolved.
+  the WindowProxy resolve against the local Window.  Native callbacks run
+  in their creation realm (the callback machinery switches the engine's
+  realm state), so method calls through the proxy (e.g. `w.location = url`
+  reaching the Location binding's navigation) run in the target realm and
+  work.
 
 What a WindowProxy access involves therefore splits as:
 
-- **Same cluster (same process)**: the V8 Proxy resolves the target
-  window's realm locally (property gets/sets work with the shared security
-  token; method invocation is the follow-up above).
-- **Cross cluster (cross process)**: the shim forwards to the target
-  process via the user agent (postMessage already routes; the remaining
-  members need selective-access forwarding, gap 2 below).
+- **Same cluster (same process)**: the proxy resolves the target window's
+  realm locally (property gets/sets work with the shared security token;
+  method invocation runs the target realm's native bindings).
+- **Cross cluster (cross process)**: the proxy's `local_window` is `None`
+  and the traps resolve the shim's fixed member set; `postMessage` routes
+  through the user agent (the remaining members need selective-access
+  forwarding, gap 2 below).
 
 ### Remaining gaps
 
-**1. Cross-realm method invocation through the V8 Proxy is not safe.**  The
-V8 Proxy delegates property gets/sets to the local Window (same-cluster
-windows share the security token), but calling the target realm's native
-bindings from the caller's realm (the proxy's callable wrapper) is not yet
-safe in V8.  The shim's caller-realm `postMessage` is the working
-cross-window path; navigating the proxy's returned window (`w.location =
-url`) and other method calls are blocked by this.
-
-**2. Cross-cluster selective access is not wired.**  When the target
+**1. Cross-cluster selective access is not wired.**  When the target
 navigable lives in another agent cluster (another content process), the
 shim must give selective access to the remote window: `postMessage` already
 routes through the user agent (see "Posting messages" above), and the
@@ -367,32 +385,24 @@ the target process the same way.  The shim's business-logic design is what
 makes this possible — the proxy is just a navigable id plus a forwarding
 policy, so it can hand any member off to the user agent.
 
-**3. The shim exposes a fixed member set.**  The shim (cross-cluster
+**2. The shim exposes a fixed member set.**  The shim (cross-cluster
 WindowProxy) exposes the Window members the current features need rather
 than delegating every property access; members not in its set (e.g.
 `setTimeout`, `onmessage`, or script-defined globals on the target window)
 are absent until the selective-access forwarding is wired.
 
-**4. Child navigable properties (array-index and named).**  The spec requires
+**3. Child navigable properties (array-index and named).**  The spec requires
 WindowProxy to expose child browsing contexts by numeric index (`window[0]`,
 `window[1]`) and by name.  This requires tracking the document-tree child
 navigables on the Document, which is not yet implemented.
 
-**5. `top`/`parent` return the proxy itself.**  Resolving the top/parent
+**4. `top`/`parent` return the proxy itself.**  Resolving the top/parent
 navigable's WindowProxy requires the navigable hierarchy, which the shim does
 not yet consult.
 
-**6. `name`, `opener`, `closed`, `focus` are stubs.**  The navigable target
+**5. `name`, `opener`, `closed`, `focus` are stubs.**  The navigable target
 name, opener relationship, and closed state are user-agent state that the
 shim does not yet track or forward.
-
-**7. Navigation window swapping is not implemented.**  The spec requires
-one WindowProxy per navigable whose wrapped Window changes on navigation
-commit (see "Lifecycle" above).  Today the V8 Proxy wraps the window it was
-created with and is never updated, and the shim's `local_window` is seeded
-at creation or left `None` without a commit-time transition; nothing severs
-the backing at document unload or downgrades the proxy to a remote shim on
-a cross-process navigation.
 
 ## Related documentation
 

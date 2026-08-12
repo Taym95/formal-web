@@ -326,7 +326,13 @@ impl ApplicationHandler<FormalWebUserEvent> for HeadlessEmbedderApp {
             }
             FormalWebUserEvent::NavigationCompleted(c) => self.handle_navigation_completed(c),
             FormalWebUserEvent::NewWebview(wid, _) => {
-                self.current_webview_id = Some(wid);
+                // Keep the first (primary) webview as the automation target:
+                // popups opened by window.open must not steal the WebDriver
+                // session's current window, or test reports would be polled
+                // against the popup instead of the test page.
+                if self.current_webview_id.is_none() {
+                    self.current_webview_id = Some(wid);
+                }
                 self.apply_viewport_snapshot();
             }
             FormalWebUserEvent::CreateWindow => {}

@@ -1,5 +1,5 @@
 use crate::html::HTMLIFrameElement;
-use crate::html::windowproxy::create_window_proxy_shim;
+use crate::html::windowproxy::create_window_proxy;
 use crate::js::try_with_event_target_mut;
 use crate::webidl::bindings::{AttributeDef, InterfaceDefinition, WebIdlInterface};
 use crate::webidl::{callback_function_value, nullable_value};
@@ -384,12 +384,15 @@ fn get_content_window(
     })?;
     // <https://html.spec.whatwg.org/#dom-iframe-contentwindow>
     // Resolve the content navigable from the realm's registry and hand out
-    // its WindowProxy shim (created in this realm, cached per navigable).
+    // its WindowProxy (created in this realm, cached per navigable).  The
+    // cached shim for the navigable already carries the child document's
+    // Window when it lives in this content process, so the WindowProxy is
+    // locally backed.
     let navigable_id = crate::js::platform_objects::with_global_scope(ec, |global_scope, ec| {
         Ok(global_scope.iframe_content_navigable(node_id, ec))
     })?;
     let Some(navigable_id) = navigable_id else {
         return Ok(ec.value_null());
     };
-    create_window_proxy_shim(navigable_id, None, ec)
+    create_window_proxy(navigable_id, None, ec)
 }

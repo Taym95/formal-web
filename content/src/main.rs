@@ -1231,6 +1231,7 @@ impl ContentProcess {
     fn destroy_document(&mut self, document_id: DocumentId) -> Result<(), String> {
         run_dom_removing_steps_for_document(self, document_id)?;
         if let Some(mut content_document) = self.documents.remove(&document_id) {
+            let traversable_id = content_document.traversable_id;
             // Release every event listener and event handler callback on the
             // document's EventTargets (window, document, cached node
             // wrappers): the callbacks are strong JS handles that would
@@ -1246,6 +1247,27 @@ impl ContentProcess {
             {
                 self.active_documents_by_traversable
                     .remove(&content_document.traversable_id);
+            }
+            // WindowProxy lifecycle: navigation commit severs or re-points the
+            // cached WindowProxy backings for this navigable.  If a new
+            // document for the traversable is already active in this process
+            // (same-process navigation), re-point to its Window; otherwise
+            // the navigable's document was created in another content process
+            // and every WindowProxy for it becomes a remote shim.
+            // <https://html.spec.whatwg.org/#the-windowproxy-exotic-object>
+            let replacement_window = self
+                .active_documents_by_traversable
+                .get(&traversable_id)
+                .and_then(|current_document_id| self.documents.get(current_document_id))
+                .map(|document| {
+                    document
+                        .settings
+                        .realm_execution_context
+                        .realm_global_object()
+                });
+            if let Err(error) = self.sever_window_proxy_backings(traversable_id, replacement_window)
+            {
+                error!("failed to sever window proxy backings: {error}");
             }
             if let Err(error) = content_document.settings.clear_all_window_timers() {
                 error!("failed to clear window timers during document teardown: {error}");
@@ -1296,6 +1318,41 @@ impl ContentProcess {
             log::debug!("microtask checkpoint during document teardown failed: {error:?}");
         }
         self.realm_parent.gc();
+        Ok(())
+    }
+
+    /// Navigation-commit hook: every cached WindowProxy (in every realm of
+    /// this process) that targets a navigable whose document was just
+    /// destroyed is severed or re-pointed.  `replacement_window` is the new
+    /// document's Window when the navigation stayed in this process, and
+    /// `None` when the navigable's document was created in another content
+    /// process (the WindowProxy becomes a remote shim).
+    /// <https://html.spec.whatwg.org/#the-windowproxy-exotic-object>
+    fn sever_window_proxy_backings(
+        &mut self,
+        traversable_id: NavigableId,
+        replacement_window: Option<JsObject>,
+    ) -> Result<(), String> {
+        let document_ids: Vec<DocumentId> = self.documents.keys().copied().collect();
+        for document_id in document_ids {
+            let Some(content_document) = self.documents.get_mut(&document_id) else {
+                continue;
+            };
+            with_global_scope(
+                &mut content_document.settings.realm_execution_context,
+                |global_scope, ec| {
+                    global_scope.set_window_proxy_backing(
+                        traversable_id,
+                        replacement_window.clone(),
+                        ec,
+                    );
+                    Ok(())
+                },
+            )
+            .map_err(|error| {
+                format!("failed to sever window proxy backings: {}", error.display())
+            })?;
+        }
         Ok(())
     }
 
@@ -1416,10 +1473,10 @@ impl ContentProcess {
             .documents
             .get(&target_document_id)
             .map(|document| document.traversable_id);
-        if let Some(traversable_id) = traversable_id {
-            if let Err(error) = self.set_up_new_document_registry(traversable_id) {
-                warn!("failed to set up new document registry: {error}");
-            }
+        if let Some(traversable_id) = traversable_id
+            && let Err(error) = self.set_up_new_document_registry(traversable_id)
+        {
+            warn!("failed to set up new document registry: {error}");
         }
 
         // Step 8.2: Let origin be incumbentSettings's origin.
@@ -1427,9 +1484,20 @@ impl ContentProcess {
 
         // Step 8.3: Let source be the WindowProxy object corresponding to
         //           incumbentSettings's global object (a Window object).
-        // The WindowProxy is a shim for the source navigable, created in the
-        // target realm so its methods (postMessage) run in a realm that can
-        // reach the user agent.
+        // The WindowProxy is created in the target realm so its methods
+        // (postMessage) run in a realm that can reach the user agent; when
+        // the source navigable's document lives in this content process, the
+        // WindowProxy is backed by the source Window.
+        let source_window = self
+            .active_documents_by_traversable
+            .get(&request.source_navigable_id)
+            .and_then(|document_id| self.documents.get(document_id))
+            .map(|document| {
+                document
+                    .settings
+                    .realm_execution_context
+                    .realm_global_object()
+            });
         let source = {
             let ec = &mut self
                 .documents
@@ -1439,13 +1507,16 @@ impl ContentProcess {
                 })?
                 .settings
                 .realm_execution_context;
-            crate::html::windowproxy::window_proxy_object(request.source_navigable_id, ec).map_err(
-                |error| {
-                    ec.to_rust_string(error).unwrap_or_else(|_| {
-                        String::from("postMessage: failed to create source WindowProxy")
-                    })
-                },
-            )?
+            crate::html::windowproxy::window_proxy_object(
+                request.source_navigable_id,
+                source_window,
+                ec,
+            )
+            .map_err(|error| {
+                ec.to_rust_string(error).unwrap_or_else(|_| {
+                    String::from("postMessage: failed to create source WindowProxy")
+                })
+            })?
         };
 
         let document = self

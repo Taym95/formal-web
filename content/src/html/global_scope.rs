@@ -5,6 +5,7 @@ use std::{
     vec::Vec,
 };
 
+use super::windowproxy::WindowProxy;
 use super::{create_a_new_realm, environment_settings_object::EnvironmentSettingsObject};
 
 use blitz_dom::BaseDocument;
@@ -15,7 +16,7 @@ use ipc_messages::content::{
 };
 use ipc_messages::media::VideoPaintId;
 use js_engine::gc::{GcCell, gc_cell_new};
-use js_engine::{ExecutionContext, JsTypes, gc_struct};
+use js_engine::{Completion, ExecutionContext, JsTypes, gc_struct};
 use log::{debug, error};
 
 use crate::js::{Engine, Types};
@@ -51,12 +52,15 @@ pub struct CachedNodeObject {
     pub object: JsObject,
 }
 
-/// A cached WindowProxy shim for a navigable, keyed by navigable id.
-/// The cache lives on the realm's GlobalScope so the same shim object is
+/// A cached WindowProxy for a navigable, keyed by navigable id.  The cache
+/// lives on the realm's GlobalScope so the same WindowProxy object is
 /// returned for `event.source`, `iframe.contentWindow`, and `window.open`
 /// results referring to the same navigable.  The same entry also records the
-/// iframe node whose content navigable the shim backs (the `contentWindow`
-/// binding resolves the navigable from the element's node id).
+/// iframe node whose content navigable the WindowProxy backs (the
+/// `contentWindow` binding resolves the navigable from the element's node
+/// id).  `shim` is the navigable-backed platform object that holds the local
+/// backing Window; `object` is the ECMAScript Proxy wrapping it that is
+/// handed to JavaScript.
 /// <https://html.spec.whatwg.org/#the-windowproxy-exotic-object>
 #[gc_struct]
 pub struct CachedWindowProxy {
@@ -65,10 +69,15 @@ pub struct CachedWindowProxy {
     pub navigable_id: ipc_messages::content::NavigableId,
 
     /// <https://html.spec.whatwg.org/#the-windowproxy-exotic-object>
-    /// The WindowProxy shim for the navigable; `None` until the realm first
-    /// accesses the window (the iframe mapping is recorded before any
-    /// `contentWindow` access).
+    /// The WindowProxy object handed to JavaScript (the ECMAScript Proxy
+    /// wrapping the shim); `None` until the realm first accesses the window.
     pub object: Option<JsObject>,
+
+    /// <https://html.spec.whatwg.org/#the-windowproxy-exotic-object>
+    /// The shim platform object (the proxy's target) whose `local_window`
+    /// field carries the navigable's local backing Window; navigation commit
+    /// severs or re-points that backing in place.
+    pub shim: Option<JsObject>,
 
     /// <https://html.spec.whatwg.org/#content-navigable>
     /// The iframe element's node id in this realm's document when the
@@ -390,25 +399,53 @@ impl GlobalScope {
     }
 
     /// <https://html.spec.whatwg.org/#the-windowproxy-exotic-object>
-    pub(crate) fn cached_window_proxy(
+    /// Returns the (shim platform object, WindowProxy identity) pair cached
+    /// for the navigable, if any.
+    pub(crate) fn cached_window_proxy_state(
         &self,
         navigable_id: ipc_messages::content::NavigableId,
         ec: &mut dyn ExecutionContext<Types>,
-    ) -> Option<JsObject> {
-        let mut cached = None;
+    ) -> (Option<JsObject>, Option<JsObject>) {
+        let mut state = (None, None);
         for entry in self.window_proxies.borrow(ec).iter() {
             if entry.navigable_id == navigable_id {
-                cached = entry.object.clone();
+                state = (entry.shim.clone(), entry.object.clone());
             }
         }
-        cached
+        state
     }
 
     /// <https://html.spec.whatwg.org/#the-windowproxy-exotic-object>
-    pub(crate) fn cache_window_proxy(
+    pub(crate) fn cache_window_proxy_shim(
         &self,
         navigable_id: ipc_messages::content::NavigableId,
-        object: JsObject,
+        shim: JsObject,
+        ec: &mut dyn ExecutionContext<Types>,
+    ) {
+        let mut entries = self.window_proxies.borrow_mut(ec);
+        match entries
+            .iter_mut()
+            .find(|entry| entry.navigable_id == navigable_id)
+        {
+            Some(entry) => {
+                if entry.shim.is_none() {
+                    entry.shim = Some(shim);
+                }
+            }
+            None => entries.push(CachedWindowProxy {
+                navigable_id,
+                object: None,
+                shim: Some(shim),
+                iframe_node_id: None,
+            }),
+        }
+    }
+
+    /// <https://html.spec.whatwg.org/#the-windowproxy-exotic-object>
+    pub(crate) fn cache_window_proxy_identity(
+        &self,
+        navigable_id: ipc_messages::content::NavigableId,
+        identity: JsObject,
         ec: &mut dyn ExecutionContext<Types>,
     ) {
         let mut entries = self.window_proxies.borrow_mut(ec);
@@ -418,14 +455,47 @@ impl GlobalScope {
         {
             Some(entry) => {
                 if entry.object.is_none() {
-                    entry.object = Some(object);
+                    entry.object = Some(identity);
                 }
             }
             None => entries.push(CachedWindowProxy {
                 navigable_id,
-                object: Some(object),
+                object: Some(identity),
+                shim: None,
                 iframe_node_id: None,
             }),
+        }
+    }
+
+    /// <https://html.spec.whatwg.org/#the-windowproxy-exotic-object>
+    /// Set (or clear) the local backing Window of every cached shim for a
+    /// navigable.  `create_window_proxy` seeds the backing when a same-process
+    /// Window becomes known; navigation commit calls this with `None` when the
+    /// navigable's active document was created in another content process, or
+    /// with the new Window when the navigation stays in this process.
+    pub(crate) fn set_window_proxy_backing(
+        &self,
+        navigable_id: ipc_messages::content::NavigableId,
+        window: Option<JsObject>,
+        ec: &mut dyn ExecutionContext<Types>,
+    ) {
+        let shims: Vec<JsObject> = self
+            .window_proxies
+            .borrow(ec)
+            .iter()
+            .filter(|entry| entry.navigable_id == navigable_id)
+            .filter_map(|entry| entry.shim.clone())
+            .collect();
+        for shim in shims {
+            let backing = window.clone();
+            ec.with_object_any_mut_with(
+                &shim,
+                Box::new(move |data, _ec| {
+                    if let Some(proxy) = data.downcast_mut::<WindowProxy>() {
+                        proxy.set_local_window(backing.clone());
+                    }
+                }),
+            );
         }
     }
 
@@ -444,33 +514,72 @@ impl GlobalScope {
 
     /// <https://html.spec.whatwg.org/#create-a-new-child-navigable>
     /// Records the iframe node -> content navigable mapping used by the
-    /// `contentWindow` getter; the shim entry may not exist yet.
+    /// `contentWindow` getter and creates the navigable's shim with the
+    /// child document's Window (created in this process), so the
+    /// `contentWindow` binding hands out a locally-backed WindowProxy.
     pub(crate) fn set_iframe_content_navigable(
         &self,
         node_id: usize,
         navigable_id: ipc_messages::content::NavigableId,
+        local_window: Option<JsObject>,
         ec: &mut dyn ExecutionContext<Types>,
-    ) {
-        let mut entries = self.window_proxies.borrow_mut(ec);
+    ) -> Completion<(), Types> {
+        // Clone the current entry state out of the cell before creating the
+        // shim (which allocates and must not run under the cell borrow).
+        let existing = {
+            let entries = self.window_proxies.borrow(ec);
+            entries
+                .iter()
+                .find(|entry| entry.navigable_id == navigable_id)
+                .cloned()
+        };
+
         // A node can only be the content navigable of one element.
-        for entry in entries.iter_mut() {
-            if entry.iframe_node_id == Some(node_id) {
-                entry.iframe_node_id = None;
+        {
+            let mut entries = self.window_proxies.borrow_mut(ec);
+            for entry in entries.iter_mut() {
+                if entry.iframe_node_id == Some(node_id) {
+                    entry.iframe_node_id = None;
+                }
             }
         }
+
+        let shim = if existing
+            .as_ref()
+            .and_then(|entry| entry.shim.as_ref())
+            .is_some()
+        {
+            None
+        } else if let Some(window) = local_window {
+            Some(crate::webidl::bindings::create_interface_instance::<
+                Types,
+                WindowProxy,
+            >(
+                WindowProxy::new(navigable_id, Some(window), ec), ec
+            )?)
+        } else {
+            None
+        };
+
+        let mut entries = self.window_proxies.borrow_mut(ec);
         match entries
             .iter_mut()
             .find(|entry| entry.navigable_id == navigable_id)
         {
             Some(entry) => {
                 entry.iframe_node_id = Some(node_id);
+                if entry.shim.is_none() {
+                    entry.shim = shim;
+                }
             }
             None => entries.push(CachedWindowProxy {
                 navigable_id,
                 object: None,
+                shim,
                 iframe_node_id: Some(node_id),
             }),
         }
+        Ok(())
     }
 
     /// <https://html.spec.whatwg.org/#destroy-a-child-navigable>

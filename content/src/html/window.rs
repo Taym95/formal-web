@@ -374,12 +374,18 @@ pub(crate) fn window_open_steps(
     // Step 18: Return targetNavigable's active WindowProxy.
     // <https://html.spec.whatwg.org/#the-windowproxy-exotic-object>
     // Note: window.open creates an auxiliary browsing context in the same
-    // agent cluster (same content process), so the V8 Proxy WindowProxy is
-    // returned; it delegates property access to the local Window.
+    // agent cluster (same content process), so the WindowProxy is backed by
+    // the locally-created about:blank Window; if the navigable is later
+    // navigated across origin (its Window is created in another content
+    // process), navigation commit severs that backing and the WindowProxy
+    // becomes a remote shim.
     let window = result
         .return_window
         .expect("window_open_steps: all navigable branches set a return window");
-    create_window_proxy(&window, ec)
+    let navigable_id = result
+        .chosen_navigable_id
+        .expect("window_open_steps: all navigable branches set a chosen navigable");
+    create_window_proxy(navigable_id, Some(window), ec)
 }
 
 /// <https://html.spec.whatwg.org/#get-noopener-for-window-open>

@@ -222,7 +222,7 @@ impl WebIdlInterface<crate::js::Types> for WindowProxy {
             promise_type: false,
             legacy_lenient_this: false,
             replaceable: false,
-            put_forwards: None,
+            put_forwards: Some("href"),
             legacy_lenient_setter: false,
             exposed: None,
         });

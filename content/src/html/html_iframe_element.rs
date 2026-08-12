@@ -414,7 +414,7 @@ fn create_a_new_child_navigable(
         .ok_or_else(|| format!("missing parent document {parent_document_id}"))?
         .settings
         .realm_execution_context;
-    let (_global_object, settings, new_document) = create_a_new_browsing_context_and_document(
+    let (global_object, settings, new_document) = create_a_new_browsing_context_and_document(
         parent_engine,
         &event_sender,
         content_navigable,
@@ -482,12 +482,17 @@ fn create_a_new_child_navigable(
         );
         // Register the iframe node -> content navigable mapping on the
         // parent realm's GlobalScope so the contentWindow binding can hand
-        // out the child navigable's WindowProxy shim.
+        // out the child navigable's WindowProxy, backed by the child
+        // document's Window created in this process.
         crate::js::platform_objects::with_global_scope(
             &mut content_document.settings.realm_execution_context,
             |global_scope, ec| {
-                global_scope.set_iframe_content_navigable(iframe_node_id, content_navigable, ec);
-                Ok(())
+                global_scope.set_iframe_content_navigable(
+                    iframe_node_id,
+                    content_navigable,
+                    Some(global_object.clone()),
+                    ec,
+                )
             },
         )
         .map_err(|error| {

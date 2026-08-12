@@ -1605,6 +1605,28 @@ impl UserAgentWorker {
             .ok_or_else(|| format!("missing event loop for id {event_loop_id}"))
     }
 
+    /// Resolve the command sender for the event loop that owns a document.
+    /// After a cross-process navigation the traversable has moved to a new
+    /// event loop while the outgoing document is still owned by the old one;
+    /// document-routed commands (e.g. DestroyDocument) must reach the process
+    /// that actually holds the document so its teardown can run there.
+    fn command_sender_for_document(
+        &self,
+        document_id: DocumentId,
+    ) -> Result<Sender<EventLoopCommand>, String> {
+        let event_loop_id = self
+            .state
+            .documents
+            .get(&document_id)
+            .map(|document| document.event_loop_id)
+            .ok_or_else(|| format!("unknown document id: {document_id}"))?;
+        self.state
+            .event_loops
+            .get(&event_loop_id)
+            .map(|entry| entry.command_sender.clone())
+            .ok_or_else(|| format!("missing event loop for id {event_loop_id}"))
+    }
+
     /// <https://html.spec.whatwg.org/multipage/#create-an-agent>
     fn create_agent(&mut self, can_block: bool, process_label: String) -> Result<Agent, String> {
         // Step 1: Let signifier be a new unique internal value.
@@ -3100,24 +3122,28 @@ impl UserAgentWorker {
             },
         );
 
-        if let Some(previous_document_id) = pending.previous_document_id {
-            if previous_document_id != finalized.document_id {
-                // The old document is destroyed after the new document commits so stale
-                // content-side traffic cannot revive it after the traversable has advanced.
-                if let Ok(command_sender) =
-                    self.command_sender_for_traversable(pending.traversable_id)
-                {
-                    if let Err(error) = self.send_event_loop_command(
-                        &command_sender,
-                        ContentCommand::DestroyDocument {
-                            document_id: previous_document_id,
-                        },
-                    ) {
-                        error!("[user-agent] failed to destroy previous document: {error}");
-                    }
-                }
-                self.state.documents.remove(&previous_document_id);
+        if let Some(previous_document_id) = pending.previous_document_id
+            && previous_document_id != finalized.document_id
+        {
+            // The old document is destroyed after the new document commits so stale
+            // content-side traffic cannot revive it after the traversable has advanced.
+            // It is destroyed on the event loop that owns it: after a cross-process
+            // navigation the traversable has moved to a new event loop, and routing by
+            // traversable would send the destroy to the wrong content process.
+            let command_sender = self
+                .command_sender_for_document(previous_document_id)
+                .or_else(|_| self.command_sender_for_traversable(pending.traversable_id));
+            if let Ok(command_sender) = command_sender
+                && let Err(error) = self.send_event_loop_command(
+                    &command_sender,
+                    ContentCommand::DestroyDocument {
+                        document_id: previous_document_id,
+                    },
+                )
+            {
+                error!("[user-agent] failed to destroy previous document: {error}");
             }
+            self.state.documents.remove(&previous_document_id);
         }
 
         if let Some(new_browsing_context_id) = pending.browsing_context_id {
