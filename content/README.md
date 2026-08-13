@@ -11,7 +11,13 @@ Content code follows the same call chains the web standards define.  When a
 spec algorithm calls Web IDL (e.g. type conversion, promise manipulation),
 content code routes through `content/src/webidl/`.  When a spec algorithm
 calls ECMA-262 directly (e.g. realm creation, script evaluation), content
-code calls the `js_engine` trait directly.  No Boa-specific APIs appear
+code calls the `js_engine` trait directly.  The exception that routes
+through `content/src/webidl/` anyway: HTML algorithms that read JS state in
+place of a Web IDL step (e.g. the `self` getter's "relevant
+realm.[[GlobalEnv]].[[GlobalThisValue]]" read, implemented in
+`content/src/webidl/realm.rs`) — webidl hosts those direct-JS-call quirks
+so the domain getter implements the spec steps and the bindings stay thin.
+See `content/src/js/bindings/README.md`.  No Boa-specific APIs appear
 above `js_engine/src/boa/`.  See `js_engine/README.md` for the full
 design philosophy and `content/src/generic_js_test.rs` for validated
 patterns.

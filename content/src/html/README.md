@@ -251,6 +251,35 @@ UA-side state. The opener is only used for:
 - `window.opener` JS property (not yet implemented)
 - Popup blocking
 
+## Window IDL members (`window.rs`)
+
+Every Window interface member is implemented as a `Window` method in
+`content/src/html/window.rs`, following the spec's getter/method steps with
+verbatim `// Step N:` comments (`self_value` implements the `self` getter
+steps, `top_value` the top getter steps, `close` the `close()` method steps,
+…).  The getters that read realm state (`window`/`frames`/`self` — "return
+this's relevant realm.[[GlobalEnv]].[[GlobalThisValue]]") route through
+`content/src/webidl/realm.rs::relevant_realm_global_this_value`, which owns
+the JS-side read.  Members whose state is user-agent-only (navigable target
+name, opener, closed, document-tree child navigable count) return placeholder
+values from the domain methods with a `// Note:`.
+
+Both bindings files are thin glue over these methods:
+
+- `content/src/js/bindings/html/window.rs` — the Window interface (exposed
+  on the global object and reached by the proxy's `[[Get]]` trap for
+  same-process windows via OrdinaryGet on the Window).
+- `content/src/js/bindings/html/windowproxy.rs` — the WindowProxy shim's
+  member set, which is only reached for remote windows (no local backing);
+  the same member names on the Window interface shadow them for local
+  windows.
+
+Each binding function downcasts the receiver, resolves the local Window
+(`local_window_domain` / `window_domain_from`), calls the domain method, and
+wraps the result.  The remote fallbacks in the shim bindings return
+placeholder values for user-agent state that does not exist in this content
+process.
+
 ## WindowProxy (`windowproxy.rs`)
 
 <https://html.spec.whatwg.org/#the-windowproxy-exotic-object>
@@ -396,13 +425,22 @@ WindowProxy to expose child browsing contexts by numeric index (`window[0]`,
 `window[1]`) and by name.  This requires tracking the document-tree child
 navigables on the Document, which is not yet implemented.
 
-**4. `top`/`parent` return the proxy itself.**  Resolving the top/parent
-navigable's WindowProxy requires the navigable hierarchy, which the shim does
-not yet consult.
+**4. `top`/`parent` resolve the WindowProxy per realm, without a local
+backing.**  The domain `Window::top_value`/`parent_value` consult the
+navigable hierarchy (`top_level_traversable_id`/`parent_traversable_id`) and
+create the resolved navigable's WindowProxy via `create_window_proxy` with
+no local window, so the proxy behaves as a remote shim (its members resolve
+through the shim's member set, and its cross-origin `top`/`parent`/`self`
+return the proxy itself).  The top-level window's own `top`/`parent` return
+the realm's global object (preserving `window.top === window`), which means
+`iframe.contentWindow.top === window` does not hold like in browsers (per-
+realm WindowProxy identity).
 
-**5. `name`, `opener`, `closed`, `focus` are stubs.**  The navigable target
-name, opener relationship, and closed state are user-agent state that the
-shim does not yet track or forward.
+**5. `name`, `opener`, `closed` are stubs.**  The navigable target name,
+opener relationship, and closed state are user-agent state; the domain
+methods (`Window::name_value`, `opener_value`, `closed_value`, `close`)
+return placeholder values with `// Note:` annotations until that state is
+tracked or forwarded.
 
 ## Related documentation
 

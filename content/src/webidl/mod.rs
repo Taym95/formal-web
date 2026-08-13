@@ -6,6 +6,7 @@ mod callback;
 pub(crate) mod dictionary;
 pub(crate) mod dom_exception;
 pub(crate) mod promise;
+mod realm;
 
 pub(crate) use array_index::is_array_index_key;
 pub(crate) use async_iterable::{AsyncValueIterable, create_value_async_iterator};
@@ -22,3 +23,4 @@ pub(crate) use promise::{
     mark_promise_as_handled, promise_from_value, rejected_promise, rejected_promise_from_error,
     resolved_promise, transform_promise_to_undefined, upon_settlement,
 };
+pub(crate) use realm::relevant_realm_global_this_value;

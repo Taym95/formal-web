@@ -98,8 +98,8 @@ pub(crate) fn add_event_listener(
 ### What the binding must NOT do
 
 - **No spec logic** — the binding does not implement any part of a spec
-algorithm.  It converts JS args to IDL types, calls a domain method, and
-wraps the return value.
+  algorithm.  It converts JS args to IDL types, calls a domain method, and
+  wraps the return value.
 - **No path building** — `dispatchEvent` does not build the event path inline.
 The binding calls `build_path_from_target_js_object` (in the HTML/events bridge)
 and then calls the domain method `EventTarget::dispatch_event()`.
@@ -107,6 +107,37 @@ and then calls the domain method `EventTarget::dispatch_event()`.
 automatically by the Web IDL layer (`create_interface_instance` →
 `PostCreateReflector::set_reflector`).  Domain code and bindings must never
 touch reflectors.
+- **No spec algorithm implemented in the binding, ever** — every Window IDL
+  member is a domain method on `Window` (`content/src/html/window.rs`); the
+  bindings files (`bindings/html/window.rs` for the Window interface,
+  `bindings/html/windowproxy.rs` for the WindowProxy shim) downcast the
+  receiver, resolve the local Window, and call the domain method.  A member
+  that returns a placeholder because its state is user-agent-only (navigable
+  target name, opener, closed, child-navigable count) still delegates to a
+  domain method that carries the `// Step N:` annotations and the `// Note:`;
+  the binding never inlines the stub.
+
+### When the spec calls into JS directly (not via Web IDL)
+
+Some HTML algorithms read realm/JS state directly instead of going through
+Web IDL — e.g. the `window`/`frames`/`self` getters "return this's relevant
+realm.[[GlobalEnv]].[[GlobalThisValue]]"
+(<https://html.spec.whatwg.org/#dom-self>).  The spec structure must be
+mirrored exactly:
+
+1. The **domain getter** (`Window::self_value` in `content/src/html/window.rs`)
+   implements the getter steps and names the concept it uses, e.g. the
+   [relevant realm](https://html.spec.whatwg.org/#concept-relevant-realm).
+2. The **JS-side read** (`[[GlobalEnv]].[[GlobalThisValue]]`) lives in
+   `content/src/webidl/realm.rs` (`relevant_realm_global_this_value`):
+   webidl hosts "stuff that is used to call into js indirectly", including
+   HTML's direct-JS-call quirks.  The helper carries the concept anchor
+   (`#concept-relevant-realm`) and a `// Note:` that the read is the spec's
+   direct-JS-call quirk.
+
+Never implement the JS read inside the binding, and never skip the domain
+step: the binding stays thin (downcast → call domain → wrap), the domain
+implements the spec steps, and webidl owns the call into the engine.
 
 ### Where code lives is dictated by which spec it implements
 

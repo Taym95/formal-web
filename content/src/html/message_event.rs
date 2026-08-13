@@ -128,11 +128,6 @@ impl MessageEvent {
     }
 
     /// <https://html.spec.whatwg.org/#dom-messageevent-ports>
-    pub(crate) fn ports_value(&self, ec: &mut dyn ExecutionContext<Types>) -> Vec<JsObject> {
-        self.ports.borrow(ec).clone()
-    }
-
-    /// <https://html.spec.whatwg.org/#dom-messageevent-ports>
     /// The `ports` getter must return the value it was initialized to; the
     /// binding delivers this as a single frozen array object, created here on
     /// first access so every getter call returns the same object.

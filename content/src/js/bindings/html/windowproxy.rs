@@ -1,4 +1,5 @@
 use crate::html::Window;
+use crate::html::window_post_message_steps;
 use crate::html::windowproxy::WindowProxy;
 use crate::js::bindings::html::window::parse_post_message_options;
 use crate::webidl::bindings::{AttributeDef, InterfaceDefinition, OperationDef, WebIdlInterface};
@@ -11,7 +12,7 @@ fn with_window_proxy_ref<R>(
     ec: &mut dyn ExecutionContext<crate::js::Types>,
     f: impl FnOnce(&WindowProxy) -> R,
 ) -> Completion<R, crate::js::Types> {
-    let obj = crate::js::Types::value_as_object(this)
+    let obj = <crate::js::Types as JsTypes>::value_as_object(this)
         .ok_or_else(|| ec.new_type_error("WindowProxy receiver is not an object"))?;
     let proxy = ec
         .with_object_any(&obj)
@@ -28,11 +29,22 @@ fn local_window_for(
     this: &JsValue,
     ec: &mut dyn ExecutionContext<crate::js::Types>,
 ) -> Option<<crate::js::Types as JsTypes>::JsObject> {
-    let obj = crate::js::Types::value_as_object(this)?;
+    let obj = <crate::js::Types as JsTypes>::value_as_object(this)?;
     let proxy = ec
         .with_object_any(&obj)
         .and_then(|data| data.downcast_ref::<WindowProxy>().cloned())?;
     proxy.local_window(ec)
+}
+
+/// Resolve the domain [`Window`] backing the shim, when the target
+/// navigable lives in this content process.
+fn local_window_domain(
+    this: &JsValue,
+    ec: &mut dyn ExecutionContext<crate::js::Types>,
+) -> Option<Window> {
+    let local_window = local_window_for(this, ec)?;
+    ec.with_object_any(&local_window)
+        .and_then(|data| data.downcast_ref::<Window>().cloned())
 }
 
 impl WebIdlInterface<crate::js::Types> for WindowProxy {
@@ -243,111 +255,158 @@ fn post_message_method(
     // The shim runs steps 1–7 in the caller's realm (the incumbent settings
     // object), then hands the serialized message to the user agent for step 8.
     let target_navigable_id = with_window_proxy_ref(this, ec, |proxy| proxy.target_navigable_id())?;
-    crate::html::window_post_message_steps(target_navigable_id, message, options, ec)?;
+    window_post_message_steps(target_navigable_id, message, options, ec)?;
     Ok(ec.value_undefined())
 }
 
 fn close_method(
-    _this: &JsValue,
+    this: &JsValue,
     _args: &[JsValue],
     ec: &mut dyn ExecutionContext<crate::js::Types>,
 ) -> Completion<JsValue, crate::js::Types> {
+    // <https://html.spec.whatwg.org/#dom-window-close>
+    // A remote shim (no local Window) has no closeable window in this
+    // content process.
+    if let Some(window) = local_window_domain(this, ec) {
+        window.close();
+    }
     Ok(ec.value_undefined())
 }
 
 fn focus_method(
-    _this: &JsValue,
+    this: &JsValue,
     _args: &[JsValue],
     ec: &mut dyn ExecutionContext<crate::js::Types>,
 ) -> Completion<JsValue, crate::js::Types> {
+    // <https://html.spec.whatwg.org/#dom-window-focus>
+    if let Some(window) = local_window_domain(this, ec) {
+        window.focus();
+    }
     Ok(ec.value_undefined())
 }
 
 fn blur_method(
-    _this: &JsValue,
+    this: &JsValue,
     _args: &[JsValue],
     ec: &mut dyn ExecutionContext<crate::js::Types>,
 ) -> Completion<JsValue, crate::js::Types> {
+    // <https://html.spec.whatwg.org/#dom-window-blur>
+    if let Some(window) = local_window_domain(this, ec) {
+        window.blur();
+    }
     Ok(ec.value_undefined())
 }
 
 fn get_closed(
-    _this: &JsValue,
+    this: &JsValue,
     _args: &[JsValue],
     ec: &mut dyn ExecutionContext<crate::js::Types>,
 ) -> Completion<JsValue, crate::js::Types> {
-    Ok(ec.value_from_bool(false))
+    // <https://html.spec.whatwg.org/#dom-window-closed>
+    let closed = local_window_domain(this, ec)
+        .map(|window| window.closed_value())
+        .unwrap_or(false);
+    Ok(ec.value_from_bool(closed))
 }
 
 fn get_self(
     this: &JsValue,
     _args: &[JsValue],
-    _ec: &mut dyn ExecutionContext<crate::js::Types>,
+    ec: &mut dyn ExecutionContext<crate::js::Types>,
 ) -> Completion<JsValue, crate::js::Types> {
+    // <https://html.spec.whatwg.org/#dom-self>
+    // The `window`, `frames`, and `self` members share the same getter
+    // steps.  A remote shim resolves these keys through the proxy's [[Get]]
+    // trap, which returns the WindowProxy itself per CrossOriginGet; the
+    // member is only reachable on a shim with a local backing.
+    if let Some(window) = local_window_domain(this, ec) {
+        return Ok(window.self_value(ec));
+    }
     Ok(this.clone())
 }
 
 fn get_name(
-    _this: &JsValue,
+    this: &JsValue,
     _args: &[JsValue],
     ec: &mut dyn ExecutionContext<crate::js::Types>,
 ) -> Completion<JsValue, crate::js::Types> {
-    // <https://html.spec.whatwg.org/#the-window-object>
-    // Note: The navigable target name lives in the user agent; the local
-    // window's GlobalScope does not yet track it, so the getter returns the
-    // empty string.
-    Ok(ec.value_from_string(ec.js_string_from_str("")))
+    // <https://html.spec.whatwg.org/#dom-name>
+    // A remote shim's navigable target name is user-agent state that is not
+    // available in this content process.
+    let name = local_window_domain(this, ec)
+        .map(|window| window.name_value())
+        .unwrap_or_default();
+    Ok(ec.value_from_string(ec.js_string_from_str(&name)))
 }
 
 fn set_name(
-    _this: &JsValue,
-    _args: &[JsValue],
+    this: &JsValue,
+    args: &[JsValue],
     ec: &mut dyn ExecutionContext<crate::js::Types>,
 ) -> Completion<JsValue, crate::js::Types> {
-    // Note: The navigable target name is user-agent state; setting it is not
-    // yet wired.
+    // <https://html.spec.whatwg.org/#dom-name>
+    let Some(window) = local_window_domain(this, ec) else {
+        // Note: A remote shim's navigable target name is user-agent state;
+        // setting it is not yet wired.
+        return Ok(ec.value_undefined());
+    };
+    let undefined = ec.value_undefined();
+    let value = ec.to_rust_string(args.first().cloned().unwrap_or(undefined))?;
+    window.set_name_value(value);
     Ok(ec.value_undefined())
 }
 
 fn get_length(
-    _this: &JsValue,
+    this: &JsValue,
     _args: &[JsValue],
     ec: &mut dyn ExecutionContext<crate::js::Types>,
 ) -> Completion<JsValue, crate::js::Types> {
-    // <https://html.spec.whatwg.org/#the-window-object>
-    // Note: Document-tree child navigable tracking is not yet implemented.
-    Ok(ec.value_from_number(0.0))
+    // <https://html.spec.whatwg.org/#dom-length>
+    let length = local_window_domain(this, ec)
+        .map(|window| window.length_value())
+        .unwrap_or(0);
+    Ok(ec.value_from_number(length as f64))
 }
 
 fn get_top(
     this: &JsValue,
     _args: &[JsValue],
-    _ec: &mut dyn ExecutionContext<crate::js::Types>,
+    ec: &mut dyn ExecutionContext<crate::js::Types>,
 ) -> Completion<JsValue, crate::js::Types> {
-    // <https://html.spec.whatwg.org/#the-window-object>
-    // Note: Resolving the top traversable's WindowProxy requires the
-    // navigable hierarchy; return the proxy itself for now.
+    // <https://html.spec.whatwg.org/#dom-top>
+    // A remote shim resolves `top` through the proxy's [[Get]] trap, which
+    // returns the WindowProxy itself per CrossOriginGet.
+    if let Some(window) = local_window_domain(this, ec) {
+        return window.top_value(ec);
+    }
     Ok(this.clone())
 }
 
 fn get_parent(
     this: &JsValue,
     _args: &[JsValue],
-    _ec: &mut dyn ExecutionContext<crate::js::Types>,
+    ec: &mut dyn ExecutionContext<crate::js::Types>,
 ) -> Completion<JsValue, crate::js::Types> {
-    // <https://html.spec.whatwg.org/#the-window-object>
-    // Note: Resolving the parent navigable's WindowProxy requires the
-    // navigable hierarchy; return the proxy itself for now.
+    // <https://html.spec.whatwg.org/#dom-parent>
+    // A remote shim resolves `parent` through the proxy's [[Get]] trap,
+    // which returns the WindowProxy itself per CrossOriginGet.
+    if let Some(window) = local_window_domain(this, ec) {
+        return window.parent_value(ec);
+    }
     Ok(this.clone())
 }
 
 fn get_opener(
-    _this: &JsValue,
+    this: &JsValue,
     _args: &[JsValue],
     ec: &mut dyn ExecutionContext<crate::js::Types>,
 ) -> Completion<JsValue, crate::js::Types> {
-    // <https://html.spec.whatwg.org/#the-window-object>
-    // Note: Opener tracking is user-agent state and is not yet wired.
+    // <https://html.spec.whatwg.org/#dom-opener>
+    // Note: The opener browsing context is user-agent state; a remote shim
+    // has no opener in this content process.
+    if let Some(window) = local_window_domain(this, ec) {
+        return Ok(window.opener_value(ec));
+    }
     Ok(ec.value_null())
 }
 
@@ -356,18 +415,10 @@ fn get_document(
     _args: &[JsValue],
     ec: &mut dyn ExecutionContext<crate::js::Types>,
 ) -> Completion<JsValue, crate::js::Types> {
-    // <https://html.spec.whatwg.org/#the-window-object>
-    // Note: Resolves the target window's document when the target navigable
-    // lives in this content process; cross-realm property reads on the
-    // returned object are subject to V8's context isolation.
-    if let Some(local_window) = local_window_for(this, ec) {
-        let document = ec
-            .with_object_any(&local_window)
-            .and_then(|data| data.downcast_ref::<Window>().cloned())
-            .and_then(|window| window.global_scope.document_object(ec));
-        if let Some(document) = document {
-            return Ok(crate::js::Types::value_from_object(document));
-        }
+    // <https://html.spec.whatwg.org/#dom-document>
+    // A remote shim's document lives in another content process.
+    if let Some(window) = local_window_domain(this, ec) {
+        return window.document_value(ec);
     }
     Ok(ec.value_null())
 }
@@ -377,17 +428,10 @@ fn get_location(
     _args: &[JsValue],
     ec: &mut dyn ExecutionContext<crate::js::Types>,
 ) -> Completion<JsValue, crate::js::Types> {
-    // <https://html.spec.whatwg.org/#the-window-object>
-    // Note: Resolves the target window's location when the target navigable
-    // lives in this content process.
-    if let Some(local_window) = local_window_for(this, ec) {
-        let location = ec
-            .with_object_any(&local_window)
-            .and_then(|data| data.downcast_ref::<Window>().cloned())
-            .and_then(|window| window.global_scope.location_object(ec));
-        if let Some(location) = location {
-            return Ok(crate::js::Types::value_from_object(location));
-        }
+    // <https://html.spec.whatwg.org/#dom-location>
+    // A remote shim's Location object lives in another content process.
+    if let Some(window) = local_window_domain(this, ec) {
+        return window.location_value(ec);
     }
     Ok(ec.value_null())
 }

@@ -3,18 +3,14 @@ type JsObject = <crate::js::Types as JsTypes>::JsObject;
 
 use crate::html::windowproxy::resolve_window;
 use crate::html::{
-    Location, PostMessageOptions, Window, WindowOrWorkerGlobalScope,
+    PostMessageOptions, Window, WindowOrWorkerGlobalScope,
     safe_passing_of_structured_data::StructuredCloneOptions,
     window_computed_style_properties_for_element, window_post_message_steps,
 };
 use crate::js::bindings::html::global_event_handlers::define_global_event_handlers;
-use crate::js::platform_objects;
-use crate::webidl::bindings::{
-    AttributeDef, InterfaceDefinition, OperationDef, WebIdlInterface, create_interface_instance,
-};
+use crate::webidl::bindings::{AttributeDef, InterfaceDefinition, OperationDef, WebIdlInterface};
 use crate::webidl::callback_function_value;
 
-use super::hyperlink_element_utils::document_creation_url;
 use super::style_declaration_object;
 
 use js_engine::{Completion, ExecutionContext, JsTypes};
@@ -33,8 +29,126 @@ impl WebIdlInterface<crate::js::Types> for Window {
     fn define_members(def: &mut InterfaceDefinition<crate::js::Types>) {
         define_global_event_handlers(def);
         def.add_attribute(AttributeDef {
-            id: "parent",
-            getter: get_parent,
+            id: "window",
+            getter: get_window,
+            setter: None,
+            static_: false,
+            unforgeable: false,
+            promise_type: false,
+            legacy_lenient_this: false,
+            replaceable: false,
+            put_forwards: None,
+            legacy_lenient_setter: false,
+            exposed: None,
+        });
+        def.add_attribute(AttributeDef {
+            id: "self",
+            getter: get_self,
+            setter: None,
+            static_: false,
+            unforgeable: false,
+            promise_type: false,
+            legacy_lenient_this: false,
+            replaceable: false,
+            put_forwards: None,
+            legacy_lenient_setter: false,
+            exposed: None,
+        });
+        def.add_attribute(AttributeDef {
+            id: "document",
+            getter: get_document,
+            setter: None,
+            static_: false,
+            unforgeable: false,
+            promise_type: false,
+            legacy_lenient_this: false,
+            replaceable: false,
+            put_forwards: None,
+            legacy_lenient_setter: false,
+            exposed: None,
+        });
+        def.add_attribute(AttributeDef {
+            id: "name",
+            getter: get_name,
+            setter: Some(set_name),
+            static_: false,
+            unforgeable: false,
+            promise_type: false,
+            legacy_lenient_this: false,
+            replaceable: false,
+            put_forwards: None,
+            legacy_lenient_setter: false,
+            exposed: None,
+        });
+        def.add_attribute(AttributeDef {
+            id: "location",
+            getter: get_location,
+            setter: None,
+            static_: false,
+            unforgeable: false,
+            promise_type: false,
+            legacy_lenient_this: false,
+            replaceable: false,
+            put_forwards: Some("href"),
+            legacy_lenient_setter: false,
+            exposed: None,
+        });
+        def.add_operation(OperationDef {
+            id: "close",
+            length: 0,
+            method: close_method,
+            static_: false,
+            unforgeable: false,
+            promise_type: false,
+            exposed: None,
+        });
+        def.add_attribute(AttributeDef {
+            id: "closed",
+            getter: get_closed,
+            setter: None,
+            static_: false,
+            unforgeable: false,
+            promise_type: false,
+            legacy_lenient_this: false,
+            replaceable: false,
+            put_forwards: None,
+            legacy_lenient_setter: false,
+            exposed: None,
+        });
+        def.add_operation(OperationDef {
+            id: "focus",
+            length: 0,
+            method: focus_method,
+            static_: false,
+            unforgeable: false,
+            promise_type: false,
+            exposed: None,
+        });
+        def.add_operation(OperationDef {
+            id: "blur",
+            length: 0,
+            method: blur_method,
+            static_: false,
+            unforgeable: false,
+            promise_type: false,
+            exposed: None,
+        });
+        def.add_attribute(AttributeDef {
+            id: "frames",
+            getter: get_frames,
+            setter: None,
+            static_: false,
+            unforgeable: false,
+            promise_type: false,
+            legacy_lenient_this: false,
+            replaceable: false,
+            put_forwards: None,
+            legacy_lenient_setter: false,
+            exposed: None,
+        });
+        def.add_attribute(AttributeDef {
+            id: "length",
+            getter: get_length,
             setter: None,
             static_: false,
             unforgeable: false,
@@ -59,15 +173,28 @@ impl WebIdlInterface<crate::js::Types> for Window {
             exposed: None,
         });
         def.add_attribute(AttributeDef {
-            id: "location",
-            getter: get_location,
+            id: "opener",
+            getter: get_opener,
             setter: None,
             static_: false,
             unforgeable: false,
             promise_type: false,
             legacy_lenient_this: false,
             replaceable: false,
-            put_forwards: Some("href"),
+            put_forwards: None,
+            legacy_lenient_setter: false,
+            exposed: None,
+        });
+        def.add_attribute(AttributeDef {
+            id: "parent",
+            getter: get_parent,
+            setter: None,
+            static_: false,
+            unforgeable: false,
+            promise_type: false,
+            legacy_lenient_this: false,
+            replaceable: false,
+            put_forwards: None,
             legacy_lenient_setter: false,
             exposed: None,
         });
@@ -164,12 +291,24 @@ impl WebIdlInterface<crate::js::Types> for Window {
     }
 }
 
+/// Resolve the domain [`Window`] from a receiver that may be a Window or a
+/// WindowProxy, cloning it out of the object registry so no borrow is live
+/// while the domain method runs.
+fn window_domain_from(
+    this: &JsValue,
+    ec: &mut dyn ExecutionContext<crate::js::Types>,
+) -> Completion<Window, crate::js::Types> {
+    let window_object = current_window_object_from(this, ec);
+    ec.with_object_any(&window_object)
+        .and_then(|data| data.downcast_ref::<Window>().cloned())
+        .ok_or_else(|| ec.new_type_error("receiver is not a Window"))
+}
+
 fn structured_clone_method(
     this: &JsValue,
     args: &[JsValue],
     ec: &mut dyn ExecutionContext<crate::js::Types>,
 ) -> Completion<JsValue, crate::js::Types> {
-    let window_object = current_window_object_from(this, ec);
     let undefined = ec.value_undefined();
     let value = args.first().cloned().unwrap_or_else(|| undefined.clone());
     let options = parse_structured_clone_options(args.get(1), ec);
@@ -179,10 +318,7 @@ fn structured_clone_method(
     // backend the window is the realm global object, and a mutable borrow held
     // across engine calls panics when the algorithm touches the global (e.g.
     // construct_typed_array_view looks up the typed-array constructor on it).
-    let window = ec
-        .with_object_any(&window_object)
-        .and_then(|data| data.downcast_ref::<Window>().cloned())
-        .ok_or_else(|| ec.new_type_error("receiver is not a Window"))?;
+    let window = window_domain_from(this, ec)?;
     window.structured_clone(value, options, ec)
 }
 
@@ -242,11 +378,7 @@ fn post_message_method(
     let message = args.first().cloned().unwrap_or_else(|| undefined.clone());
     let options = parse_post_message_options(args, ec)?;
 
-    let window_object = current_window_object_from(this, ec);
-    let window = ec
-        .with_object_any(&window_object)
-        .and_then(|data| data.downcast_ref::<Window>().cloned())
-        .ok_or_else(|| ec.new_type_error("receiver is not a Window"))?;
+    let window = window_domain_from(this, ec)?;
     let target_navigable_id = window
         .global_scope
         .source_navigable_id()
@@ -355,11 +487,7 @@ fn open_method(
     let target = ec.to_rust_string(args.get(1).cloned().unwrap_or_else(|| undefined.clone()))?;
     let features = ec.to_rust_string(args.get(2).cloned().unwrap_or_else(|| undefined))?;
 
-    let window_object = current_window_object_from(this, ec);
-    let window = ec
-        .with_object_any(&window_object)
-        .and_then(|data| data.downcast_ref::<Window>().cloned())
-        .ok_or_else(|| ec.new_type_error("receiver is not a Window"))?;
+    let window = window_domain_from(this, ec)?;
     window.open(&url, &target, &features, ec)
 }
 
@@ -370,23 +498,73 @@ fn request_animation_frame_method(
 ) -> Completion<JsValue, crate::js::Types> {
     let undefined = ec.value_undefined();
     let callback = callback_function_value(args.first().unwrap_or(&undefined), ec)?;
-    let window_object = current_window_object_from(this, ec);
-    let window = ec
-        .with_object_any(&window_object)
-        .and_then(|data| data.downcast_ref::<Window>().cloned())
-        .ok_or_else(|| ec.new_type_error("receiver is not a Window"))?;
+    let window = window_domain_from(this, ec)?;
     let handle = window.global_scope.request_animation_frame(callback, ec);
     Ok(ec.value_from_number(handle as f64))
 }
 
-fn get_parent(
+fn get_window(
     this: &JsValue,
     _: &[JsValue],
     ec: &mut dyn ExecutionContext<crate::js::Types>,
 ) -> Completion<JsValue, crate::js::Types> {
-    Ok(crate::js::Types::value_from_object(
-        current_window_object_from(this, ec),
-    ))
+    // <https://html.spec.whatwg.org/#dom-window>
+    let window = window_domain_from(this, ec)?;
+    Ok(window.window_value(ec))
+}
+
+fn get_self(
+    this: &JsValue,
+    _: &[JsValue],
+    ec: &mut dyn ExecutionContext<crate::js::Types>,
+) -> Completion<JsValue, crate::js::Types> {
+    // <https://html.spec.whatwg.org/#dom-self>
+    let window = window_domain_from(this, ec)?;
+    Ok(window.self_value(ec))
+}
+
+fn get_frames(
+    this: &JsValue,
+    _: &[JsValue],
+    ec: &mut dyn ExecutionContext<crate::js::Types>,
+) -> Completion<JsValue, crate::js::Types> {
+    // <https://html.spec.whatwg.org/#dom-frames>
+    let window = window_domain_from(this, ec)?;
+    Ok(window.frames_value(ec))
+}
+
+fn get_name(
+    this: &JsValue,
+    _: &[JsValue],
+    ec: &mut dyn ExecutionContext<crate::js::Types>,
+) -> Completion<JsValue, crate::js::Types> {
+    // <https://html.spec.whatwg.org/#dom-name>
+    let window = window_domain_from(this, ec)?;
+    let name = window.name_value();
+    Ok(ec.value_from_string(ec.js_string_from_str(&name)))
+}
+
+fn set_name(
+    this: &JsValue,
+    args: &[JsValue],
+    ec: &mut dyn ExecutionContext<crate::js::Types>,
+) -> Completion<JsValue, crate::js::Types> {
+    // <https://html.spec.whatwg.org/#dom-name>
+    let window = window_domain_from(this, ec)?;
+    let undefined = ec.value_undefined();
+    let value = ec.to_rust_string(args.first().cloned().unwrap_or(undefined))?;
+    window.set_name_value(value);
+    Ok(ec.value_undefined())
+}
+
+fn get_length(
+    this: &JsValue,
+    _: &[JsValue],
+    ec: &mut dyn ExecutionContext<crate::js::Types>,
+) -> Completion<JsValue, crate::js::Types> {
+    // <https://html.spec.whatwg.org/#dom-length>
+    let window = window_domain_from(this, ec)?;
+    Ok(ec.value_from_number(window.length_value() as f64))
 }
 
 fn get_top(
@@ -394,18 +572,92 @@ fn get_top(
     _: &[JsValue],
     ec: &mut dyn ExecutionContext<crate::js::Types>,
 ) -> Completion<JsValue, crate::js::Types> {
-    Ok(crate::js::Types::value_from_object(
-        current_window_object_from(this, ec),
-    ))
+    // <https://html.spec.whatwg.org/#dom-top>
+    let window = window_domain_from(this, ec)?;
+    window.top_value(ec)
 }
 
-fn get_location(
-    _: &JsValue,
+fn get_parent(
+    this: &JsValue,
     _: &[JsValue],
     ec: &mut dyn ExecutionContext<crate::js::Types>,
 ) -> Completion<JsValue, crate::js::Types> {
-    let location_val = location_object(ec)?;
-    Ok(crate::js::Types::value_from_object(location_val))
+    // <https://html.spec.whatwg.org/#dom-parent>
+    let window = window_domain_from(this, ec)?;
+    window.parent_value(ec)
+}
+
+fn get_opener(
+    this: &JsValue,
+    _: &[JsValue],
+    ec: &mut dyn ExecutionContext<crate::js::Types>,
+) -> Completion<JsValue, crate::js::Types> {
+    // <https://html.spec.whatwg.org/#dom-opener>
+    let window = window_domain_from(this, ec)?;
+    Ok(window.opener_value(ec))
+}
+
+fn get_document(
+    this: &JsValue,
+    _: &[JsValue],
+    ec: &mut dyn ExecutionContext<crate::js::Types>,
+) -> Completion<JsValue, crate::js::Types> {
+    // <https://html.spec.whatwg.org/#dom-document>
+    let window = window_domain_from(this, ec)?;
+    window.document_value(ec)
+}
+
+fn get_location(
+    this: &JsValue,
+    _: &[JsValue],
+    ec: &mut dyn ExecutionContext<crate::js::Types>,
+) -> Completion<JsValue, crate::js::Types> {
+    // <https://html.spec.whatwg.org/#dom-location>
+    let window = window_domain_from(this, ec)?;
+    window.location_value(ec)
+}
+
+fn close_method(
+    this: &JsValue,
+    _: &[JsValue],
+    ec: &mut dyn ExecutionContext<crate::js::Types>,
+) -> Completion<JsValue, crate::js::Types> {
+    // <https://html.spec.whatwg.org/#dom-window-close>
+    let window = window_domain_from(this, ec)?;
+    window.close();
+    Ok(ec.value_undefined())
+}
+
+fn get_closed(
+    this: &JsValue,
+    _: &[JsValue],
+    ec: &mut dyn ExecutionContext<crate::js::Types>,
+) -> Completion<JsValue, crate::js::Types> {
+    // <https://html.spec.whatwg.org/#dom-window-closed>
+    let window = window_domain_from(this, ec)?;
+    Ok(ec.value_from_bool(window.closed_value()))
+}
+
+fn focus_method(
+    this: &JsValue,
+    _: &[JsValue],
+    ec: &mut dyn ExecutionContext<crate::js::Types>,
+) -> Completion<JsValue, crate::js::Types> {
+    // <https://html.spec.whatwg.org/#dom-window-focus>
+    let window = window_domain_from(this, ec)?;
+    window.focus();
+    Ok(ec.value_undefined())
+}
+
+fn blur_method(
+    this: &JsValue,
+    _: &[JsValue],
+    ec: &mut dyn ExecutionContext<crate::js::Types>,
+) -> Completion<JsValue, crate::js::Types> {
+    // <https://html.spec.whatwg.org/#dom-window-blur>
+    let window = window_domain_from(this, ec)?;
+    window.blur();
+    Ok(ec.value_undefined())
 }
 
 fn cancel_animation_frame_method(
@@ -415,11 +667,7 @@ fn cancel_animation_frame_method(
 ) -> Completion<JsValue, crate::js::Types> {
     let undefined = ec.value_undefined();
     let handle = ec.to_uint32(args.first().cloned().unwrap_or_else(|| undefined))?;
-    let window_object = current_window_object_from(this, ec);
-    let window = ec
-        .with_object_any(&window_object)
-        .and_then(|data| data.downcast_ref::<Window>().cloned())
-        .ok_or_else(|| ec.new_type_error("receiver is not a Window"))?;
+    let window = window_domain_from(this, ec)?;
     window.global_scope.cancel_animation_frame(handle, ec);
     Ok(ec.value_undefined())
 }
@@ -429,15 +677,11 @@ fn set_timeout_method(
     args: &[JsValue],
     ec: &mut dyn ExecutionContext<crate::js::Types>,
 ) -> Completion<JsValue, crate::js::Types> {
-    let window_object = current_window_object_from(this, ec);
     let undefined = ec.value_undefined();
     let handler = args.first().cloned().unwrap_or_else(|| undefined.clone());
     let delay = args.get(1).cloned().unwrap_or_else(|| undefined);
     let extra_args: Vec<JsValue> = args.iter().skip(2).cloned().collect();
-    let window = ec
-        .with_object_any(&window_object)
-        .and_then(|data| data.downcast_ref::<Window>().cloned())
-        .ok_or_else(|| ec.new_type_error("receiver is not a Window"))?;
+    let window = window_domain_from(this, ec)?;
     window
         .set_timeout(&handler, &delay, extra_args, ec)
         .map(|id| ec.value_from_number(id as f64))
@@ -450,11 +694,7 @@ fn clear_timeout_method(
 ) -> Completion<JsValue, crate::js::Types> {
     let undefined = ec.value_undefined();
     let timer_id = ec.to_uint32(args.first().cloned().unwrap_or_else(|| undefined))?;
-    let window_object = current_window_object_from(this, ec);
-    let window = ec
-        .with_object_any(&window_object)
-        .and_then(|data| data.downcast_ref::<Window>().cloned())
-        .ok_or_else(|| ec.new_type_error("receiver is not a Window"))?;
+    let window = window_domain_from(this, ec)?;
     window.clear_timeout(timer_id, ec);
     Ok(ec.value_undefined())
 }
@@ -464,15 +704,11 @@ fn set_interval_method(
     args: &[JsValue],
     ec: &mut dyn ExecutionContext<crate::js::Types>,
 ) -> Completion<JsValue, crate::js::Types> {
-    let window_object = current_window_object_from(this, ec);
     let undefined = ec.value_undefined();
     let handler = args.first().cloned().unwrap_or_else(|| undefined.clone());
     let delay = args.get(1).cloned().unwrap_or_else(|| undefined);
     let extra_args: Vec<JsValue> = args.iter().skip(2).cloned().collect();
-    let window = ec
-        .with_object_any(&window_object)
-        .and_then(|data| data.downcast_ref::<Window>().cloned())
-        .ok_or_else(|| ec.new_type_error("receiver is not a Window"))?;
+    let window = window_domain_from(this, ec)?;
     window
         .set_interval(&handler, &delay, extra_args, ec)
         .map(|id| ec.value_from_number(id as f64))
@@ -485,11 +721,7 @@ fn clear_interval_method(
 ) -> Completion<JsValue, crate::js::Types> {
     let undefined = ec.value_undefined();
     let timer_id = ec.to_uint32(args.first().cloned().unwrap_or_else(|| undefined))?;
-    let window_object = current_window_object_from(this, ec);
-    let window = ec
-        .with_object_any(&window_object)
-        .and_then(|data| data.downcast_ref::<Window>().cloned())
-        .ok_or_else(|| ec.new_type_error("receiver is not a Window"))?;
+    let window = window_domain_from(this, ec)?;
     window.clear_interval(timer_id, ec);
     Ok(ec.value_undefined())
 }
@@ -526,34 +758,6 @@ fn get_computed_style_method(
     };
     // ec borrow from with_object_any is released here.
     style_declaration_object(&properties, ec).map(|obj| crate::js::Types::value_from_object(obj))
-}
-
-/// <https://html.spec.whatwg.org/#the-windowproxy-exotic-object>
-///
-
-fn location_object(
-    ec: &mut dyn ExecutionContext<crate::js::Types>,
-) -> Completion<JsObject, crate::js::Types> {
-    if let Some(object) = platform_objects::location_object(ec)? {
-        return Ok(object);
-    }
-
-    let url = document_creation_url(ec)?;
-    let window = ec.global_object();
-    let (source_navigable_id, event_sender) = ec
-        .with_object_any(&window)
-        .and_then(|data| data.downcast_ref::<Window>())
-        .map(|window| {
-            (
-                window.global_scope.source_navigable_id(),
-                window.global_scope.event_sender(),
-            )
-        })
-        .unwrap_or((None, None));
-    let location = Location::new(url, source_navigable_id, event_sender);
-    let object = create_interface_instance::<crate::js::Types, Location>(location, ec)?;
-    platform_objects::store_location_object(ec, object.clone())?;
-    Ok(object)
 }
 
 /// <https://html.spec.whatwg.org/#the-windowproxy-exotic-object>

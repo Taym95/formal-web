@@ -11,14 +11,16 @@ use crate::js::{Engine, Types};
 
 type JsValue = <Types as JsTypes>::JsValue;
 
-use crate::dom::Element;
 use crate::dom::event::{EventTarget, EventTargetAccess};
+use crate::dom::{Document, Element};
 use crate::js::platform_objects::with_global_scope;
+use crate::webidl::bindings::create_interface_instance;
+use crate::webidl::relevant_realm_global_this_value;
 
 use super::resolved_style_properties_for_element;
 use super::safe_passing_of_structured_data::structured_serialize_with_transfer;
 use super::windowproxy::create_window_proxy;
-use super::{GlobalScope, the_rules_for_choosing_a_navigable};
+use super::{GlobalScope, Location, the_rules_for_choosing_a_navigable};
 use js_engine::gc_struct;
 
 /// <https://html.spec.whatwg.org/#window>
@@ -57,6 +59,223 @@ impl Window {
             return Ok(ec.value_null());
         };
         window_open_steps(ec, url, target, features, &self.global_scope, &event_sender)
+    }
+
+    /// <https://html.spec.whatwg.org/#dom-window>
+    pub(crate) fn window_value(&self, ec: &mut dyn ExecutionContext<Types>) -> JsValue {
+        // The window, frames, and self getter steps are to return this's
+        // relevant realm.[[GlobalEnv]].[[GlobalThisValue]].
+        // <https://html.spec.whatwg.org/#concept-relevant-realm>
+        relevant_realm_global_this_value(ec)
+    }
+
+    /// <https://html.spec.whatwg.org/#dom-self>
+    pub(crate) fn self_value(&self, ec: &mut dyn ExecutionContext<Types>) -> JsValue {
+        // The window, frames, and self getter steps are to return this's
+        // relevant realm.[[GlobalEnv]].[[GlobalThisValue]].
+        // <https://html.spec.whatwg.org/#concept-relevant-realm>
+        relevant_realm_global_this_value(ec)
+    }
+
+    /// <https://html.spec.whatwg.org/#dom-frames>
+    pub(crate) fn frames_value(&self, ec: &mut dyn ExecutionContext<Types>) -> JsValue {
+        // The window, frames, and self getter steps are to return this's
+        // relevant realm.[[GlobalEnv]].[[GlobalThisValue]].
+        // <https://html.spec.whatwg.org/#concept-relevant-realm>
+        relevant_realm_global_this_value(ec)
+    }
+
+    /// <https://html.spec.whatwg.org/#dom-name>
+    pub(crate) fn name_value(&self) -> String {
+        // Step 1: If this's navigable is null, then return the empty string.
+        if self.global_scope.source_navigable_id().is_none() {
+            return String::new();
+        }
+        // Step 2: Return this's navigable's target name.
+        // Note: The navigable target name is user-agent state that the realm
+        // does not track, so the getter returns the empty string.
+        String::new()
+    }
+
+    /// <https://html.spec.whatwg.org/#dom-name>
+    pub(crate) fn set_name_value(&self, _: String) {
+        // Step 1: If this's navigable is null, then return.
+        // Step 2: Set this's navigable's active session history entry's
+        //         document state's navigable target name to the given value.
+        // Note: The navigable target name is user-agent state; setting it is
+        // not yet wired.
+    }
+
+    /// <https://html.spec.whatwg.org/#dom-length>
+    pub(crate) fn length_value(&self) -> u32 {
+        // The length getter steps are to return this's associated Document's
+        // document-tree child navigables's size.
+        // Note: Document-tree child navigable tracking is not yet
+        // implemented, so the getter returns 0.
+        0
+    }
+
+    /// <https://html.spec.whatwg.org/#dom-top>
+    pub(crate) fn top_value(
+        &self,
+        ec: &mut dyn ExecutionContext<Types>,
+    ) -> Completion<JsValue, Types> {
+        // Step 1: If this's navigable is null, then return null.
+        let Some(navigable_id) = self.global_scope.source_navigable_id() else {
+            return Ok(ec.value_null());
+        };
+        // Step 2: Return this's navigable's top-level traversable's active
+        //         WindowProxy.
+        let top_level_id = self
+            .global_scope
+            .top_level_traversable_id()
+            .unwrap_or(navigable_id);
+        if top_level_id == navigable_id {
+            // Note: For a top-level window the active WindowProxy is the
+            // realm's own window identity, so `window.top === window` holds.
+            return Ok(relevant_realm_global_this_value(ec));
+        }
+        create_window_proxy(top_level_id, None, ec)
+    }
+
+    /// <https://html.spec.whatwg.org/#dom-parent>
+    pub(crate) fn parent_value(
+        &self,
+        ec: &mut dyn ExecutionContext<Types>,
+    ) -> Completion<JsValue, Types> {
+        // Step 1: Let navigable be this's navigable.
+        let Some(navigable_id) = self.global_scope.source_navigable_id() else {
+            // Step 2: If navigable is null, then return null.
+            return Ok(ec.value_null());
+        };
+        // Step 3: If navigable's parent is not null, then set navigable to
+        //         navigable's parent.
+        // Note: The realm tracks the parent navigable's id; the top-level
+        // window has no parent and keeps its own navigable.
+        match self.global_scope.parent_traversable_id() {
+            Some(parent_id) if parent_id != navigable_id => {
+                // Step 4: Return navigable's active WindowProxy.
+                create_window_proxy(parent_id, None, ec)
+            }
+            _ => {
+                // Step 3 (parent is null): navigable stays this's navigable.
+                // Step 4: Return navigable's active WindowProxy.
+                // Note: The top-level window's active WindowProxy is the
+                // realm's own window identity, so `window.parent === window`
+                // holds.
+                Ok(relevant_realm_global_this_value(ec))
+            }
+        }
+    }
+
+    /// <https://html.spec.whatwg.org/#dom-opener>
+    pub(crate) fn opener_value(&self, ec: &mut dyn ExecutionContext<Types>) -> JsValue {
+        // Step 1: Let current be this's browsing context.
+        // Step 2: If current is null, then return null.
+        // Step 3: If current's opener browsing context is null, then return
+        //         null.
+        // Step 4: Return current's opener browsing context's WindowProxy
+        //         object.
+        // Note: The opener browsing context is user-agent state that the
+        // realm does not track, so the getter returns null.
+        ec.value_null()
+    }
+
+    /// <https://html.spec.whatwg.org/#dom-document>
+    pub(crate) fn document_value(
+        &self,
+        ec: &mut dyn ExecutionContext<Types>,
+    ) -> Completion<JsValue, Types> {
+        // The document getter steps are to return this's associated Document.
+        // The associated Document platform object is cached on the realm's
+        // global scope; it is null only while the window is being torn down.
+        match self.global_scope.document_object(ec) {
+            Some(document) => Ok(<Types as JsTypes>::value_from_object(document)),
+            None => Ok(ec.value_null()),
+        }
+    }
+
+    /// <https://html.spec.whatwg.org/#dom-location>
+    pub(crate) fn location_value(
+        &self,
+        ec: &mut dyn ExecutionContext<Types>,
+    ) -> Completion<JsValue, Types> {
+        // The Window object's location getter steps are to return this's
+        // Location object.
+        // Note: Each Window object is associated with a unique Location
+        // object; it is created on first access and cached on the realm's
+        // global scope.
+        if let Some(location) = self.global_scope.location_object(ec) {
+            return Ok(<Types as JsTypes>::value_from_object(location));
+        }
+        let document_object = self.global_scope.document_object(ec);
+        let Some(document_object) = document_object else {
+            return Err(ec.new_type_error("window has no document"));
+        };
+        let document = ec
+            .with_object_any(&document_object)
+            .and_then(|data| data.downcast_ref::<Document>().cloned())
+            .ok_or_else(|| ec.new_type_error("document object is not a Document"))?;
+        let location = Location::new(
+            document.creation_url.clone(),
+            self.global_scope.source_navigable_id(),
+            self.global_scope.event_sender(),
+        );
+        let object = create_interface_instance::<Types, Location>(location, ec)?;
+        self.global_scope.store_location_object(object.clone(), ec);
+        Ok(<Types as JsTypes>::value_from_object(object))
+    }
+
+    /// <https://html.spec.whatwg.org/#dom-window-close>
+    pub(crate) fn close(&self) {
+        // Step 1: Let thisTraversable be this's navigable.
+        // Step 2: If thisTraversable is not a top-level traversable, then
+        //         return.
+        // Step 3: If thisTraversable's is closing is true, then return.
+        // Step 4: Let browsingContext be thisTraversable's active browsing
+        //         context.
+        // Step 5: Let sourceSnapshotParams be the result of snapshotting
+        //         source snapshot params given thisTraversable's active
+        //         document.
+        // Step 6: If all the following are true: thisTraversable is
+        //         script-closable; the incumbent global object's browsing
+        //         context is familiar with browsingContext; and the
+        //         incumbent global object's navigable is allowed by
+        //         sandboxing to navigate thisTraversable, given
+        //         sourceSnapshotParams, then:
+        // Step 6.1: Set thisTraversable's is closing to true.
+        // Step 6.2: Queue a task on the DOM manipulation task source to
+        //           definitely close thisTraversable.
+        // TODO: The is closing flag and the close task are user-agent state;
+        // closing is not yet wired.
+    }
+
+    /// <https://html.spec.whatwg.org/#dom-window-closed>
+    pub(crate) fn closed_value(&self) -> bool {
+        // The closed getter steps are to return true if this's browsing
+        // context is null or its is closing is true; otherwise false.
+        // Note: The is closing flag is user-agent state; the getter returns
+        // false.
+        false
+    }
+
+    /// <https://html.spec.whatwg.org/#dom-window-focus>
+    pub(crate) fn focus(&self) {
+        // Step 1: Let current be this's navigable.
+        // Step 2: If current is null, then return.
+        // Step 3: If the allow focus steps given current's active document
+        //         return false, then return.
+        // Step 4: Run the focusing steps with current.
+        // Step 5: If current is a top-level traversable, user agents are
+        //         encouraged to trigger some sort of notification to indicate
+        //         to the user that the page is attempting to gain focus.
+        // TODO: The allow focus steps and the focusing steps are not yet
+        // implemented.
+    }
+
+    /// <https://html.spec.whatwg.org/#dom-window-blur>
+    pub(crate) fn blur(&self) {
+        // The Window blur() method steps are to do nothing.
     }
 }
 

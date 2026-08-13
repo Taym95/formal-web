@@ -61,6 +61,21 @@ not yet wired to any domain call site (kept with `#[allow(dead_code)]`).
 
 These are used by DOM event dispatch and other algorithm callbacks.
 
+### Realm access (HTML's direct JS calls)
+
+The HTML spec sometimes reads realm state directly instead of going through
+Web IDL — e.g. the `window`/`frames`/`self` getters return "this's relevant
+realm.[[GlobalEnv]].[[GlobalThisValue]]"
+(<https://html.spec.whatwg.org/#dom-self>).  Such JS-side reads live here
+(`realm.rs::relevant_realm_global_this_value`) even though they are not Web
+IDL algorithms; webidl hosts "stuff that is used to call into js
+indirectly", including HTML's direct-JS-call quirks.  The domain getter
+(e.g. `Window::self_value` in `content/src/html/window.rs`) implements the
+spec steps and calls this helper; the helper carries the concept anchor
+(<https://html.spec.whatwg.org/#concept-relevant-realm>) and a `// Note:`
+documenting that the read is the spec's direct-JS-call quirk rather than a
+Web IDL conversion.
+
 ## JS binding infrastructure (`bindings/`)
 
 `content/src/webidl/bindings/` implements the algorithms from Web IDL §3
