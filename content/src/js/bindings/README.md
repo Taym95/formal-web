@@ -110,12 +110,12 @@ touch reflectors.
 - **No spec algorithm implemented in the binding, ever** — every Window IDL
   member is a domain method on `Window` (`content/src/html/window.rs`); the
   bindings files (`bindings/html/window.rs` for the Window interface,
-  `bindings/html/windowproxy.rs` for the WindowProxy shim) downcast the
-  receiver, resolve the local Window, and call the domain method.  A member
-  that returns a placeholder because its state is user-agent-only (navigable
-  target name, opener, closed, child-navigable count) still delegates to a
-  domain method that carries the `// Step N:` annotations and the `// Note:`;
-  the binding never inlines the stub.
+  `bindings/html/windowproxy.rs` for the WindowProxy platform object)
+  downcast the receiver, resolve the local Window, and call the domain
+  method.  A member that returns a placeholder because its state lives in
+  another process (navigable target name, opener, closed, child-navigable
+  count) still delegates to a domain method that carries the `// Step N:`
+  annotations and the `// Note:`; the binding never inlines the stub.
 
 ### When the spec calls into JS directly (not via Web IDL)
 

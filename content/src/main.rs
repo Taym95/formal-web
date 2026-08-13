@@ -21,13 +21,14 @@ pub mod webidl;
 use crate::dom::{EventTargetAccess, dispatch_with_path, fire_event, simple_path};
 use crate::html::ui_events::{dispatch_trusted_click_event, dispatch_ui_event};
 use crate::html::{
-    EnvironmentSettingsObject, JsHtmlParserProvider, MessageEvent, PendingParserScript,
+    EnvironmentSettingsObject, JsHtmlParserProvider, MessageEvent, PendingParserScript, Window,
     attach_same_origin_child_document_for_traversable, execute_parser_scripts,
     parse_html_into_document, run_dom_post_connection_steps_for_document,
     run_dom_removing_steps_for_document, run_iframe_load_event_steps_for_traversable,
     safe_passing_of_structured_data::{
         SerializeWithTransferResult, structured_deserialize_with_transfer,
     },
+    windowproxy::WindowProxyBacking,
 };
 use crate::js::Engine;
 use crate::js::downcast::try_with_event_target_mut;
@@ -1248,22 +1249,28 @@ impl ContentProcess {
                 self.active_documents_by_traversable
                     .remove(&content_document.traversable_id);
             }
-            // WindowProxy lifecycle: navigation commit severs or re-points the
+            // WindowProxy lifecycle: navigation commit re-points the
             // cached WindowProxy backings for this navigable.  If a new
             // document for the traversable is already active in this process
             // (same-process navigation), re-point to its Window; otherwise
             // the navigable's document was created in another content process
-            // and every WindowProxy for it becomes a remote shim.
+            // and every WindowProxy for it becomes cross-content.
             // <https://html.spec.whatwg.org/#the-windowproxy-exotic-object>
             let replacement_window = self
                 .active_documents_by_traversable
                 .get(&traversable_id)
                 .and_then(|current_document_id| self.documents.get(current_document_id))
-                .map(|document| {
+                .and_then(|document| {
+                    let global_object = document
+                        .settings
+                        .realm_execution_context
+                        .realm_global_object();
                     document
                         .settings
                         .realm_execution_context
-                        .realm_global_object()
+                        .with_object_any(&global_object)
+                        .and_then(|data| data.downcast_ref::<Window>().cloned())
+                        .map(|window| (window, global_object))
                 });
             if let Err(error) = self.sever_window_proxy_backings(traversable_id, replacement_window)
             {
@@ -1323,16 +1330,22 @@ impl ContentProcess {
 
     /// Navigation-commit hook: every cached WindowProxy (in every realm of
     /// this process) that targets a navigable whose document was just
-    /// destroyed is severed or re-pointed.  `replacement_window` is the new
-    /// document's Window when the navigation stayed in this process, and
-    /// `None` when the navigable's document was created in another content
-    /// process (the WindowProxy becomes a remote shim).
+    /// destroyed is re-pointed.  `replacement_window` is the new document's
+    /// Window when the navigation stayed in this process, and `None` when
+    /// the navigable's document was created in another content process (the
+    /// WindowProxy becomes cross-content).
     /// <https://html.spec.whatwg.org/#the-windowproxy-exotic-object>
     fn sever_window_proxy_backings(
         &mut self,
         traversable_id: NavigableId,
-        replacement_window: Option<JsObject>,
+        replacement_window: Option<(Window, JsObject)>,
     ) -> Result<(), String> {
+        let backing = match replacement_window {
+            Some((window, js_object)) => {
+                WindowProxyBacking::SameContentProcess { window, js_object }
+            }
+            None => WindowProxyBacking::CrossContentProcess,
+        };
         let document_ids: Vec<DocumentId> = self.documents.keys().copied().collect();
         for document_id in document_ids {
             let Some(content_document) = self.documents.get_mut(&document_id) else {
@@ -1341,11 +1354,7 @@ impl ContentProcess {
             with_global_scope(
                 &mut content_document.settings.realm_execution_context,
                 |global_scope, ec| {
-                    global_scope.set_window_proxy_backing(
-                        traversable_id,
-                        replacement_window.clone(),
-                        ec,
-                    );
+                    global_scope.set_window_proxy_backing(traversable_id, backing.clone(), ec);
                     Ok(())
                 },
             )
@@ -1492,11 +1501,17 @@ impl ContentProcess {
             .active_documents_by_traversable
             .get(&request.source_navigable_id)
             .and_then(|document_id| self.documents.get(document_id))
-            .map(|document| {
+            .and_then(|document| {
+                let global_object = document
+                    .settings
+                    .realm_execution_context
+                    .realm_global_object();
                 document
                     .settings
                     .realm_execution_context
-                    .realm_global_object()
+                    .with_object_any(&global_object)
+                    .and_then(|data| data.downcast_ref::<Window>().cloned())
+                    .map(|window| (window, global_object))
             });
         let source = {
             let ec = &mut self

@@ -124,6 +124,7 @@ pub(crate) fn create_a_new_browsing_context_and_document(
 ) -> Result<
     (
         JsObject,
+        Window,
         EnvironmentSettingsObject,
         Rc<RefCell<BaseDocument>>,
     ),
@@ -146,6 +147,7 @@ pub(crate) fn create_a_new_realm(
 ) -> Result<
     (
         JsObject,
+        Window,
         EnvironmentSettingsObject,
         Rc<RefCell<BaseDocument>>,
     ),
@@ -180,9 +182,16 @@ pub(crate) fn create_a_new_realm(
     // Step 22: Populate with html/head/body given document.
     parse_html_into_document(&mut document.borrow_mut(), crate::EMPTY_HTML_DOCUMENT);
 
-    // Step 10 (continued): global object is the Window.
+    // Step 10 (continued): global object is the Window.  The Window domain
+    // struct is extracted while the new realm is current, so its platform
+    // data is reachable from this execution context.
     let global_object = settings.realm_execution_context.realm_global_object();
-    Ok((global_object, settings, document))
+    let window = settings
+        .realm_execution_context
+        .with_object_any(&global_object)
+        .and_then(|data| data.downcast_ref::<Window>().cloned())
+        .ok_or_else(|| String::from("realm global object is not a Window"))?;
+    Ok((global_object, window, settings, document))
 }
 
 /// <https://html.spec.whatwg.org/#navigate>
@@ -221,7 +230,7 @@ pub(crate) fn navigate(
 pub(crate) struct ChosenNavigableResult {
     pub(crate) chosen_navigable_id: Option<NavigableId>,
     pub(crate) new_traversable_info: Option<NewTraversableInfo>,
-    pub(crate) return_window: Option<JsObject>,
+    pub(crate) return_window: Option<(Window, JsObject)>,
 }
 
 /// <https://html.spec.whatwg.org/#the-rules-for-choosing-a-navigable>
@@ -305,7 +314,7 @@ pub(crate) fn the_rules_for_choosing_a_navigable(
                 let new_traversable_id = NavigableId::new();
                 let new_document_id = DocumentId::new();
 
-                let (global_object, settings, document) = match global_scope
+                let (global_object, window, settings, document) = match global_scope
                     .create_auxiliary_context_document(
                         parent_engine,
                         new_traversable_id,
@@ -341,7 +350,7 @@ pub(crate) fn the_rules_for_choosing_a_navigable(
                 return ChosenNavigableResult {
                     chosen_navigable_id: Some(new_traversable_id),
                     new_traversable_info: Some(new_info),
-                    return_window: Some(global_object),
+                    return_window: Some((window, global_object)),
                 };
             }
 
@@ -364,9 +373,17 @@ pub(crate) fn the_rules_for_choosing_a_navigable(
     // Step 9: Return chosen and windowType.
     // Note: windowType is always "existing or none" (Step 2 deferred).
     // The return_window for _self / _parent / _top is the source document's
-    // global object (correct for _self; _parent and _top that target a
+    // Window (correct for _self; _parent and _top that target a
     // different process are a known gap — see content/src/html/README.md).
-    let return_window = window_global;
+    // The realm is the source window's realm here, so its platform data is
+    // reachable from the parent engine's execution context.
+    let return_window = window_global.as_ref().and_then(|object| {
+        parent_engine
+            .as_ref()
+            .and_then(|engine| engine.with_object_any(object))
+            .and_then(|data| data.downcast_ref::<Window>().cloned())
+            .map(|window| (window, object.clone()))
+    });
     ChosenNavigableResult {
         chosen_navigable_id: Some(chosen),
         new_traversable_info: None,

@@ -385,11 +385,11 @@ fn get_content_window(
     // <https://html.spec.whatwg.org/#dom-iframe-contentwindow>
     // Resolve the content navigable from the realm's registry and hand out
     // its WindowProxy (created in this realm, cached per navigable).  The
-    // cached shim for the navigable already carries the child document's
-    // Window when it lives in this content process, so the WindowProxy is
-    // locally backed.
+    // cached WindowProxy for the navigable already carries the child
+    // document's Window when it lives in this content process, so the
+    // WindowProxy is locally backed.
     let navigable_id = crate::js::platform_objects::with_global_scope(ec, |global_scope, ec| {
-        Ok(global_scope.iframe_content_navigable(node_id, ec))
+        Ok(global_scope.content_navigable_for_iframe(node_id, ec))
     })?;
     let Some(navigable_id) = navigable_id else {
         return Ok(ec.value_null());

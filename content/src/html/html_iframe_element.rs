@@ -414,12 +414,13 @@ fn create_a_new_child_navigable(
         .ok_or_else(|| format!("missing parent document {parent_document_id}"))?
         .settings
         .realm_execution_context;
-    let (global_object, settings, new_document) = create_a_new_browsing_context_and_document(
-        parent_engine,
-        &event_sender,
-        content_navigable,
-        new_document_id,
-    )?;
+    let (global_object, window, settings, new_document) =
+        create_a_new_browsing_context_and_document(
+            parent_engine,
+            &event_sender,
+            content_navigable,
+            new_document_id,
+        )?;
 
     // Register the document in ContentProcess immediately.
     process.documents.insert(
@@ -487,10 +488,10 @@ fn create_a_new_child_navigable(
         crate::js::platform_objects::with_global_scope(
             &mut content_document.settings.realm_execution_context,
             |global_scope, ec| {
-                global_scope.set_iframe_content_navigable(
+                global_scope.register_iframe_content_navigable(
                     iframe_node_id,
                     content_navigable,
-                    Some(global_object.clone()),
+                    Some((window.clone(), global_object.clone())),
                     ec,
                 )
             },
@@ -783,13 +784,13 @@ fn run_iframe_removing_steps(
         crate::js::platform_objects::with_global_scope(
             &mut content_document.settings.realm_execution_context,
             |global_scope, ec| {
-                global_scope.clear_iframe_content_navigable(iframe_node_id, ec);
+                global_scope.unregister_iframe_content_navigable(iframe_node_id, ec);
                 Ok(())
             },
         )
         .map_err(|error| {
             format!(
-                "failed to clear iframe content navigable: {}",
+                "failed to unregister iframe content navigable: {}",
                 error.display()
             )
         })?;

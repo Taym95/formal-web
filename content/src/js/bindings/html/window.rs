@@ -5,7 +5,7 @@ use crate::html::windowproxy::resolve_window;
 use crate::html::{
     PostMessageOptions, Window, WindowOrWorkerGlobalScope,
     safe_passing_of_structured_data::StructuredCloneOptions,
-    window_computed_style_properties_for_element, window_post_message_steps,
+    window_computed_style_properties_for_element,
 };
 use crate::js::bindings::html::global_event_handlers::define_global_event_handlers;
 use crate::webidl::bindings::{AttributeDef, InterfaceDefinition, OperationDef, WebIdlInterface};
@@ -379,11 +379,7 @@ fn post_message_method(
     let options = parse_post_message_options(args, ec)?;
 
     let window = window_domain_from(this, ec)?;
-    let target_navigable_id = window
-        .global_scope
-        .source_navigable_id()
-        .ok_or_else(|| ec.new_type_error("postMessage: no target navigable"))?;
-    window_post_message_steps(target_navigable_id, message, options, ec)?;
+    window.post_message(message, options, ec)?;
     Ok(ec.value_undefined())
 }
 
@@ -614,7 +610,16 @@ fn get_location(
 ) -> Completion<JsValue, crate::js::Types> {
     // <https://html.spec.whatwg.org/#dom-location>
     let window = window_domain_from(this, ec)?;
-    window.location_value(ec)
+    // The domain method creates the Location on first access and caches its
+    // JS object on the global scope; the binding returns that cached object.
+    window.location_value(ec)?;
+    let location_object = window
+        .global_scope
+        .location_object(ec)
+        .ok_or_else(|| ec.new_type_error("window has no Location object"))?;
+    Ok(<crate::js::Types as JsTypes>::value_from_object(
+        location_object,
+    ))
 }
 
 fn close_method(

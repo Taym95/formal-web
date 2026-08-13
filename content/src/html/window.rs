@@ -92,8 +92,10 @@ impl Window {
             return String::new();
         }
         // Step 2: Return this's navigable's target name.
-        // Note: The navigable target name is user-agent state that the realm
-        // does not track, so the getter returns the empty string.
+        // Note: The navigable target name is tracked by the user agent
+        // (`traversable_target_names` in `user_agent/src/user_agent.rs`) and
+        // is not sent to the content process, so the getter returns the
+        // empty string.
         String::new()
     }
 
@@ -102,8 +104,9 @@ impl Window {
         // Step 1: If this's navigable is null, then return.
         // Step 2: Set this's navigable's active session history entry's
         //         document state's navigable target name to the given value.
-        // Note: The navigable target name is user-agent state; setting it is
-        // not yet wired.
+        // Note: The navigable target name is tracked by the user agent
+        // (`traversable_target_names` in `user_agent/src/user_agent.rs`);
+        // setting it from the content process is not yet wired.
     }
 
     /// <https://html.spec.whatwg.org/#dom-length>
@@ -176,8 +179,11 @@ impl Window {
         //         null.
         // Step 4: Return current's opener browsing context's WindowProxy
         //         object.
-        // Note: The opener browsing context is user-agent state that the
-        // realm does not track, so the getter returns null.
+        // Note: The opener browsing context id is tracked by the user agent
+        // (`BrowsingContext.opener_browsing_context` in
+        // `user_agent/src/user_agent.rs`); the content process does not
+        // receive it, so the getter cannot resolve the opener's WindowProxy
+        // and returns null.
         ec.value_null()
     }
 
@@ -199,14 +205,19 @@ impl Window {
     pub(crate) fn location_value(
         &self,
         ec: &mut dyn ExecutionContext<Types>,
-    ) -> Completion<JsValue, Types> {
+    ) -> Completion<Location, Types> {
         // The Window object's location getter steps are to return this's
         // Location object.
         // Note: Each Window object is associated with a unique Location
         // object; it is created on first access and cached on the realm's
-        // global scope.
-        if let Some(location) = self.global_scope.location_object(ec) {
-            return Ok(<Types as JsTypes>::value_from_object(location));
+        // global scope.  The binding layer converts the returned Location to
+        // the cached JS object.
+        if let Some(location_object) = self.global_scope.location_object(ec) {
+            let location = ec
+                .with_object_any(&location_object)
+                .and_then(|data| data.downcast_ref::<Location>().cloned())
+                .ok_or_else(|| ec.new_type_error("location object is not a Location"))?;
+            return Ok(location);
         }
         let document_object = self.global_scope.document_object(ec);
         let Some(document_object) = document_object else {
@@ -221,9 +232,23 @@ impl Window {
             self.global_scope.source_navigable_id(),
             self.global_scope.event_sender(),
         );
-        let object = create_interface_instance::<Types, Location>(location, ec)?;
-        self.global_scope.store_location_object(object.clone(), ec);
-        Ok(<Types as JsTypes>::value_from_object(object))
+        let object = create_interface_instance::<Types, Location>(location.clone(), ec)?;
+        self.global_scope.store_location_object(object, ec);
+        Ok(location)
+    }
+
+    /// <https://html.spec.whatwg.org/#dom-window-postmessage>
+    pub(crate) fn post_message(
+        &self,
+        message: JsValue,
+        options: PostMessageOptions,
+        ec: &mut dyn ExecutionContext<crate::js::Types>,
+    ) -> Completion<(), crate::js::Types> {
+        let target_navigable_id = self
+            .global_scope
+            .source_navigable_id()
+            .ok_or_else(|| ec.new_type_error("postMessage: no target navigable"))?;
+        window_post_message_steps(target_navigable_id, message, options, ec)
     }
 
     /// <https://html.spec.whatwg.org/#dom-window-close>
@@ -246,16 +271,16 @@ impl Window {
         // Step 6.1: Set thisTraversable's is closing to true.
         // Step 6.2: Queue a task on the DOM manipulation task source to
         //           definitely close thisTraversable.
-        // TODO: The is closing flag and the close task are user-agent state;
-        // closing is not yet wired.
+        // TODO: The is closing flag and the close task are not implemented
+        // in any process yet; closing is not wired.
     }
 
     /// <https://html.spec.whatwg.org/#dom-window-closed>
     pub(crate) fn closed_value(&self) -> bool {
         // The closed getter steps are to return true if this's browsing
         // context is null or its is closing is true; otherwise false.
-        // Note: The is closing flag is user-agent state; the getter returns
-        // false.
+        // Note: The is closing flag is not implemented in any process yet;
+        // the getter returns false.
         false
     }
 
@@ -596,15 +621,12 @@ pub(crate) fn window_open_steps(
     // agent cluster (same content process), so the WindowProxy is backed by
     // the locally-created about:blank Window; if the navigable is later
     // navigated across origin (its Window is created in another content
-    // process), navigation commit severs that backing and the WindowProxy
-    // becomes a remote shim.
-    let window = result
-        .return_window
-        .expect("window_open_steps: all navigable branches set a return window");
+    // process), navigation commit re-points the backing and the WindowProxy
+    // becomes cross-content.
     let navigable_id = result
         .chosen_navigable_id
         .expect("window_open_steps: all navigable branches set a chosen navigable");
-    create_window_proxy(navigable_id, Some(window), ec)
+    create_window_proxy(navigable_id, result.return_window, ec)
 }
 
 /// <https://html.spec.whatwg.org/#get-noopener-for-window-open>
