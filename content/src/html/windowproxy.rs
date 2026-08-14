@@ -119,6 +119,113 @@ fn window_object_handle(backing: &WindowProxyBacking) -> Option<JsObject> {
 }
 
 // ────────────────────────────────────────────────────────────────────────────
+// The cross-origin abstract operations
+// ────────────────────────────────────────────────────────────────────────────
+
+/// <https://html.spec.whatwg.org/#crossoriginpropertyfallback-(-p-)>
+fn cross_origin_property_fallback(
+    ec: &mut dyn ExecutionContext<Types>,
+) -> Completion<JsValue, Types> {
+    // Step 1: "If P is 'then', %Symbol.toStringTag%, %Symbol.hasInstance%,
+    //           or %Symbol.isConcatSpreadable%, then return
+    //           PropertyDescriptor { [[Value]]: undefined, [[Writable]]: false,
+    //           [[Enumerable]]: false, [[Configurable]]: true }."
+    // Step 2: "Throw a 'SecurityError' DOMException."
+    // Note: Not implemented: the fallback returns undefined for every key.
+    Ok(ec.value_undefined())
+}
+
+/// <https://html.spec.whatwg.org/#isplatformobjectsameorigin-(-o-)>
+fn is_platform_object_same_origin(backing: &WindowProxyBacking) -> bool {
+    // Step 1: "Return true if the current settings object's origin is same
+    //           origin-domain with O's relevant settings object's origin, and
+    //           false otherwise."
+    // Note: Same origin-domain is approximated by the navigable's window
+    // living in this content process (same agent cluster).
+    matches!(backing, WindowProxyBacking::SameContentProcess { .. })
+}
+
+/// <https://html.spec.whatwg.org/#crossorigingetownpropertyhelper-(-o,-p-)>
+fn cross_origin_get_own_property_helper() -> Option<JsValue> {
+    // Step 1: "Let crossOriginKey be a tuple consisting of the current
+    //           settings object, O's relevant settings object, and P."
+    // Step 2: "For each e of CrossOriginProperties(O):"
+    // Step 3: "Return undefined."
+    // Note: CrossOriginProperties is not implemented: no cross-origin
+    // property descriptors are produced.
+    None
+}
+
+/// <https://html.spec.whatwg.org/#crossoriginget-(-o,-p,-receiver-)>
+fn cross_origin_get(
+    proxy_target: &JsObject,
+    key: &JsValue,
+    receiver: Option<JsObject>,
+    ec: &mut dyn ExecutionContext<Types>,
+) -> Completion<JsValue, Types> {
+    // Step 1: "Let desc be ? O.[[GetOwnProperty]](P)."
+    // Step 2: "Assert: desc is not undefined."
+    // Step 3: "If IsDataDescriptor(desc) is true, then return desc.[[Value]]."
+    // Step 4: "Assert: IsAccessorDescriptor(desc) is true."
+    // Step 5: "Let getter be desc.[[Getter]]."
+    // Step 6: "If getter is undefined, then throw a 'SecurityError'
+    //           DOMException."
+    // Step 7: "Return ? Call(getter, Receiver)."
+    // Note: CrossOriginProperties is not implemented: the self-referencing
+    // members (self, window, frames, top, parent) return the WindowProxy
+    // itself, and every other property is read off the platform object's
+    // prototype.
+    if let Some(s) = key.as_string()
+        && (s == "self" || s == "window" || s == "frames" || s == "top" || s == "parent")
+    {
+        if let Some(receiver) = receiver {
+            return Ok(<Types as JsTypes>::value_from_object(receiver));
+        }
+        return Ok(<Types as JsTypes>::value_from_object(proxy_target.clone()));
+    }
+    let prop_key = ec.to_property_key(key.clone())?;
+    let receiver_value = <Types as JsTypes>::value_from_object(proxy_target.clone());
+    let result = ec.get_v(receiver_value, prop_key)?;
+    if let Some(wrapped) = wrap_callable_result(&result, proxy_target.clone(), ec) {
+        return Ok(wrapped);
+    }
+    Ok(result)
+}
+
+/// <https://html.spec.whatwg.org/#crossoriginset-(-o,-p,-v,-receiver-)>
+fn cross_origin_set(ec: &mut dyn ExecutionContext<Types>) -> Completion<JsValue, Types> {
+    // Step 1: "Let desc be ? O.[[GetOwnProperty]](P)."
+    // Step 2: "Assert: desc is not undefined."
+    // Step 3: "If desc.[[Setter]] is present and its value is not undefined:"
+    // Step 4: "Throw a 'SecurityError' DOMException."
+    // Note: Not implemented: the set is refused.
+    Ok(ec.value_from_bool(false))
+}
+
+/// <https://html.spec.whatwg.org/#crossoriginownpropertykeys-(-o-)>
+fn cross_origin_own_property_keys(
+    proxy_target: &JsObject,
+    ec: &mut dyn ExecutionContext<Types>,
+) -> Completion<JsValue, Types> {
+    // Step 1: "Let keys be a new empty List."
+    // Step 2: "For each e of CrossOriginProperties(O), append e.[[Property]]
+    //           to keys."
+    // Step 3: "Return the concatenation of keys and « 'then',
+    //           %Symbol.toStringTag%, %Symbol.hasInstance%,
+    //           %Symbol.isConcatSpreadable% »."
+    // Note: CrossOriginProperties is not implemented: the approximation
+    // returns the platform object's own keys (the cross-origin member set
+    // lives on the platform object's prototype).
+    let window_keys = ec.own_property_keys(proxy_target.clone())?;
+    let key_array = ec.create_empty_array();
+    for val in window_keys.into_iter() {
+        let js_val = ec.value_from_property_key(val);
+        ec.array_push(&key_array, js_val)?;
+    }
+    Ok(<Types as JsTypes>::value_from_object(key_array))
+}
+
+// ────────────────────────────────────────────────────────────────────────────
 // The WindowProxy traps (same-content-process and cross-content-process)
 // ────────────────────────────────────────────────────────────────────────────
 
@@ -131,9 +238,9 @@ fn window_object_handle(backing: &WindowProxyBacking) -> Option<JsObject> {
 // the first argument (`args[0]`).  Since the WindowProxy is created with the
 // [`WindowProxy`] platform object as the proxy target, `args[0]` is that
 // platform object in every trap call.  The traps resolve the proxy's backing
-// from the target's `backing` cell; when it is `CrossContentProcess` (the
-// navigable's document lives in another content process) the traps resolve
-// the proxy's cross-origin member set instead.
+// from the target's `backing` cell and branch on
+// [`is_platform_object_same_origin`]: the ordinary operation on the local
+// Window, or the cross-origin abstract operations.
 //
 // These functions are used as built-in function behaviours: each is wrapped
 // with `ec.create_builtin_fn()` and set as a property on the handler
@@ -169,23 +276,19 @@ fn trap_get_prototype_of(
     // Step 1: "Let W be the value of the [[Window]] internal slot of this."
     // Step 2: "If IsPlatformObjectSameOrigin(W) is true, then return !
     //           OrdinaryGetPrototypeOf(W)."
-    // Note: A cross-content-process window has no local Window, so the
-    // same-origin branch is skipped and the proxy returns null per step 3.
-    let proto = match &backing {
-        WindowProxyBacking::SameContentProcess { .. } => {
-            let Some(window_object) = window_object_handle(&backing) else {
-                return Ok(ec.value_null());
-            };
-            ec.get_prototype_of(window_object)?
-        }
-        WindowProxyBacking::CrossContentProcess => None,
-    };
-    match proto {
-        Some(p) => Ok(<crate::js::Types as JsTypes>::value_from_object(p)),
-
-        // Step 3: "Return null."
-        None => Ok(ec.value_null()),
+    if is_platform_object_same_origin(&backing) {
+        let Some(window_object) = window_object_handle(&backing) else {
+            return Ok(ec.value_null());
+        };
+        let Some(proto) = ec.get_prototype_of(window_object)? else {
+            // Step 3: "Return null."
+            return Ok(ec.value_null());
+        };
+        return Ok(<crate::js::Types as JsTypes>::value_from_object(proto));
     }
+
+    // Step 3: "Return null."
+    Ok(ec.value_null())
 }
 
 /// <https://html.spec.whatwg.org/#windowproxy-setprototypeof>
@@ -200,14 +303,13 @@ fn trap_set_prototype_of(
     // Step 1: "Return ! SetImmutablePrototype(this, V)."
     // Note: A cross-content-process window has no local Window, so its
     // prototype is null.
-    let current = match &backing {
-        WindowProxyBacking::SameContentProcess { .. } => {
-            let Some(window_object) = window_object_handle(&backing) else {
-                return Ok(ec.value_from_bool(false));
-            };
-            ec.get_prototype_of(window_object)?
-        }
-        WindowProxyBacking::CrossContentProcess => None,
+    let current = if is_platform_object_same_origin(&backing) {
+        let Some(window_object) = window_object_handle(&backing) else {
+            return Ok(ec.value_from_bool(false));
+        };
+        ec.get_prototype_of(window_object)?
+    } else {
+        None
     };
     let same = match (&current, val.as_object()) {
         (Some(current_proto), Some(v)) => *current_proto == v,
@@ -246,63 +348,70 @@ fn trap_get_own_property_descriptor(
     let (_proxy_target, backing) = proxy_target_and_backing(args, ec)?;
     let key = args.get(1).cloned().unwrap_or_else(|| ec.value_undefined());
 
+    // Step 1: "Let W be the value of the [[Window]] internal slot of this."
     // Step 2: "If P is an array index property name: ..."
     // Note: Child navigable support not yet implemented.
     // Step 3: "If IsPlatformObjectSameOrigin(W) is true, then return !
     //           OrdinaryGetOwnProperty(W, P)."
-    let Some(window_object) = (match &backing {
-        WindowProxyBacking::SameContentProcess { .. } => window_object_handle(&backing),
-        WindowProxyBacking::CrossContentProcess => None,
-    }) else {
-        // Step 4: "Let property be CrossOriginGetOwnPropertyHelper(W, P)."
-        // Step 5: "If property is not undefined, then return property."
-        // Step 6: Named child navigable target name properties.
-        // Step 7: "Return ? CrossOriginPropertyFallback(P)."
-        // Note: A cross-content-process window exposes no own properties
-        // beyond the fixed member set, which is resolved by the [[Get]] trap.
-        return Ok(ec.value_undefined());
-    };
+    if is_platform_object_same_origin(&backing) {
+        let Some(window_object) = window_object_handle(&backing) else {
+            return Ok(ec.value_undefined());
+        };
+        let prop_key = ec.to_property_key(key)?;
+        let Some(desc) = ec.get_own_property(window_object, prop_key)? else {
+            return Ok(ec.value_undefined());
+        };
+        let desc_obj = ec.create_plain_object(None);
+        if let Some(value) = desc.value {
+            let key = ec.property_key_from_str("value");
+            ec.set(desc_obj.clone(), key, value, false)?;
+        }
+        if let Some(writable) = desc.writable {
+            let key = ec.property_key_from_str("writable");
+            let value = ec.value_from_bool(writable);
+            ec.set(desc_obj.clone(), key, value, false)?;
+        }
+        if let Some(get) = desc.get {
+            let key = ec.property_key_from_str("get");
+            let value = <crate::js::Types as JsTypes>::value_from_object(
+                <crate::js::Types as JsTypes>::object_from_function(get),
+            );
+            ec.set(desc_obj.clone(), key, value, false)?;
+        }
+        if let Some(set) = desc.set {
+            let key = ec.property_key_from_str("set");
+            let value = <crate::js::Types as JsTypes>::value_from_object(
+                <crate::js::Types as JsTypes>::object_from_function(set),
+            );
+            ec.set(desc_obj.clone(), key, value, false)?;
+        }
+        if let Some(enumerable) = desc.enumerable {
+            let key = ec.property_key_from_str("enumerable");
+            let value = ec.value_from_bool(enumerable);
+            ec.set(desc_obj.clone(), key, value, false)?;
+        }
+        if let Some(configurable) = desc.configurable {
+            let key = ec.property_key_from_str("configurable");
+            let value = ec.value_from_bool(configurable);
+            ec.set(desc_obj.clone(), key, value, false)?;
+        }
+        return Ok(<crate::js::Types as JsTypes>::value_from_object(desc_obj));
+    }
 
-    let prop_key = ec.to_property_key(key)?;
-    let Some(desc) = ec.get_own_property(window_object, prop_key)? else {
-        return Ok(ec.value_undefined());
-    };
+    // Step 4: "Let property be CrossOriginGetOwnPropertyHelper(W, P)."
+    let property = cross_origin_get_own_property_helper();
 
-    let desc_obj = ec.create_plain_object(None);
-    if let Some(value) = desc.value {
-        let key = ec.property_key_from_str("value");
-        ec.set(desc_obj.clone(), key, value, false)?;
+    // Step 5: "If property is not undefined, then return property."
+    if let Some(property) = property {
+        return Ok(property);
     }
-    if let Some(writable) = desc.writable {
-        let key = ec.property_key_from_str("writable");
-        let value = ec.value_from_bool(writable);
-        ec.set(desc_obj.clone(), key, value, false)?;
-    }
-    if let Some(get) = desc.get {
-        let key = ec.property_key_from_str("get");
-        let value = <crate::js::Types as JsTypes>::value_from_object(
-            <crate::js::Types as JsTypes>::object_from_function(get),
-        );
-        ec.set(desc_obj.clone(), key, value, false)?;
-    }
-    if let Some(set) = desc.set {
-        let key = ec.property_key_from_str("set");
-        let value = <crate::js::Types as JsTypes>::value_from_object(
-            <crate::js::Types as JsTypes>::object_from_function(set),
-        );
-        ec.set(desc_obj.clone(), key, value, false)?;
-    }
-    if let Some(enumerable) = desc.enumerable {
-        let key = ec.property_key_from_str("enumerable");
-        let value = ec.value_from_bool(enumerable);
-        ec.set(desc_obj.clone(), key, value, false)?;
-    }
-    if let Some(configurable) = desc.configurable {
-        let key = ec.property_key_from_str("configurable");
-        let value = ec.value_from_bool(configurable);
-        ec.set(desc_obj.clone(), key, value, false)?;
-    }
-    Ok(<crate::js::Types as JsTypes>::value_from_object(desc_obj))
+
+    // Step 6: "If property is undefined and P is in W's document-tree
+    //           child navigable target name property set: ..."
+    // Note: Child navigable target name properties are not yet implemented.
+
+    // Step 7: "Return ? CrossOriginPropertyFallback(P)."
+    cross_origin_property_fallback(ec)
 }
 
 /// <https://html.spec.whatwg.org/#windowproxy-defineownproperty>
@@ -315,29 +424,31 @@ fn trap_define_property(
     let key = args.get(1).cloned().unwrap_or_else(|| ec.value_undefined());
     let desc_obj_val = args.get(2).cloned().unwrap_or_else(|| ec.value_undefined());
 
+    // Step 1: "Let W be the value of the [[Window]] internal slot of this."
     // Step 2: "If IsPlatformObjectSameOrigin(W) is true:"
-    let Some(window_object) = (match &backing {
-        WindowProxyBacking::SameContentProcess { .. } => window_object_handle(&backing),
-        WindowProxyBacking::CrossContentProcess => None,
-    }) else {
+    if is_platform_object_same_origin(&backing) {
+        let Some(window_object) = window_object_handle(&backing) else {
+            return Ok(ec.value_from_bool(false));
+        };
+
+        // Step 2.1: "If P is an array index property name, return false."
+        if is_array_index_key(&key, ec) {
+            return Ok(ec.value_from_bool(false));
+        }
+
+        // Step 2.2: "Return ? OrdinaryDefineOwnProperty(W, P, Desc)."
+        let desc_obj = ec.to_object(desc_obj_val)?;
+        let desc = ec.to_property_descriptor(desc_obj)?;
+        let prop_key = ec.to_property_key(key)?;
+        match ec.define_property_or_throw(window_object, prop_key, desc) {
+            Ok(_) => Ok(ec.value_from_bool(true)),
+            Err(_) => Ok(ec.value_from_bool(false)),
+        }
+    } else {
         // Step 3: "Throw a 'SecurityError' DOMException."
         // Note: The trap contract returns a boolean; the security error is
         // approximated by refusing the define.
-        return Ok(ec.value_from_bool(false));
-    };
-
-    // Step 2.1: "If P is an array index property name, return false."
-    if is_array_index_key(&key, ec) {
-        return Ok(ec.value_from_bool(false));
-    }
-
-    // Step 2.2: "Return ? OrdinaryDefineOwnProperty(W, P, Desc)."
-    let desc_obj = ec.to_object(desc_obj_val)?;
-    let desc = ec.to_property_descriptor(desc_obj)?;
-    let prop_key = ec.to_property_key(key)?;
-    match ec.define_property_or_throw(window_object, prop_key, desc) {
-        Ok(_) => Ok(ec.value_from_bool(true)),
-        Err(_) => Ok(ec.value_from_bool(false)),
+        Ok(ec.value_from_bool(false))
     }
 }
 
@@ -350,67 +461,36 @@ fn trap_get(
     let (proxy_target, backing) = proxy_target_and_backing(args, ec)?;
     let key = args.get(1).cloned().unwrap_or_else(|| ec.value_undefined());
 
+    // Step 1: "Let W be the value of the [[Window]] internal slot of this."
     // Step 2: "Check if an access between two browsing contexts should be
     //           reported, given the current global object's browsing context,
     //           W's browsing context, P, and the current settings object."
     // Note: Access reporting is not yet implemented.
     // Step 3: "If IsPlatformObjectSameOrigin(W) is true, then return ?
     //           OrdinaryGet(this, P, Receiver)."
-    // Step 4: "Return ? CrossOriginGet(this, P, Receiver)."
-    let receiver = match &backing {
-        WindowProxyBacking::SameContentProcess { .. } => {
-            let Some(window_object) = window_object_handle(&backing) else {
-                return Ok(ec.value_undefined());
-            };
-            window_object
+    if is_platform_object_same_origin(&backing) {
+        let Some(window_object) = window_object_handle(&backing) else {
+            return Ok(ec.value_undefined());
+        };
+        let prop_key = ec.to_property_key(key)?;
+        let result = {
+            let receiver_value =
+                <crate::js::Types as JsTypes>::value_from_object(window_object.clone());
+            ec.get_v(receiver_value, prop_key)?
+        };
+        if let Some(wrapped) = wrap_callable_result(&result, window_object, ec) {
+            return Ok(wrapped);
         }
-        WindowProxyBacking::CrossContentProcess => {
-            // The self-referencing members return the WindowProxy itself
-            // (the trap's Receiver argument), per CrossOriginGet.
-            if let Some(s) = key.as_string()
-                && (s == "self" || s == "window" || s == "frames" || s == "top" || s == "parent")
-            {
-                if let Some(receiver) = args.get(2).and_then(<Types as JsTypes>::value_as_object) {
-                    return Ok(<Types as JsTypes>::value_from_object(receiver));
-                }
-                return Ok(<Types as JsTypes>::value_from_object(proxy_target));
-            }
-            proxy_target
-        }
-    };
-
-    let prop_key = ec.to_property_key(key)?;
-    let result = {
-        let receiver_value = <crate::js::Types as JsTypes>::value_from_object(receiver.clone());
-        ec.get_v(receiver_value, prop_key)?
-    };
-
-    // Note: Wrap callable results so they are invoked with `this` set to the
-    // resolved receiver — the Window for a same-content-process window, the
-    // proxy's platform object for a cross-content-process window.  The Proxy
-    // [[Get]] returns the trap result, but the subsequent Call expression
-    // uses the Proxy itself as `this`, and the member functions downcast
-    // their receiver to a platform object.
-    if let Some(func_obj) = <Types as JsTypes>::value_as_object(&result)
-        && ec.is_callable(&result)
-    {
-        let name_key = ec.property_key_from_str("wrapped");
-        let wrapper_fn = create_builtin_fn_with_traced_captures(
-            ec,
-            WindowProxyGetCapture {
-                receiver,
-                original_fn: func_obj,
-            },
-            window_proxy_get_wrapper_behaviour,
-            0,
-            name_key,
-            false,
-        );
-        let wrapper_obj = <Types as JsTypes>::object_from_function(wrapper_fn);
-        return Ok(<Types as JsTypes>::value_from_object(wrapper_obj));
+        return Ok(result);
     }
 
-    Ok(result)
+    // Step 4: "Return ? CrossOriginGet(this, P, Receiver)."
+    cross_origin_get(
+        &proxy_target,
+        &key,
+        args.get(2).and_then(<Types as JsTypes>::value_as_object),
+        ec,
+    )
 }
 
 /// <https://html.spec.whatwg.org/#windowproxy-set>
@@ -422,29 +502,30 @@ fn trap_set(
     let (_proxy_target, backing) = proxy_target_and_backing(args, ec)?;
     let key = args.get(1).cloned().unwrap_or_else(|| ec.value_undefined());
 
+    // Step 1: "Let W be the value of the [[Window]] internal slot of this."
     // Step 2: "Check if an access between two browsing contexts should be
     //           reported, ..."
     // Note: Access reporting is not yet implemented.
     // Step 3: "If IsPlatformObjectSameOrigin(W) is true:"
-    let Some(window_object) = (match &backing {
-        WindowProxyBacking::SameContentProcess { .. } => window_object_handle(&backing),
-        WindowProxyBacking::CrossContentProcess => None,
-    }) else {
-        // Step 4: "Return ? CrossOriginSet(this, P, V, Receiver)."
-        // Note: The cross-origin member set has no settable members yet.
-        return Ok(ec.value_from_bool(false));
-    };
+    if is_platform_object_same_origin(&backing) {
+        let Some(window_object) = window_object_handle(&backing) else {
+            return Ok(ec.value_from_bool(false));
+        };
 
-    // Step 3.1: "If P is an array index property name, return false."
-    if is_array_index_key(&key, ec) {
-        return Ok(ec.value_from_bool(false));
+        // Step 3.1: "If P is an array index property name, then return false."
+        if is_array_index_key(&key, ec) {
+            return Ok(ec.value_from_bool(false));
+        }
+
+        // Step 3.2: "Return ? OrdinarySet(W, P, V, Receiver)."
+        let value = args.get(2).cloned().unwrap_or_else(|| ec.value_undefined());
+        let prop_key = ec.to_property_key(key)?;
+        ec.set(window_object, prop_key, value, false)?;
+        return Ok(ec.value_from_bool(true));
     }
 
-    // Step 3.2: "Return ? OrdinarySet(W, P, V, Receiver)."
-    let value = args.get(2).cloned().unwrap_or_else(|| ec.value_undefined());
-    let prop_key = ec.to_property_key(key)?;
-    ec.set(window_object, prop_key, value, false)?;
-    Ok(ec.value_from_bool(true))
+    // Step 4: "Return ? CrossOriginSet(this, P, V, Receiver)."
+    cross_origin_set(ec)
 }
 
 /// <https://html.spec.whatwg.org/#windowproxy-delete>
@@ -456,33 +537,35 @@ fn trap_delete_property(
     let (_proxy_target, backing) = proxy_target_and_backing(args, ec)?;
     let key = args.get(1).cloned().unwrap_or_else(|| ec.value_undefined());
 
+    // Step 1: "Let W be the value of the [[Window]] internal slot of this."
     // Step 2: "If IsPlatformObjectSameOrigin(W) is true:"
-    let Some(window_object) = (match &backing {
-        WindowProxyBacking::SameContentProcess { .. } => window_object_handle(&backing),
-        WindowProxyBacking::CrossContentProcess => None,
-    }) else {
-        // Step 3: "Throw a 'SecurityError' DOMException."
-        // Note: The trap contract returns a boolean; the security error is
-        // approximated by refusing the delete.
-        return Ok(ec.value_from_bool(false));
-    };
+    if is_platform_object_same_origin(&backing) {
+        let Some(window_object) = window_object_handle(&backing) else {
+            return Ok(ec.value_from_bool(false));
+        };
 
-    // Step 2.1: "If P is an array index property name:"
-    if is_array_index_key(&key, ec) {
+        // Step 2.1: "If P is an array index property name:"
+        if is_array_index_key(&key, ec) {
+            let prop_key = ec.to_property_key(key)?;
+
+            // Step 2.1.1: "Let desc be ! this.[[GetOwnProperty]](P)."
+            // Uses has_own_property as proxy for "desc is undefined".
+            // Step 2.1.2: "If desc is undefined, then return true."
+            // Step 2.1.3: "Return false."
+            let has = ec.has_own_property(window_object, prop_key)?;
+            return Ok(ec.value_from_bool(!has));
+        }
+
+        // Step 2.2: "Return ? OrdinaryDelete(W, P)."
         let prop_key = ec.to_property_key(key)?;
-
-        // Step 2.1.1: "Let desc be ! this.[[GetOwnProperty]](P)."
-        // Uses has_own_property as proxy for "desc is undefined".
-        // Step 2.1.2: "If desc is undefined, then return true."
-        // Step 2.1.3: "Return false."
-        let has = ec.has_own_property(window_object, prop_key)?;
-        return Ok(ec.value_from_bool(!has));
+        ec.delete_property_or_throw(window_object, prop_key)?;
+        return Ok(ec.value_from_bool(true));
     }
 
-    // Step 2.2: "Return ? OrdinaryDelete(W, P)."
-    let prop_key = ec.to_property_key(key)?;
-    ec.delete_property_or_throw(window_object, prop_key)?;
-    Ok(ec.value_from_bool(true))
+    // Step 3: "Throw a 'SecurityError' DOMException."
+    // Note: The trap contract returns a boolean; the security error is
+    // approximated by refusing the delete.
+    Ok(ec.value_from_bool(false))
 }
 
 /// <https://html.spec.whatwg.org/#windowproxy-has>
@@ -504,11 +587,10 @@ fn trap_has(
     }
 
     let prop_key = ec.to_property_key(key)?;
-    let backing_object = match &backing {
-        WindowProxyBacking::SameContentProcess { .. } => {
-            window_object_handle(&backing).unwrap_or(proxy_target)
-        }
-        WindowProxyBacking::CrossContentProcess => proxy_target,
+    let backing_object = if is_platform_object_same_origin(&backing) {
+        window_object_handle(&backing).unwrap_or_else(|| proxy_target.clone())
+    } else {
+        proxy_target
     };
     let result = ec.has_property(backing_object, prop_key)?;
     Ok(ec.value_from_bool(result))
@@ -522,30 +604,27 @@ fn trap_own_keys(
 ) -> Completion<JsValue, crate::js::Types> {
     let (proxy_target, backing) = proxy_target_and_backing(args, ec)?;
 
+    // Step 1: "Let W be the value of the [[Window]] internal slot of this."
     // Step 2: "Let maxProperties be W's associated Document's document-tree
     //          child navigables's size."
     // Note: Child navigable support not yet implemented — keys is empty.
     // Step 3: "Let keys be the range 0 to maxProperties, exclusive."
     // Step 4: "If IsPlatformObjectSameOrigin(W) is true, then return the
     //           concatenation of keys and OrdinaryOwnPropertyKeys(W)."
+    if is_platform_object_same_origin(&backing) {
+        let backing_object = window_object_handle(&backing).unwrap_or_else(|| proxy_target.clone());
+        let window_keys = ec.own_property_keys(backing_object)?;
+        let key_array = ec.create_empty_array();
+        for val in window_keys.into_iter() {
+            let js_val = ec.value_from_property_key(val);
+            ec.array_push(&key_array, js_val)?;
+        }
+        return Ok(<crate::js::Types as JsTypes>::value_from_object(key_array));
+    }
+
     // Step 5: "Return the concatenation of keys and !
     //           CrossOriginOwnPropertyKeys(W)."
-    // Note: A cross-content-process window resolves the proxy's own keys
-    // (empty; the cross-origin member set lives on the platform object's
-    // prototype).
-    let backing_object = match &backing {
-        WindowProxyBacking::SameContentProcess { .. } => {
-            window_object_handle(&backing).unwrap_or(proxy_target)
-        }
-        WindowProxyBacking::CrossContentProcess => proxy_target,
-    };
-    let window_keys = ec.own_property_keys(backing_object)?;
-    let key_array = ec.create_empty_array();
-    for val in window_keys.into_iter() {
-        let js_val = ec.value_from_property_key(val);
-        ec.array_push(&key_array, js_val)?;
-    }
-    Ok(<crate::js::Types as JsTypes>::value_from_object(key_array))
+    cross_origin_own_property_keys(&proxy_target, ec)
 }
 
 /// Captures for the wrapper function created by `trap_get`.
@@ -572,6 +651,33 @@ fn window_proxy_get_wrapper_behaviour(
 ) -> Completion<JsValue, crate::js::Types> {
     let this_value = <Types as JsTypes>::value_from_object(captures.receiver.clone());
     ec.call(&captures.original_fn, &this_value, args)
+}
+
+/// Wrap a callable result so calls use the resolved receiver as `this`.
+fn wrap_callable_result(
+    result: &JsValue,
+    receiver: JsObject,
+    ec: &mut dyn ExecutionContext<Types>,
+) -> Option<JsValue> {
+    if let Some(func_obj) = <Types as JsTypes>::value_as_object(result)
+        && ec.is_callable(result)
+    {
+        let name_key = ec.property_key_from_str("wrapped");
+        let wrapper_fn = create_builtin_fn_with_traced_captures(
+            ec,
+            WindowProxyGetCapture {
+                receiver,
+                original_fn: func_obj,
+            },
+            window_proxy_get_wrapper_behaviour,
+            0,
+            name_key,
+            false,
+        );
+        let wrapper_obj = <Types as JsTypes>::object_from_function(wrapper_fn);
+        return Some(<Types as JsTypes>::value_from_object(wrapper_obj));
+    }
+    None
 }
 
 // ────────────────────────────────────────────────────────────────────────────

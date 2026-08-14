@@ -298,10 +298,13 @@ the local behavior (`window.open` results, `iframe.contentWindow`, and the
 message event's `source` all resolve property gets/sets against the local
 Window, e.g. `w.location = url` reaches the target's Location binding).
 When the navigable's document was created in another content process, the
-backing is `WindowProxyBacking::CrossContentProcess` and the traps resolve
-the platform object's cross-origin member set instead — `postMessage`
+backing is `WindowProxyBacking::CrossContentProcess` and the traps branch on
+`is_platform_object_same_origin`, delegating to the cross-origin abstract
+operations (`CrossOriginGet`, `CrossOriginSet`, `CrossOriginGetOwnPropertyHelper`,
+`CrossOriginPropertyFallback`, `CrossOriginOwnPropertyKeys`) — `postMessage`
 routes through the user agent (steps 1–7 locally, user-agent routing for
-step 8), and the remaining members are the fixed member set.
+step 8), and the remaining members resolve off the platform object's
+prototype.
 
 The `SameContentProcess` variant carries the domain `Window` and the
 Window's JS object handle.  The handle is deliberately rooted (not a
@@ -413,9 +416,10 @@ What a WindowProxy access involves therefore splits as:
   realm locally (property gets/sets work with the shared security token;
   method invocation runs the target realm's native bindings).
 - **Cross cluster (cross process)**: the proxy's backing is
-  `CrossContentProcess` and the traps resolve the platform object's fixed
-  member set; `postMessage` routes through the user agent (the remaining
-  members need selective-access forwarding, gap 1 below).
+  `CrossContentProcess` and the traps delegate to the cross-origin abstract
+  operations, which resolve the platform object's member set; `postMessage`
+  routes through the user agent (the remaining members need selective-access
+  forwarding, gap 1 below).
 
 ### Remaining gaps
 
