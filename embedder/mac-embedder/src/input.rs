@@ -160,9 +160,9 @@ pub(super) fn modifiers_from_flags(flags: NSEventModifierFlags) -> KeyboardModif
 pub(super) fn ns_event_to_blitz_key(event: &NSEvent) -> BlitzKeyEvent {
     let pressed = event.r#type() == NSEventType::KeyDown;
     let characters = if pressed {
-        event.characters().and_then(|text| {
+        event.characters().map(|text| {
             let value: blitz_traits::SmolStr = text.to_string().into();
-            Some(value)
+            value
         })
     } else {
         None
@@ -232,11 +232,8 @@ pub(super) fn pointer_event(
 /// line deltas become line deltas.
 pub(super) fn wheel_delta_from_event(event: &NSEvent) -> BlitzWheelDelta {
     if event.hasPreciseScrollingDeltas() {
-        BlitzWheelDelta::Pixels(
-            f64::from(event.scrollingDeltaX()),
-            f64::from(event.scrollingDeltaY()),
-        )
+        BlitzWheelDelta::Pixels(event.scrollingDeltaX(), event.scrollingDeltaY())
     } else {
-        BlitzWheelDelta::Lines(f64::from(event.deltaX()), f64::from(event.deltaY()))
+        BlitzWheelDelta::Lines(event.deltaX(), event.deltaY())
     }
 }

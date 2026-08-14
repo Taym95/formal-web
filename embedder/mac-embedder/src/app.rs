@@ -497,10 +497,9 @@ impl MacApp {
         if let Some(window_id) = self.active_window_id
             && let Some(webview_id) = self.windows.get(&window_id).and_then(|w| w.active_tab)
             && let Some(provider) = &self.provider
+            && let Err(error) = provider.frame_needed(webview_id)
         {
-            if let Err(error) = provider.frame_needed(webview_id) {
-                error!("[mac-embedder] frame needed: {error}");
-            }
+            error!("[mac-embedder] frame needed: {error}");
         }
     }
 
@@ -538,7 +537,7 @@ impl MacApp {
             });
         // SAFETY: the block is valid and lives for as long as the monitor.
         let monitor = unsafe {
-            NSEvent::addLocalMonitorForEventsMatchingMask_handler(NSEventMask::Any, &*block)
+            NSEvent::addLocalMonitorForEventsMatchingMask_handler(NSEventMask::Any, &block)
         };
         let Some(monitor) = monitor else {
             return Err(String::from("failed to install the local event monitor"));
@@ -595,20 +594,29 @@ impl MacApp {
         }
     }
 
+    /// True while the native address field is being edited: the window's
+    /// first responder is the field's field editor (an internal NSTextView),
+    /// not the NSTextField itself.
+    fn address_field_is_editing(window_state: &MacWindow) -> bool {
+        let Some(editor) = window_state.address_field.currentEditor() else {
+            return false;
+        };
+        window_state
+            .window
+            .firstResponder()
+            .is_some_and(|responder| {
+                // SAFETY: `isEqual` is identity comparison for Objective-C
+                // objects.
+                let same: bool = unsafe { msg_send![&responder, isEqual: &*editor] };
+                same
+            })
+    }
+
     fn address_field_is_first_responder(&self) -> bool {
         self.active_window_id.is_some_and(|window_id| {
-            self.windows.get(&window_id).is_some_and(|window_state| {
-                window_state
-                    .window
-                    .firstResponder()
-                    .is_some_and(|responder| {
-                        // SAFETY: `isEqual` is identity comparison for
-                        // Objective-C objects.
-                        let same: bool =
-                            unsafe { msg_send![&responder, isEqual: &*window_state.address_field] };
-                        same
-                    })
-            })
+            self.windows
+                .get(&window_id)
+                .is_some_and(Self::address_field_is_editing)
         })
     }
 
@@ -837,17 +845,7 @@ impl MacApp {
             .map(TabState::display_url)
             .unwrap_or_default();
         // Don't clobber the field while the user is typing into it.
-        let is_editing = window_state
-            .window
-            .firstResponder()
-            .is_some_and(|responder| {
-                // SAFETY: `isEqual` is identity comparison for Objective-C
-                // objects.
-                let same: bool =
-                    unsafe { msg_send![&responder, isEqual: &*window_state.address_field] };
-                same
-            });
-        if !is_editing {
+        if !Self::address_field_is_editing(window_state) {
             window_state
                 .address_field
                 .setStringValue(&NSString::from_str(&address));
@@ -1115,6 +1113,11 @@ impl MacApp {
 
         window.center();
         window.makeKeyAndOrderFront(None);
+        // AppKit's default key-view-loop focus would hand the first
+        // responder to the native chrome (the address field starts
+        // editing). A browser hands keystrokes to the web content by
+        // default; clear the focus the window just assigned.
+        window.makeFirstResponder(None);
 
         let destination = startup_destination_url(event_loop_options().startup_url.as_deref())
             .unwrap_or_else(|_| String::from("about:blank"));
@@ -1128,9 +1131,13 @@ impl MacApp {
 
     fn viewport_tuple(content_size: (f64, f64), scale: f64) -> (u32, u32, f32, ColorScheme) {
         let (width, height) = content_size;
+        // The web content occupies the window below the native chrome bar;
+        // the content viewport must match the displayed area or the scene
+        // is stretched vertically when presented.
+        let web_height = (height - CHROME_BAR_HEIGHT).max(0.0);
         (
             (width * scale) as u32,
-            (height * scale) as u32,
+            (web_height * scale) as u32,
             scale as f32,
             ColorScheme::Light,
         )
@@ -1268,10 +1275,10 @@ impl MacApp {
         let Some(webview_id) = webview_id else {
             return;
         };
-        if let Some(provider) = &self.provider {
-            if let Err(error) = provider.send_ui_event(webview_id, event) {
-                error!("content event error: {error}");
-            }
+        if let Some(provider) = &self.provider
+            && let Err(error) = provider.send_ui_event(webview_id, event)
+        {
+            error!("content event error: {error}");
         }
     }
 

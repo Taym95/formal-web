@@ -16,6 +16,30 @@ processes through the `webview` and `user_agent` crates.
   automation-only hosting (WebDriver, CDP). No window, no chrome, just a fixed
   viewport and event-loop plumbing.
 
+### Windowed backend split (`embedder-backend`)
+
+The headed app is provided by one of two backends selected at startup via
+`install_default_windowed_backend()`:
+
+- **`mac-embedder`** (AppKit): the default on macOS. Runs an `NSApplication`
+  with `NSWindow`/`NSView`/`CALayer` display; the web content is presented
+  zero-copy by setting the content layer's `contents` to the shared IOSurface
+  from the graphics process. The chrome is native AppKit controls: a tab strip
+  of `NSButton`s and an editable `NSTextField` address bar. A `CVDisplayLink`
+  paces animated content via `WebviewProvider::frame_needed`.
+
+- **`winit-embedder`**: winit windows with a Blitz-rendered chrome. The default
+  on non-macOS platforms; opt-in on macOS via the `winit_embedder` feature.
+
+Known gaps in the AppKit backend relative to winit:
+
+- **IME is not implemented.** The AppKit backend sends `KeyDown`/`KeyUp` events
+  only; text composition (CJK and other marked-text input) requires the
+  `NSTextInputClient` protocol on the web content view, which is not yet wired.
+  Basic ASCII text input into page fields works through `KeyDown` text.
+- **Touch events are not handled** (desktop macOS has no touch input; winit's
+  touch path is for trackpads/tablets).
+
 ### Multi-window and multi-tab
 
 `WindowedApp` owns a `HashMap<WindowId, WindowState>` where each `WindowState`
@@ -128,3 +152,8 @@ references after HTML rebuilds.
 | `src/event_loop/windowed/chrome.rs` | `ChromeUi` — Blitz-based browser chrome |
 | `src/event_loop/headless.rs` | `HeadlessEmbedderApp` |
 | `src/ui_event.rs` | UI event serialization |
+| `backend/src/lib.rs` | Backend selection (`install_default_windowed_backend`) |
+| `mac-embedder/src/app.rs` | AppKit application, window/chrome/event routing |
+| `mac-embedder/src/window.rs` | Layer-hosting view, IOSurface presentation |
+| `mac-embedder/src/input.rs` | NSEvent → Blitz input mapping |
+| `winit-embedder/src/windowed.rs` | `WindowedApp` — winit window/chrome/events |
