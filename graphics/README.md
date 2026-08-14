@@ -67,13 +67,13 @@ CPU → GPU upload, and Vello's internal atlas copy.
 
 ```
 [ PRODUCER: graphics process ]          [ CONSUMER: embedder ]
-  IOSurfaceRef::create(...)             receive the surface's Mach port
-  Metal texture from the IOSurface      IOSurfaceRef::lookup_from_mach_port(port)
-  (objc2-metal newTextureWithDescriptor_iosurface_plane)
+  IOSurfaceRef::create(...)             receive the surface's ID + Mach port
+  Metal texture from the IOSurface      IOSurfaceLookup(id) / fallback to
+  (objc2-metal newTextureWithDescriptor_iosurface_plane)  lookup_from_mach_port
   import into wgpu via wgpu-hal         import into wgpu via wgpu-hal
   (texture_from_raw + create_texture_from_hal)
   Vello render_to_texture INTO it       try_register_custom_resource (unchanged)
-  create_mach_port + send the port      blit via PaintRef::Resource (unchanged)
+  send the global ID + Mach port        blit via PaintRef::Resource (unchanged)
   ... alternate to the other buffer ... ... send FrameNeeded (next cycle) ...
 ```
 
@@ -84,8 +84,8 @@ blits it. No readback, no IPC pixel bytes, no upload, no ack.
 ### Verified platform APIs (macOS, as used by this workspace)
 
 - `objc2-io-surface` 0.3.2 (already a dependency of both processes) provides
-  `IOSurfaceRef::create(&CFDictionary)`, `.create_mach_port()`, and
-  `.lookup_from_mach_port(port)`.
+  `IOSurfaceRef::create(&CFDictionary)`, `.create_mach_port()`, `.id()`,
+  `.lookup(id)`, and `.lookup_from_mach_port(port)`.
 - `objc2-metal` 0.3.2 (already a dependency) provides
   `MTLDevice::newTextureWithDescriptor_iosurface_plane(...)`.
 - wgpu 29 exposes `Device::create_texture_from_hal::<Metal>` and
@@ -112,16 +112,30 @@ blits it. No readback, no IPC pixel bytes, no upload, no ack.
 - **Lifecycle**: resize recreates the IOSurface + re-shares + re-registers; the
   texture handle's lifetime must outlive in-flight blits.
 
-### Transporting the IOSurface Mach port
+### Transporting the IOSurface ID and Mach port
 
-The producer creates a Mach port for the IOSurface (`IOSurfaceRef::create_mach_port`)
-and sends it in the `PixelFrameReady` message. The forked `ipc-channel` (a git
-dependency on <https://github.com/gterzian/ipc-channel>) provides a
-serializable `OsMachPort` type: the port is pushed into a serialization
-thread-local (mirroring `OS_IPC_CHANNELS_FOR_SERIALIZATION`) and popped on
-deserialize, traveling as a single `MACH_MSG_OOL_PORTS_DESCRIPTOR`
-(out-of-line ports, `MOVE_SEND`) appended after the shared-memory descriptors;
-the receive path collects them into a third descriptor phase. The fork adds
+The producer creates each shared surface with `kIOSurfaceIsGlobal` (deprecated
+by Apple, but the only mechanism for cross-process IOSurfaceID visibility on
+macOS 13+; the surfaces carry page pixels, not secrets) and ships both the
+surface's global ID and a Mach port in the `PixelFrameReady` message. The
+embedder looks the surface up by ID first (`IOSurfaceLookup`) and falls back
+to the Mach port.
+
+The two handles exist because of how CoreAnimation composites layer contents:
+a surface object imported only from its Mach port (`IOSurfaceLookupFromMachPort`)
+renders empty in a `CALayer`, while a by-ID lookup of the same surface
+composites correctly — and, without `kIOSurfaceIsGlobal`, the by-ID lookup
+fails for a surface created in another process (macOS 13+ keeps IOSurfaces
+process-local by default). The port remains as a fallback for producers that
+do not mark the surface global.
+
+The forked `ipc-channel` (a git dependency on
+<https://github.com/gterzian/ipc-channel>) provides a serializable `OsMachPort`
+type: the port is pushed into a serialization thread-local (mirroring
+`OS_IPC_CHANNELS_FOR_SERIALIZATION`) and popped on deserialize, traveling as a
+single `MACH_MSG_OOL_PORTS_DESCRIPTOR` (out-of-line ports, `MOVE_SEND`)
+appended after the shared-memory descriptors; the receive path collects them
+into a third descriptor phase. The fork adds
 `OsIpcSender::send_with_mach_ports`; non-macOS platforms are untouched.
 
 ## Generic surface backend abstraction

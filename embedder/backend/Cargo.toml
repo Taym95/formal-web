@@ -1,0 +1,21 @@
+[package]
+name = "embedder-backend"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[features]
+default = []
+# Opt into the winit windowed embedder on macOS (the default there is the
+# AppKit backend). On other platforms the winit backend is the only option
+# and this feature is a no-op.
+winit_embedder = ["dep:winit-embedder"]
+
+[target.'cfg(target_os = "macos")'.dependencies]
+embedder-core = { path = "../core" }
+mac-embedder = { path = "../mac-embedder" }
+winit-embedder = { path = "../winit-embedder", optional = true }
+
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+embedder-core = { path = "../core" }
+winit-embedder = { path = "../winit-embedder" }

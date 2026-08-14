@@ -1,0 +1,33 @@
+[package]
+name = "embedder-core"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[features]
+default = []
+media = ["webview/media"]
+
+[dependencies]
+anyrender = { version = "0.10", features = ["serde"] }
+anyrender_vello_cpu = "0.12.1"
+automation = { path = "../../automation" }
+arboard = { version = "3.6.1", default-features = false }
+blitz-dom = { workspace = true, features = ["system_fonts", "svg"] }
+blitz-html = { workspace = true }
+blitz-paint = { workspace = true, features = ["svg"] }
+blitz-traits = { workspace = true }
+cursor-icon = "1"
+ipc = { path = "../../ipc" }
+ipc-channel = { git = "https://github.com/gterzian/ipc-channel", rev = "169da83" }
+ipc_messages = { path = "../../ipc_messages" }
+keyboard-types = "0.7"
+kurbo = "0.13"
+log = "0.4"
+peniko = "0.6"
+png = "0.17"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+verification = { path = "../../verification" }
+webview = { path = "../../webview", default-features = false }
+winit = "0.30"

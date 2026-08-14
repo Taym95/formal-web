@@ -1,4 +1,4 @@
-#[path = "../../embedder/src/ui_event.rs"]
+#[path = "../../webview/src/ui_event.rs"]
 #[allow(dead_code)]
 pub(crate) mod ui_event;
 

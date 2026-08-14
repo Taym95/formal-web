@@ -641,8 +641,10 @@ At the end of each task, run the following steps **in order**:
    - **Spec verification** — Validates all TLA+ spec traces (Navigation, RenderingOpportunity, etc.) via the headless verification script (no GUI needed, fully automated):
 
      ```bash
-     ./verification/verify-specs.sh
+     JAVA_HOME=/Library/Java/JavaVirtualMachines/temurin-21.jdk/Contents/Home ./verification/verify-specs.sh
      ```
+
+     TLC runs on Java; set `JAVA_HOME` to a JDK home when the macOS `/usr/bin/java` stub cannot locate a JVM (see `verification/README.md`, "TLA+/TLC gotchas").
 
      The script starts the embedder headless with TLA+ tracing, runs a minimal WebDriver session, collects trace events, and validates them against TLA+ models.
 

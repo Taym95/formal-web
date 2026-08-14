@@ -1,8 +1,7 @@
-use crate::event_loop::winit_integration::event_loop_options;
 use crate::event_loop::{
     FormalWebUserEvent, NavigationCompleted, NavigationCompletion, automation_screenshot_png,
-    read_clipboard_text, startup_destination_url, update_window_viewport_snapshot,
-    write_clipboard_text,
+    event_loop_options, read_clipboard_text, startup_destination_url,
+    update_window_viewport_snapshot, write_clipboard_text,
 };
 use ::winit::application::ApplicationHandler;
 use ::winit::event::WindowEvent;

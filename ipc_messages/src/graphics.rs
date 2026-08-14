@@ -163,13 +163,19 @@ pub enum SurfacePayload {
         shmem_key: usize,
     },
     /// macOS zero-copy: the frame was rendered directly into a shared
-    /// IOSurface, whose Mach port travels in this variant. The embedder
-    /// looks the surface up from the port and blits it.
+    /// IOSurface, whose global IOSurfaceID and Mach port travel in this
+    /// variant. The embedder looks the surface up by ID (`IOSurfaceLookup`)
+    /// and blits it, falling back to the port lookup when the ID is not
+    /// resolvable. The by-ID object is what CoreAnimation composites: a
+    /// surface object imported only from the port renders empty in the
+    /// layer.
     #[cfg(target_os = "macos")]
     SharedTexture {
         /// Stable identity of the shared IOSurface; changes on resize.
         texture_id: u64,
-        /// Mach port (send right) to the IOSurface.
+        /// Global IOSurfaceID of the shared IOSurface.
+        surface_id: u32,
+        /// Mach port (send right) to the IOSurface, for the fallback lookup.
         port: OsMachPort,
     },
 }
@@ -187,7 +193,9 @@ pub enum SurfaceFrame {
     SharedTexture {
         /// Stable identity of the shared IOSurface; changes on resize.
         texture_id: u64,
-        /// Mach port (send right) to the IOSurface.
+        /// Global IOSurfaceID of the shared IOSurface.
+        surface_id: u32,
+        /// Mach port (send right) to the IOSurface, for the fallback lookup.
         port: OsMachPort,
     },
 }

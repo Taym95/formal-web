@@ -139,6 +139,9 @@ pub trait Embedder: Send + Sync {
     /// Forward a rendered surface frame from the graphics process. `frame`
     /// identifies how the pixels are delivered (CPU shared memory vs. a
     /// shared IOSurface on macOS) and carries the delivery payload.
+    /// `animating` reports whether the composed scene contains animated
+    /// content (video, CSS animations) that needs the next frame at display
+    /// cadence.
     fn new_web_content_surface(
         &self,
         webview_id: WebviewId,
@@ -146,6 +149,7 @@ pub trait Embedder: Send + Sync {
         width: u32,
         height: u32,
         generation: u64,
+        animating: bool,
     ) -> Result<(), String>;
 }
 
@@ -4195,12 +4199,15 @@ impl UserAgentWorker {
                         ipc_messages::graphics::SurfaceFrame::CpuShmem(region)
                     }
                     #[cfg(target_os = "macos")]
-                    ipc_messages::graphics::SurfacePayload::SharedTexture { texture_id, port } => {
-                        ipc_messages::graphics::SurfaceFrame::SharedTexture {
-                            texture_id: *texture_id,
-                            port: port.clone(),
-                        }
-                    }
+                    ipc_messages::graphics::SurfacePayload::SharedTexture {
+                        texture_id,
+                        surface_id,
+                        port,
+                    } => ipc_messages::graphics::SurfaceFrame::SharedTexture {
+                        texture_id: *texture_id,
+                        surface_id: *surface_id,
+                        port: port.clone(),
+                    },
                 };
                 debug!(
                     "[graphics] received surface frame for {:?} ({}x{}, {}B)",
@@ -4276,6 +4283,7 @@ impl UserAgentWorker {
                     *width,
                     *height,
                     *generation,
+                    *animating,
                 ) {
                     error!("[graphics] forward surface: {e}");
                 }

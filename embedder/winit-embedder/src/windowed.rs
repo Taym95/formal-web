@@ -1,15 +1,9 @@
 use log::{debug, error, info};
-mod chrome;
 
-use self::chrome::{ChromeAction, ChromeTabInfo, ChromeUi, ChromeViewState, WinitShellProvider};
-use super::winit_integration::{
-    event_loop_options, touch_pointer_details, viewport_of_snapshot, viewport_snapshot_for_window,
-    winit_ime_to_blitz, winit_key_event_to_blitz, winit_modifiers_to_kbt_modifiers,
-};
-use super::{
-    FormalWebUserEvent, NavigationCompletion, automation_screenshot_png,
-    normalize_browser_destination, read_clipboard_text, startup_destination_url,
-    write_clipboard_text,
+use crate::winit_integration::WinitShellProvider;
+use crate::winit_integration::{
+    touch_pointer_details, viewport_of_snapshot, viewport_snapshot_for_window, winit_ime_to_blitz,
+    winit_key_event_to_blitz, winit_modifiers_to_kbt_modifiers,
 };
 use anyrender::{PaintRef, PaintScene, RenderContext, ResourceId, WindowRenderer};
 use anyrender_vello::VelloWindowRenderer;
@@ -18,20 +12,24 @@ use automation::{
 };
 use blitz_traits::SmolStr;
 use blitz_traits::events::{
-    BlitzKeyEvent, BlitzPointerEvent, BlitzPointerId, BlitzWheelDelta, BlitzWheelEvent,
-    MouseEventButton, MouseEventButtons, PointerCoords, PointerDetails, UiEvent,
+    BlitzPointerEvent, BlitzPointerId, BlitzWheelDelta, BlitzWheelEvent, MouseEventButton,
+    MouseEventButtons, PointerCoords, PointerDetails, UiEvent,
 };
-use blitz_traits::shell::{ColorScheme, ShellProvider};
+use blitz_traits::shell::ShellProvider;
+use embedder_core::{
+    ChromeAction, ChromeTabInfo, ChromeUi, ChromeViewState, FormalWebUserEvent,
+    NavigationCompletion, apple_standard_keybinding_for_key_down, automation_screenshot_png,
+    event_loop_options, normalize_browser_destination, read_clipboard_text,
+    startup_destination_url, update_window_viewport_snapshot, write_clipboard_text,
+};
 #[cfg(target_os = "macos")]
 use ipc_channel::platform::deallocate_mach_port;
 use ipc_messages::content::WebviewId;
-#[cfg(target_os = "macos")]
-use keyboard_types::{Key, Modifiers as KeyboardModifiers};
 use kurbo::Affine;
 use serde_json::Value;
 use std::collections::HashMap;
 
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 use webview::WebviewProvider;
@@ -71,87 +69,6 @@ impl TabState {
             .clone()
             .or_else(|| self.committed_url.clone())
             .unwrap_or_default()
-    }
-}
-
-fn apple_standard_keybinding_for_key_down(event: &BlitzKeyEvent) -> Option<&'static str> {
-    #[cfg(target_os = "macos")]
-    {
-        if !event.state.is_pressed() {
-            return None;
-        }
-
-        let command_mod = event.modifiers.contains(KeyboardModifiers::SUPER);
-        let control_mod = event.modifiers.contains(KeyboardModifiers::CONTROL);
-        let option_mod = event.modifiers.contains(KeyboardModifiers::ALT);
-        let shift_mod = event.modifiers.contains(KeyboardModifiers::SHIFT);
-
-        if command_mod {
-            match &event.key {
-                Key::Backspace => return Some("deleteToBeginningOfLine:"),
-                Key::Delete => return Some("deleteToEndOfLine:"),
-                Key::ArrowLeft if shift_mod => {
-                    return Some("moveToBeginningOfLineAndModifySelection:");
-                }
-                Key::ArrowLeft => return Some("moveToBeginningOfLine:"),
-                Key::ArrowRight if shift_mod => return Some("moveToEndOfLineAndModifySelection:"),
-                Key::ArrowRight => return Some("moveToEndOfLine:"),
-                Key::ArrowUp if shift_mod => {
-                    return Some("moveToBeginningOfDocumentAndModifySelection:");
-                }
-                Key::ArrowUp => return Some("moveToBeginningOfDocument:"),
-                Key::ArrowDown if shift_mod => {
-                    return Some("moveToEndOfDocumentAndModifySelection:");
-                }
-                Key::ArrowDown => return Some("moveToEndOfDocument:"),
-                _ => {}
-            }
-        }
-
-        if option_mod {
-            match &event.key {
-                Key::Backspace => return Some("deleteWordBackward:"),
-                Key::Delete => return Some("deleteWordForward:"),
-                Key::ArrowLeft if shift_mod => return Some("moveWordLeftAndModifySelection:"),
-                Key::ArrowLeft => return Some("moveWordLeft:"),
-                Key::ArrowRight if shift_mod => return Some("moveWordRightAndModifySelection:"),
-                Key::ArrowRight => return Some("moveWordRight:"),
-                _ => {}
-            }
-        }
-
-        if control_mod && let Key::Character(value) = &event.key {
-            return match value.to_lowercase().as_str() {
-                "a" if shift_mod => Some("moveToBeginningOfParagraphAndModifySelection:"),
-                "a" => Some("moveToBeginningOfParagraph:"),
-                "b" if shift_mod => Some("moveBackwardAndModifySelection:"),
-                "b" => Some("moveBackward:"),
-                "d" => Some("deleteForward:"),
-                "e" if shift_mod => Some("moveToEndOfParagraphAndModifySelection:"),
-                "e" => Some("moveToEndOfParagraph:"),
-                "f" if shift_mod => Some("moveForwardAndModifySelection:"),
-                "f" => Some("moveForward:"),
-                "h" => Some("deleteBackward:"),
-                "k" => Some("deleteToEndOfParagraph:"),
-                "n" if shift_mod => Some("moveDownAndModifySelection:"),
-                "n" => Some("moveDown:"),
-                "o" => Some("insertNewlineIgnoringFieldEditor:"),
-                "p" if shift_mod => Some("moveUpAndModifySelection:"),
-                "p" => Some("moveUp:"),
-                _ => None,
-            };
-        }
-
-        match &event.key {
-            Key::Backspace => Some("deleteBackward:"),
-            _ => None,
-        }
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = event;
-        None
     }
 }
 
@@ -318,7 +235,7 @@ impl WindowState {
     }
 }
 
-pub(super) struct WindowedApp {
+pub struct WindowedApp {
     pub(super) windows: HashMap<WindowId, WindowState>,
     pub(super) provider: Option<WebviewProvider>,
     pub(super) active_window_id: Option<WindowId>,
@@ -332,18 +249,6 @@ impl Default for WindowedApp {
             active_window_id: None,
         }
     }
-}
-
-type ViewportSnapshot = Option<(u32, u32, f32, ColorScheme)>;
-pub(super) static WINDOW_VIEWPORT_SNAPSHOT: LazyLock<Mutex<ViewportSnapshot>> =
-    LazyLock::new(|| Mutex::new(None));
-
-pub(super) fn update_window_viewport_snapshot(snapshot: Option<(u32, u32, f32, ColorScheme)>) {
-    *WINDOW_VIEWPORT_SNAPSHOT.lock().expect("poisoned") = snapshot;
-}
-
-pub(super) fn window_viewport_snapshot() -> Option<(u32, u32, f32, ColorScheme)> {
-    *WINDOW_VIEWPORT_SNAPSHOT.lock().expect("poisoned")
 }
 
 // ── Static helpers ─────────────────────────────────────────────────────────
@@ -1004,7 +909,7 @@ impl ApplicationHandler<FormalWebUserEvent> for WindowedApp {
                 }
                 self.windows.remove(&window_id);
                 if self.windows.is_empty() {
-                    let _ = super::send_user_event(FormalWebUserEvent::Exit);
+                    let _ = embedder_core::send_user_event(FormalWebUserEvent::Exit);
                 }
             }
             WindowEvent::Ime(event) => {
@@ -1537,7 +1442,11 @@ impl ApplicationHandler<FormalWebUserEvent> for WindowedApp {
                         }
                     }
                     #[cfg(target_os = "macos")]
-                    ipc_messages::graphics::SurfaceFrame::SharedTexture { texture_id, port } => {
+                    ipc_messages::graphics::SurfaceFrame::SharedTexture {
+                        texture_id,
+                        surface_id,
+                        port,
+                    } => {
                         // Zero-copy path: the frame was rendered directly
                         // into a shared IOSurface by the graphics process.
                         // Import the surface (once per texture id) as the
@@ -1560,20 +1469,22 @@ impl ApplicationHandler<FormalWebUserEvent> for WindowedApp {
                             {
                                 state.renderer.unregister_resource(old.resource_id());
                             }
-                            // The port is a send right to the shared surface;
-                            // `into_name` transfers ownership of it to this
-                            // process. `IOSurfaceLookupFromMachPort` does not
-                            // consume the port (the returned surface is
-                            // retained independently by CoreFoundation), so
-                            // the send right is released right after the
-                            // lookup on both the success and failure paths.
-                            let port_name = port.into_name();
-                            let surface =
-                                objc2_io_surface::IOSurfaceRef::lookup_from_mach_port(port_name);
-                            deallocate_mach_port(port_name);
-                            let Some(surface_ref) = surface else {
+                            // Look the shared surface up by its global ID
+                            // first; fall back to the Mach port when the ID
+                            // is not resolvable.
+                            let surface_ref = objc2_io_surface::IOSurfaceRef::lookup(surface_id)
+                                .or_else(|| {
+                                    let port_name = port.into_name();
+                                    let surface =
+                                        objc2_io_surface::IOSurfaceRef::lookup_from_mach_port(
+                                            port_name,
+                                        );
+                                    deallocate_mach_port(port_name);
+                                    surface
+                                });
+                            let Some(surface_ref) = surface_ref else {
                                 error!(
-                                    "[embedder] IOSurfaceLookupFromMachPort failed for webview={:?}",
+                                    "[embedder] IOSurfaceLookup failed for webview={:?} id={surface_id}",
                                     webview_id
                                 );
                                 return;
@@ -1718,7 +1629,7 @@ impl WindowedApp {
                 }
             }
             ChromeAction::NewWindow => {
-                let _ = super::send_user_event(FormalWebUserEvent::CreateWindow);
+                let _ = embedder_core::send_user_event(FormalWebUserEvent::CreateWindow);
             }
             ChromeAction::SwitchTab(index) => {
                 if let Some(state) = app.windows.get_mut(&window_id) {

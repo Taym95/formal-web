@@ -12,6 +12,9 @@ path = "src/main.rs"
 [features]
 default = ["media", "v8"]
 media = ["dep:media"]
+# Force the winit windowed embedder on macOS (the default there is the
+# AppKit backend). On other platforms the winit backend is the only option.
+winit_embedder = ["embedder/winit_embedder"]
 
 # Backend selection.
 # These propagate to the content crate via workspace dependency resolution.
@@ -42,6 +45,10 @@ members = [
     "ipc",
     "ipc/xpc-sys",
     "embedder",
+    "embedder/core",
+    "embedder/backend",
+    "embedder/winit-embedder",
+    "embedder/mac-embedder",
     "ipc_messages",
     "js_engine",
     "js_engine_macros",

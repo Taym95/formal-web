@@ -1,0 +1,31 @@
+[package]
+name = "mac-embedder"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+automation = { path = "../../automation" }
+blitz-traits = { workspace = true }
+embedder-core = { path = "../core" }
+ipc = { path = "../../ipc" }
+ipc-channel = { git = "https://github.com/gterzian/ipc-channel", rev = "169da83" }
+ipc_messages = { path = "../../ipc_messages" }
+keyboard-types = "0.7"
+log = "0.4"
+serde_json = "1"
+uuid = { version = "1", features = ["v4"] }
+verification = { path = "../../verification" }
+webview = { path = "../../webview", default-features = false }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+dispatch = "0.2"
+block2 = "0.6"
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", features = ["block2"] }
+objc2-core-foundation = "0.3"
+objc2-core-graphics = "0.3"
+objc2-core-video = "0.3"
+objc2-foundation = "0.3"
+objc2-io-surface = "0.3"
+objc2-quartz-core = "0.3"

@@ -206,11 +206,16 @@ impl SurfaceRenderer for IosurfaceRenderer {
             return delivery;
         };
         let texture_id = texture.texture_id;
+        let surface_id = texture.surface_id();
         let port = texture.port_for_frame();
 
         let frame_event = GraphicsEvent::PixelFrameReady {
             webview_id,
-            payload: SurfacePayload::SharedTexture { texture_id, port },
+            payload: SurfacePayload::SharedTexture {
+                texture_id,
+                surface_id,
+                port,
+            },
             animating: metadata.animating,
             animating_frame_ids: metadata.animating_frame_ids,
             width,
