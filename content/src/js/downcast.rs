@@ -8,7 +8,7 @@ use crate::dom::{
 };
 use crate::html::{
     HTMLAnchorElement, HTMLElement, HTMLIFrameElement, HTMLInputElement, HTMLMediaElement,
-    HTMLVideoElement, Window,
+    HTMLVideoElement, MessageEvent, Window,
 };
 use crate::js::Types;
 use crate::ui_events::{MouseEvent, UIEvent};
@@ -27,6 +27,10 @@ pub(crate) fn event_from_js_object(
             .or_else(|| {
                 data.downcast_ref::<UIEvent>()
                     .map(|ui_event| ui_event.event().clone())
+            })
+            .or_else(|| {
+                data.downcast_ref::<MessageEvent>()
+                    .map(|message_event| message_event.event().clone())
             })
             .or_else(|| {
                 data.downcast_ref::<MouseEvent>()
@@ -160,6 +164,8 @@ pub(crate) fn try_set_event_target_reflector(
                     );
                 } else if let Some(event) = data.downcast_mut::<Event>() {
                     ec.store_js_object(&mut event.event_mut().reflector, reflector);
+                } else if let Some(message_event) = data.downcast_mut::<MessageEvent>() {
+                    ec.store_js_object(&mut message_event.event_mut().reflector, reflector);
                 } else if let Some(ui_event) = data.downcast_mut::<UIEvent>() {
                     ec.store_js_object(&mut ui_event.event_mut().reflector, reflector);
                 } else if let Some(mouse_event) = data.downcast_mut::<MouseEvent>() {

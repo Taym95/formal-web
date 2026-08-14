@@ -140,6 +140,66 @@ where
                 false,
             );
             desc.set = Some(setter_fn);
+        } else if let Some(forward_id) = attr.put_forwards {
+            // <https://webidl.spec.whatwg.org/#dfn-attribute-setter>
+            // The [PutForwards] extended attribute turns the assignment into
+            // an assignment of the forwarded attribute on the object the
+            // attribute currently references (step 4.5.8).
+            #[gc_struct]
+            struct PutForwardsCapture<T: JsTypes> {
+                #[ignore_trace]
+                attr_id: &'static str,
+                #[ignore_trace]
+                forward_id: &'static str,
+                #[ignore_trace]
+                marker: std::marker::PhantomData<T>,
+            }
+
+            fn put_forwards_behaviour<T: JsTypes + JsTypesWithRealm>(
+                args: &[T::JsValue],
+                this: T::JsValue,
+                captures: &PutForwardsCapture<T>,
+                ec: &mut dyn ExecutionContext<T>,
+            ) -> Completion<T::JsValue, T> {
+                let undefined = ec.value_undefined();
+                let value = args.first().cloned().unwrap_or_else(|| undefined.clone());
+
+                // Step 4.5.8.1: "Let Q be ? Get(jsValue, id)."
+                let attr_key = ec.property_key_from_str(captures.attr_id);
+                let q = ec.get_v(this, attr_key)?;
+
+                // Step 4.5.8.2: "If Q is not an Object, then throw a
+                //               TypeError."
+                let Some(q_object) = T::value_as_object(&q) else {
+                    return Err(ec.new_type_error(&format!(
+                        "cannot forward assignment: attribute '{}' is not an object",
+                        captures.attr_id
+                    )));
+                };
+
+                // Step 4.5.8.3: "Let forwardId be the identifier argument of
+                //               the [PutForwards] extended attribute."
+                // Step 4.5.8.4: "Perform ? Set(Q, forwardId, V, false)."
+                let forward_key = ec.property_key_from_str(captures.forward_id);
+                ec.set(q_object, forward_key, value, false)?;
+
+                // Step 4.5.8.5: "Return undefined."
+                Ok(ec.value_undefined())
+            }
+
+            let setter_fn = crate::js::create_builtin_fn_with_traced_captures(
+                engine,
+                PutForwardsCapture {
+                    attr_id: attr.id,
+                    forward_id,
+                    marker: std::marker::PhantomData,
+                },
+                put_forwards_behaviour::<Ty>,
+                1,
+                name_key,
+                false,
+            );
+            desc.set = Some(setter_fn);
         }
         engine.define_property_or_throw(
             target_obj.clone(),

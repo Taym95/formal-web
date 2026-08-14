@@ -332,11 +332,30 @@
         <p class="section-desc">
           Embedded third-party content via <code>&lt;iframe&gt;</code>.
         </p>
+        <!--
+          To exercise cross-origin postMessage, point this iframe at the
+          deployed message-receiver page (scratchpad/message-receiver.html),
+          then use the "Send message" control below.
+        -->
         <iframe
           class="cross-origin-frame"
+          id="cross-origin-frame"
           title="Cross-origin verification frame"
           src="https://gterzian.github.io/lsp_agent/"
         ></iframe>
+
+        <div class="btn-row" style="margin-top:0.8rem;">
+          <input
+            id="xo-msg-input"
+            type="text"
+            placeholder="Message text to send"
+            style="flex:1;min-width:12rem;padding:0.6rem 0.8rem;border:1px solid #e4e2ec;border-radius:0.6rem;font:inherit;font-size:0.9rem;"
+          />
+          <button class="btn btn-primary" id="xo-send-btn" type="button">Send message</button>
+        </div>
+        <div class="output-box" id="xo-msg-output" style="margin-top:0.6rem;">
+          Enter a message and send it to the iframe.
+        </div>
       </section>
 
       <!-- ──── 7. React Todo App ──── -->
@@ -510,6 +529,36 @@
 
       domClearBtn.addEventListener("click", function() {
         domContainer.innerHTML = "";
+      });
+
+      // ──── 6b. Cross-origin postMessage ────
+      var xoInput   = document.getElementById("xo-msg-input");
+      var xoSendBtn = document.getElementById("xo-send-btn");
+      var xoOutput  = document.getElementById("xo-msg-output");
+      var xoFrame   = document.getElementById("cross-origin-frame");
+
+      xoSendBtn.addEventListener("click", function() {
+        try {
+          var win = xoFrame.contentWindow;
+          if (!win) {
+            xoOutput.textContent = "iframe contentWindow is unavailable";
+            xoOutput.className = "output-box error";
+            return;
+          }
+          var text = xoInput.value || "hello from StartupExample";
+          win.postMessage(text, "*");
+          xoOutput.textContent = "Sent \"" + text + "\" to " + xoFrame.src;
+          xoOutput.className = "output-box success";
+        } catch (e) {
+          xoOutput.textContent = "postMessage error: " + e.message;
+          xoOutput.className = "output-box error";
+        }
+      });
+
+      window.addEventListener("message", function(e) {
+        var reply = (typeof e.data === "string") ? e.data : JSON.stringify(e.data);
+        xoOutput.textContent = "Received from " + e.origin + ": " + reply;
+        xoOutput.className = "output-box success";
       });
     </script>
   </body>

@@ -13,6 +13,7 @@ use ipc_messages::content::{
     FrameId, LoadedDocumentResponse, NavigableId, NavigateRequest, NavigationFetchId, NavigationId,
     NewTraversableInfo, UserNavigationInvolvement, WebviewId, WindowTimerKey, iframe_target_name,
 };
+use ipc_messages::safe_passing_of_structured_data::PostMessageRequest;
 use log::{debug, error, info, trace};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -876,6 +877,12 @@ pub enum UserAgentCommand {
         event_loop_id: Option<EventLoopId>,
         request: NavigateRequest,
     },
+    /// <https://html.spec.whatwg.org/#window-post-message-steps> step 8: the
+    /// user agent queues a global task on the posted message task source given
+    /// targetWindow and routes the message to the target window's event loop.
+    PostMessage {
+        request: PostMessageRequest,
+    },
     CompleteBeforeUnload {
         result: BeforeUnloadResult,
     },
@@ -1429,6 +1436,9 @@ impl UserAgentWorker {
                     } => {
                         self.handle_navigate(event_loop_id, request);
                     }
+                    UserAgentCommand::PostMessage { request } => {
+                        self.handle_post_message(request);
+                    }
                     UserAgentCommand::CompleteBeforeUnload { result } => {
                         self.handle_complete_before_unload(result);
                     }
@@ -1588,6 +1598,28 @@ impl UserAgentWorker {
             .get(&traversable_id)
             .copied()
             .ok_or_else(|| format!("unknown traversable id: {traversable_id}"))?;
+        self.state
+            .event_loops
+            .get(&event_loop_id)
+            .map(|entry| entry.command_sender.clone())
+            .ok_or_else(|| format!("missing event loop for id {event_loop_id}"))
+    }
+
+    /// Resolve the command sender for the event loop that owns a document.
+    /// After a cross-process navigation the traversable has moved to a new
+    /// event loop while the outgoing document is still owned by the old one;
+    /// document-routed commands (e.g. DestroyDocument) must reach the process
+    /// that actually holds the document so its teardown can run there.
+    fn command_sender_for_document(
+        &self,
+        document_id: DocumentId,
+    ) -> Result<Sender<EventLoopCommand>, String> {
+        let event_loop_id = self
+            .state
+            .documents
+            .get(&document_id)
+            .map(|document| document.event_loop_id)
+            .ok_or_else(|| format!("unknown document id: {document_id}"))?;
         self.state
             .event_loops
             .get(&event_loop_id)
@@ -3090,24 +3122,28 @@ impl UserAgentWorker {
             },
         );
 
-        if let Some(previous_document_id) = pending.previous_document_id {
-            if previous_document_id != finalized.document_id {
-                // The old document is destroyed after the new document commits so stale
-                // content-side traffic cannot revive it after the traversable has advanced.
-                if let Ok(command_sender) =
-                    self.command_sender_for_traversable(pending.traversable_id)
-                {
-                    if let Err(error) = self.send_event_loop_command(
-                        &command_sender,
-                        ContentCommand::DestroyDocument {
-                            document_id: previous_document_id,
-                        },
-                    ) {
-                        error!("[user-agent] failed to destroy previous document: {error}");
-                    }
-                }
-                self.state.documents.remove(&previous_document_id);
+        if let Some(previous_document_id) = pending.previous_document_id
+            && previous_document_id != finalized.document_id
+        {
+            // The old document is destroyed after the new document commits so stale
+            // content-side traffic cannot revive it after the traversable has advanced.
+            // It is destroyed on the event loop that owns it: after a cross-process
+            // navigation the traversable has moved to a new event loop, and routing by
+            // traversable would send the destroy to the wrong content process.
+            let command_sender = self
+                .command_sender_for_document(previous_document_id)
+                .or_else(|_| self.command_sender_for_traversable(pending.traversable_id));
+            if let Ok(command_sender) = command_sender
+                && let Err(error) = self.send_event_loop_command(
+                    &command_sender,
+                    ContentCommand::DestroyDocument {
+                        document_id: previous_document_id,
+                    },
+                )
+            {
+                error!("[user-agent] failed to destroy previous document: {error}");
             }
+            self.state.documents.remove(&previous_document_id);
         }
 
         if let Some(new_browsing_context_id) = pending.browsing_context_id {
@@ -3569,6 +3605,27 @@ impl UserAgentWorker {
         let _ = entry
             .command_sender
             .send(EventLoopCommand::FireAndForget { command });
+    }
+
+    /// <https://html.spec.whatwg.org/#window-post-message-steps> step 8:
+    /// queue a global task on the posted message task source given targetWindow
+    /// by routing the message to the target window's event loop, even when the
+    /// target window lives in the same event loop as the source (no
+    /// same-process optimization at this stage).
+    fn handle_post_message(&mut self, request: PostMessageRequest) {
+        let Ok(command_sender) = self.command_sender_for_traversable(request.target_navigable_id)
+        else {
+            error!(
+                "postMessage: no event loop for target navigable {}",
+                request.target_navigable_id
+            );
+            return;
+        };
+        if let Err(error) = command_sender.send(EventLoopCommand::FireAndForget {
+            command: ContentCommand::PostMessage(request),
+        }) {
+            error!("postMessage: failed to queue message task: {error}");
+        }
     }
 
     /// Milliseconds since the Unix epoch of `instant`, measured on the

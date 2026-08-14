@@ -18,13 +18,17 @@ pub mod ui_events;
 pub mod wasm;
 pub mod webidl;
 
-use crate::dom::{EventTargetAccess, fire_event};
+use crate::dom::{EventTargetAccess, dispatch_with_path, fire_event, simple_path};
 use crate::html::ui_events::{dispatch_trusted_click_event, dispatch_ui_event};
 use crate::html::{
-    EnvironmentSettingsObject, JsHtmlParserProvider, PendingParserScript,
+    EnvironmentSettingsObject, JsHtmlParserProvider, MessageEvent, PendingParserScript, Window,
     attach_same_origin_child_document_for_traversable, execute_parser_scripts,
     parse_html_into_document, run_dom_post_connection_steps_for_document,
     run_dom_removing_steps_for_document, run_iframe_load_event_steps_for_traversable,
+    safe_passing_of_structured_data::{
+        SerializeWithTransferResult, structured_deserialize_with_transfer,
+    },
+    windowproxy::WindowProxyBacking,
 };
 use crate::js::Engine;
 use crate::js::downcast::try_with_event_target_mut;
@@ -57,6 +61,7 @@ use ipc_messages::content::{
     TraversableViewport, ViewportSnapshot, WebviewId, WindowTimerKey,
 };
 use ipc_messages::media::{VideoEmbedData, VideoPaintId};
+use ipc_messages::safe_passing_of_structured_data::PostMessageRequest;
 use log::{debug, error, info, warn};
 use std::{
     cell::RefCell,
@@ -68,6 +73,11 @@ use std::{
 };
 use url::Url;
 use verification::{TLATracer, TraceSender};
+
+use crate::webidl::bindings::create_interface_instance;
+
+type JsValue = <crate::js::Types as JsTypes>::JsValue;
+type JsObject = <crate::js::Types as JsTypes>::JsObject;
 
 pub(crate) const EMPTY_HTML_DOCUMENT: &str = "<html><head></head><body></body></html>";
 
@@ -780,6 +790,11 @@ impl ContentProcess {
             );
             self.active_documents_by_traversable
                 .insert(new_traversable_id, document_id);
+            // Set up the shared registry so window.open calls made by this
+            // new traversable's scripts can register further documents.
+            if let Err(error) = self.set_up_new_document_registry(new_traversable_id) {
+                warn!("failed to set up new document registry: {error}");
+            }
         }
         Ok(())
     }
@@ -792,6 +807,19 @@ impl ContentProcess {
 
     /// <https://html.spec.whatwg.org/multipage/#navigate-html>
     fn continue_document_load(&mut self, document_id: DocumentId) -> Result<(), String> {
+        // Set up the shared registry so window.open calls made by the inline
+        // and deferred scripts running during the load can register new
+        // traversable documents.
+        let load_traversable_id = self
+            .documents
+            .get(&document_id)
+            .map(|document| document.traversable_id);
+        if let Some(traversable_id) = load_traversable_id {
+            if let Err(error) = self.set_up_new_document_registry(traversable_id) {
+                warn!("failed to set up new document registry: {error}");
+            }
+        }
+
         let (ready_to_finish, traversable_id, resources_ready, scripts_ready) = {
             let content_document = self
                 .documents
@@ -838,24 +866,41 @@ impl ContentProcess {
             .take()
             .ok_or_else(|| format!("missing pending document load for document {document_id}"))?;
 
+        {
+            let content_document = self
+                .documents
+                .get_mut(&document_id)
+                .ok_or_else(|| format!("unknown document id: {document_id}"))?;
+
+            for (script_idx, script) in pending_document_load.scripts.iter().enumerate() {
+                match script {
+                    DeferredScriptState::Inline { source }
+                    | DeferredScriptState::ExternalReady { source } => {
+                        if let Err(error) = content_document.settings.evaluate_script(source) {
+                            error!("[deferred eval #{script_idx}] content error: {error}");
+                        }
+                    }
+                    DeferredScriptState::ExternalPending { .. }
+                    | DeferredScriptState::ExternalFailed { .. } => {}
+                }
+            }
+        }
+
+        // Tear down the shared registry and drain any traversable documents
+        // created by the load's scripts (window.open) into this process's
+        // document tables so the user agent's navigation continuations can
+        // address them.
+        if let Err(error) = self.tear_down_new_document_registry(traversable_id) {
+            warn!("failed to tear down new document registry: {error}");
+        }
+        if let Err(error) = self.drain_new_traversable_documents() {
+            warn!("failed to drain new traversable documents: {error}");
+        }
+
         let content_document = self
             .documents
             .get_mut(&document_id)
             .ok_or_else(|| format!("unknown document id: {document_id}"))?;
-
-        for (script_idx, script) in pending_document_load.scripts.iter().enumerate() {
-            match script {
-                DeferredScriptState::Inline { source }
-                | DeferredScriptState::ExternalReady { source } => {
-                    if let Err(error) = content_document.settings.evaluate_script(source) {
-                        error!("[deferred eval #{script_idx}] content error: {error}");
-                    }
-                }
-                DeferredScriptState::ExternalPending { .. }
-                | DeferredScriptState::ExternalFailed { .. } => {}
-            }
-        }
-
         let window = content_document
             .settings
             .realm_execution_context
@@ -980,6 +1025,12 @@ impl ContentProcess {
         // can resolve `_parent`/`_top` targets.
         self.set_navigable_hierarchy_on_global_scope(document_id)?;
 
+        // Set up the shared registry so window.open calls made by the parser
+        // scripts can register new traversable documents.
+        if let Err(error) = self.set_up_new_document_registry(traversable_id) {
+            warn!("failed to set up new document registry: {error}");
+        }
+
         run_dom_post_connection_steps_for_document(self, document_id)?;
         let content_document = self
             .documents
@@ -1074,6 +1125,11 @@ impl ContentProcess {
                     .unwrap_or(0.0),
             },
         );
+        // Make the document addressable immediately so the shared
+        // new-document registry (window.open) works during the load's
+        // script execution.
+        self.active_documents_by_traversable
+            .insert(traversable_id, document_id);
         attach_same_origin_child_document_for_traversable(self, traversable_id)?;
 
         // Set the navigable hierarchy on the GlobalScope so that `window.open`
@@ -1176,6 +1232,7 @@ impl ContentProcess {
     fn destroy_document(&mut self, document_id: DocumentId) -> Result<(), String> {
         run_dom_removing_steps_for_document(self, document_id)?;
         if let Some(mut content_document) = self.documents.remove(&document_id) {
+            let traversable_id = content_document.traversable_id;
             // Release every event listener and event handler callback on the
             // document's EventTargets (window, document, cached node
             // wrappers): the callbacks are strong JS handles that would
@@ -1191,6 +1248,33 @@ impl ContentProcess {
             {
                 self.active_documents_by_traversable
                     .remove(&content_document.traversable_id);
+            }
+            // WindowProxy lifecycle: navigation commit re-points the
+            // cached WindowProxy backings for this navigable.  If a new
+            // document for the traversable is already active in this process
+            // (same-process navigation), re-point to its Window; otherwise
+            // the navigable's document was created in another content process
+            // and every WindowProxy for it becomes cross-content.
+            // <https://html.spec.whatwg.org/#the-windowproxy-exotic-object>
+            let replacement_window = self
+                .active_documents_by_traversable
+                .get(&traversable_id)
+                .and_then(|current_document_id| self.documents.get(current_document_id))
+                .and_then(|document| {
+                    let global_object = document
+                        .settings
+                        .realm_execution_context
+                        .realm_global_object();
+                    document
+                        .settings
+                        .realm_execution_context
+                        .with_object_any(&global_object)
+                        .and_then(|data| data.downcast_ref::<Window>().cloned())
+                        .map(|window| (window, global_object))
+                });
+            if let Err(error) = self.sever_window_proxy_backings(traversable_id, replacement_window)
+            {
+                error!("failed to sever window proxy backings: {error}");
             }
             if let Err(error) = content_document.settings.clear_all_window_timers() {
                 error!("failed to clear window timers during document teardown: {error}");
@@ -1241,6 +1325,43 @@ impl ContentProcess {
             log::debug!("microtask checkpoint during document teardown failed: {error:?}");
         }
         self.realm_parent.gc();
+        Ok(())
+    }
+
+    /// Navigation-commit hook: every cached WindowProxy (in every realm of
+    /// this process) that targets a navigable whose document was just
+    /// destroyed is re-pointed.  `replacement_window` is the new document's
+    /// Window when the navigation stayed in this process, and `None` when
+    /// the navigable's document was created in another content process (the
+    /// WindowProxy becomes cross-content).
+    /// <https://html.spec.whatwg.org/#the-windowproxy-exotic-object>
+    fn sever_window_proxy_backings(
+        &mut self,
+        traversable_id: NavigableId,
+        replacement_window: Option<(Window, JsObject)>,
+    ) -> Result<(), String> {
+        let backing = match replacement_window {
+            Some((window, js_object)) => {
+                WindowProxyBacking::SameContentProcess { window, js_object }
+            }
+            None => WindowProxyBacking::CrossContentProcess,
+        };
+        let document_ids: Vec<DocumentId> = self.documents.keys().copied().collect();
+        for document_id in document_ids {
+            let Some(content_document) = self.documents.get_mut(&document_id) else {
+                continue;
+            };
+            with_global_scope(
+                &mut content_document.settings.realm_execution_context,
+                |global_scope, ec| {
+                    global_scope.set_window_proxy_backing(traversable_id, backing.clone(), ec);
+                    Ok(())
+                },
+            )
+            .map_err(|error| {
+                format!("failed to sever window proxy backings: {}", error.display())
+            })?;
+        }
         Ok(())
     }
 
@@ -1317,6 +1438,169 @@ impl ContentProcess {
                 event,
             )?;
 
+            if let Err(error) = self.tear_down_new_document_registry(traversable_id) {
+                warn!("failed to tear down new document registry: {error}");
+            }
+            if let Err(error) = self.drain_new_traversable_documents() {
+                warn!("failed to drain new traversable documents: {error}");
+            }
+        }
+
+        Ok(())
+    }
+
+    /// The target-process half of the window post message steps (the
+    /// substeps of step 8).  The user agent routed `request` to this event
+    /// loop after the source content process ran steps 1–7.
+    /// <https://html.spec.whatwg.org/#window-post-message-steps>
+    fn dispatch_post_message(&mut self, request: PostMessageRequest) -> Result<(), String> {
+        // Step 8.1: If the targetOrigin argument is not a single literal U+002A
+        //           ASTERISK character (*) and targetWindow's associated
+        //           Document's origin is not same origin with targetOrigin,
+        //           then return.
+        let target_document_id = *self
+            .active_documents_by_traversable
+            .get(&request.target_navigable_id)
+            .ok_or_else(|| {
+                format!(
+                    "postMessage: unknown target traversable {}",
+                    request.target_navigable_id
+                )
+            })?;
+        let target_origin = self
+            .documents
+            .get(&target_document_id)
+            .map(|document| document.settings.origin.serialized.clone())
+            .ok_or_else(|| format!("postMessage: unknown target document {target_document_id}"))?;
+        if request.target_origin != "*" && request.target_origin != target_origin {
+            return Ok(());
+        }
+
+        // Set up the shared registry so window.open calls made while the
+        // message handlers run can register new documents.
+        let traversable_id = self
+            .documents
+            .get(&target_document_id)
+            .map(|document| document.traversable_id);
+        if let Some(traversable_id) = traversable_id
+            && let Err(error) = self.set_up_new_document_registry(traversable_id)
+        {
+            warn!("failed to set up new document registry: {error}");
+        }
+
+        // Step 8.2: Let origin be incumbentSettings's origin.
+        let origin = request.source_origin.clone();
+
+        // Step 8.3: Let source be the WindowProxy object corresponding to
+        //           incumbentSettings's global object (a Window object).
+        // The WindowProxy is created in the target realm so its methods
+        // (postMessage) run in a realm that can reach the user agent; when
+        // the source navigable's document lives in this content process, the
+        // WindowProxy is backed by the source Window.
+        let source_window = self
+            .active_documents_by_traversable
+            .get(&request.source_navigable_id)
+            .and_then(|document_id| self.documents.get(document_id))
+            .and_then(|document| {
+                let global_object = document
+                    .settings
+                    .realm_execution_context
+                    .realm_global_object();
+                document
+                    .settings
+                    .realm_execution_context
+                    .with_object_any(&global_object)
+                    .and_then(|data| data.downcast_ref::<Window>().cloned())
+                    .map(|window| (window, global_object))
+            });
+        let source = {
+            let ec = &mut self
+                .documents
+                .get_mut(&target_document_id)
+                .ok_or_else(|| {
+                    format!("postMessage: unknown target document {target_document_id}")
+                })?
+                .settings
+                .realm_execution_context;
+            crate::html::windowproxy::window_proxy_object(
+                request.source_navigable_id,
+                source_window,
+                ec,
+            )
+            .map_err(|error| {
+                ec.to_rust_string(error).unwrap_or_else(|_| {
+                    String::from("postMessage: failed to create source WindowProxy")
+                })
+            })?
+        };
+
+        let document = self
+            .documents
+            .get_mut(&target_document_id)
+            .ok_or_else(|| format!("postMessage: unknown target document {target_document_id}"))?;
+
+        // Step 8.4: Let deserializeRecord be
+        //           StructuredDeserializeWithTransfer(serializeWithTransferResult,
+        //           targetRealm).
+        // Note: The deserialization runs in the target window's realm (the
+        // target document's execution context), so `targetRealm` is the
+        // current realm; the targetRealm argument is unused by the
+        // deserializer, which constructs objects in the current realm.
+        let serialize_result = SerializeWithTransferResult {
+            serialized: request.serialized,
+            transfer_data_holders: request.transfer_data_holders,
+        };
+        let deserialize_outcome = {
+            let ec = &mut document.settings.realm_execution_context;
+            structured_deserialize_with_transfer(&serialize_result, &ec.value_undefined(), ec)
+        };
+        let deserialize_result = match deserialize_outcome {
+            Ok(result) => result,
+            Err(_) => {
+                // If this throws an exception, catch it, fire an event named
+                // messageerror at targetWindow, using MessageEvent, with its
+                // origin initialized to origin and the source attribute
+                // initialized to source, and then return.
+                let data = {
+                    let ec = &mut document.settings.realm_execution_context;
+                    ec.value_null()
+                };
+                let message_event = build_message_event(
+                    &mut document.settings,
+                    "messageerror",
+                    origin,
+                    Some(source),
+                    data,
+                )?;
+                fire_event_at_window(&mut document.settings, &message_event.event)?;
+                return Ok(());
+            }
+        };
+
+        // Step 8.5: Let messageClone be deserializeRecord.[[Deserialized]].
+        let message_clone = deserialize_result.deserialized;
+
+        // Step 8.6: Let newPorts be a new frozen array consisting of all
+        //           MessagePort objects in deserializeRecord.[[TransferredValues]],
+        //           if any, maintaining their relative order.
+        // Note: The current transfer support only produces ArrayBuffers, never
+        // MessagePorts, so newPorts is always empty here.
+
+        // Step 8.7: Fire an event named message at targetWindow, using
+        //           MessageEvent, with its origin initialized to origin, the
+        //           source attribute initialized to source, the data attribute
+        //           initialized to messageClone, and the ports attribute
+        //           initialized to newPorts.
+        let message_event = build_message_event(
+            &mut document.settings,
+            "message",
+            origin,
+            Some(source),
+            message_clone,
+        )?;
+        fire_event_at_window(&mut document.settings, &message_event.event)?;
+
+        if let Some(traversable_id) = traversable_id {
             if let Err(error) = self.tear_down_new_document_registry(traversable_id) {
                 warn!("failed to tear down new document registry: {error}");
             }
@@ -2222,6 +2506,10 @@ impl ContentProcess {
                 // the DOM and doesn't directly create traversable documents.)
                 Ok(true)
             }
+            Command::PostMessage(request) => {
+                self.dispatch_post_message(request)?;
+                Ok(true)
+            }
             Command::RunBeforeUnload {
                 document_id,
                 check_id,
@@ -2384,6 +2672,7 @@ fn run_content_message_loop(
                                 | RunWindowTimer { .. }
                                 | CompleteDocumentFetch { .. }
                                 | FailDocumentFetch { .. }
+                                | Command::PostMessage { .. }
                         );
                         match process.handle_command(command) {
                             Ok(true) => {
@@ -2428,4 +2717,64 @@ pub fn run_content_process_from_args() -> Result<(), String> {
     // If a token was provided (ipc-channel mode), use it.
     // Otherwise, use the native XPC backend (process launched by launchd).
     run_content_process(token.unwrap_or_default())
+}
+/// Build the MessageEvent for the `message`/`messageerror` event fired by
+/// the window post message steps (steps 8.4 and 8.7), with the message
+/// attributes and the trusted flag + timestamp of a user-agent-fired event.
+/// The caller fires it via <https://dom.spec.whatwg.org/#concept-event-fire>.
+fn build_message_event(
+    settings: &mut EnvironmentSettingsObject,
+    event_type: &str,
+    origin: String,
+    source: Option<JsObject>,
+    data: JsValue,
+) -> Result<MessageEvent, String> {
+    let time_millis = settings.current_time_millis();
+    let ec = &mut settings.realm_execution_context;
+    let message_event = crate::html::MessageEvent::new(
+        event_type.to_owned(),
+        crate::html::MessageEventInit {
+            bubbles: false,
+            cancelable: false,
+            composed: false,
+            data,
+            origin,
+            last_event_id: String::new(),
+            source,
+            ports: Vec::new(),
+        },
+        ec,
+    );
+    let event_object =
+        create_interface_instance::<crate::js::Types, MessageEvent>(message_event, ec)
+            .map_err(|error| format!("failed to create MessageEvent: {error:?}"))?;
+    let message_event: MessageEvent = ec
+        .with_object_any(&event_object)
+        .and_then(|data| data.downcast_ref::<MessageEvent>().cloned())
+        .ok_or_else(|| String::from("event_object is not a MessageEvent"))?;
+    // <https://dom.spec.whatwg.org/#concept-event-fire>
+    // Events fired by the user agent are trusted and carry the current time.
+    *message_event.event.is_trusted.borrow_mut(ec) = true;
+    *message_event.event.time_stamp.borrow_mut(ec) = time_millis;
+    Ok(message_event)
+}
+
+/// <https://dom.spec.whatwg.org/#concept-event-fire>
+/// Fire a pre-built event at the realm's Window: build the event path and
+/// dispatch (the fire-event algorithm with the event already created and
+/// initialized).
+fn fire_event_at_window(
+    settings: &mut EnvironmentSettingsObject,
+    event: &crate::dom::Event,
+) -> Result<(), String> {
+    let ec = &mut settings.realm_execution_context;
+    let window_target = ec
+        .with_object_any(&ec.realm_global_object())
+        .and_then(|data| data.downcast_ref::<crate::html::Window>().cloned())
+        .map(|window| window.get_event_target(ec))
+        .ok_or_else(|| String::from("target window not found"))?;
+    let path = simple_path(&window_target, ec);
+    dispatch_with_path(ec, &path, event)
+        .map(|_| ())
+        .map_err(|error| format!("failed to dispatch event: {error:?}"))
 }

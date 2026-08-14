@@ -1,4 +1,5 @@
 use crate::media::{VideoEmbedData, VideoPaintId};
+use crate::safe_passing_of_structured_data::PostMessageRequest;
 use anyrender::{
     Scene,
     recording::{GlyphRunCommand, RenderCommand},
@@ -898,6 +899,11 @@ pub enum Command {
     NotifyVideoEnded {
         video_paint_id: VideoPaintId,
     },
+    /// The target-process half of the window post message steps (step 8 and
+    /// its substeps): the user agent routes this to the target window's event
+    /// loop after the source content process ran steps 1–7.
+    /// <https://html.spec.whatwg.org/#window-post-message-steps>
+    PostMessage(PostMessageRequest),
     Shutdown,
 }
 
@@ -918,6 +924,13 @@ pub enum Event {
     /// Content requests a rendering opportunity, e.g. after a network fetch completes.
     RenderingOpRequested(NavigableId),
     RegisterMediaPipeline(RegisterMediaPipeline),
+    /// The source-process half of the window post message steps: the source
+    /// content process ran steps 1–7 and hands the serialized message to the
+    /// user agent, which runs step 8 (queue a global task on the posted
+    /// message task source given targetWindow) and routes to the target
+    /// window's event loop.
+    /// <https://html.spec.whatwg.org/#window-post-message-steps>
+    PostMessageRequested(PostMessageRequest),
     ShutdownCompleted,
 }
 

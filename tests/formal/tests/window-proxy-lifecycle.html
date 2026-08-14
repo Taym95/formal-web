@@ -1,0 +1,107 @@
+<!DOCTYPE html>
+<meta charset="utf-8">
+<title>WindowProxy lifecycle: local proxy to cross-process shim</title>
+<script src="/resources/testharness.js"></script>
+<script src="/resources/testharnessreport.js"></script>
+<iframe id="child"></iframe>
+<script>
+'use strict';
+
+// Test 1: window.open('', '_blank') returns a WindowProxy backed by the
+// popup's locally-created about:blank Window.
+test(() => {
+  const w = window.open('', '_blank');
+  assert_not_equals(w, null, 'window.open should not return null');
+  assert_equals(typeof w.open, 'function', 'WindowProxy exposes the target window open method');
+  assert_equals(typeof w.postMessage, 'function', 'WindowProxy exposes postMessage');
+  assert_not_equals(w.document, null, 'local WindowProxy exposes the popup document');
+}, 'window.open about:blank is locally backed');
+
+// Test 2: iframe.contentWindow is backed by the iframe's local document.
+test(() => {
+  const iframe = document.getElementById('child');
+  const w = iframe.contentWindow;
+  assert_not_equals(w, null, 'iframe contentWindow should be an object');
+  assert_not_equals(w.document, null, 'iframe WindowProxy exposes the child document');
+  assert_not_equals(w.document, document, 'child document is not the parent document');
+  assert_equals(typeof w.postMessage, 'function', 'WindowProxy exposes postMessage');
+}, 'iframe.contentWindow is locally backed');
+
+// Test 3: a same-process navigation re-points the WindowProxy's backing to
+// the new document's Window (navigation commit, same-process branch).
+async_test((t) => {
+  const w = window.open('/__formal__/window-proxy-popup.html');
+  assert_not_equals(w, null, 'popup opened');
+  const deadline = Date.now() + 10000;
+  function poll() {
+    if (w.document !== null && w.document.title === 'window-proxy-popup target') {
+      // The initial about:blank window was replaced by the popup page's
+      // window: the WindowProxy identity is unchanged and still local.
+      assert_equals(typeof w.postMessage, 'function');
+      assert_equals(typeof w.open, 'function');
+      t.done();
+      return;
+    }
+    if (Date.now() > deadline) {
+      t.step(() => {
+        assert_true(false, 'timed out waiting for the same-process navigation to re-point the WindowProxy');
+      });
+      t.done();
+      return;
+    }
+    setTimeout(poll, 100);
+  }
+  poll();
+}, 'same-process navigation re-points the WindowProxy backing');
+
+// Test 4: navigating the popup across site (its Window is created in another
+// content process) switches the WindowProxy to a remote shim while keeping
+// its identity.  The navigation goes through the proxy's location setter
+// (`w.location = url`, the [PutForwards=href] Location attribute), which
+// runs the target window's Location binding from the caller's realm.
+async_test((t) => {
+  const w = window.open('/__formal__/window-proxy-popup.html');
+  assert_not_equals(w, null, 'popup opened');
+  // 127.0.0.1 is a different site from localhost, so wptserve serves it as a
+  // cross-origin destination; the navigable's document is then created in
+  // another content process.
+  const crossSiteUrl = 'http://127.0.0.1:' + location.port + '/__formal__/window-proxy-popup.html';
+  const deadline = Date.now() + 15000;
+  function navigateAndPoll() {
+    if (w.document !== null && w.document.title === 'window-proxy-popup target') {
+      // Assign through the proxy: the [PutForwards=href] setter forwards the
+      // assignment to the target window's Location.href.
+      w.location = crossSiteUrl;
+      poll();
+      return;
+    }
+    if (Date.now() > deadline) {
+      t.step(() => {
+        assert_true(false, 'timed out waiting for the popup to load before the cross-site navigation');
+      });
+      t.done();
+      return;
+    }
+    setTimeout(navigateAndPoll, 100);
+  }
+  function poll() {
+    if (w.document === null) {
+      // Remote shim: the cross-origin member set is exposed and postMessage
+      // still routes through the user agent.
+      assert_equals(typeof w.postMessage, 'function', 'shim still exposes postMessage');
+      assert_equals(typeof w.close, 'function', 'shim exposes the cross-origin close member');
+      t.done();
+      return;
+    }
+    if (Date.now() > deadline) {
+      t.step(() => {
+        assert_true(false, 'timed out waiting for the WindowProxy to become a remote shim');
+      });
+      t.done();
+      return;
+    }
+    setTimeout(poll, 100);
+  }
+  navigateAndPoll();
+}, 'cross-site navigation via the location setter switches the WindowProxy to a remote shim');
+</script>

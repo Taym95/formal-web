@@ -136,6 +136,8 @@ pub(crate) fn define_global_event_handlers(def: &mut InterfaceDefinition<Types>)
         (onmouseout, mouseout),
         (onmouseover, mouseover),
         (onmouseup, mouseup),
+        (onmessage, message),
+        (onmessageerror, messageerror),
         (onpaste, paste),
         (onpause, pause),
         (onplay, play),

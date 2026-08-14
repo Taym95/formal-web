@@ -98,8 +98,8 @@ pub(crate) fn add_event_listener(
 ### What the binding must NOT do
 
 - **No spec logic** — the binding does not implement any part of a spec
-algorithm.  It converts JS args to IDL types, calls a domain method, and
-wraps the return value.
+  algorithm.  It converts JS args to IDL types, calls a domain method, and
+  wraps the return value.
 - **No path building** — `dispatchEvent` does not build the event path inline.
 The binding calls `build_path_from_target_js_object` (in the HTML/events bridge)
 and then calls the domain method `EventTarget::dispatch_event()`.
@@ -107,6 +107,37 @@ and then calls the domain method `EventTarget::dispatch_event()`.
 automatically by the Web IDL layer (`create_interface_instance` →
 `PostCreateReflector::set_reflector`).  Domain code and bindings must never
 touch reflectors.
+- **No spec algorithm implemented in the binding, ever** — every Window IDL
+  member is a domain method on `Window` (`content/src/html/window.rs`); the
+  bindings files (`bindings/html/window.rs` for the Window interface,
+  `bindings/html/windowproxy.rs` for the WindowProxy platform object)
+  downcast the receiver, resolve the local Window, and call the domain
+  method.  A member that returns a placeholder because its state lives in
+  another process (navigable target name, opener, closed, child-navigable
+  count) still delegates to a domain method that carries the `// Step N:`
+  annotations and the `// Note:`; the binding never inlines the stub.
+
+### When the spec calls into JS directly (not via Web IDL)
+
+Some HTML algorithms read realm/JS state directly instead of going through
+Web IDL — e.g. the `window`/`frames`/`self` getters "return this's relevant
+realm.[[GlobalEnv]].[[GlobalThisValue]]"
+(<https://html.spec.whatwg.org/#dom-self>).  The spec structure must be
+mirrored exactly:
+
+1. The **domain getter** (`Window::self_value` in `content/src/html/window.rs`)
+   implements the getter steps and names the concept it uses, e.g. the
+   [relevant realm](https://html.spec.whatwg.org/#concept-relevant-realm).
+2. The **JS-side read** (`[[GlobalEnv]].[[GlobalThisValue]]`) lives in
+   `content/src/webidl/realm.rs` (`relevant_realm_global_this_value`):
+   webidl hosts "stuff that is used to call into js indirectly", including
+   HTML's direct-JS-call quirks.  The helper carries the concept anchor
+   (`#concept-relevant-realm`) and a `// Note:` that the read is the spec's
+   direct-JS-call quirk.
+
+Never implement the JS read inside the binding, and never skip the domain
+step: the binding stays thin (downcast → call domain → wrap), the domain
+implements the spec steps, and webidl owns the call into the engine.
 
 ### Where code lives is dictated by which spec it implements
 
@@ -224,7 +255,7 @@ fn module_exports_binding<T: JsTypes>(
 | Function name doesn't match the spec algorithm name (e.g. `fire_global_event` for "steps to fire beforeunload") | Rust function name MUST match the spec algorithm name with `_` separators (e.g. `steps_to_fire_beforeunload`). The spec→code mapping must be discoverable by name alone. |
 | Splitting a spec algorithm into multiple functions with non-spec names (e.g. `open_dictionary` + `get_dictionary_member` instead of a single `convert_js_to_dictionary`) | Name functions after the spec algorithm they implement. If you must split a spec algorithm into helpers, name them as internal private items and provide a single public function with the spec's name. Any deviation from the spec's algorithmic structure must be explained in a `// Note:`. |
 | Blank line between `// Step N:` comment and its code, or no blank line between code and the next `// Step` comment | NO blank line between comment and its code. Blank line AFTER the code, before the next step's comment. Also NO blank line between `{` (block opening) and the first step comment. See `dispatch.rs` for the correct pattern. |
-| Vague Note on a partial algorithm implementation (e.g. "this is a helper for X") | When a function partially implements a spec algorithm, annotate with `// Step N:` for ALL steps of the algorithm. Mark missing steps with `// TODO: Not yet implemented.` and sub-algorithm references with the spec anchor. The note should only describe discrepancies between the code and the spec text, not hand-wave about "this is a helper". See `html/dispatch.rs::fire_global_event` for the correct pattern. |
+| Vague Note on a partial algorithm implementation (e.g. "this is a helper for X") | When a function partially implements a spec algorithm, annotate with `// Step N:` for ALL steps of the algorithm. Mark missing steps with `// TODO: Not yet implemented.` and sub-algorithm references with the spec anchor. The note should only describe discrepancies between the code and the spec text, not hand-wave about "this is a helper". See `html/dispatch.rs::steps_to_fire_beforeunload` for the correct pattern. |
 | Creating a platform object copy outside `create_interface_instance` then manually syncing its reflector | Create the platform object inside `create_interface_instance` (reflector is set automatically by `PostCreateReflector::set_reflector`), then extract the clone from the JsObject for the ESO/domain struct. Never manually set reflectors. See `environment_settings_object.rs` for the correct pattern. |
 | Engine-specific GC wrapper names in content comments (e.g. "wrapped in `V8PlatformData` / `TraceableBox` / stored in the JSC side table") | Platform data is stored via the generic `js_engine::create_platform_object`; comment in backend-neutral terms ("the engine stores the platform data in a GC wrapper so its cells and JS edges are traced from the JS wrapper"). Engine-specific wrapper mechanics are documented in `js_engine/src/gc.rs`, not in content code. |
 | Prefixing spec types with "domain" (e.g. `domain_document`) | Our Document is just `document`. The blitz document is the external dependency and should be labeled as such if disambiguation is needed (e.g. `blitz_document`). The "domain" prefix implies our types are somehow secondary to the "real" spec types, which is backwards.

@@ -40,6 +40,14 @@ state.  Content code only sees the generic traits from the `js_engine` crate.
   [inherited
   interfaces](https://webidl.spec.whatwg.org/#dfn-inherited-interfaces) to
   identify the platform object's type, and delegates to domain functions.
+  A binding function must **never** implement a spec algorithm itself: every
+  Window IDL member is a `Window` method in `content/src/html/window.rs`
+  (`self_value`, `top_value`, `close`, …), and both bindings files
+  (`bindings/html/window.rs`, `bindings/html/windowproxy.rs`) just downcast,
+  resolve the local Window, and delegate.  JS-side reads the spec performs in
+  place of Web IDL (e.g. the `self` getter's relevant
+  realm.[[GlobalEnv]].[[GlobalThisValue]]) live in
+  `content/src/webidl/realm.rs` — never directly in a binding.
 - **Domain code must not depend on a backing engine crate** (e.g. `boa_engine`
   or `rusty_v8`) **or return `JsValue`.**
   The domain layer returns Rust types; the bindings layer converts to JS

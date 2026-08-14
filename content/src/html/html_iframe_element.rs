@@ -414,12 +414,13 @@ fn create_a_new_child_navigable(
         .ok_or_else(|| format!("missing parent document {parent_document_id}"))?
         .settings
         .realm_execution_context;
-    let (_global_object, settings, new_document) = create_a_new_browsing_context_and_document(
-        parent_engine,
-        &event_sender,
-        content_navigable,
-        new_document_id,
-    )?;
+    let (global_object, window, settings, new_document) =
+        create_a_new_browsing_context_and_document(
+            parent_engine,
+            &event_sender,
+            content_navigable,
+            new_document_id,
+        )?;
 
     // Register the document in ContentProcess immediately.
     process.documents.insert(
@@ -480,6 +481,27 @@ fn create_a_new_child_navigable(
                 cross_origin: false,
             },
         );
+        // Register the iframe node -> content navigable mapping on the
+        // parent realm's GlobalScope so the contentWindow binding can hand
+        // out the child navigable's WindowProxy, backed by the child
+        // document's Window created in this process.
+        crate::js::platform_objects::with_global_scope(
+            &mut content_document.settings.realm_execution_context,
+            |global_scope, ec| {
+                global_scope.register_iframe_content_navigable(
+                    iframe_node_id,
+                    content_navigable,
+                    Some((window.clone(), global_object.clone())),
+                    ec,
+                )
+            },
+        )
+        .map_err(|error| {
+            format!(
+                "failed to register iframe content navigable: {}",
+                error.display()
+            )
+        })?;
     }
 
     // Step 10: "Let historyEntry be navigable's active session history entry."
@@ -758,6 +780,20 @@ fn run_iframe_removing_steps(
     retire_iframe_traversable(process, parent_traversable_id, &iframe_state)?;
     remove_iframe_subdocument(process, parent_document_id, iframe_node_id);
     if let Some(content_document) = process.documents.get_mut(&parent_document_id) {
+        // Unregister the iframe node -> content navigable mapping.
+        crate::js::platform_objects::with_global_scope(
+            &mut content_document.settings.realm_execution_context,
+            |global_scope, ec| {
+                global_scope.unregister_iframe_content_navigable(iframe_node_id, ec);
+                Ok(())
+            },
+        )
+        .map_err(|error| {
+            format!(
+                "failed to unregister iframe content navigable: {}",
+                error.display()
+            )
+        })?;
         content_document
             .navigable_container_states
             .remove(&iframe_node_id);

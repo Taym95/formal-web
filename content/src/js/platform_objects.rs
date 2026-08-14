@@ -93,22 +93,6 @@ pub(crate) fn document_object(
     })
 }
 
-pub(crate) fn location_object(
-    ec: &mut dyn ExecutionContext<crate::js::Types>,
-) -> Completion<Option<<crate::js::Types as JsTypes>::JsObject>, crate::js::Types> {
-    with_global_scope(ec, |global_scope, ec| Ok(global_scope.location_object(ec)))
-}
-
-pub(crate) fn store_location_object(
-    ec: &mut dyn ExecutionContext<crate::js::Types>,
-    object: <crate::js::Types as JsTypes>::JsObject,
-) -> Completion<(), crate::js::Types> {
-    with_global_scope(ec, |global_scope, ec| {
-        global_scope.store_location_object(object, ec);
-        Ok(())
-    })
-}
-
 pub(crate) fn invalidate_cached_node_ids(
     ec: &mut dyn ExecutionContext<crate::js::Types>,
     node_ids: &[usize],
