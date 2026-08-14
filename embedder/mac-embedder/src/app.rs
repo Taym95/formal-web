@@ -72,6 +72,13 @@ const TAB_STRIP_HEIGHT: f64 = 30.0;
 const TAB_BUTTON_WIDTH: f64 = 140.0;
 const TAB_BUTTON_HEIGHT: f64 = 26.0;
 const NEW_TAB_BUTTON_WIDTH: f64 = 28.0;
+/// Points inside this margin of the content view's bottom/side edges belong
+/// to the window frame's resize handles; the initial mouse-down there must
+/// reach AppKit's resize tracking loop.
+const WINDOW_RESIZE_MARGIN: f64 = 6.0;
+/// Points inside this radius of the content view's bottom corners belong to
+/// the frame's grow box (larger than the edge margin).
+const WINDOW_RESIZE_CORNER_RADIUS: f64 = 16.0;
 
 // ── App delegate ───────────────────────────────────────────────────────────
 
@@ -580,6 +587,13 @@ impl MacApp {
                 let Some(window_id) = self.window_id_for_ns_event(event_ref) else {
                     return event.as_ptr();
                 };
+                // While AppKit's live-resize tracking loop is running
+                // (the user is dragging a resize handle), every mouse
+                // event belongs to that loop: consuming any of them
+                // stalls the drag and leaves the resize cursor stuck.
+                if self.window_in_live_resize(window_id) {
+                    return event.as_ptr();
+                }
                 let Some((x, y_from_top)) = self.content_point(window_id, event_ref) else {
                     return event.as_ptr();
                 };
@@ -587,11 +601,43 @@ impl MacApp {
                     // Inside the native chrome: let the controls handle it.
                     return event.as_ptr();
                 }
+                let (width, height) = self
+                    .windows
+                    .get(&window_id)
+                    .map(|window_state| window_state.content_size)
+                    .unwrap_or_default();
+                // The initial mouse-down in the window frame's resize
+                // region (bottom edge, side edges, bottom corners) must
+                // reach AppKit so the resize tracking loop starts.
+                if Self::in_window_resize_region(x, y_from_top, width, height) {
+                    return event.as_ptr();
+                }
                 self.handle_content_mouse_event(window_id, event_ref, event_type, x, y_from_top);
                 std::ptr::null_mut()
             }
             _ => event.as_ptr(),
         }
+    }
+
+    /// True while the window is in AppKit's live-resize tracking loop (the
+    /// user is dragging a resize handle).
+    fn window_in_live_resize(&self, window_id: WindowId) -> bool {
+        self.windows
+            .get(&window_id)
+            .is_some_and(|window_state| window_state.window.inLiveResize())
+    }
+
+    /// Whether a point in the content view's coordinate space (x right,
+    /// y from top) lies in the window frame's resize region: the bottom
+    /// edge, the left/right edges, or the bottom corners (the grow box).
+    /// Events there belong to AppKit's resize tracking, not the content.
+    fn in_window_resize_region(x: f64, y_from_top: f64, width: f64, height: f64) -> bool {
+        let on_edge = x <= WINDOW_RESIZE_MARGIN
+            || x >= width - WINDOW_RESIZE_MARGIN
+            || y_from_top >= height - WINDOW_RESIZE_MARGIN;
+        let on_bottom_corner = y_from_top >= height - WINDOW_RESIZE_CORNER_RADIUS
+            && (x <= WINDOW_RESIZE_CORNER_RADIUS || x >= width - WINDOW_RESIZE_CORNER_RADIUS);
+        on_edge || on_bottom_corner
     }
 
     /// True while the native address field is being edited: the window's
