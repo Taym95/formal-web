@@ -136,7 +136,7 @@ crate::dom::dispatch_event(ec, path, event)
   `// Note:`.
 - When a function partially implements a spec algorithm, annotate with `// Step N:`
   for ALL steps of the algorithm. Mark missing steps with `// TODO: Not yet
-  implemented.` See `html/dispatch.rs::fire_global_event` for the correct pattern.
+  implemented.` See `html/dispatch.rs::steps_to_fire_beforeunload` for the correct pattern.
 
 ### `// Note:` for discrepancies only
 

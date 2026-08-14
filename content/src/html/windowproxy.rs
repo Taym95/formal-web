@@ -27,10 +27,6 @@ use crate::js::Types;
 type JsValue = <Types as JsTypes>::JsValue;
 type JsObject = <Types as JsTypes>::JsObject;
 
-// ────────────────────────────────────────────────────────────────────────────
-// The WindowProxy domain object
-// ────────────────────────────────────────────────────────────────────────────
-
 /// <https://html.spec.whatwg.org/#concept-windowproxy-window>
 /// The Window the proxy exposes, when its document lives in this content
 /// process; a cross-process window is not backed by a local Window.
@@ -118,10 +114,6 @@ fn window_object_handle(backing: &WindowProxyBacking) -> Option<JsObject> {
     }
 }
 
-// ────────────────────────────────────────────────────────────────────────────
-// The cross-origin abstract operations
-// ────────────────────────────────────────────────────────────────────────────
-
 /// <https://html.spec.whatwg.org/#crossoriginpropertyfallback-(-p-)>
 fn cross_origin_property_fallback(
     ec: &mut dyn ExecutionContext<Types>,
@@ -130,8 +122,10 @@ fn cross_origin_property_fallback(
     //           or %Symbol.isConcatSpreadable%, then return
     //           PropertyDescriptor { [[Value]]: undefined, [[Writable]]: false,
     //           [[Enumerable]]: false, [[Configurable]]: true }."
+    // TODO: Not yet implemented.
     // Step 2: "Throw a 'SecurityError' DOMException."
-    // Note: Not implemented: the fallback returns undefined for every key.
+    // TODO: Not yet implemented.
+    // Note: The fallback returns undefined for every key.
     Ok(ec.value_undefined())
 }
 
@@ -149,10 +143,10 @@ fn is_platform_object_same_origin(backing: &WindowProxyBacking) -> bool {
 fn cross_origin_get_own_property_helper() -> Option<JsValue> {
     // Step 1: "Let crossOriginKey be a tuple consisting of the current
     //           settings object, O's relevant settings object, and P."
+    // TODO: Not yet implemented.
     // Step 2: "For each e of CrossOriginProperties(O):"
+    // TODO: Not yet implemented — CrossOriginProperties is empty.
     // Step 3: "Return undefined."
-    // Note: CrossOriginProperties is not implemented: no cross-origin
-    // property descriptors are produced.
     None
 }
 
@@ -164,17 +158,23 @@ fn cross_origin_get(
     ec: &mut dyn ExecutionContext<Types>,
 ) -> Completion<JsValue, Types> {
     // Step 1: "Let desc be ? O.[[GetOwnProperty]](P)."
+    // TODO: Not yet implemented.
     // Step 2: "Assert: desc is not undefined."
+    // TODO: Not yet implemented.
     // Step 3: "If IsDataDescriptor(desc) is true, then return desc.[[Value]]."
+    // TODO: Not yet implemented.
     // Step 4: "Assert: IsAccessorDescriptor(desc) is true."
+    // TODO: Not yet implemented.
     // Step 5: "Let getter be desc.[[Getter]]."
+    // TODO: Not yet implemented.
     // Step 6: "If getter is undefined, then throw a 'SecurityError'
     //           DOMException."
+    // TODO: Not yet implemented.
     // Step 7: "Return ? Call(getter, Receiver)."
-    // Note: CrossOriginProperties is not implemented: the self-referencing
-    // members (self, window, frames, top, parent) return the WindowProxy
-    // itself, and every other property is read off the platform object's
-    // prototype.
+    // Note: CrossOriginProperties is not implemented: the descriptor-based
+    // steps are replaced by a direct read off the platform object's
+    // prototype (the self-referencing members return the WindowProxy
+    // itself).
     if let Some(s) = key.as_string()
         && (s == "self" || s == "window" || s == "frames" || s == "top" || s == "parent")
     {
@@ -195,10 +195,16 @@ fn cross_origin_get(
 /// <https://html.spec.whatwg.org/#crossoriginset-(-o,-p,-v,-receiver-)>
 fn cross_origin_set(ec: &mut dyn ExecutionContext<Types>) -> Completion<JsValue, Types> {
     // Step 1: "Let desc be ? O.[[GetOwnProperty]](P)."
+    // TODO: Not yet implemented.
     // Step 2: "Assert: desc is not undefined."
+    // TODO: Not yet implemented.
     // Step 3: "If desc.[[Setter]] is present and its value is not undefined:"
+    // Step 3.1: "Perform ? Call(desc.[[Setter]], Receiver, « V »)."
+    // Step 3.2: "Return true."
+    // TODO: Not yet implemented.
     // Step 4: "Throw a 'SecurityError' DOMException."
-    // Note: Not implemented: the set is refused.
+    // TODO: Not yet implemented.
+    // Note: The set is refused.
     Ok(ec.value_from_bool(false))
 }
 
@@ -210,12 +216,13 @@ fn cross_origin_own_property_keys(
     // Step 1: "Let keys be a new empty List."
     // Step 2: "For each e of CrossOriginProperties(O), append e.[[Property]]
     //           to keys."
+    // TODO: Not yet implemented — CrossOriginProperties is empty.
     // Step 3: "Return the concatenation of keys and « 'then',
     //           %Symbol.toStringTag%, %Symbol.hasInstance%,
     //           %Symbol.isConcatSpreadable% »."
-    // Note: CrossOriginProperties is not implemented: the approximation
-    // returns the platform object's own keys (the cross-origin member set
-    // lives on the platform object's prototype).
+    // TODO: Not yet implemented.
+    // Note: The approximation returns the platform object's own keys (the
+    // cross-origin member set lives on the platform object's prototype).
     let window_keys = ec.own_property_keys(proxy_target.clone())?;
     let key_array = ec.create_empty_array();
     for val in window_keys.into_iter() {
@@ -224,10 +231,6 @@ fn cross_origin_own_property_keys(
     }
     Ok(<Types as JsTypes>::value_from_object(key_array))
 }
-
-// ────────────────────────────────────────────────────────────────────────────
-// The WindowProxy traps (same-content-process and cross-content-process)
-// ────────────────────────────────────────────────────────────────────────────
 
 //
 // Each trap is called by the Proxy internal methods and receives:
@@ -679,10 +682,6 @@ fn wrap_callable_result(
     }
     None
 }
-
-// ────────────────────────────────────────────────────────────────────────────
-// The WindowProxy platform object and the ECMAScript Proxy wrapping it
-// ────────────────────────────────────────────────────────────────────────────
 
 /// Create (or fetch from the realm's cache) the WindowProxy for a navigable:
 /// an ECMAScript Proxy wrapping the cached [`WindowProxy`] platform object
