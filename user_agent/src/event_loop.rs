@@ -2,8 +2,8 @@ use blitz_traits::shell::ColorScheme;
 use crossbeam_channel::{Receiver, Sender, bounded, select, unbounded};
 use ipc_messages::content::{
     ClipboardWriteRequested, ColorScheme as MessageColorScheme, Command as ContentCommand,
-    ElementClickResult, Event as ContentEvent, EventLoopId, NavigableId, TraversableViewport,
-    ViewportSnapshot,
+    ElementClickResult, Event as ContentEvent, EventLoopId, NavigableId, TitleChanged,
+    TraversableViewport, ViewportSnapshot, WebviewId,
 };
 use ipc_messages::graphics::GraphicsCommand;
 use log::error;
@@ -520,6 +520,18 @@ impl EventLoopWorker {
                     .clipboard_set_text(text, CONTENT_CLIPBOARD_TIMEOUT)
                 {
                     log::error!("clipboard write failed: {error}");
+                }
+            }
+            ContentEvent::TitleChanged(TitleChanged {
+                traversable_id,
+                title,
+            }) => {
+                // The content process reports the parsed title of the
+                // top-level document; forward it to the embedder so it can
+                // label the tab and window.
+                // <https://html.spec.whatwg.org/#the-title-element>
+                if let Err(error) = self.host.title_changed(WebviewId(traversable_id), title) {
+                    log::error!("failed to forward document title: {error}");
                 }
             }
             ContentEvent::RegisterMediaPipeline(_) => {

@@ -208,6 +208,10 @@ impl Embedder for EventLoopEmbedder {
         clipboard_set_text(text, timeout)
     }
 
+    fn title_changed(&self, webview_id: WebviewId, title: String) -> Result<(), String> {
+        send_user_event(FormalWebUserEvent::TitleChanged { webview_id, title })
+    }
+
     fn new_web_content_scene(
         &self,
         webview_id: WebviewId,
@@ -280,6 +284,11 @@ pub enum FormalWebUserEvent {
     ClipboardWrite {
         text: String,
         reply: mpsc::Sender<Result<(), String>>,
+    },
+    /// The parsed title of a top-level document, for tab and window labels.
+    TitleChanged {
+        webview_id: WebviewId,
+        title: String,
     },
     Exit,
 }

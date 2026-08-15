@@ -334,6 +334,8 @@ impl ApplicationHandler<FormalWebUserEvent> for HeadlessEmbedderApp {
                 }
                 self.apply_viewport_snapshot();
             }
+            // Headless has no chrome to label; the title is not needed.
+            FormalWebUserEvent::TitleChanged { .. } => {}
             FormalWebUserEvent::CreateWindow => {}
             FormalWebUserEvent::Automation(cmd) => {
                 self.with_automation(|a, app| a.handle_command(app, cmd));

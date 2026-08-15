@@ -54,6 +54,9 @@ impl WindowId {
 pub(super) struct TabState {
     pending_url: Option<String>,
     committed_url: Option<String>,
+    /// The parsed title of the committed document, reported by the content
+    /// process after parsing.
+    page_title: Option<String>,
 }
 
 impl TabState {
@@ -61,6 +64,7 @@ impl TabState {
         Self {
             pending_url: None,
             committed_url: None,
+            page_title: None,
         }
     }
 
@@ -332,6 +336,14 @@ impl WindowedApp {
 
     fn tab_label(window_state: &WindowState, webview_id: &WebviewId) -> String {
         if let Some(tab) = window_state.tabs.get(webview_id) {
+            // The tab label is the page title when available, falling back
+            // to the URL for documents without one (and "New Tab" for
+            // blank pages).
+            if let Some(title) = &tab.page_title
+                && !title.is_empty()
+            {
+                return title.clone();
+            }
             if let Some(url) = &tab.committed_url
                 && !url.is_empty()
             {
@@ -1246,6 +1258,10 @@ impl ApplicationHandler<FormalWebUserEvent> for WindowedApp {
                         {
                             tab.pending_url = None;
                             tab.committed_url = Some(url.clone());
+                            // The previous document's title no longer
+                            // applies; the new document reports its parsed
+                            // title separately.
+                            tab.page_title = None;
                         }
                         // Clear compositor first so new paint frames populate it.
                         if let Some(provider) = self.provider.as_mut() {
@@ -1284,6 +1300,17 @@ impl ApplicationHandler<FormalWebUserEvent> for WindowedApp {
                     Self::add_tab(state, webview_id);
                     Self::sync_chrome(state);
                     Self::update_provider_viewport(state, &mut self.provider);
+                    Self::request_visible_redraw(state);
+                }
+            }
+            FormalWebUserEvent::TitleChanged { webview_id, title } => {
+                let window_opt = Self::window_for_webview(self, webview_id);
+                if let Some(window) = window_opt
+                    && let Some(state) = self.windows.get_mut(&window)
+                    && let Some(tab) = state.tabs.get_mut(&webview_id)
+                {
+                    tab.page_title = Some(title);
+                    Self::sync_chrome(state);
                     Self::request_visible_redraw(state);
                 }
             }

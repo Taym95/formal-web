@@ -127,6 +127,10 @@ pub trait Embedder: Send + Sync {
     fn window_viewport_snapshot(&self) -> Option<(u32, u32, f32, ColorScheme)>;
     fn clipboard_get_text(&self, timeout: Duration) -> Result<String, String>;
     fn clipboard_set_text(&self, text: String, timeout: Duration) -> Result<(), String>;
+    /// The parsed title of a top-level document, reported by the content
+    /// process after parsing; the embedder labels the tab and window with it.
+    /// <https://html.spec.whatwg.org/#the-title-element>
+    fn title_changed(&self, webview_id: WebviewId, title: String) -> Result<(), String>;
     /// Forward a composed web content scene from the graphics process to the
     /// embedder for rendering.
     fn new_web_content_scene(

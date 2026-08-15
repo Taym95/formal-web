@@ -35,19 +35,23 @@ use keyboard_types::Modifiers as KeyboardModifiers;
 use log::{debug, error, info};
 use objc2::define_class;
 use objc2::rc::Retained;
-use objc2::runtime::{AnyObject, ProtocolObject};
+use objc2::runtime::{AnyObject, ProtocolObject, Sel};
 use objc2::{DefinedClass, MainThreadOnly, msg_send, sel};
 use objc2_app_kit::{
-    NSApplication, NSApplicationActivationPolicy, NSButton, NSButtonType, NSFont, NSTextField,
-    NSTextFieldBezelStyle, NSView, NSWindow, NSWindowDelegate, NSWindowStyleMask,
+    NSApplication, NSApplicationActivationPolicy, NSButton, NSButtonType, NSFont, NSImage, NSMenu,
+    NSMenuItem, NSTextField, NSTextFieldBezelStyle, NSToolbar, NSToolbarDelegate,
+    NSToolbarDisplayMode, NSToolbarFlexibleSpaceItemIdentifier, NSToolbarItem,
+    NSToolbarItemIdentifier, NSView, NSVisualEffectBlendingMode, NSVisualEffectMaterial,
+    NSVisualEffectState, NSVisualEffectView, NSWindow, NSWindowDelegate, NSWindowStyleMask,
+    NSWindowTitleVisibility, NSWindowToolbarStyle,
 };
 use objc2_app_kit::{NSBezelStyle, NSEvent, NSEventMask, NSEventModifierFlags, NSEventType};
 use objc2_core_foundation::CFRetained;
 use objc2_core_video::{CVDisplayLink, CVOptionFlags, CVReturn, CVTimeStamp, kCVReturnSuccess};
 use objc2_foundation::NSInteger;
 use objc2_foundation::{
-    MainThreadMarker, NSNotification, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize,
-    NSString, ns_string,
+    MainThreadMarker, NSArray, NSNotification, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSet,
+    NSSize, NSString, ns_string,
 };
 use objc2_io_surface::IOSurfaceRef;
 use serde_json::Value;
@@ -64,13 +68,18 @@ use webview::WebviewProvider;
 const INITIAL_WINDOW_WIDTH: f64 = 1200.0;
 const INITIAL_WINDOW_HEIGHT: f64 = 800.0;
 
-/// The native chrome bar height in points: the tab strip on top, the
-/// address field below.
-const CHROME_BAR_HEIGHT: f64 = 76.0;
-const ADDRESS_FIELD_HEIGHT: f64 = 34.0;
-const TAB_STRIP_HEIGHT: f64 = 30.0;
+/// The tab strip and address field live in the window's native toolbar row
+/// as custom-view items; these are the sizes of the hosted views.
+const ADDRESS_FIELD_HEIGHT: f64 = 28.0;
+const TAB_STRIP_HEIGHT: f64 = 36.0;
+/// The narrowest the tab-strip and address-field toolbar items may shrink.
+const TOOLBAR_ITEM_MIN_WIDTH: f64 = 240.0;
+/// The widest the address-field toolbar item may grow.
+const ADDRESS_FIELD_MAX_WIDTH: f64 = 600.0;
 const TAB_BUTTON_WIDTH: f64 = 140.0;
 const TAB_BUTTON_HEIGHT: f64 = 26.0;
+/// The close (×) button inside each tab cell.
+const TAB_CLOSE_BUTTON_WIDTH: f64 = 22.0;
 const NEW_TAB_BUTTON_WIDTH: f64 = 28.0;
 /// Points inside this margin of the content view's bottom/side edges belong
 /// to the window frame's resize handles; the initial mouse-down there must
@@ -140,6 +149,49 @@ define_class!(
         }
     }
 
+    // SAFETY: `NSToolbarDelegate` has no safety requirements; the methods
+    // only touch main-thread-confined app state. The protocol's generated
+    // method names are the raw selectors (camel case).
+    #[allow(non_snake_case)]
+    unsafe impl NSToolbarDelegate for Delegate {
+        #[unsafe(method_id(toolbarDefaultItemIdentifiers:))]
+        fn toolbarDefaultItemIdentifiers(
+            &self,
+            _toolbar: &NSToolbar,
+        ) -> Retained<NSArray<NSToolbarItemIdentifier>> {
+            Self::toolbar_default_identifiers()
+        }
+
+        #[unsafe(method_id(toolbarAllowedItemIdentifiers:))]
+        fn toolbarAllowedItemIdentifiers(
+            &self,
+            _toolbar: &NSToolbar,
+        ) -> Retained<NSArray<NSToolbarItemIdentifier>> {
+            Self::toolbar_default_identifiers()
+        }
+
+        #[unsafe(method_id(toolbarImmovableItemIdentifiers:))]
+        fn toolbarImmovableItemIdentifiers(
+            &self,
+            _toolbar: &NSToolbar,
+        ) -> Retained<NSSet<NSToolbarItemIdentifier>> {
+            // The address field cannot be removed or moved: a browser
+            // needs it.
+            NSSet::from_retained_slice(&[NSString::from_str("address")])
+        }
+
+        #[unsafe(method_id(toolbar:itemForItemIdentifier:willBeInsertedIntoToolbar:))]
+        fn toolbar_itemForItemIdentifier_willBeInsertedIntoToolbar(
+            &self,
+            toolbar: &NSToolbar,
+            item_identifier: &NSToolbarItemIdentifier,
+            flag: bool,
+        ) -> Option<Retained<NSToolbarItem>> {
+            let app = unsafe { &mut *(*self.ivars().app.get()) };
+            app.make_toolbar_item(toolbar, item_identifier, flag)
+        }
+    }
+
     impl Delegate {
         #[unsafe(method(quit:))]
         fn quit(&self, _sender: Option<&AnyObject>) {
@@ -172,6 +224,46 @@ define_class!(
             let value: Retained<NSString> = unsafe { msg_send![sender, stringValue] };
             app.action_navigate(value.to_string());
         }
+
+        #[unsafe(method(newWindow:))]
+        fn new_window(&self, _sender: Option<&AnyObject>) {
+            let app = unsafe { &mut *(*self.ivars().app.get()) };
+            app.action_new_window();
+        }
+
+        #[unsafe(method(closeTab:))]
+        fn close_tab(&self, _sender: Option<&AnyObject>) {
+            let app = unsafe { &mut *(*self.ivars().app.get()) };
+            app.action_close_tab();
+        }
+
+        #[unsafe(method(closeTabAt:))]
+        fn close_tab_at(&self, sender: Option<&AnyObject>) {
+            let app = unsafe { &mut *(*self.ivars().app.get()) };
+            let Some(sender) = sender else { return };
+            // SAFETY: the sender is one of the tab close buttons, which
+            // respond to `tag`.
+            let tag: NSInteger = unsafe { msg_send![sender, tag] };
+            app.action_close_tab_at(tag.max(0) as usize);
+        }
+
+        #[unsafe(method(closeWindow:))]
+        fn close_window(&self, _sender: Option<&AnyObject>) {
+            let app = unsafe { &mut *(*self.ivars().app.get()) };
+            app.action_close_window();
+        }
+
+        #[unsafe(method(reload:))]
+        fn reload(&self, _sender: Option<&AnyObject>) {
+            let app = unsafe { &mut *(*self.ivars().app.get()) };
+            app.action_reload();
+        }
+
+        #[unsafe(method(focusAddress:))]
+        fn focus_address(&self, _sender: Option<&AnyObject>) {
+            let app = unsafe { &mut *(*self.ivars().app.get()) };
+            app.action_focus_address();
+        }
     }
 );
 
@@ -182,6 +274,22 @@ impl Delegate {
         });
         // SAFETY: the superclass initializer has the correct signature.
         unsafe { msg_send![super(this), init] }
+    }
+
+    /// The ordered toolbar item identifiers: navigation buttons, a
+    /// flexible space, then the tab strip and the address field.
+    fn toolbar_default_identifiers() -> Retained<NSArray<NSToolbarItemIdentifier>> {
+        let back = NSString::from_str("back");
+        let forward = NSString::from_str("forward");
+        let reload = NSString::from_str("reload");
+        let address = NSString::from_str("address");
+        // The flexible-space item must be the system constant object, not
+        // a string with the same content: AppKit matches space items by
+        // identity.
+        let flexible_space = unsafe { NSToolbarFlexibleSpaceItemIdentifier };
+        // The tab strip is not a toolbar item; it lives below the toolbar
+        // as its own row.
+        NSArray::from_slice(&[&back, &forward, &reload, flexible_space, &address])
     }
 }
 
@@ -270,6 +378,9 @@ impl WindowId {
 struct TabState {
     pending_url: Option<String>,
     committed_url: Option<String>,
+    /// The parsed title of the committed document, reported by the content
+    /// process after parsing.
+    page_title: Option<String>,
 }
 
 impl TabState {
@@ -277,6 +388,7 @@ impl TabState {
         Self {
             pending_url: None,
             committed_url: None,
+            page_title: None,
         }
     }
 
@@ -304,10 +416,13 @@ struct SurfaceState {
 /// per-webview surfaces.
 struct MacWindow {
     window: Retained<NSWindow>,
-    chrome_bar: Retained<NSView>,
-    tab_strip: Retained<NSView>,
+    /// The window's native toolbar, which hosts the tab strip and the
+    /// address field as custom-view items.
+    toolbar: Retained<NSToolbar>,
+    tab_strip: Retained<NSVisualEffectView>,
     address_field: Retained<NSTextField>,
     tab_buttons: Vec<Retained<NSButton>>,
+    tab_close_buttons: Vec<Retained<NSButton>>,
     new_tab_button: Retained<NSButton>,
     web_view: Retained<NSView>,
     /// The layer-hosting layer that presents the shared IOSurface; kept
@@ -387,7 +502,9 @@ impl MacApp {
         let title = event_loop_options()
             .window_title
             .unwrap_or_else(|| String::from("formal-web"));
-        let window_id = app.create_window(&title)?;
+        let destination = startup_destination_url(event_loop_options().startup_url.as_deref())
+            .unwrap_or_else(|_| String::from("about:blank"));
+        let window_id = app.create_window(&title, &destination)?;
         app.active_window_id = Some(window_id);
 
         // Activate the app (required when launching unbundled) and start
@@ -514,23 +631,329 @@ impl MacApp {
 
     fn install_main_menu(&mut self) {
         let mtm = self.mtm;
-        let main_menu = objc2_app_kit::NSMenu::new(mtm);
-        let app_menu_item = objc2_app_kit::NSMenuItem::new(mtm);
+        let main_menu = NSMenu::new(mtm);
+
+        // App menu: about, hide, and quit. The top-level item title is the
+        // app name shown next to the Apple menu glyph.
+        let app_menu_item = NSMenuItem::new(mtm);
+        app_menu_item.setTitle(ns_string!("formal-web"));
+        let app_menu = NSMenu::new(mtm);
+        app_menu.addItem(&Self::make_menu_item(
+            mtm,
+            "About formal-web",
+            None,
+            NSEventModifierFlags::Command,
+            Some(sel!(orderFrontStandardAboutPanel:)),
+            None,
+        ));
+        app_menu.addItem(&NSMenuItem::separatorItem(mtm));
+        app_menu.addItem(&Self::make_menu_item(
+            mtm,
+            "Hide formal-web",
+            Some("h"),
+            NSEventModifierFlags::Command,
+            Some(sel!(hide:)),
+            None,
+        ));
+        app_menu.addItem(&Self::make_menu_item(
+            mtm,
+            "Hide Others",
+            Some("h"),
+            NSEventModifierFlags::Command | NSEventModifierFlags::Option,
+            Some(sel!(hideOtherApplications:)),
+            None,
+        ));
+        app_menu.addItem(&Self::make_menu_item(
+            mtm,
+            "Show All",
+            None,
+            NSEventModifierFlags::Command,
+            Some(sel!(unhideAllApplications:)),
+            None,
+        ));
+        app_menu.addItem(&NSMenuItem::separatorItem(mtm));
+        app_menu.addItem(&Self::make_menu_item(
+            mtm,
+            "Quit formal-web",
+            Some("q"),
+            NSEventModifierFlags::Command,
+            Some(sel!(quit:)),
+            Some(&*self.delegate),
+        ));
+        app_menu_item.setSubmenu(Some(&app_menu));
         main_menu.addItem(&app_menu_item);
 
-        let app_menu = objc2_app_kit::NSMenu::new(mtm);
-        let quit_item = objc2_app_kit::NSMenuItem::new(mtm);
-        quit_item.setTitle(&NSString::from_str("Quit"));
-        quit_item.setKeyEquivalent(ns_string!("q"));
-        quit_item.setKeyEquivalentModifierMask(NSEventModifierFlags::Command);
-        // SAFETY: the selector is a valid action for the delegate.
-        unsafe { quit_item.setAction(Some(sel!(quit:))) };
-        // SAFETY: the delegate is a valid target object.
-        let _: () = unsafe { msg_send![&quit_item, setTarget: &*self.delegate] };
-        app_menu.addItem(&quit_item);
-        app_menu_item.setSubmenu(Some(&app_menu));
+        // File: window and tab management, location entry, and closing.
+        main_menu.addItem(&Self::make_menu_with_items(
+            mtm,
+            "File",
+            &[
+                Self::make_menu_item(
+                    mtm,
+                    "New Window",
+                    Some("n"),
+                    NSEventModifierFlags::Command,
+                    Some(sel!(newWindow:)),
+                    Some(&*self.delegate),
+                ),
+                Self::make_menu_item(
+                    mtm,
+                    "New Tab",
+                    Some("t"),
+                    NSEventModifierFlags::Command,
+                    Some(sel!(newTab:)),
+                    Some(&*self.delegate),
+                ),
+                Self::make_menu_item(
+                    mtm,
+                    "Open Location…",
+                    Some("l"),
+                    NSEventModifierFlags::Command,
+                    Some(sel!(focusAddress:)),
+                    Some(&*self.delegate),
+                ),
+                NSMenuItem::separatorItem(mtm),
+                Self::make_menu_item(
+                    mtm,
+                    "Close Tab",
+                    Some("w"),
+                    NSEventModifierFlags::Command,
+                    Some(sel!(closeTab:)),
+                    Some(&*self.delegate),
+                ),
+                Self::make_menu_item(
+                    mtm,
+                    "Close Window",
+                    Some("w"),
+                    NSEventModifierFlags::Command | NSEventModifierFlags::Shift,
+                    Some(sel!(closeWindow:)),
+                    Some(&*self.delegate),
+                ),
+            ],
+        ));
+
+        // Edit: the standard text-edit commands. With no target they are
+        // dispatched through the responder chain, so they operate on the
+        // address field's editor while it is being edited and stay
+        // disabled otherwise.
+        main_menu.addItem(&Self::make_menu_with_items(
+            mtm,
+            "Edit",
+            &[
+                Self::make_menu_item(
+                    mtm,
+                    "Undo",
+                    Some("z"),
+                    NSEventModifierFlags::Command,
+                    Some(sel!(undo:)),
+                    None,
+                ),
+                Self::make_menu_item(
+                    mtm,
+                    "Redo",
+                    Some("z"),
+                    NSEventModifierFlags::Command | NSEventModifierFlags::Shift,
+                    Some(sel!(redo:)),
+                    None,
+                ),
+                NSMenuItem::separatorItem(mtm),
+                Self::make_menu_item(
+                    mtm,
+                    "Cut",
+                    Some("x"),
+                    NSEventModifierFlags::Command,
+                    Some(sel!(cut:)),
+                    None,
+                ),
+                Self::make_menu_item(
+                    mtm,
+                    "Copy",
+                    Some("c"),
+                    NSEventModifierFlags::Command,
+                    Some(sel!(copy:)),
+                    None,
+                ),
+                Self::make_menu_item(
+                    mtm,
+                    "Paste",
+                    Some("v"),
+                    NSEventModifierFlags::Command,
+                    Some(sel!(paste:)),
+                    None,
+                ),
+                Self::make_menu_item(
+                    mtm,
+                    "Select All",
+                    Some("a"),
+                    NSEventModifierFlags::Command,
+                    Some(sel!(selectAll:)),
+                    None,
+                ),
+            ],
+        ));
+
+        // View: reload and full screen.
+        main_menu.addItem(&Self::make_menu_with_items(
+            mtm,
+            "View",
+            &[
+                Self::make_menu_item(
+                    mtm,
+                    "Reload",
+                    Some("r"),
+                    NSEventModifierFlags::Command,
+                    Some(sel!(reload:)),
+                    Some(&*self.delegate),
+                ),
+                NSMenuItem::separatorItem(mtm),
+                Self::make_menu_item(
+                    mtm,
+                    "Enter Full Screen",
+                    Some("f"),
+                    NSEventModifierFlags::Command | NSEventModifierFlags::Control,
+                    Some(sel!(toggleFullScreen:)),
+                    None,
+                ),
+            ],
+        ));
+
+        // History: session history is not implemented yet, so the standard
+        // navigation items exist but stay disabled.
+        let history_menu_item = NSMenuItem::new(mtm);
+        history_menu_item.setTitle(ns_string!("History"));
+        let history_menu = NSMenu::new(mtm);
+        let back_item = Self::make_menu_item(
+            mtm,
+            "Back",
+            Some("["),
+            NSEventModifierFlags::Command,
+            Some(sel!(goBack:)),
+            None,
+        );
+        back_item.setEnabled(false);
+        history_menu.addItem(&back_item);
+        let forward_item = Self::make_menu_item(
+            mtm,
+            "Forward",
+            Some("]"),
+            NSEventModifierFlags::Command,
+            Some(sel!(goForward:)),
+            None,
+        );
+        forward_item.setEnabled(false);
+        history_menu.addItem(&forward_item);
+        history_menu.addItem(&NSMenuItem::separatorItem(mtm));
+        let show_all_item = Self::make_menu_item(
+            mtm,
+            "Show All History",
+            Some("y"),
+            NSEventModifierFlags::Command,
+            Some(sel!(showAllHistory:)),
+            None,
+        );
+        show_all_item.setEnabled(false);
+        history_menu.addItem(&show_all_item);
+        history_menu_item.setSubmenu(Some(&history_menu));
+        main_menu.addItem(&history_menu_item);
+
+        // Window: the standard window commands, dispatched through the
+        // responder chain to the key window (NSWindow implements
+        // performMiniaturize:/performZoom:).
+        main_menu.addItem(&Self::make_menu_with_items(
+            mtm,
+            "Window",
+            &[
+                Self::make_menu_item(
+                    mtm,
+                    "Minimize",
+                    Some("m"),
+                    NSEventModifierFlags::Command,
+                    Some(sel!(performMiniaturize:)),
+                    None,
+                ),
+                Self::make_menu_item(
+                    mtm,
+                    "Zoom",
+                    None,
+                    NSEventModifierFlags::Command,
+                    Some(sel!(performZoom:)),
+                    None,
+                ),
+                NSMenuItem::separatorItem(mtm),
+                Self::make_menu_item(
+                    mtm,
+                    "Bring All to Front",
+                    None,
+                    NSEventModifierFlags::Command,
+                    Some(sel!(arrangeInFront:)),
+                    None,
+                ),
+            ],
+        ));
+
+        // Help: no help book yet, so the item stays disabled.
+        let help_menu_item = NSMenuItem::new(mtm);
+        help_menu_item.setTitle(ns_string!("Help"));
+        let help_menu = NSMenu::new(mtm);
+        let help_item = Self::make_menu_item(
+            mtm,
+            "formal-web Help",
+            None,
+            NSEventModifierFlags::Command,
+            None,
+            None,
+        );
+        help_item.setEnabled(false);
+        help_menu.addItem(&help_item);
+        help_menu_item.setSubmenu(Some(&help_menu));
+        main_menu.addItem(&help_menu_item);
 
         self.ns_app.setMainMenu(Some(&main_menu));
+    }
+
+    /// A menu item with an optional key equivalent and action. With a nil
+    /// target the action is dispatched through the responder chain, the
+    /// standard AppKit mechanism for edit/window commands.
+    fn make_menu_item(
+        mtm: MainThreadMarker,
+        title: &str,
+        key_equivalent: Option<&str>,
+        modifiers: NSEventModifierFlags,
+        action: Option<Sel>,
+        target: Option<&AnyObject>,
+    ) -> Retained<NSMenuItem> {
+        let item = NSMenuItem::new(mtm);
+        item.setTitle(&NSString::from_str(title));
+        if let Some(key_equivalent) = key_equivalent {
+            item.setKeyEquivalent(&NSString::from_str(key_equivalent));
+            item.setKeyEquivalentModifierMask(modifiers);
+        }
+        if let Some(action) = action {
+            // SAFETY: the selector is a valid action for the target; with
+            // a nil target it is dispatched through the responder chain.
+            unsafe { item.setAction(Some(action)) };
+        }
+        if let Some(target) = target {
+            // SAFETY: the target (the window delegate) outlives the menu.
+            unsafe { item.setTarget(Some(target)) };
+        }
+        item
+    }
+
+    /// A top-level menu item titled `title` whose submenu contains `items`.
+    fn make_menu_with_items(
+        mtm: MainThreadMarker,
+        title: &str,
+        items: &[Retained<NSMenuItem>],
+    ) -> Retained<NSMenuItem> {
+        let menu_item = NSMenuItem::new(mtm);
+        menu_item.setTitle(&NSString::from_str(title));
+        let menu = NSMenu::new(mtm);
+        for item in items {
+            menu.addItem(item);
+        }
+        menu_item.setSubmenu(Some(&menu));
+        menu_item
     }
 
     // ── Event monitor ──────────────────────────────────────────────────────
@@ -567,6 +990,16 @@ impl MacApp {
                     // The address field is editing: let AppKit deliver the
                     // event to the field (IME, shortcuts, etc.).
                     event.as_ptr()
+                } else if event_type == NSEventType::KeyDown
+                    && event_ref
+                        .modifierFlags()
+                        .contains(NSEventModifierFlags::Command)
+                    && self.menu_performs_key_equivalent(event_ref)
+                {
+                    // The main menu matched a ⌘-shortcut (⌘T, ⌘W, ⌘L, …)
+                    // and has dispatched the action: consume the event so
+                    // it does not also reach the web content.
+                    std::ptr::null_mut()
                 } else {
                     self.handle_content_keyboard_event(event_ref);
                     std::ptr::null_mut()
@@ -597,10 +1030,6 @@ impl MacApp {
                 let Some((x, y_from_top)) = self.content_point(window_id, event_ref) else {
                     return event.as_ptr();
                 };
-                if y_from_top < CHROME_BAR_HEIGHT {
-                    // Inside the native chrome: let the controls handle it.
-                    return event.as_ptr();
-                }
                 let (width, height) = self
                     .windows
                     .get(&window_id)
@@ -693,36 +1122,22 @@ impl MacApp {
         }
     }
 
+    /// Ask the main menu to perform the key equivalent for this event.
+    /// The local event monitor sees key events before the menu system
+    /// does, so ⌘-shortcuts bound to menu items are executed here and
+    /// consumed; unbound ⌘-combinations return false and keep flowing to
+    /// the web content (pages keep their own ⌘-shortcuts).
+    fn menu_performs_key_equivalent(&self, event: &NSEvent) -> bool {
+        let Some(menu) = self.ns_app.mainMenu() else {
+            return false;
+        };
+        menu.performKeyEquivalent(event)
+    }
+
     fn handle_content_keyboard_event(&mut self, event: &NSEvent) {
         let Some(window_id) = self.active_window_id else {
             return;
         };
-
-        // App-level shortcuts, handled before the content.
-        if event.r#type() == NSEventType::KeyDown
-            && event
-                .modifierFlags()
-                .contains(NSEventModifierFlags::Command)
-        {
-            match event.keyCode() {
-                0x0C => {
-                    // ⌘Q
-                    self.post_exit();
-                    return;
-                }
-                0x0D => {
-                    // ⌘W: close the active window.
-                    self.close_window(window_id);
-                    return;
-                }
-                0x2D => {
-                    // ⌘N: new window.
-                    let _ = self.create_window("formal-web");
-                    return;
-                }
-                _ => {}
-            }
-        }
 
         let key = input::ns_event_to_blitz_key(event);
         let ui_event = if event.r#type() == NSEventType::KeyDown {
@@ -770,7 +1185,7 @@ impl MacApp {
             // native address field, so the next keystrokes go to the page.
             window_state.window.makeFirstResponder(None);
         }
-        let coords = input::content_coords(x, y_from_top, CHROME_BAR_HEIGHT);
+        let coords = input::content_coords(x, y_from_top);
 
         let event_kind = if is_down {
             UiEventKind::PointerDown
@@ -843,6 +1258,24 @@ impl MacApp {
         button
     }
 
+    fn make_tab_close_button(
+        mtm: MainThreadMarker,
+        delegate: &Delegate,
+        index: usize,
+    ) -> Retained<NSButton> {
+        let button = NSButton::new(mtm);
+        button.setTitle(ns_string!("✕"));
+        button.setButtonType(NSButtonType::MomentaryPushIn);
+        button.setBezelStyle(NSBezelStyle::Toolbar);
+        button.setFont(Some(&NSFont::systemFontOfSize(10.0)));
+        button.setTag(index as NSInteger);
+        // SAFETY: the delegate is a valid target and the selector matches
+        // its `closeTabAt:` action.
+        let _: () = unsafe { msg_send![&button, setTarget: delegate] };
+        unsafe { button.setAction(Some(sel!(closeTabAt:))) };
+        button
+    }
+
     fn make_address_field(mtm: MainThreadMarker, delegate: &Delegate) -> Retained<NSTextField> {
         let field = NSTextField::new(mtm);
         field.setEditable(true);
@@ -862,6 +1295,159 @@ impl MacApp {
         field
     }
 
+    // ── Toolbar ───────────────────────────────────────────────────────────
+
+    /// The window owning `toolbar` (the toolbar delegate is shared by all
+    /// windows; each toolbar's items carry that window's chrome views).
+    fn window_for_toolbar(&self, toolbar: &NSToolbar) -> Option<WindowId> {
+        self.windows.iter().find_map(|(window_id, window_state)| {
+            if std::ptr::eq(&*window_state.toolbar, toolbar) {
+                Some(*window_id)
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Build the toolbar item for an identifier, as asked by the toolbar
+    /// delegate. Custom-view items (tabs, address) return the window's
+    /// views; when the request is for the customization palette (not an
+    /// insertion) they return a labeled placeholder so the real views stay
+    /// in the toolbar.
+    fn make_toolbar_item(
+        &mut self,
+        toolbar: &NSToolbar,
+        identifier: &NSToolbarItemIdentifier,
+        will_be_inserted: bool,
+    ) -> Option<Retained<NSToolbarItem>> {
+        let identifier = identifier.to_string();
+        match identifier.as_str() {
+            "back" => Some(Self::make_nav_toolbar_item(
+                self.mtm,
+                &identifier,
+                "Back",
+                "chevron.left",
+                Some(sel!(goBack:)),
+                None,
+                false,
+            )),
+            "forward" => Some(Self::make_nav_toolbar_item(
+                self.mtm,
+                &identifier,
+                "Forward",
+                "chevron.right",
+                Some(sel!(goForward:)),
+                None,
+                false,
+            )),
+            "reload" => Some(Self::make_nav_toolbar_item(
+                self.mtm,
+                &identifier,
+                "Reload",
+                "arrow.clockwise",
+                Some(sel!(reload:)),
+                Some(&*self.delegate),
+                true,
+            )),
+            "tabs" | "address" if !will_be_inserted => {
+                // The customization palette requests a representation
+                // without inserting the item.
+                Some(Self::make_nav_toolbar_item(
+                    self.mtm,
+                    &identifier,
+                    &identifier,
+                    "",
+                    None,
+                    None,
+                    true,
+                ))
+            }
+            "address" => {
+                let window_id = self.window_for_toolbar(toolbar)?;
+                let window_state = self.windows.get(&window_id)?;
+                Some(Self::make_custom_view_toolbar_item(
+                    self.mtm,
+                    "address",
+                    &window_state.address_field,
+                    NSSize::new(TOOLBAR_ITEM_MIN_WIDTH, ADDRESS_FIELD_HEIGHT),
+                    NSSize::new(ADDRESS_FIELD_MAX_WIDTH, ADDRESS_FIELD_HEIGHT),
+                    "Address",
+                ))
+            }
+            _ => None,
+        }
+    }
+
+    /// A toolbar item with an image (SF Symbol), label, action, and target.
+    fn make_nav_toolbar_item(
+        mtm: MainThreadMarker,
+        identifier: &str,
+        label: &str,
+        symbol: &str,
+        action: Option<Sel>,
+        target: Option<&AnyObject>,
+        enabled: bool,
+    ) -> Retained<NSToolbarItem> {
+        // The item is initialized with the standard initializer.
+        let item = NSToolbarItem::initWithItemIdentifier(
+            NSToolbarItem::alloc(mtm),
+            &NSString::from_str(identifier),
+        );
+        item.setLabel(&NSString::from_str(label));
+        item.setPaletteLabel(&NSString::from_str(label));
+        if !symbol.is_empty() {
+            let image = NSImage::imageWithSystemSymbolName_accessibilityDescription(
+                &NSString::from_str(symbol),
+                None,
+            );
+            if let Some(image) = image {
+                item.setImage(Some(&image));
+            }
+        }
+        if let Some(action) = action {
+            // SAFETY: the selector is valid for the target; with a nil
+            // target it is dispatched through the responder chain.
+            unsafe { item.setAction(Some(action)) };
+        }
+        if let Some(target) = target {
+            // SAFETY: the target (the window delegate) outlives the
+            // toolbar.
+            unsafe { item.setTarget(Some(target)) };
+        }
+        item.setEnabled(enabled);
+        item
+    }
+
+    /// A toolbar item hosting a custom view (the tab strip or the address
+    /// field), flexible within the given min/max sizes.
+    fn make_custom_view_toolbar_item(
+        mtm: MainThreadMarker,
+        identifier: &str,
+        view: &NSView,
+        min_size: NSSize,
+        max_size: NSSize,
+        label: &str,
+    ) -> Retained<NSToolbarItem> {
+        // The item is initialized with the standard initializer.
+        let item = NSToolbarItem::initWithItemIdentifier(
+            NSToolbarItem::alloc(mtm),
+            &NSString::from_str(identifier),
+        );
+        item.setLabel(&NSString::from_str(label));
+        item.setPaletteLabel(&NSString::from_str(label));
+        item.setView(Some(view));
+        // The min/max sizes make the item flexible within the toolbar row.
+        // They are deprecated in favor of Auto Layout constraints, but a
+        // plain container view has no intrinsic size to measure, and the
+        // constraint-based equivalent cannot express "grow with the toolbar"
+        // as simply; the deprecated properties still function.
+        #[allow(deprecated)]
+        item.setMinSize(min_size);
+        #[allow(deprecated)]
+        item.setMaxSize(max_size);
+        item
+    }
+
     fn refresh_tab_strip(&mut self, window_id: WindowId) {
         let delegate = self.delegate.clone();
         let mtm = self.mtm;
@@ -871,12 +1457,18 @@ impl MacApp {
         for button in window_state.tab_buttons.drain(..) {
             button.removeFromSuperview();
         }
+        for button in window_state.tab_close_buttons.drain(..) {
+            button.removeFromSuperview();
+        }
         for (index, webview_id) in window_state.tab_order.iter().enumerate() {
             let label = Self::tab_label(window_state, webview_id);
             let active = window_state.active_tab == Some(*webview_id);
             let button = Self::make_tab_button(mtm, &delegate, &label, index, active);
             window_state.tab_buttons.push(button.clone());
             window_state.tab_strip.addSubview(&button);
+            let close_button = Self::make_tab_close_button(mtm, &delegate, index);
+            window_state.tab_close_buttons.push(close_button.clone());
+            window_state.tab_strip.addSubview(&close_button);
         }
         Self::layout_tab_strip(window_state);
     }
@@ -901,76 +1493,114 @@ impl MacApp {
     fn refresh_chrome(&mut self, window_id: WindowId) {
         self.refresh_tab_strip(window_id);
         self.refresh_address_field(window_id);
+        // Mirror the active tab's label in the window title until page
+        // titles are plumbed from the content process.
+        let Some(window_state) = self.windows.get(&window_id) else {
+            return;
+        };
+        let title = window_state
+            .active_tab
+            .and_then(|webview_id| window_state.tabs.get(&webview_id))
+            .map(Self::tab_label_for_tab)
+            .unwrap_or_else(|| String::from("formal-web"));
+        window_state.window.setTitle(&NSString::from_str(&title));
     }
 
     fn tab_label(window_state: &MacWindow, webview_id: &WebviewId) -> String {
-        if let Some(tab) = window_state.tabs.get(webview_id) {
-            if let Some(url) = &tab.committed_url
-                && !url.is_empty()
-            {
-                return Self::truncate_url(url);
-            }
-            if let Some(url) = &tab.pending_url
-                && !url.is_empty()
-            {
-                return Self::truncate_url(url);
-            }
+        match window_state.tabs.get(webview_id) {
+            Some(tab) => Self::tab_label_for_tab(tab),
+            None => String::from("New Tab"),
+        }
+    }
+
+    fn tab_label_for_tab(tab: &TabState) -> String {
+        // The tab label is the page title when available, falling back to
+        // the URL for documents without one (and "New Tab" for blank
+        // pages).
+        if let Some(title) = &tab.page_title
+            && !title.is_empty()
+        {
+            return title.clone();
+        }
+        if let Some(url) = &tab.committed_url
+            && !url.is_empty()
+        {
+            return Self::truncate_url(url);
+        }
+        if let Some(url) = &tab.pending_url
+            && !url.is_empty()
+        {
+            return Self::truncate_url(url);
         }
         String::from("New Tab")
     }
 
     fn truncate_url(url: &str) -> String {
-        let display = url
-            .strip_prefix("https://")
-            .or_else(|| url.strip_prefix("http://"))
-            .or_else(|| url.strip_prefix("file://"))
-            .unwrap_or(url);
-        if display.len() > 24 {
-            format!("{}…", &display[..21])
+        let display = if let Some(path) = url.strip_prefix("file://") {
+            // For local files the last path component is the useful label
+            // (a directory or the file name); the full path duplicates the
+            // address field and is unreadable once narrowed.
+            let trimmed = path.trim_end_matches('/');
+            trimmed
+                .rsplit('/')
+                .find(|component| !component.is_empty())
+                .unwrap_or(trimmed)
+        } else {
+            url.strip_prefix("https://")
+                .or_else(|| url.strip_prefix("http://"))
+                .unwrap_or(url)
+        };
+        if display.chars().count() > 24 {
+            let truncated: String = display.chars().take(21).collect();
+            format!("{truncated}…")
         } else {
             display.to_owned()
         }
     }
 
-    /// Lay out the native chrome: the tab strip on top, the address field
-    /// below, the web content filling the rest.
+    /// Lay out the chrome rows: the tab strip spans the content area just
+    /// below the titlebar and toolbar, with the web content filling the
+    /// rest.
     fn layout_window_views(window_state: &mut MacWindow) {
-        let (width, height) = window_state.content_size;
-        let web_height = (height - CHROME_BAR_HEIGHT).max(0.0);
+        let rect = window_state.window.contentLayoutRect();
+        let web_height = (rect.size.height - TAB_STRIP_HEIGHT).max(0.0);
+        window_state.content_size = (rect.size.width, web_height);
         // The content view is not flipped: frames use a bottom-left origin,
-        // so the web content sits at the bottom and the chrome on top.
+        // so the web content sits at the bottom and the tab strip above it.
         window_state.web_view.setFrame(NSRect::new(
             NSPoint::new(0.0, 0.0),
-            NSSize::new(width, web_height),
+            NSSize::new(rect.size.width, web_height),
         ));
         // Keep the layer-hosting layer's frame in sync with the view.
         window_state.web_layer.setFrame(NSRect::new(
             NSPoint::new(0.0, 0.0),
-            NSSize::new(width, web_height),
-        ));
-        window_state.chrome_bar.setFrame(NSRect::new(
-            NSPoint::new(0.0, web_height),
-            NSSize::new(width, CHROME_BAR_HEIGHT),
-        ));
-        window_state.address_field.setFrame(NSRect::new(
-            NSPoint::new(8.0, 8.0),
-            NSSize::new((width - 16.0).max(0.0), ADDRESS_FIELD_HEIGHT),
+            NSSize::new(rect.size.width, web_height),
         ));
         window_state.tab_strip.setFrame(NSRect::new(
-            NSPoint::new(0.0, 8.0 + ADDRESS_FIELD_HEIGHT + 6.0),
-            NSSize::new(width, TAB_STRIP_HEIGHT),
+            NSPoint::new(0.0, web_height),
+            NSSize::new(rect.size.width, TAB_STRIP_HEIGHT),
         ));
         Self::layout_tab_strip(window_state);
     }
 
     fn layout_tab_strip(window_state: &mut MacWindow) {
         let strip_width = window_state.tab_strip.frame().size.width;
+        // Each tab cell holds the label button plus the close (×) button
+        // beside it, vertically centered in the toolbar row.
+        let label_width = (TAB_BUTTON_WIDTH - TAB_CLOSE_BUTTON_WIDTH - 2.0).max(0.0);
+        let button_y = ((TAB_STRIP_HEIGHT - TAB_BUTTON_HEIGHT) / 2.0).max(0.0);
         for (index, button) in window_state.tab_buttons.iter().enumerate() {
             let x = 8.0 + (index as f64) * (TAB_BUTTON_WIDTH + 6.0);
             button.setFrame(NSRect::new(
-                NSPoint::new(x, 2.0),
-                NSSize::new(TAB_BUTTON_WIDTH, TAB_BUTTON_HEIGHT),
+                NSPoint::new(x, button_y),
+                NSSize::new(label_width, TAB_BUTTON_HEIGHT),
             ));
+            if let Some(close_button) = window_state.tab_close_buttons.get(index) {
+                close_button.setFrame(NSRect::new(
+                    NSPoint::new(x + label_width + 2.0, button_y),
+                    NSSize::new(TAB_CLOSE_BUTTON_WIDTH, TAB_BUTTON_HEIGHT),
+                ));
+            }
         }
         let new_tab_x =
             8.0 + (window_state.tab_buttons.len() as f64) * (TAB_BUTTON_WIDTH + 6.0) + 2.0;
@@ -980,7 +1610,7 @@ impl MacApp {
             new_tab_x
         };
         window_state.new_tab_button.setFrame(NSRect::new(
-            NSPoint::new(new_tab_x, 2.0),
+            NSPoint::new(new_tab_x, button_y),
             NSSize::new(NEW_TAB_BUTTON_WIDTH, TAB_BUTTON_HEIGHT),
         ));
     }
@@ -1010,9 +1640,140 @@ impl MacApp {
     }
 
     fn action_new_tab(&mut self) {
+        // New tabs start on a blank page; the startup destination is only
+        // loaded into the first window at launch.
         if let Some(provider) = self.provider.as_ref() {
             let _ = provider.navigate(None, "about:blank");
         }
+    }
+
+    fn action_new_window(&mut self) {
+        // New windows start on a blank page; the startup destination is
+        // only loaded into the first window at launch.
+        let _ = self.create_window("formal-web", "about:blank");
+    }
+
+    fn action_close_tab(&mut self) {
+        let Some(window_id) = self.active_window_id else {
+            return;
+        };
+        let Some(webview_id) = self
+            .windows
+            .get(&window_id)
+            .and_then(|window_state| window_state.active_tab)
+        else {
+            return;
+        };
+        self.close_tab(window_id, webview_id);
+    }
+
+    fn action_close_tab_at(&mut self, index: usize) {
+        let Some(window_id) = self.active_window_id else {
+            return;
+        };
+        let webview_id = self
+            .windows
+            .get(&window_id)
+            .and_then(|window_state| window_state.tab_order.get(index).copied());
+        let Some(webview_id) = webview_id else {
+            return;
+        };
+        self.close_tab(window_id, webview_id);
+    }
+
+    fn action_close_window(&mut self) {
+        let Some(window_id) = self.active_window_id else {
+            return;
+        };
+        self.close_window(window_id);
+    }
+
+    fn action_reload(&mut self) {
+        let Some(window_id) = self.active_window_id else {
+            return;
+        };
+        let Some(webview_id) = self
+            .windows
+            .get(&window_id)
+            .and_then(|window_state| window_state.active_tab)
+        else {
+            return;
+        };
+        let Some(url) = self
+            .windows
+            .get(&window_id)
+            .and_then(|window_state| window_state.tabs.get(&webview_id))
+            .and_then(|tab| tab.committed_url.clone())
+        else {
+            return;
+        };
+        // Session history (and hence a dedicated reload command) is not
+        // implemented in the user agent yet; re-navigating to the committed
+        // URL performs a fresh load.
+        if let Some(provider) = self.provider.as_ref() {
+            let _ = provider.navigate(Some(webview_id), &url);
+        }
+        if let Some(window_state) = self.windows.get_mut(&window_id)
+            && let Some(tab) = window_state.tabs.get_mut(&webview_id)
+        {
+            tab.pending_url = Some(url);
+        }
+        self.refresh_address_field(window_id);
+    }
+
+    fn action_focus_address(&mut self) {
+        let Some(window_id) = self.active_window_id else {
+            return;
+        };
+        let Some(window_state) = self.windows.get(&window_id) else {
+            return;
+        };
+        // SAFETY: `selectText:` is a valid NSTextField message; a nil
+        // sender selects the field's contents and makes it first responder.
+        let _: () =
+            unsafe { msg_send![&window_state.address_field, selectText: None::<&AnyObject>] };
+    }
+
+    /// Close a tab: drop its window state, surfaces, and chrome buttons,
+    /// then activate a neighbour. Closing the last tab closes the window
+    /// (which exits the app when it was the only window). The underlying
+    /// traversable in the user agent is not destroyed — the user agent has
+    /// no webview teardown path yet, the same situation as closing a
+    /// window.
+    fn close_tab(&mut self, window_id: WindowId, webview_id: WebviewId) {
+        let (empty, window) = {
+            let Some(window_state) = self.windows.get_mut(&window_id) else {
+                return;
+            };
+            let index = window_state
+                .tab_order
+                .iter()
+                .position(|candidate| *candidate == webview_id);
+            window_state.tabs.remove(&webview_id);
+            window_state.surfaces.remove(&webview_id);
+            if let Some(index) = index {
+                window_state.tab_order.remove(index);
+            }
+            if window_state.active_tab == Some(webview_id) {
+                // Prefer the tab that slid into the closed tab's slot, then
+                // the tab before it.
+                window_state.active_tab = window_state
+                    .tab_order
+                    .get(index.unwrap_or(0))
+                    .copied()
+                    .or_else(|| window_state.tab_order.last().copied());
+            }
+            (
+                window_state.tab_order.is_empty(),
+                window_state.window.clone(),
+            )
+        };
+        if empty {
+            window.close();
+            return;
+        }
+        self.refresh_chrome(window_id);
+        self.update_provider_viewport(window_id);
     }
 
     fn action_navigate(&mut self, input: String) {
@@ -1073,7 +1834,7 @@ impl MacApp {
 
     // ── Windows ────────────────────────────────────────────────────────────
 
-    fn create_window(&mut self, title: &str) -> Result<WindowId, String> {
+    fn create_window(&mut self, title: &str, destination: &str) -> Result<WindowId, String> {
         let mtm = self.mtm;
         // SAFETY: the window is created with the standard init; it is
         // retained by the app and released when closed (see below).
@@ -1087,7 +1848,8 @@ impl MacApp {
                 NSWindowStyleMask::Titled
                     | NSWindowStyleMask::Closable
                     | NSWindowStyleMask::Miniaturizable
-                    | NSWindowStyleMask::Resizable,
+                    | NSWindowStyleMask::Resizable
+                    | NSWindowStyleMask::FullSizeContentView,
                 objc2_app_kit::NSBackingStoreType::Buffered,
                 false,
             )
@@ -1099,40 +1861,42 @@ impl MacApp {
         window.setBackgroundColor(Some(&objc2_app_kit::NSColor::windowBackgroundColor()));
         window.setDelegate(Some(ProtocolObject::from_ref(&*self.delegate)));
         window.setAcceptsMouseMovedEvents(true);
+        // The native toolbar sits in the titlebar (unified style) and the
+        // web content extends behind it, so the chrome is not a separate
+        // strip below the titlebar.
+        window.setTitlebarAppearsTransparent(true);
+        window.setTitleVisibility(NSWindowTitleVisibility::Hidden);
+        window.setToolbarStyle(NSWindowToolbarStyle::UnifiedCompact);
 
-        let content_view = NSView::new(mtm);
-        content_view.setWantsLayer(true);
-
-        let chrome_bar = NSView::new(mtm);
-        chrome_bar.setWantsLayer(true);
-        let tab_strip = NSView::new(mtm);
-        tab_strip.setWantsLayer(true);
+        // The tab strip is its own row below the toolbar; the header-view
+        // material makes it read as a continuation of the titlebar area.
+        let tab_strip = NSVisualEffectView::new(mtm);
+        tab_strip.setMaterial(NSVisualEffectMaterial::HeaderView);
+        tab_strip.setBlendingMode(NSVisualEffectBlendingMode::WithinWindow);
+        tab_strip.setState(NSVisualEffectState::Active);
         let new_tab_button = Self::make_new_tab_button(mtm, &self.delegate);
         tab_strip.addSubview(&new_tab_button);
         let address_field = Self::make_address_field(mtm, &self.delegate);
-        chrome_bar.addSubview(&tab_strip);
-        chrome_bar.addSubview(&address_field);
 
         let window_id = WindowId::new();
         let scale = window.backingScaleFactor();
         let (web_view, web_layer) = new_layer_hosted_view(mtm, scale);
-        let content_size = (
-            window
-                .contentView()
-                .map(|view| view.frame().size.width)
-                .unwrap_or(INITIAL_WINDOW_WIDTH),
-            window
-                .contentView()
-                .map(|view| view.frame().size.height)
-                .unwrap_or(INITIAL_WINDOW_HEIGHT),
-        );
 
-        let mut window_state = MacWindow {
+        // Each toolbar needs a unique identifier: customizable toolbars
+        // are synchronized by it, and AppKit raises otherwise.
+        let toolbar_identifier = NSString::from_str(&format!("formal-web-{}", window_id.0));
+        let toolbar = NSToolbar::initWithIdentifier(NSToolbar::alloc(mtm), &toolbar_identifier);
+        toolbar.setDelegate(Some(ProtocolObject::from_ref(&*self.delegate)));
+        toolbar.setDisplayMode(NSToolbarDisplayMode::IconOnly);
+        toolbar.setAllowsUserCustomization(true);
+
+        let window_state = MacWindow {
             window: window.clone(),
-            chrome_bar,
+            toolbar: toolbar.clone(),
             tab_strip,
             address_field,
             tab_buttons: Vec::new(),
+            tab_close_buttons: Vec::new(),
             new_tab_button,
             web_view,
             web_layer,
@@ -1142,15 +1906,33 @@ impl MacApp {
             surfaces: HashMap::new(),
             keyboard_modifiers: KeyboardModifiers::default(),
             buttons: MouseEventButtons::None,
-            content_size,
+            content_size: (INITIAL_WINDOW_WIDTH, INITIAL_WINDOW_HEIGHT),
             scale,
             minimized: false,
         };
-        Self::layout_window_views(&mut window_state);
+        // The window is registered before the toolbar is attached: the
+        // toolbar delegate builds the address item from the window's view,
+        // so the window must be findable in the map when AppKit queries
+        // the delegate. Registering it as the active window before the
+        // initial navigation starts also routes the user agent's
+        // NewWebview and NavigationRequested events for the new traversable
+        // to this window rather than the previously active one.
+        self.windows.insert(window_id, window_state);
+        self.active_window_id = Some(window_id);
 
-        content_view.addSubview(&window_state.chrome_bar);
-        content_view.addSubview(&window_state.web_view);
-        window.setContentView(Some(&content_view));
+        // Attach the toolbar, then measure and lay out the content area
+        // below it (the tab strip row and the web content).
+        window.setToolbar(Some(&toolbar));
+        let content_size = if let Some(window_state) = self.windows.get_mut(&window_id) {
+            let content_view = NSView::new(mtm);
+            Self::layout_window_views(window_state);
+            content_view.addSubview(&window_state.web_view);
+            content_view.addSubview(&window_state.tab_strip);
+            window.setContentView(Some(&content_view));
+            window_state.content_size
+        } else {
+            (INITIAL_WINDOW_WIDTH, INITIAL_WINDOW_HEIGHT)
+        };
 
         update_window_viewport_snapshot(Some(Self::viewport_tuple(content_size, scale)));
         if let Some(provider) = self.provider.as_mut() {
@@ -1165,25 +1947,18 @@ impl MacApp {
         // default; clear the focus the window just assigned.
         window.makeFirstResponder(None);
 
-        let destination = startup_destination_url(event_loop_options().startup_url.as_deref())
-            .unwrap_or_else(|_| String::from("about:blank"));
         if let Some(provider) = self.provider.as_ref() {
-            let _ = provider.navigate(None, &destination);
+            let _ = provider.navigate(None, destination);
         }
 
-        self.windows.insert(window_id, window_state);
         Ok(window_id)
     }
 
     fn viewport_tuple(content_size: (f64, f64), scale: f64) -> (u32, u32, f32, ColorScheme) {
         let (width, height) = content_size;
-        // The web content occupies the window below the native chrome bar;
-        // the content viewport must match the displayed area or the scene
-        // is stretched vertically when presented.
-        let web_height = (height - CHROME_BAR_HEIGHT).max(0.0);
         (
             (width * scale) as u32,
-            (web_height * scale) as u32,
+            (height * scale) as u32,
             scale as f32,
             ColorScheme::Light,
         )
@@ -1216,6 +1991,7 @@ impl MacApp {
             window_state.active_tab = None;
             window_state.surfaces.clear();
             window_state.tab_buttons.clear();
+            window_state.tab_close_buttons.clear();
         }
         self.windows.remove(&window_id);
         if self.active_window_id == Some(window_id) {
@@ -1233,12 +2009,6 @@ impl MacApp {
         let Some(window_state) = self.windows.get_mut(&window_id) else {
             return;
         };
-        let size = window_state
-            .window
-            .contentView()
-            .map(|view| view.frame().size)
-            .unwrap_or_default();
-        window_state.content_size = (size.width, size.height);
         window_state.scale = window_state.window.backingScaleFactor();
         Self::layout_window_views(window_state);
         let viewport = Self::viewport_tuple(window_state.content_size, window_state.scale);
@@ -1381,8 +2151,26 @@ impl MacApp {
                     self.update_provider_viewport(active_window);
                 }
             }
+            FormalWebUserEvent::TitleChanged { webview_id, title } => {
+                let update = {
+                    let Some(window_id) = self.window_for_webview(webview_id) else {
+                        return;
+                    };
+                    let Some(window_state) = self.windows.get_mut(&window_id) else {
+                        return;
+                    };
+                    let Some(tab) = window_state.tabs.get_mut(&webview_id) else {
+                        return;
+                    };
+                    tab.page_title = Some(title);
+                    Some(window_id)
+                };
+                if let Some(window_id) = update {
+                    self.refresh_chrome(window_id);
+                }
+            }
             FormalWebUserEvent::CreateWindow => {
-                let _ = self.create_window("formal-web");
+                let _ = self.create_window("formal-web", "about:blank");
             }
             FormalWebUserEvent::Automation(command) => {
                 let mut automation = std::mem::take(&mut self.automation);
@@ -1432,6 +2220,9 @@ impl MacApp {
                 {
                     tab.pending_url = None;
                     tab.committed_url = Some(url.clone());
+                    // The previous document's title no longer applies; the
+                    // new document reports its parsed title separately.
+                    tab.page_title = None;
                 }
                 if let Some(provider) = self.provider.as_mut() {
                     provider.on_navigation_committed(completion.webview_id);
@@ -1661,11 +2452,7 @@ impl AutomationHost for MacApp {
             .provider
             .as_mut()
             .ok_or_else(|| String::from("no provider"))?;
-        let coords = input::content_coords(
-            f64::from(x),
-            f64::from(y) + CHROME_BAR_HEIGHT,
-            CHROME_BAR_HEIGHT,
-        );
+        let coords = input::content_coords(f64::from(x), f64::from(y));
         let send_event = |provider: &mut WebviewProvider, webview_id: WebviewId, ui_event| {
             provider.send_ui_event(webview_id, ui_event).ok();
         };
@@ -1729,11 +2516,7 @@ impl AutomationHost for MacApp {
             .provider
             .as_mut()
             .ok_or_else(|| String::from("no provider"))?;
-        let coords = input::content_coords(
-            f64::from(x),
-            f64::from(y) + CHROME_BAR_HEIGHT,
-            CHROME_BAR_HEIGHT,
-        );
+        let coords = input::content_coords(f64::from(x), f64::from(y));
         let pointer = input::pointer_event(
             BlitzPointerId::Mouse,
             true,

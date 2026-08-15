@@ -194,16 +194,16 @@ pub(super) fn button_from_number(button_number: NSInteger) -> MouseEventButton {
     }
 }
 
-/// Build pointer coordinates for the web content, offset below the chrome
-/// strip (`chrome_height` points).
-pub(super) fn content_coords(x: f64, y_from_top: f64, chrome_height: f64) -> PointerCoords {
+/// Build pointer coordinates for the web content from a point measured in
+/// the web area's top-left coordinate space (points).
+pub(super) fn content_coords(x: f64, y_from_top: f64) -> PointerCoords {
     PointerCoords {
         screen_x: x as f32,
-        screen_y: (y_from_top - chrome_height) as f32,
+        screen_y: y_from_top as f32,
         client_x: x as f32,
-        client_y: (y_from_top - chrome_height) as f32,
+        client_y: y_from_top as f32,
         page_x: x as f32,
-        page_y: (y_from_top - chrome_height) as f32,
+        page_y: y_from_top as f32,
     }
 }
 

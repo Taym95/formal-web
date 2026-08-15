@@ -24,9 +24,29 @@ The headed app is provided by one of two backends selected at startup via
 - **`mac-embedder`** (AppKit): the default on macOS. Runs an `NSApplication`
   with `NSWindow`/`NSView`/`CALayer` display; the web content is presented
   zero-copy by setting the content layer's `contents` to the shared IOSurface
-  from the graphics process. The chrome is native AppKit controls: a tab strip
-  of `NSButton`s and an editable `NSTextField` address bar. A `CVDisplayLink`
-  paces animated content via `WebviewProvider::frame_needed`.
+  from the graphics process. The chrome is native AppKit controls: a main
+  menu bar (App/File/Edit/View/History/Window/Help), a real `NSToolbar` in a
+  unified (transparent-titlebar, full-size content) window, and a tab strip
+  as its own row below the toolbar. The toolbar hosts back/forward/reload
+  items and the editable address field (which shows the active tab's URL);
+  the tab strip row (a header-view material) hosts the tabs (each with a
+  close × button and a `+` new-tab button) and shows the page title, falling
+  back to the truncated URL. The window title mirrors the active tab's
+  label. A `CVDisplayLink` paces animated content via
+  `WebviewProvider::frame_needed`.
+
+  Menu key equivalents are executed from the local event monitor via
+  `NSMenu::performKeyEquivalent`, which lets the menu own ⌘T/⌘W/⌘L/⌘R and
+  friends while unbound ⌘-combinations still reach the web content (pages
+  keep their own ⌘-shortcuts). The toolbar allows user customization
+  (drag-to-rearrange the navigation items, Customize Toolbar…) but the
+  address field is immovable. The web viewport is the window's
+  `contentLayoutRect` minus the tab strip row, and mouse events in the
+  titlebar/toolbar/tab-strip region pass through to AppKit. The content
+  process reports a top-level document's parsed `<title>` after parsing
+  (content → user agent → embedder), so tab labels and the window title
+  reflect page titles on load; titles changed later via JS
+  (`document.title = …`) are not yet propagated.
 
 - **`winit-embedder`**: winit windows with a Blitz-rendered chrome. The default
   on non-macOS platforms; opt-in on macOS via the `winit_embedder` feature.
@@ -39,6 +59,17 @@ Known gaps in the AppKit backend relative to winit:
   Basic ASCII text input into page fields works through `KeyDown` text.
 - **Touch events are not handled** (desktop macOS has no touch input; winit's
   touch path is for trackpads/tablets).
+- **JS-driven titles are not propagated.** The content process reports a
+  top-level document's parsed `<title>` after parsing, but titles changed
+  later via JS (`document.title = …` or DOM manipulation of the title
+  element) are not sent, so a page that sets its title after load keeps the
+  parsed title.
+- **Session history is not implemented.** The History menu's Back/Forward items
+  are disabled; Reload re-navigates to the tab's committed URL because the
+  user agent has no reload command.
+- **Closing a tab does not tear down its traversable.** The user agent has no
+  webview-teardown path, so a closed tab's webview keeps living there (the
+  same situation as closing a window).
 
 ### Multi-window and multi-tab
 
@@ -107,7 +138,9 @@ references after HTML rebuilds.
 - [x] Tab labels show page URL (truncated) or "New Tab" for blank pages
 - [x] Viewport tracking and propagation to provider
 - [x] Automation (WebDriver/CDP) targets the active tab in the active window
-- [x] `about:blank` navigation fails (pre-existing content-process issue)
+- [x] Navigating an existing tab to `about:blank` logs a content-process
+  "unknown document id" error (pre-existing); new top-level traversables to
+  `about:blank` (new tabs, new windows, startup) work
 - [ ] Address-bar Enter opens new tab instead of navigating (under investigation)
 - [ ] Tab close button
 - [ ] Tab reordering
@@ -124,13 +157,16 @@ references after HTML rebuilds.
 - **URL bar spellcheck/suggestions**: Autocomplete or search-engine integration
   in the address bar.
 - **Window title update**: Sync the winit window title with the active tab's
-  page title (requires plumbing page title through the user agent).
+  page title. The content→UA title plumbing exists (parse-time titles); the
+  winit window title is not yet set from it.
 - **CDP multi-target support**: Expose each tab/window as a separate CDP target
   (`Target.getTargets`, `Target.attachToTarget`) so automation tools can
   interact with specific pages.
-- **About:blank fix**: The content process currently fails to handle
-  `about:blank` navigation ("builder error"). Fixing this would allow the CDP
-  server to start with a blank page instead of requiring a real URL.
+- **About:blank fix**: Navigating an *existing* tab to `about:blank` (e.g.
+  the address bar) logs a content-process "unknown document id" error during
+  navigation finalization, although the URL still ends up as `about:blank`.
+  New top-level traversables to `about:blank` (new tabs, new windows, CDP
+  startup) work; only the existing-tab path is affected.
 - **Browser history integration**: Remove the per-tab `committed_url` /
   `pending_url` tracking in favour of the user agent's session history once
   that's implemented.
