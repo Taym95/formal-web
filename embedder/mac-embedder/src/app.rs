@@ -5,7 +5,7 @@
 //! The app runs an `NSApplication` with the web content in a layer-hosting
 //! view whose layer `contents` is set to the shared IOSurface from the
 //! graphics process (the zero-copy blit). The chrome is native AppKit
-//! controls: a tab strip of `NSButton`s and an editable `NSTextField`
+//! controls: a tab strip of rounded tab cells and an editable `NSTextField`
 //! address bar. A `CVDisplayLink` paces animated content: each tick
 //! requests the next frame via `WebviewProvider::frame_needed` at the
 //! display refresh rate, and the link runs only while the composed scene is
@@ -38,22 +38,25 @@ use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, ProtocolObject, Sel};
 use objc2::{DefinedClass, MainThreadOnly, msg_send, sel};
 use objc2_app_kit::{
-    NSApplication, NSApplicationActivationPolicy, NSButton, NSButtonType, NSFont, NSImage, NSMenu,
-    NSMenuItem, NSTextField, NSTextFieldBezelStyle, NSToolbar, NSToolbarDelegate,
-    NSToolbarDisplayMode, NSToolbarFlexibleSpaceItemIdentifier, NSToolbarItem,
-    NSToolbarItemIdentifier, NSView, NSVisualEffectBlendingMode, NSVisualEffectMaterial,
-    NSVisualEffectState, NSVisualEffectView, NSWindow, NSWindowDelegate, NSWindowStyleMask,
-    NSWindowTitleVisibility, NSWindowToolbarStyle,
+    NSApplication, NSApplicationActivationPolicy, NSButton, NSButtonType, NSCellImagePosition,
+    NSColor, NSControlTextEditingDelegate, NSFont, NSImage, NSImageSymbolConfiguration,
+    NSImageSymbolScale, NSLineBreakMode, NSMenu, NSMenuItem, NSTextField, NSTextFieldBezelStyle,
+    NSTextFieldDelegate, NSToolbar, NSToolbarDelegate, NSToolbarDisplayMode,
+    NSToolbarFlexibleSpaceItemIdentifier, NSToolbarItem, NSToolbarItemGroup,
+    NSToolbarItemGroupControlRepresentation, NSToolbarItemIdentifier, NSView,
+    NSVisualEffectBlendingMode, NSVisualEffectMaterial, NSVisualEffectState, NSVisualEffectView,
+    NSWindow, NSWindowDelegate, NSWindowStyleMask, NSWindowTitleVisibility, NSWindowToolbarStyle,
 };
-use objc2_app_kit::{NSBezelStyle, NSEvent, NSEventMask, NSEventModifierFlags, NSEventType};
+use objc2_app_kit::{NSEvent, NSEventMask, NSEventModifierFlags, NSEventType, NSFontWeightMedium};
 use objc2_core_foundation::CFRetained;
 use objc2_core_video::{CVDisplayLink, CVOptionFlags, CVReturn, CVTimeStamp, kCVReturnSuccess};
 use objc2_foundation::NSInteger;
 use objc2_foundation::{
-    MainThreadMarker, NSArray, NSNotification, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSet,
-    NSSize, NSString, ns_string,
+    MainThreadMarker, NSArray, NSNotification, NSObject, NSObjectProtocol, NSPoint, NSRange,
+    NSRect, NSSet, NSSize, NSString, ns_string,
 };
 use objc2_io_surface::IOSurfaceRef;
+use objc2_quartz_core::{CAAutoresizingMask, CALayer};
 use serde_json::Value;
 use std::cell::UnsafeCell;
 use std::collections::HashMap;
@@ -76,11 +79,16 @@ const TAB_STRIP_HEIGHT: f64 = 36.0;
 const TOOLBAR_ITEM_MIN_WIDTH: f64 = 240.0;
 /// The widest the address-field toolbar item may grow.
 const ADDRESS_FIELD_MAX_WIDTH: f64 = 600.0;
-const TAB_BUTTON_WIDTH: f64 = 140.0;
+const TAB_BUTTON_WIDTH: f64 = 160.0;
+/// The narrowest a tab cell may shrink before overflowing the strip.
+const MIN_TAB_CELL_WIDTH: f64 = 90.0;
+/// The gap between adjacent tab cells.
+const TAB_CELL_GAP: f64 = 2.0;
 const TAB_BUTTON_HEIGHT: f64 = 26.0;
+/// The corner radius of the tab pill (the cell's background).
+const TAB_CORNER_RADIUS: f64 = 8.0;
 /// The close (×) button inside each tab cell.
 const TAB_CLOSE_BUTTON_WIDTH: f64 = 22.0;
-const NEW_TAB_BUTTON_WIDTH: f64 = 28.0;
 /// Points inside this margin of the content view's bottom/side edges belong
 /// to the window frame's resize handles; the initial mouse-down there must
 /// reach AppKit's resize tracking loop.
@@ -136,10 +144,16 @@ define_class!(
             app.window_did_become_key(notification);
         }
 
-        #[unsafe(method(windowDidMiniaturize:))]
-        fn window_did_miniaturize(&self, _notification: &NSNotification) {
+        #[unsafe(method(windowDidResignKey:))]
+        fn window_did_resign_key(&self, notification: &NSNotification) {
             let app = unsafe { &mut *(*self.ivars().app.get()) };
-            app.stop_display_link();
+            app.window_did_resign_key(notification);
+        }
+
+        #[unsafe(method(windowDidMiniaturize:))]
+        fn window_did_miniaturize(&self, notification: &NSNotification) {
+            let app = unsafe { &mut *(*self.ivars().app.get()) };
+            app.window_did_miniaturize(notification);
         }
 
         #[unsafe(method(windowDidDeminiaturize:))]
@@ -191,6 +205,27 @@ define_class!(
             app.make_toolbar_item(toolbar, item_identifier, flag)
         }
     }
+
+    // SAFETY: `NSControlTextEditingDelegate` has no safety requirements;
+    // the methods only touch main-thread-confined app state.
+    unsafe impl NSControlTextEditingDelegate for Delegate {
+        #[unsafe(method(controlTextDidBeginEditing:))]
+        fn control_text_did_begin_editing(&self, _notification: &NSNotification) {
+            let app = unsafe { &mut *(*self.ivars().app.get()) };
+            app.address_field_begin_editing();
+        }
+
+        #[unsafe(method(controlTextDidEndEditing:))]
+        fn control_text_did_end_editing(&self, _notification: &NSNotification) {
+            let app = unsafe { &mut *(*self.ivars().app.get()) };
+            app.address_field_end_editing();
+        }
+    }
+
+    // SAFETY: `NSTextFieldDelegate` adds no required methods beyond its
+    // superprotocol; the field's delegate must conform to it for
+    // `setDelegate:`.
+    unsafe impl NSTextFieldDelegate for Delegate {}
 
     impl Delegate {
         #[unsafe(method(quit:))]
@@ -276,21 +311,43 @@ impl Delegate {
         unsafe { msg_send![super(this), init] }
     }
 
-    /// The ordered toolbar item identifiers: navigation buttons, a
-    /// flexible space, then the tab strip and the address field.
+    /// The ordered toolbar item identifiers: the joined back/forward
+    /// control, the reload button, and the address field centered between
+    /// two flexible spaces.
     fn toolbar_default_identifiers() -> Retained<NSArray<NSToolbarItemIdentifier>> {
-        let back = NSString::from_str("back");
-        let forward = NSString::from_str("forward");
+        let back_forward = NSString::from_str("backForward");
         let reload = NSString::from_str("reload");
         let address = NSString::from_str("address");
+        let new_tab = NSString::from_str("newTab");
         // The flexible-space item must be the system constant object, not
         // a string with the same content: AppKit matches space items by
         // identity.
         let flexible_space = unsafe { NSToolbarFlexibleSpaceItemIdentifier };
-        // The tab strip is not a toolbar item; it lives below the toolbar
-        // as its own row.
-        NSArray::from_slice(&[&back, &forward, &reload, flexible_space, &address])
+        // A flexible space on each side of the address field keeps it
+        // horizontally centered (Safari-style). The new-tab button sits at
+        // the trailing edge, in the toolbar rather than the tab strip. The
+        // tab strip is not a toolbar item; it lives below the toolbar as
+        // its own row.
+        NSArray::from_slice(&[
+            &back_forward,
+            &reload,
+            flexible_space,
+            &address,
+            flexible_space,
+            &new_tab,
+        ])
     }
+}
+
+// ── Tab cell ───────────────────────────────────────────────────────────────
+
+/// The tab pill's fill: the resting state (inactive), the active tab's
+/// fill, or the hover fill.
+#[derive(Clone, Copy)]
+enum TabPill {
+    None,
+    Active,
+    Hover,
 }
 
 // ── Main-thread handle ─────────────────────────────────────────────────────
@@ -421,9 +478,17 @@ struct MacWindow {
     toolbar: Retained<NSToolbar>,
     tab_strip: Retained<NSVisualEffectView>,
     address_field: Retained<NSTextField>,
+    /// One cell per tab: the container holding the label and close
+    /// buttons and the pill background (drawn on its layer).
+    tab_cells: Vec<Retained<NSView>>,
     tab_buttons: Vec<Retained<NSButton>>,
     tab_close_buttons: Vec<Retained<NSButton>>,
-    new_tab_button: Retained<NSButton>,
+    /// The tab under the pointer, for re-applying the hover state when
+    /// the strip is rebuilt.
+    hovered_tab: Option<usize>,
+    /// True while the address field is editing; the whole URL is selected
+    /// only on the first focus of each editing session (Safari behavior).
+    address_field_focused: bool,
     web_view: Retained<NSView>,
     /// The layer-hosting layer that presents the shared IOSurface; kept
     /// alive by the app.
@@ -1020,6 +1085,24 @@ impl MacApp {
                 let Some(window_id) = self.window_id_for_ns_event(event_ref) else {
                     return event.as_ptr();
                 };
+                // Keep the tab hover state synced to the cursor on every
+                // pointer event, so it cannot go stale.
+                self.update_tab_hover_from_event(window_id, event_ref);
+                // A mouse-down on the address field focuses it: draw the
+                // focus border immediately and select the URL once the
+                // click has been delivered (see `address_field_clicked`).
+                // This does not depend on the field-editor notifications,
+                // whose timing varies.
+                if matches!(
+                    event_type,
+                    NSEventType::LeftMouseDown
+                        | NSEventType::RightMouseDown
+                        | NSEventType::OtherMouseDown
+                ) && self.click_is_on_address_field(window_id, event_ref)
+                {
+                    self.address_field_clicked(window_id);
+                    return event.as_ptr();
+                }
                 // While AppKit's live-resize tracking loop is running
                 // (the user is dragging a resize handle), every mouse
                 // event belongs to that loop: consuming any of them
@@ -1182,8 +1265,11 @@ impl MacApp {
 
         if is_down {
             // Clicking the content hands text-input focus away from the
-            // native address field, so the next keystrokes go to the page.
+            // native address field, so the next keystrokes go to the page,
+            // and clears its focus border.
             window_state.window.makeFirstResponder(None);
+            window_state.address_field_focused = false;
+            Self::set_address_field_focus_style(&window_state.address_field, false);
         }
         let coords = input::content_coords(x, y_from_top);
 
@@ -1232,12 +1318,25 @@ impl MacApp {
         let button = NSButton::new(mtm);
         button.setTitle(&NSString::from_str(label));
         button.setButtonType(NSButtonType::MomentaryPushIn);
-        button.setBezelStyle(NSBezelStyle::Toolbar);
+        // Borderless: the tab cell's pill (see `make_tab_cell`) draws the
+        // selected state; the button itself is just the label.
+        button.setBordered(false);
         button.setFont(Some(&NSFont::systemFontOfSize(12.0)));
         button.setTag(index as NSInteger);
-        if active {
-            button.setState(1);
-        }
+        // Long titles truncate at the trailing edge when tabs get narrow.
+        button.setLineBreakMode(NSLineBreakMode::ByTruncatingTail);
+        // The tint carries the tab state: the active tab reads in the
+        // primary label color, inactive tabs in the secondary (Safari
+        // greys the inactive ones out).
+        let tint = if active {
+            NSColor::labelColor()
+        } else {
+            NSColor::secondaryLabelColor()
+        };
+        button.setContentTintColor(Some(&tint));
+        // No focus ring: the tab cell's pill indicates selection, and the
+        // ring would read as a text-field affordance.
+        button.setFocusRingType(objc2_app_kit::NSFocusRingType::None);
         // SAFETY: the delegate is a valid target and the selector matches
         // its `switchTab:` action.
         let _: () = unsafe { msg_send![&button, setTarget: delegate] };
@@ -1245,17 +1344,28 @@ impl MacApp {
         button
     }
 
-    fn make_new_tab_button(mtm: MainThreadMarker, delegate: &Delegate) -> Retained<NSButton> {
-        let button = NSButton::new(mtm);
-        button.setTitle(ns_string!("+"));
-        button.setButtonType(NSButtonType::MomentaryPushIn);
-        button.setBezelStyle(NSBezelStyle::Toolbar);
-        button.setFont(Some(&NSFont::boldSystemFontOfSize(14.0)));
-        // SAFETY: the delegate is a valid target and the selector matches
-        // its `newTab:` action.
-        let _: () = unsafe { msg_send![&button, setTarget: delegate] };
-        unsafe { button.setAction(Some(sel!(newTab:))) };
-        button
+    fn make_tab_cell(
+        mtm: MainThreadMarker,
+        active: bool,
+        label_button: &NSButton,
+        close_button: &NSButton,
+    ) -> Retained<NSView> {
+        let cell = NSView::new(mtm);
+        cell.setWantsLayer(true);
+        cell.addSubview(label_button);
+        cell.addSubview(close_button);
+        if let Some(layer) = cell.layer() {
+            layer.setCornerRadius(TAB_CORNER_RADIUS);
+            Self::set_tab_cell_pill(
+                &cell,
+                if active {
+                    TabPill::Active
+                } else {
+                    TabPill::None
+                },
+            );
+        }
+        cell
     }
 
     fn make_tab_close_button(
@@ -1264,10 +1374,19 @@ impl MacApp {
         index: usize,
     ) -> Retained<NSButton> {
         let button = NSButton::new(mtm);
-        button.setTitle(ns_string!("✕"));
-        button.setButtonType(NSButtonType::MomentaryPushIn);
-        button.setBezelStyle(NSBezelStyle::Toolbar);
-        button.setFont(Some(&NSFont::systemFontOfSize(10.0)));
+        // A template SF Symbol ✕ renders with the current label color and
+        // adapts to light/dark; the literal "✕" glyph it replaces did
+        // not.
+        let image = NSImage::imageWithSystemSymbolName_accessibilityDescription(
+            &NSString::from_str("xmark"),
+            None,
+        );
+        button.setImage(image.as_deref());
+        button.setImagePosition(NSCellImagePosition::ImageOnly);
+        button.setButtonType(NSButtonType::MomentaryChange);
+        // Borderless: the cell's pill is the tab's background; the close
+        // button is just the glyph.
+        button.setBordered(false);
         button.setTag(index as NSInteger);
         // SAFETY: the delegate is a valid target and the selector matches
         // its `closeTabAt:` action.
@@ -1285,9 +1404,30 @@ impl MacApp {
         field.setBezelStyle(NSTextFieldBezelStyle::RoundedBezel);
         field.setFont(Some(&NSFont::systemFontOfSize(13.0)));
         field.setPlaceholderString(Some(&NSString::from_str("Search or enter address")));
-        // No focus ring: the field's rounded bezel already indicates focus,
-        // and the animated blue ring is distracting in a browser chrome.
+        // The system focus ring's shape does not match the tight accent
+        // border Safari draws around the field; a dedicated sublayer draws
+        // that border instead, toggled on focus (see
+        // `set_address_field_focus_style`). The border lives on a sublayer
+        // rather than the field's own layer because AppKit manages the
+        // latter for controls and may reset it when the field redraws.
         field.setFocusRingType(objc2_app_kit::NSFocusRingType::None);
+        field.setWantsLayer(true);
+        if let Some(layer) = field.layer() {
+            let border_layer = CALayer::layer();
+            border_layer.setName(Some(&NSString::from_str("address-focus-border")));
+            border_layer.setFrame(layer.bounds());
+            border_layer.setAutoresizingMask(
+                CAAutoresizingMask::LayerWidthSizable | CAAutoresizingMask::LayerHeightSizable,
+            );
+            border_layer.setCornerRadius(6.0);
+            border_layer.setBorderWidth(0.0);
+            layer.addSublayer(&border_layer);
+        }
+        // The delegate drives the focus border and URL selection via
+        // `controlTextDidBeginEditing:`/`controlTextDidEndEditing:`.
+        // SAFETY: the delegate implements `NSTextFieldDelegate` and
+        // outlives the field (it is retained by the app).
+        unsafe { field.setDelegate(Some(ProtocolObject::from_ref(delegate))) };
         // SAFETY: the delegate is a valid target and the selector matches
         // its `navigate:` action; the action fires on Return.
         let _: () = unsafe { msg_send![&field, setTarget: delegate] };
@@ -1322,23 +1462,15 @@ impl MacApp {
     ) -> Option<Retained<NSToolbarItem>> {
         let identifier = identifier.to_string();
         match identifier.as_str() {
-            "back" => Some(Self::make_nav_toolbar_item(
+            "backForward" => Some(Self::make_back_forward_group(self.mtm)),
+            "newTab" => Some(Self::make_nav_toolbar_item(
                 self.mtm,
                 &identifier,
-                "Back",
-                "chevron.left",
-                Some(sel!(goBack:)),
-                None,
-                false,
-            )),
-            "forward" => Some(Self::make_nav_toolbar_item(
-                self.mtm,
-                &identifier,
-                "Forward",
-                "chevron.right",
-                Some(sel!(goForward:)),
-                None,
-                false,
+                "New Tab",
+                "plus",
+                Some(sel!(newTab:)),
+                Some(&*self.delegate),
+                true,
             )),
             "reload" => Some(Self::make_nav_toolbar_item(
                 self.mtm,
@@ -1401,7 +1533,18 @@ impl MacApp {
                 None,
             );
             if let Some(image) = image {
-                item.setImage(Some(&image));
+                // Toolbar icons read better at a slightly heavier weight
+                // than the SF Symbol default; keep the system point size
+                // and scale.
+                let configuration =
+                    NSImageSymbolConfiguration::configurationWithPointSize_weight_scale(
+                        0.0,
+                        unsafe { NSFontWeightMedium },
+                        NSImageSymbolScale::Medium,
+                    );
+                if let Some(configured) = image.imageWithSymbolConfiguration(&configuration) {
+                    item.setImage(Some(&configured));
+                }
             }
         }
         if let Some(action) = action {
@@ -1418,8 +1561,42 @@ impl MacApp {
         item
     }
 
-    /// A toolbar item hosting a custom view (the tab strip or the address
-    /// field), flexible within the given min/max sizes.
+    /// The Back/Forward pair as a single joined control (an
+    /// `NSToolbarItemGroup` in expanded representation), the Safari-style
+    /// look, instead of two loose toolbar items.
+    fn make_back_forward_group(mtm: MainThreadMarker) -> Retained<NSToolbarItem> {
+        let group = NSToolbarItemGroup::initWithItemIdentifier(
+            NSToolbarItemGroup::alloc(mtm),
+            &NSString::from_str("backForward"),
+        );
+        let back = Self::make_nav_toolbar_item(
+            mtm,
+            "back",
+            "Back",
+            "chevron.left",
+            Some(sel!(goBack:)),
+            None,
+            false,
+        );
+        let forward = Self::make_nav_toolbar_item(
+            mtm,
+            "forward",
+            "Forward",
+            "chevron.right",
+            Some(sel!(goForward:)),
+            None,
+            false,
+        );
+        group.setSubitems(&NSArray::<NSToolbarItem>::from_slice(&[&back, &forward]));
+        group.setControlRepresentation(NSToolbarItemGroupControlRepresentation::Expanded);
+        // Session history is not implemented yet, so the pair stays
+        // disabled (matching the History menu's Back/Forward items).
+        group.setEnabled(false);
+        group.into_super()
+    }
+
+    /// A toolbar item hosting a custom view (the address field), flexible
+    /// within the given min/max sizes.
     fn make_custom_view_toolbar_item(
         mtm: MainThreadMarker,
         identifier: &str,
@@ -1454,6 +1631,9 @@ impl MacApp {
         let Some(window_state) = self.windows.get_mut(&window_id) else {
             return;
         };
+        for cell in window_state.tab_cells.drain(..) {
+            cell.removeFromSuperview();
+        }
         for button in window_state.tab_buttons.drain(..) {
             button.removeFromSuperview();
         }
@@ -1463,14 +1643,23 @@ impl MacApp {
         for (index, webview_id) in window_state.tab_order.iter().enumerate() {
             let label = Self::tab_label(window_state, webview_id);
             let active = window_state.active_tab == Some(*webview_id);
-            let button = Self::make_tab_button(mtm, &delegate, &label, index, active);
-            window_state.tab_buttons.push(button.clone());
-            window_state.tab_strip.addSubview(&button);
+            let label_button = Self::make_tab_button(mtm, &delegate, &label, index, active);
+            window_state.tab_buttons.push(label_button.clone());
             let close_button = Self::make_tab_close_button(mtm, &delegate, index);
             window_state.tab_close_buttons.push(close_button.clone());
-            window_state.tab_strip.addSubview(&close_button);
+            let cell = Self::make_tab_cell(mtm, active, &label_button, &close_button);
+            window_state.tab_cells.push(cell.clone());
+            window_state.tab_strip.addSubview(&cell);
         }
         Self::layout_tab_strip(window_state);
+        // Re-apply the hover state after a rebuild (e.g. a page title
+        // arriving while the pointer is over a tab); the next pointer
+        // event re-syncs it from the cursor position.
+        if let Some(hovered) = window_state.hovered_tab
+            && let Some(cell) = window_state.tab_cells.get(hovered)
+        {
+            Self::set_tab_cell_pill(cell, TabPill::Hover);
+        }
     }
 
     fn refresh_address_field(&mut self, window_id: WindowId) {
@@ -1488,6 +1677,131 @@ impl MacApp {
                 .address_field
                 .setStringValue(&NSString::from_str(&address));
         }
+    }
+
+    /// The address field gained focus: draw the focus border and, on the
+    /// first focus of each editing session, select the whole URL.
+    fn address_field_begin_editing(&mut self) {
+        let Some(window_id) = self.active_window_id else {
+            return;
+        };
+        let Some(window_state) = self.windows.get_mut(&window_id) else {
+            return;
+        };
+        // Select-all only on the first focus of an editing session; a
+        // subsequent click while already editing places the cursor
+        // instead (Safari behavior).
+        if !window_state.address_field_focused {
+            window_state.address_field_focused = true;
+            Self::select_all_address_field(&window_state.address_field);
+        }
+        Self::set_address_field_focus_style(&window_state.address_field, true);
+    }
+
+    /// The address field lost focus: clear the focus border.
+    fn address_field_end_editing(&mut self) {
+        let Some(window_id) = self.active_window_id else {
+            return;
+        };
+        let Some(window_state) = self.windows.get_mut(&window_id) else {
+            return;
+        };
+        window_state.address_field_focused = false;
+        Self::set_address_field_focus_style(&window_state.address_field, false);
+    }
+
+    /// The Safari-style focus indication: a tight accent-colored border
+    /// on the field's layer, drawn instead of the system focus ring.
+    fn set_address_field_focus_style(field: &NSTextField, focused: bool) {
+        let Some(layer) = field.layer() else {
+            return;
+        };
+        let Some(border_layer) = Self::address_field_border_layer(&layer) else {
+            return;
+        };
+        // Keep the border covering the field; the autoresizing mask usually
+        // handles resizes, but re-syncing here is cheap insurance.
+        border_layer.setFrame(layer.bounds());
+        if focused {
+            border_layer.setBorderWidth(2.0);
+            border_layer.setBorderColor(Some(&NSColor::controlAccentColor().CGColor()));
+        } else {
+            border_layer.setBorderWidth(0.0);
+        }
+    }
+
+    /// Whether `event`'s location lies within the address field's frame
+    /// (in window coordinates).
+    fn click_is_on_address_field(&self, window_id: WindowId, event: &NSEvent) -> bool {
+        let Some(window_state) = self.windows.get(&window_id) else {
+            return false;
+        };
+        let location = event.locationInWindow();
+        let field_frame = window_state.address_field.convertRect_toView(
+            NSRect::new(
+                NSPoint::new(0.0, 0.0),
+                window_state.address_field.bounds().size,
+            ),
+            None,
+        );
+        location.x >= field_frame.origin.x
+            && location.x <= field_frame.origin.x + field_frame.size.width
+            && location.y >= field_frame.origin.y
+            && location.y <= field_frame.origin.y + field_frame.size.height
+    }
+
+    /// A mouse-down landed on the address field: draw the focus border
+    /// and, on the first click of an editing session, select the whole
+    /// URL once the click has been delivered (so the click does not
+    /// collapse the selection).
+    fn address_field_clicked(&mut self, window_id: WindowId) {
+        let Some(window_state) = self.windows.get_mut(&window_id) else {
+            return;
+        };
+        Self::set_address_field_focus_style(&window_state.address_field, true);
+        if !window_state.address_field_focused {
+            window_state.address_field_focused = true;
+            let handle = self.handle.expect("app handle must be installed");
+            dispatch::Queue::main().exec_async(move || {
+                let app = unsafe { &mut *handle.app_ptr() };
+                app.deferred_address_field_select(window_id);
+            });
+        }
+    }
+
+    /// The deferred half of `address_field_clicked`: select the field's
+    /// contents if it is still the one being edited.
+    fn deferred_address_field_select(&mut self, window_id: WindowId) {
+        let Some(window_state) = self.windows.get(&window_id) else {
+            return;
+        };
+        if !Self::address_field_is_editing(window_state) {
+            return;
+        }
+        Self::select_all_address_field(&window_state.address_field);
+    }
+
+    /// Select the field's whole contents via its field editor, without
+    /// restarting the editing session (`selectText:` would re-enter the
+    /// first-responder machinery, ending and restarting the session).
+    fn select_all_address_field(field: &NSTextField) {
+        let Some(editor) = field.currentEditor() else {
+            return;
+        };
+        let length = field.stringValue().len_utf16();
+        editor.setSelectedRange(NSRange::new(0, length));
+    }
+
+    /// The field's focus-border sublayer (created in `make_address_field`),
+    /// found by name.
+    fn address_field_border_layer(layer: &CALayer) -> Option<Retained<CALayer>> {
+        // SAFETY: the sublayer array belongs to the field's layer.
+        let sublayers = unsafe { layer.sublayers() }?;
+        sublayers.iter().find(|sublayer| {
+            sublayer
+                .name()
+                .is_some_and(|name| name.to_string() == "address-focus-border")
+        })
     }
 
     fn refresh_chrome(&mut self, window_id: WindowId) {
@@ -1585,37 +1899,139 @@ impl MacApp {
 
     fn layout_tab_strip(window_state: &mut MacWindow) {
         let strip_width = window_state.tab_strip.frame().size.width;
-        // Each tab cell holds the label button plus the close (×) button
-        // beside it, vertically centered in the toolbar row.
-        let label_width = (TAB_BUTTON_WIDTH - TAB_CLOSE_BUTTON_WIDTH - 2.0).max(0.0);
+        let count = window_state.tab_cells.len();
+        // Tabs start at the leading edge at the max width and shrink as
+        // more open (Safari-style) instead of overflowing at a fixed
+        // width.
+        let edge = 8.0;
+        let gaps = TAB_CELL_GAP * (count.saturating_sub(1) as f64);
+        let available = (strip_width - 2.0 * edge - gaps).max(0.0);
+        let cell_width =
+            (available / (count.max(1) as f64)).clamp(MIN_TAB_CELL_WIDTH, TAB_BUTTON_WIDTH);
         let button_y = ((TAB_STRIP_HEIGHT - TAB_BUTTON_HEIGHT) / 2.0).max(0.0);
-        for (index, button) in window_state.tab_buttons.iter().enumerate() {
-            let x = 8.0 + (index as f64) * (TAB_BUTTON_WIDTH + 6.0);
-            button.setFrame(NSRect::new(
+        for (index, cell) in window_state.tab_cells.iter().enumerate() {
+            let x = edge + (index as f64) * (cell_width + TAB_CELL_GAP);
+            cell.setFrame(NSRect::new(
                 NSPoint::new(x, button_y),
-                NSSize::new(label_width, TAB_BUTTON_HEIGHT),
+                NSSize::new(cell_width, TAB_BUTTON_HEIGHT),
             ));
+            // Inside the cell: the label fills the space before the close
+            // button, which sits at the trailing edge.
+            let close_x = (cell_width - TAB_CLOSE_BUTTON_WIDTH).max(0.0);
+            if let Some(label_button) = window_state.tab_buttons.get(index) {
+                label_button.setFrame(NSRect::new(
+                    NSPoint::new(0.0, 0.0),
+                    NSSize::new(close_x, TAB_BUTTON_HEIGHT),
+                ));
+            }
             if let Some(close_button) = window_state.tab_close_buttons.get(index) {
                 close_button.setFrame(NSRect::new(
-                    NSPoint::new(x + label_width + 2.0, button_y),
+                    NSPoint::new(close_x, 0.0),
                     NSSize::new(TAB_CLOSE_BUTTON_WIDTH, TAB_BUTTON_HEIGHT),
                 ));
             }
         }
-        let new_tab_x =
-            8.0 + (window_state.tab_buttons.len() as f64) * (TAB_BUTTON_WIDTH + 6.0) + 2.0;
-        let new_tab_x = if new_tab_x + NEW_TAB_BUTTON_WIDTH > strip_width {
-            (strip_width - NEW_TAB_BUTTON_WIDTH - 8.0).max(8.0)
-        } else {
-            new_tab_x
-        };
-        window_state.new_tab_button.setFrame(NSRect::new(
-            NSPoint::new(new_tab_x, button_y),
-            NSSize::new(NEW_TAB_BUTTON_WIDTH, TAB_BUTTON_HEIGHT),
-        ));
     }
 
     // ── Chrome actions ─────────────────────────────────────────────────────
+
+    fn tab_cell_is_active(window_state: &MacWindow, index: usize) -> bool {
+        window_state
+            .tab_order
+            .get(index)
+            .is_some_and(|webview_id| window_state.active_tab == Some(*webview_id))
+    }
+
+    /// Update the tab hover state from the pointer's current location.
+    /// Driven by the event monitor on every pointer event, so the hover
+    /// always matches the cursor (tracking-area exit events were missed
+    /// when the strip was rebuilt under the cursor).
+    fn update_tab_hover_from_event(&mut self, window_id: WindowId, event: &NSEvent) {
+        let location = event.locationInWindow();
+        let Some(window_state) = self.windows.get_mut(&window_id) else {
+            return;
+        };
+        let hovered = window_state
+            .tab_cells
+            .iter()
+            .enumerate()
+            .find_map(|(index, cell)| {
+                let frame = cell.convertRect_toView(
+                    NSRect::new(NSPoint::new(0.0, 0.0), cell.bounds().size),
+                    None,
+                );
+                (location.x >= frame.origin.x
+                    && location.x <= frame.origin.x + frame.size.width
+                    && location.y >= frame.origin.y
+                    && location.y <= frame.origin.y + frame.size.height)
+                    .then_some(index)
+            });
+        if window_state.hovered_tab == hovered {
+            return;
+        }
+        let previous = window_state.hovered_tab;
+        window_state.hovered_tab = hovered;
+        // Restore the previously hovered cell's resting pill.
+        if let Some(previous) = previous
+            && let Some(cell) = window_state.tab_cells.get(previous)
+        {
+            Self::set_tab_cell_pill(
+                cell,
+                if Self::tab_cell_is_active(window_state, previous) {
+                    TabPill::Active
+                } else {
+                    TabPill::None
+                },
+            );
+        }
+        // Apply the hover pill to the cell under the cursor.
+        if let Some(hovered) = hovered
+            && let Some(cell) = window_state.tab_cells.get(hovered)
+        {
+            Self::set_tab_cell_pill(cell, TabPill::Hover);
+        }
+    }
+
+    /// Clear the tab hover state: restore the hovered cell's resting pill
+    /// and forget the hovered index. Called when the window stops being
+    /// interactive (resigns key, miniaturizes).
+    fn clear_tab_hover(&mut self, window_id: WindowId) {
+        let Some(window_state) = self.windows.get_mut(&window_id) else {
+            return;
+        };
+        let Some(hovered) = window_state.hovered_tab.take() else {
+            return;
+        };
+        if let Some(cell) = window_state.tab_cells.get(hovered) {
+            Self::set_tab_cell_pill(
+                cell,
+                if Self::tab_cell_is_active(window_state, hovered) {
+                    TabPill::Active
+                } else {
+                    TabPill::None
+                },
+            );
+        }
+    }
+
+    /// Set the tab pill's background fill on a cell's layer.
+    fn set_tab_cell_pill(cell: &NSView, state: TabPill) {
+        let Some(layer) = cell.layer() else {
+            return;
+        };
+        let background = match state {
+            TabPill::None => None,
+            // The active tab reads as a light grey pill, lighter than the
+            // hover fill, so the hover effect stays visible on it.
+            TabPill::Active => Some(NSColor::secondaryLabelColor().colorWithAlphaComponent(0.10)),
+            TabPill::Hover => Some(NSColor::secondaryLabelColor().colorWithAlphaComponent(0.16)),
+        };
+        let Some(background) = background else {
+            layer.setBackgroundColor(None);
+            return;
+        };
+        layer.setBackgroundColor(Some(&background.CGColor()));
+    }
 
     fn action_switch_tab(&mut self, index: usize) {
         let Some(window_id) = self.active_window_id else {
@@ -1725,13 +2141,23 @@ impl MacApp {
         let Some(window_id) = self.active_window_id else {
             return;
         };
-        let Some(window_state) = self.windows.get(&window_id) else {
+        let Some(window_state) = self.windows.get_mut(&window_id) else {
             return;
         };
-        // SAFETY: `selectText:` is a valid NSTextField message; a nil
-        // sender selects the field's contents and makes it first responder.
-        let _: () =
-            unsafe { msg_send![&window_state.address_field, selectText: None::<&AnyObject>] };
+        if !Self::address_field_is_editing(window_state) {
+            // Focusing the field begins an editing session; the delegate's
+            // begin-editing handler selects the URL and draws the focus
+            // border.
+            window_state
+                .window
+                .makeFirstResponder(Some(&window_state.address_field));
+        } else {
+            // Already editing: select the URL directly without restarting
+            // the editing session.
+            Self::select_all_address_field(&window_state.address_field);
+        }
+        window_state.address_field_focused = true;
+        Self::set_address_field_focus_style(&window_state.address_field, true);
     }
 
     /// Close a tab: drop its window state, surfaces, and chrome buttons,
@@ -1874,8 +2300,6 @@ impl MacApp {
         tab_strip.setMaterial(NSVisualEffectMaterial::HeaderView);
         tab_strip.setBlendingMode(NSVisualEffectBlendingMode::WithinWindow);
         tab_strip.setState(NSVisualEffectState::Active);
-        let new_tab_button = Self::make_new_tab_button(mtm, &self.delegate);
-        tab_strip.addSubview(&new_tab_button);
         let address_field = Self::make_address_field(mtm, &self.delegate);
 
         let window_id = WindowId::new();
@@ -1895,14 +2319,16 @@ impl MacApp {
             toolbar: toolbar.clone(),
             tab_strip,
             address_field,
+            tab_cells: Vec::new(),
             tab_buttons: Vec::new(),
             tab_close_buttons: Vec::new(),
-            new_tab_button,
             web_view,
             web_layer,
             tabs: HashMap::new(),
             tab_order: Vec::new(),
             active_tab: None,
+            hovered_tab: None,
+            address_field_focused: false,
             surfaces: HashMap::new(),
             keyboard_modifiers: KeyboardModifiers::default(),
             buttons: MouseEventButtons::None,
@@ -1990,8 +2416,10 @@ impl MacApp {
             window_state.tab_order.clear();
             window_state.active_tab = None;
             window_state.surfaces.clear();
+            window_state.tab_cells.clear();
             window_state.tab_buttons.clear();
             window_state.tab_close_buttons.clear();
+            window_state.hovered_tab = None;
         }
         self.windows.remove(&window_id);
         if self.active_window_id == Some(window_id) {
@@ -2048,6 +2476,19 @@ impl MacApp {
         if let Some(window_id) = self.window_id_for_notification(notification) {
             self.active_window_id = Some(window_id);
         }
+    }
+
+    fn window_did_resign_key(&mut self, notification: &NSNotification) {
+        if let Some(window_id) = self.window_id_for_notification(notification) {
+            self.clear_tab_hover(window_id);
+        }
+    }
+
+    fn window_did_miniaturize(&mut self, notification: &NSNotification) {
+        if let Some(window_id) = self.window_id_for_notification(notification) {
+            self.clear_tab_hover(window_id);
+        }
+        self.stop_display_link();
     }
 
     fn window_id_for_notification(&self, notification: &NSNotification) -> Option<WindowId> {

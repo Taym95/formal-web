@@ -27,13 +27,19 @@ The headed app is provided by one of two backends selected at startup via
   from the graphics process. The chrome is native AppKit controls: a main
   menu bar (App/File/Edit/View/History/Window/Help), a real `NSToolbar` in a
   unified (transparent-titlebar, full-size content) window, and a tab strip
-  as its own row below the toolbar. The toolbar hosts back/forward/reload
-  items and the editable address field (which shows the active tab's URL);
-  the tab strip row (a header-view material) hosts the tabs (each with a
-  close × button and a `+` new-tab button) and shows the page title, falling
-  back to the truncated URL. The window title mirrors the active tab's
-  label. A `CVDisplayLink` paces animated content via
-  `WebviewProvider::frame_needed`.
+  as its own row below the toolbar. The toolbar hosts a joined
+  back/forward control, a reload item, the editable address field (which
+  shows the active tab's URL) centered between two flexible spaces, and a
+  new-tab button at the trailing edge; focusing the address field draws a
+  tight accent-colored border on the field (instead of the system focus
+  ring) and selects the whole URL on first focus. The tab strip row (a
+  header-view material) hosts pill-styled tabs (rounded, the active tab
+  filled in light grey, the close × always visible, and a hover fill
+  darker than the active pill so the hover stays visible on the active
+  tab) that show the page title, falling back to the truncated URL, and
+  shrink as more tabs open. The window title mirrors the active tab's
+  label. A `CVDisplayLink` paces
+  animated content via `WebviewProvider::frame_needed`.
 
   Menu key equivalents are executed from the local event monitor via
   `NSMenu::performKeyEquivalent`, which lets the menu own ⌘T/⌘W/⌘L/⌘R and
