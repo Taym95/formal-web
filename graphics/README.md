@@ -67,13 +67,13 @@ CPU → GPU upload, and Vello's internal atlas copy.
 
 ```
 [ PRODUCER: graphics process ]          [ CONSUMER: embedder ]
-  IOSurfaceRef::create(...)             receive the surface's Mach port
-  Metal texture from the IOSurface      IOSurfaceRef::lookup_from_mach_port(port)
-  (objc2-metal newTextureWithDescriptor_iosurface_plane)
+  IOSurfaceRef::create(...)             receive the surface's ID + Mach port
+  Metal texture from the IOSurface      IOSurfaceLookup(id) / fallback to
+  (objc2-metal newTextureWithDescriptor_iosurface_plane)  lookup_from_mach_port
   import into wgpu via wgpu-hal         import into wgpu via wgpu-hal
   (texture_from_raw + create_texture_from_hal)
   Vello render_to_texture INTO it       try_register_custom_resource (unchanged)
-  create_mach_port + send the port      blit via PaintRef::Resource (unchanged)
+  send the global ID + Mach port        blit via PaintRef::Resource (unchanged)
   ... alternate to the other buffer ... ... send FrameNeeded (next cycle) ...
 ```
 
@@ -84,8 +84,8 @@ blits it. No readback, no IPC pixel bytes, no upload, no ack.
 ### Verified platform APIs (macOS, as used by this workspace)
 
 - `objc2-io-surface` 0.3.2 (already a dependency of both processes) provides
-  `IOSurfaceRef::create(&CFDictionary)`, `.create_mach_port()`, and
-  `.lookup_from_mach_port(port)`.
+  `IOSurfaceRef::create(&CFDictionary)`, `.create_mach_port()`, `.id()`,
+  `.lookup(id)`, and `.lookup_from_mach_port(port)`.
 - `objc2-metal` 0.3.2 (already a dependency) provides
   `MTLDevice::newTextureWithDescriptor_iosurface_plane(...)`.
 - wgpu 29 exposes `Device::create_texture_from_hal::<Metal>` and
@@ -112,16 +112,30 @@ blits it. No readback, no IPC pixel bytes, no upload, no ack.
 - **Lifecycle**: resize recreates the IOSurface + re-shares + re-registers; the
   texture handle's lifetime must outlive in-flight blits.
 
-### Transporting the IOSurface Mach port
+### Transporting the IOSurface ID and Mach port
 
-The producer creates a Mach port for the IOSurface (`IOSurfaceRef::create_mach_port`)
-and sends it in the `PixelFrameReady` message. The forked `ipc-channel` (a git
-dependency on <https://github.com/gterzian/ipc-channel>) provides a
-serializable `OsMachPort` type: the port is pushed into a serialization
-thread-local (mirroring `OS_IPC_CHANNELS_FOR_SERIALIZATION`) and popped on
-deserialize, traveling as a single `MACH_MSG_OOL_PORTS_DESCRIPTOR`
-(out-of-line ports, `MOVE_SEND`) appended after the shared-memory descriptors;
-the receive path collects them into a third descriptor phase. The fork adds
+The producer creates each shared surface with `kIOSurfaceIsGlobal` (deprecated
+by Apple, but the only mechanism for cross-process IOSurfaceID visibility on
+macOS 13+; the surfaces carry page pixels, not secrets) and ships both the
+surface's global ID and a Mach port in the `PixelFrameReady` message. The
+embedder looks the surface up by ID first (`IOSurfaceLookup`) and falls back
+to the Mach port.
+
+The two handles exist because of how CoreAnimation composites layer contents:
+a surface object imported only from its Mach port (`IOSurfaceLookupFromMachPort`)
+renders empty in a `CALayer`, while a by-ID lookup of the same surface
+composites correctly — and, without `kIOSurfaceIsGlobal`, the by-ID lookup
+fails for a surface created in another process (macOS 13+ keeps IOSurfaces
+process-local by default). The port remains as a fallback for producers that
+do not mark the surface global.
+
+The forked `ipc-channel` (a git dependency on
+<https://github.com/gterzian/ipc-channel>) provides a serializable `OsMachPort`
+type: the port is pushed into a serialization thread-local (mirroring
+`OS_IPC_CHANNELS_FOR_SERIALIZATION`) and popped on deserialize, traveling as a
+single `MACH_MSG_OOL_PORTS_DESCRIPTOR` (out-of-line ports, `MOVE_SEND`)
+appended after the shared-memory descriptors; the receive path collects them
+into a third descriptor phase. The fork adds
 `OsIpcSender::send_with_mach_ports`; non-macOS platforms are untouched.
 
 ## Generic surface backend abstraction
@@ -159,7 +173,7 @@ once the submission completes.
 
 The video texture import (macOS AVFoundation `PixelBufferFrame` → Metal
 texture → Vello `override_image`) lives in its own module, `renderer/video.rs`,
-behind the renderer trait's macOS-only `import_video_frame`.
+behind the renderer trait's macOS-only `store_video_frame`.
 
 ### Consumer side (embedder)
 
@@ -199,9 +213,35 @@ composites into the composed scene — including the shared IOSurface on the
 zero-copy surface backend — without a CPU round-trip. GStreamer keeps the CPU
 byte path (`MediaBackendEvent::Frame`).
 
+**The import is deferred from frame arrival to compose time.** The media
+callback (`store_video_frame`) only stores the latest raw frame — the pixel
+buffer, its size, and a generation counter — without touching the GPU. When
+`submit_scene` runs, `VideoTextures::record_imports` blits exactly the frames
+whose generation is newer than the last imported one in their own submission,
+right before Vello's render submits (two back-to-back submissions; GPU
+execution order guarantees the blit completes before the render reads it).
+Re-blitted images are marked dirty so Vello recopies them into its atlas;
+unchanged frames reuse their RGBA texture. This makes the import a compose-time
+step on the render cycle's own thread instead of an extra `queue.submit` from
+the media event path — every `queue.submit` on the main thread blocks on the
+gpu poll thread's fence lock until its current `device.poll(Wait)` finishes, so
+the media handler no longer stalls the loop, and frames that are never
+composited are never blitted.
+
 Caveats: the `CVPixelBuffer` must stay alive while the texture referencing it
-is in use (kept until the next frame replaces it); a BGRA→RGBA blit is needed
-because Vello's `register_texture` requires `Rgba8Unorm`.
+is in use (the stored raw frame keeps it until the next frame replaces it); a
+BGRA→RGBA blit is needed because Vello's `register_texture` requires
+`Rgba8Unorm`. A blit that fails to wrap its source (first import of a paint)
+records a texture clear instead so the frame shows black — like a browser
+shows for a video that fails to decode — and is retried on the next compose;
+a failed re-blit of a previously imported paint leaves the last good frame in
+place.
+
+(Alternative tried and parked: merging the blit and Vello's render into a
+single command encoder + one submit, which needs a record-only vello API that
+0.9 does not expose. The modified vello source with `render_to_texture_into` /
+`run_recording_into` is parked at `../../Projects/vello` for now; the build
+uses stock vello 0.9.0 with the two-submit layout.)
 
 ## Open risks and questions
 

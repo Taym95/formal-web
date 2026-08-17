@@ -180,7 +180,22 @@ shared dependency resolution and incremental compilation.
 ### Components
 
 - **Root binary** (`formal-web`): runs the embedder directly in-process, creating the window and event loop.
-- **Embedder crate** (`embedder`): a library used by the root binary that owns the winit event loop, window, chrome, and automation plumbing. A standalone `formal-web-embedder` binary is also produced for direct use.
+- **Embedder** (`embedder/`, three independent crates sharing only the `webview`
+  crate API): the root `embedder` crate is a thin dispatcher — CLI entry
+  points plus the windowed-backend selection (AppKit on macOS by default,
+  winit elsewhere). `mac-embedder` is the self-contained AppKit app (no
+  winit/Blitz/GPU dependencies). `winit-embedder` holds the winit windowed
+  app (Blitz chrome, gated behind its `windowed` feature) **and** the
+  headless app used by WPT/WebDriver/CDP. A standalone
+  `formal-web-embedder` binary is also produced for direct use.
+
+  **Testing requires building winit.** WPT, WebDriver, CDP, and the TLA+
+  verification scripts all run the winit **headless** app, so those builds
+  compile the `winit-embedder` crate even on macOS. The AppKit app itself
+  never pulls winit: on macOS the winit embedder builds headless-only
+  (no `windowed` feature, hence no wgpu/Blitz) unless `winit_embedder` is
+  enabled. The headless build has no graphics dependencies at all —
+  automation screenshots in headless mode are a plain white PNG.
 - **Helper processes** (`formal-web-content`, `formal-web-net`, `formal-web-media`, `formal-web-graphics`): spawned by the embedder.
   - `formal-web-graphics` owns per-webview compositors and video/audio playback (media backend).
     It receives `PaintFrame` and `VideoFrame` payloads and sends back composed scenes with
@@ -197,6 +212,7 @@ shared dependency resolution and incremental compilation.
 | `jsc` | JavaScriptCore backend (macOS only, experimental) | no |
 | `wasm` | Wasmtime-based WebAssembly implementation (opt-in, Boa only) | no |
 | `media` | Video/audio playback support | yes |
+| `winit_embedder` | Build the winit **windowed** embedder on macOS (the AppKit backend is the default headed one there and the only one built without this feature); no-op elsewhere, where winit is the only option. On macOS the winit embedder always builds **headless-only** (no graphics deps) for WPT/automation; this feature adds its windowed app | no |
 
 V8 is the default backend for running WPT tests.  Wasm is a separate feature
 (and Boa-only) to avoid pulling in wasmtime when not needed.  JSC is
@@ -253,6 +269,17 @@ RUST_LOG=error target/release/formal-web wpt <test-path>
 rustup run 1.94.0 cargo build --release --no-default-features --features v8
 rustup run 1.94.0 cargo run --release --no-default-features --features v8
 ```
+
+### Winit embedder (opt-in, macOS only)
+
+```bash
+rustup run 1.94.0 cargo build --release --features winit_embedder
+rustup run 1.94.0 cargo run --release --features winit_embedder
+```
+
+On macOS the AppKit backend is the default and the winit backend is not
+compiled unless `winit_embedder` is enabled. On other platforms the winit
+backend is the only option and needs no feature.
 
 ### Individual packages
 
@@ -641,8 +668,10 @@ At the end of each task, run the following steps **in order**:
    - **Spec verification** — Validates all TLA+ spec traces (Navigation, RenderingOpportunity, etc.) via the headless verification script (no GUI needed, fully automated):
 
      ```bash
-     ./verification/verify-specs.sh
+     JAVA_HOME=/Library/Java/JavaVirtualMachines/temurin-21.jdk/Contents/Home ./verification/verify-specs.sh
      ```
+
+     TLC runs on Java; set `JAVA_HOME` to a JDK home when the macOS `/usr/bin/java` stub cannot locate a JVM (see `verification/README.md`, "TLA+/TLC gotchas").
 
      The script starts the embedder headless with TLA+ tracing, runs a minimal WebDriver session, collects trace events, and validates them against TLA+ models.
 

@@ -1,62 +1,16 @@
-use crate::event_loop::FormalWebUserEvent;
 use ::winit::event::{ElementState, Ime, KeyEvent as WinitKeyEvent};
-use ::winit::event_loop::EventLoopProxy;
 use ::winit::keyboard::{
     Key as WinitKey, KeyCode as WinitKeyCode, KeyLocation as WinitKeyLocation,
     ModifiersState as WinitModifiersState, NamedKey, PhysicalKey,
 };
 use ::winit::window::Window;
 use blitz_traits::events::{BlitzImeEvent, BlitzKeyEvent, KeyState, PointerDetails};
-use blitz_traits::shell::{ColorScheme, Viewport};
+use blitz_traits::shell::{ColorScheme, ShellProvider, Viewport};
+use cursor_icon::CursorIcon;
 use keyboard_types::{Code, Key, Location, Modifiers as KeyboardModifiers};
-use std::sync::{LazyLock, Mutex};
-
-#[derive(Clone, Default)]
-pub struct EventLoopOptions {
-    pub startup_url: Option<String>,
-    pub window_title: Option<String>,
-}
-
-static EVENT_LOOP_OPTIONS: LazyLock<Mutex<EventLoopOptions>> =
-    LazyLock::new(|| Mutex::new(EventLoopOptions::default()));
-
-pub fn set_event_loop_options(options: EventLoopOptions) {
-    let mut guard = EVENT_LOOP_OPTIONS
-        .lock()
-        .expect("event loop options mutex poisoned");
-    *guard = options;
-}
-
-pub fn clear_event_loop_options() {
-    let mut options = EVENT_LOOP_OPTIONS
-        .lock()
-        .expect("event loop options mutex poisoned");
-    *options = EventLoopOptions::default();
-}
-
-pub fn event_loop_options() -> EventLoopOptions {
-    EVENT_LOOP_OPTIONS
-        .lock()
-        .expect("event loop options mutex poisoned")
-        .clone()
-}
-
-#[derive(Clone)]
-pub struct UserEventDispatcher {
-    pub(crate) proxy: EventLoopProxy<FormalWebUserEvent>,
-}
-
-impl UserEventDispatcher {
-    pub fn new(proxy: EventLoopProxy<FormalWebUserEvent>) -> Self {
-        Self { proxy }
-    }
-
-    pub fn send(&self, event: FormalWebUserEvent) -> Result<(), String> {
-        self.proxy
-            .send_event(event)
-            .map_err(|error| format!("failed to send user event: {error}"))
-    }
-}
+use std::sync::Arc;
+use winit::dpi::{LogicalPosition, LogicalSize};
+use winit::window::{Cursor, Window as WinitWindow};
 
 fn theme_to_color_scheme(theme: ::winit::window::Theme) -> ColorScheme {
     match theme {
@@ -238,5 +192,54 @@ pub fn winit_key_event_to_blitz(event: &WinitKeyEvent, mods: WinitModifiersState
             ElementState::Released => KeyState::Released,
         },
         text: event.text.as_ref().map(|text| text.as_str().into()),
+    }
+}
+
+// ── Shell provider for the chrome document ────────────────────────────────
+
+pub struct WinitShellProvider {
+    window: Arc<WinitWindow>,
+}
+
+impl WinitShellProvider {
+    pub fn new(window: Arc<WinitWindow>) -> Self {
+        Self { window }
+    }
+}
+
+fn clipboard_read() -> Result<String, String> {
+    arboard::Clipboard::new()
+        .and_then(|mut c| c.get_text())
+        .map_err(|e| format!("clipboard read error: {e}"))
+}
+
+fn clipboard_write(text: String) -> Result<(), String> {
+    arboard::Clipboard::new()
+        .and_then(|mut c| c.set_text(text))
+        .map_err(|e| format!("clipboard write error: {e}"))
+}
+
+impl ShellProvider for WinitShellProvider {
+    fn request_redraw(&self) {
+        self.window.request_redraw();
+    }
+    fn set_cursor(&self, icon: CursorIcon) {
+        self.window.set_cursor(Cursor::Icon(icon));
+    }
+    fn set_window_title(&self, title: String) {
+        self.window.set_title(&title);
+    }
+    fn set_ime_enabled(&self, enabled: bool) {
+        self.window.set_ime_allowed(enabled);
+    }
+    fn set_ime_cursor_area(&self, x: f32, y: f32, w: f32, h: f32) {
+        self.window
+            .set_ime_cursor_area(LogicalPosition::new(x, y), LogicalSize::new(w, h));
+    }
+    fn get_clipboard_text(&self) -> Result<String, blitz_traits::shell::ClipboardError> {
+        clipboard_read().map_err(|_| blitz_traits::shell::ClipboardError)
+    }
+    fn set_clipboard_text(&self, text: String) -> Result<(), blitz_traits::shell::ClipboardError> {
+        clipboard_write(text).map_err(|_| blitz_traits::shell::ClipboardError)
     }
 }

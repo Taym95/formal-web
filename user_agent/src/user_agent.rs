@@ -127,6 +127,10 @@ pub trait Embedder: Send + Sync {
     fn window_viewport_snapshot(&self) -> Option<(u32, u32, f32, ColorScheme)>;
     fn clipboard_get_text(&self, timeout: Duration) -> Result<String, String>;
     fn clipboard_set_text(&self, text: String, timeout: Duration) -> Result<(), String>;
+    /// The parsed title of a top-level document, reported by the content
+    /// process after parsing; the embedder labels the tab and window with it.
+    /// <https://html.spec.whatwg.org/#the-title-element>
+    fn title_changed(&self, webview_id: WebviewId, title: String) -> Result<(), String>;
     /// Forward a composed web content scene from the graphics process to the
     /// embedder for rendering.
     fn new_web_content_scene(
@@ -139,6 +143,9 @@ pub trait Embedder: Send + Sync {
     /// Forward a rendered surface frame from the graphics process. `frame`
     /// identifies how the pixels are delivered (CPU shared memory vs. a
     /// shared IOSurface on macOS) and carries the delivery payload.
+    /// `animating` reports whether the composed scene contains animated
+    /// content (video, CSS animations) that needs the next frame at display
+    /// cadence.
     fn new_web_content_surface(
         &self,
         webview_id: WebviewId,
@@ -146,6 +153,7 @@ pub trait Embedder: Send + Sync {
         width: u32,
         height: u32,
         generation: u64,
+        animating: bool,
     ) -> Result<(), String>;
 }
 
@@ -916,7 +924,7 @@ pub enum UserAgentCommand {
     },
     DispatchEventFor {
         traversable_id: NavigableId,
-        event: String,
+        event: Vec<u8>,
     },
     RenderingOpportunityFor {
         navigable_id: NavigableId,
@@ -938,7 +946,7 @@ pub enum UserAgentCommand {
 
     SendUiEvent {
         webview_id: WebviewId,
-        event_message: String,
+        event_message: Vec<u8>,
     },
     IframeTraversableRemoved {
         parent_traversable_id: NavigableId,
@@ -1066,7 +1074,7 @@ impl UserAgent {
     pub fn dispatch_event_for(
         &self,
         traversable_id: NavigableId,
-        event: String,
+        event: Vec<u8>,
     ) -> Result<(), String> {
         self.command_sender
             .send(UserAgentCommand::DispatchEventFor {
@@ -1080,7 +1088,7 @@ impl UserAgent {
     pub fn send_ui_event(
         &self,
         webview_id: WebviewId,
-        event_message: String,
+        event_message: Vec<u8>,
     ) -> Result<(), String> {
         self.command_sender
             .send(UserAgentCommand::SendUiEvent {
@@ -3419,7 +3427,7 @@ impl UserAgentWorker {
 
     /// queuing DOM event dispatch on the traversable's owning
     /// <https://html.spec.whatwg.org/multipage/#event-loop>.
-    fn handle_send_ui_event(&mut self, webview_id: WebviewId, event_message: String) {
+    fn handle_send_ui_event(&mut self, webview_id: WebviewId, event_message: Vec<u8>) {
         if input_debug_enabled() {
             trace!(
                 "[input-debug][user-agent] send_ui_event webview={:?} bytes={}",
@@ -3570,7 +3578,7 @@ impl UserAgentWorker {
         (root_webview_id, event, composed_frame_ids)
     }
 
-    fn handle_dispatch_event_for(&mut self, traversable_id: NavigableId, event: String) {
+    fn handle_dispatch_event_for(&mut self, traversable_id: NavigableId, event: Vec<u8>) {
         let Some(handle) = self.state.traversable_handles.get(&traversable_id).copied() else {
             return;
         };
@@ -4195,12 +4203,15 @@ impl UserAgentWorker {
                         ipc_messages::graphics::SurfaceFrame::CpuShmem(region)
                     }
                     #[cfg(target_os = "macos")]
-                    ipc_messages::graphics::SurfacePayload::SharedTexture { texture_id, port } => {
-                        ipc_messages::graphics::SurfaceFrame::SharedTexture {
-                            texture_id: *texture_id,
-                            port: port.clone(),
-                        }
-                    }
+                    ipc_messages::graphics::SurfacePayload::SharedTexture {
+                        texture_id,
+                        surface_id,
+                        port,
+                    } => ipc_messages::graphics::SurfaceFrame::SharedTexture {
+                        texture_id: *texture_id,
+                        surface_id: *surface_id,
+                        port: port.clone(),
+                    },
                 };
                 debug!(
                     "[graphics] received surface frame for {:?} ({}x{}, {}B)",
@@ -4276,6 +4287,7 @@ impl UserAgentWorker {
                     *width,
                     *height,
                     *generation,
+                    *animating,
                 ) {
                     error!("[graphics] forward surface: {e}");
                 }

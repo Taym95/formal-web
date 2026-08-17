@@ -1,4 +1,4 @@
-#[path = "../../embedder/src/ui_event.rs"]
+#[path = "../../webview/src/ui_event.rs"]
 #[allow(dead_code)]
 pub(crate) mod ui_event;
 
@@ -30,6 +30,7 @@ use crate::html::{
     },
     windowproxy::WindowProxyBacking,
 };
+use crate::infra::strip_and_collapse_ascii_whitespace;
 use crate::js::Engine;
 use crate::js::downcast::try_with_event_target_mut;
 use crate::js::platform_objects::with_global_scope;
@@ -58,7 +59,7 @@ use ipc_messages::content::{
     FetchRequest as ContentFetchRequest, FetchResponse as ContentFetchResponse,
     FontTransportSender, FrameCompositionMetadata, FrameId, IframeEmbedSite,
     LoadedDocumentResponse, NavigableId, NavigationId, PaintFrame, ScriptEvaluationResult,
-    TraversableViewport, ViewportSnapshot, WebviewId, WindowTimerKey,
+    TitleChanged, TraversableViewport, ViewportSnapshot, WebviewId, WindowTimerKey,
 };
 use ipc_messages::media::{VideoEmbedData, VideoPaintId};
 use ipc_messages::safe_passing_of_structured_data::PostMessageRequest;
@@ -1166,7 +1167,48 @@ impl ContentProcess {
             }
         }
 
+        self.report_document_title(traversable_id, top_level_traversable_id, document_id);
         self.continue_document_load(document_id)
+    }
+
+    /// Report the parsed title of a top-level document to the user agent so
+    /// the embedder can label the corresponding tab and window.
+    /// <https://html.spec.whatwg.org/#the-title-element>
+    fn report_document_title(
+        &self,
+        traversable_id: NavigableId,
+        top_level_traversable_id: NavigableId,
+        document_id: DocumentId,
+    ) {
+        // The title element: "User agents should use the document's title
+        // when referring to the document in their user interface."
+        // Only the top-level document's title labels the tab; iframe
+        // documents carry their own titles.
+        if traversable_id != top_level_traversable_id {
+            return;
+        }
+        let Some(content_document) = self.documents.get(&document_id) else {
+            return;
+        };
+        let title = content_document
+            .document
+            .borrow()
+            .find_title_node()
+            .map(|node| node.text_content())
+            .unwrap_or_default();
+        let title = strip_and_collapse_ascii_whitespace(&title);
+        if title.is_empty() {
+            return;
+        }
+        if let Err(error) = self
+            .event_sender
+            .send(ContentEvent::TitleChanged(TitleChanged {
+                traversable_id: top_level_traversable_id,
+                title,
+            }))
+        {
+            error!("failed to report document title: {error}");
+        }
     }
 
     fn evaluate_script(

@@ -232,10 +232,20 @@ pub struct ClipboardWriteRequested {
     pub text: String,
 }
 
+/// The parsed title of a top-level document. The content process sends
+/// this after parsing a document whose navigable is the top-level
+/// traversable; the embedder uses it to label the tab and window.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TitleChanged {
+    /// The top-level traversable whose document title changed.
+    pub traversable_id: NavigableId,
+    pub title: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DispatchEventEntry {
     pub document_id: DocumentId,
-    pub event: String,
+    pub event: Vec<u8>,
     /// Prefetched clipboard text attached by the embedder when it detects
     /// a paste shortcut before forwarding the event to content.
     /// Content stores this in a local cache so `ShellProvider::get_clipboard_text`
@@ -931,6 +941,10 @@ pub enum Event {
     /// window's event loop.
     /// <https://html.spec.whatwg.org/#window-post-message-steps>
     PostMessageRequested(PostMessageRequest),
+    /// The parsed title of a top-level document, reported after parsing so
+    /// the embedder can label the corresponding tab and window.
+    /// <https://html.spec.whatwg.org/#the-title-element>
+    TitleChanged(TitleChanged),
     ShutdownCompleted,
 }
 

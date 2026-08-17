@@ -2,6 +2,7 @@
 
 The `webview` crate owns per-webview compositor state: committed paint frames, embed-site composition, hit testing, and redraw signaling through `EmbedderApi`.
 
+- Re-exports the input event types (`UiEvent`, `BlitzKeyEvent`, `BlitzPointerEvent`, …) that embedder backends convert platform input into; embedder crates consume these through the webview crate instead of importing blitz event types directly.
 - `WebviewProvider` tracks webviews by stable `WebviewId`, stores committed root and child frames, and composes child embed sites into the visible scene.
 - Hit testing and event routing operate on the same composed-frame geometry used for painting, including child-frame transforms and visibility.
 - Root webviews track the focused composed frame so non-positional input routes to the correct content traversable.

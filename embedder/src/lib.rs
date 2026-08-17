@@ -1,12 +1,11 @@
-mod event_loop;
+//! CLI entry points for the `formal-web` and `formal-web-embedder`
+//! binaries, and the windowed-backend selection: AppKit on macOS by
+//! default, the winit windowed backend elsewhere or whenever the
+//! `winit_embedder` feature is enabled. The embedders themselves share
+//! nothing but the `webview` crate API.
 
+use automation::{CdpArgs, WebDriverArgs};
 use verification::{TraceSender, VerificationRun};
-
-pub use event_loop::{
-    EventLoopOptions, FormalWebUserEvent, NavigationCompleted, NavigationCompletion,
-    clear_event_loop_options, event_loop_is_ready, run_headed_event_loop, run_headless_event_loop,
-    send_user_event, set_event_loop_options, window_viewport_snapshot,
-};
 
 #[derive(Clone, Default)]
 pub struct AppRunOptions {
@@ -40,98 +39,66 @@ pub fn run_default(verify: bool, headless: bool) -> Result<(), String> {
 }
 
 pub fn run_app_with_options(options: AppRunOptions) -> Result<(), String> {
-    set_event_loop_options(EventLoopOptions {
-        startup_url: options.startup_url,
-        window_title: options.window_title,
-    });
-
-    let event_loop_result = if options.headless {
-        run_headless_event_loop(options.trace_sender.clone())
+    let trace_sender = options.trace_sender;
+    if options.headless {
+        winit_embedder::run_headless_app(trace_sender, options.startup_url, options.window_title)
     } else {
-        run_headed_event_loop(options.trace_sender.clone())
-    };
-    clear_event_loop_options();
-
-    event_loop_result
+        run_headed_app(trace_sender, options.startup_url, options.window_title)
+    }
 }
 
-pub fn run_webdriver(
-    args: automation::WebDriverArgs,
-    verify: bool,
-    headless: bool,
+#[cfg(all(target_os = "macos", not(feature = "winit_embedder")))]
+fn run_headed_app(
+    trace_sender: Option<TraceSender>,
+    startup_url: Option<String>,
+    window_title: Option<String>,
 ) -> Result<(), String> {
-    let verification_run = if verify {
-        Some(
-            VerificationRun::start()
-                .map_err(|error| format!("failed to start verification: {error}"))?,
-        )
-    } else {
-        None
-    };
-    let trace_sender = verification_run.as_ref().map(VerificationRun::sender_clone);
-
-    let runtime = automation::automation_bridge(
-        |command| send_user_event(FormalWebUserEvent::Automation(command)),
-        || send_user_event(FormalWebUserEvent::Exit),
-        event_loop_is_ready,
-    );
-    let webdriver_server = automation::WebDriverServer::start(
-        args.port,
-        args.exit_on_session_delete,
-        runtime.clone(),
-    )?;
-    let cdp_server = args
-        .cdp_port
-        .map(|port| automation::CdpServerHandle::start(port, runtime))
-        .transpose()?;
-    let result = run_app_with_options(AppRunOptions {
-        headless: args.headless || headless,
-        startup_url: args
-            .startup_url
-            .or_else(|| Some(String::from("about:blank"))),
-        window_title: Some(format!("formal-web WebDriver :{}", args.port)),
-        trace_sender,
-    });
-    drop(cdp_server);
-    drop(webdriver_server);
-
-    let verification_result = verification_run
-        .map(VerificationRun::finish)
-        .unwrap_or(Ok(()));
-    combine_results(result, verification_result)
+    mac_embedder::run_windowed_app(trace_sender, startup_url, window_title)
 }
 
-pub fn run_cdp(args: automation::CdpArgs, verify: bool, headless: bool) -> Result<(), String> {
-    let verification_run = if verify {
-        Some(
-            VerificationRun::start()
-                .map_err(|error| format!("failed to start verification: {error}"))?,
-        )
+#[cfg(any(not(target_os = "macos"), feature = "winit_embedder"))]
+fn run_headed_app(
+    trace_sender: Option<TraceSender>,
+    startup_url: Option<String>,
+    window_title: Option<String>,
+) -> Result<(), String> {
+    winit_embedder::run_windowed_app(trace_sender, startup_url, window_title)
+}
+
+pub fn run_webdriver(args: WebDriverArgs, verify: bool, headless: bool) -> Result<(), String> {
+    if args.headless || headless {
+        winit_embedder::run_webdriver(args, verify, true)
     } else {
-        None
-    };
-    let trace_sender = verification_run.as_ref().map(VerificationRun::sender_clone);
+        run_headed_webdriver(args, verify)
+    }
+}
 
-    let runtime = automation::automation_bridge(
-        |command| send_user_event(FormalWebUserEvent::Automation(command)),
-        || send_user_event(FormalWebUserEvent::Exit),
-        event_loop_is_ready,
-    );
-    let server = automation::CdpServerHandle::start(args.port, runtime)?;
-    let result = run_app_with_options(AppRunOptions {
-        headless: args.headless || headless,
-        startup_url: args
-            .startup_url
-            .or_else(|| Some(String::from("about:blank"))),
-        window_title: Some(format!("formal-web CDP :{}", args.port)),
-        trace_sender,
-    });
-    drop(server);
+#[cfg(all(target_os = "macos", not(feature = "winit_embedder")))]
+fn run_headed_webdriver(args: WebDriverArgs, verify: bool) -> Result<(), String> {
+    mac_embedder::run_webdriver(args, verify)
+}
 
-    let verification_result = verification_run
-        .map(VerificationRun::finish)
-        .unwrap_or(Ok(()));
-    combine_results(result, verification_result)
+#[cfg(any(not(target_os = "macos"), feature = "winit_embedder"))]
+fn run_headed_webdriver(args: WebDriverArgs, verify: bool) -> Result<(), String> {
+    winit_embedder::run_webdriver(args, verify, false)
+}
+
+pub fn run_cdp(args: CdpArgs, verify: bool, headless: bool) -> Result<(), String> {
+    if args.headless || headless {
+        winit_embedder::run_cdp(args, verify, true)
+    } else {
+        run_headed_cdp(args, verify)
+    }
+}
+
+#[cfg(all(target_os = "macos", not(feature = "winit_embedder")))]
+fn run_headed_cdp(args: CdpArgs, verify: bool) -> Result<(), String> {
+    mac_embedder::run_cdp(args, verify)
+}
+
+#[cfg(any(not(target_os = "macos"), feature = "winit_embedder"))]
+fn run_headed_cdp(args: CdpArgs, verify: bool) -> Result<(), String> {
+    winit_embedder::run_cdp(args, verify, false)
 }
 
 fn combine_results(

@@ -173,7 +173,13 @@ impl GpuContext {
         Some(hal_device.raw_device().clone())
     }
 
-    /// Paint `scene` into `target` with Vello's compute renderer.
+    /// Paint `scene` into `target` with Vello's compute renderer, after
+    /// importing (blitting) the pending video frames in their own
+    /// submission: two submits back to back, the blit then Vello's render
+    /// (GPU execution order guarantees the blit completes before the
+    /// render reads it). Blits run only for paints whose stored raw frame
+    /// is newer than the last imported one; unchanged frames reuse their
+    /// RGBA texture.
     pub(crate) fn render_into(
         &mut self,
         scene: &anyrender::Scene,
@@ -181,6 +187,9 @@ impl GpuContext {
         width: u32,
         height: u32,
     ) -> Result<(), String> {
+        #[cfg(target_os = "macos")]
+        self.import_video_frames();
+
         self.vello_scene.reset();
         {
             let mut painter = anyrender_vello::VelloScenePainter::new(&mut self.vello_scene);
@@ -204,38 +213,51 @@ impl GpuContext {
             .map_err(|e| format!("Vello render failed: {e:?}"))
     }
 
-    /// Mark every registered video texture dirty so Vello recopies their
-    /// (updated) contents into its atlas on the next render.
-    pub(crate) fn mark_video_textures_dirty(&mut self) {
-        #[cfg(target_os = "macos")]
-        self.video.mark_dirty(&mut self.vello_renderer);
+    /// Blit the pending video frames (macOS) in their own submission, right
+    /// before Vello's render submits. Every `queue.submit` on the main
+    /// thread blocks on the gpu poll thread's fence lock until its current
+    /// `device.poll(Wait)` finishes; two back-to-back submits per composed
+    /// frame are accepted — the win is that the media event path no longer
+    /// submits at all, and frames that are never composited are never
+    /// blitted.
+    #[cfg(target_os = "macos")]
+    fn import_video_frames(&mut self) {
+        let Some(raw_device) = self.raw_metal_device() else {
+            return;
+        };
+        let mut encoder =
+            self.device_handle
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("video-import"),
+                });
+        if self.video.record_imports(
+            &mut encoder,
+            &self.device_handle.device,
+            &mut self.vello_renderer,
+            Some(&raw_device),
+        ) {
+            self.device_handle.queue.submit([encoder.finish()]);
+        }
     }
 
-    /// Register a video frame: wrap `pixel_buffer` as a Metal texture and
-    /// blit it into an RGBA texture Vello can sample. Returns the fake
-    /// `ImageData` referencing the texture (via `override_image`) to embed
-    /// in composed scenes as a plain image brush.
+    /// Store a video frame for `paint_id` without touching the GPU: the
+    /// media callback keeps the latest decoded pixel buffer plus its
+    /// metadata here, and the compose-time import (blit) happens in
+    /// [`render_into`](Self::render_into). Returns the fake `ImageData`
+    /// (empty blob, real size) composed scenes embed as a plain image
+    /// brush; its blob is registered with Vello's `override_image` when
+    /// the frame is imported.
     #[cfg(target_os = "macos")]
-    pub(crate) fn import_video_frame(
+    pub(crate) fn store_video_frame(
         &mut self,
         paint_id: VideoPaintId,
         pixel_buffer: &Retained<CVPixelBuffer>,
         width: u32,
         height: u32,
     ) -> Option<peniko::ImageData> {
-        let raw_device = self.raw_metal_device()?;
-        self.video.import_frame(
-            video::RenderResources {
-                device: &self.device_handle.device,
-                queue: &self.device_handle.queue,
-                vello_renderer: &mut self.vello_renderer,
-                raw_device: &raw_device,
-            },
-            paint_id,
-            pixel_buffer,
-            width,
-            height,
-        )
+        self.video
+            .store_frame(paint_id, pixel_buffer, width, height)
     }
 }
 
@@ -397,11 +419,13 @@ pub trait SurfaceRenderer {
     /// webview's renderer).
     fn render_done_webview_id(data: &Self::RenderData) -> WebviewId;
 
-    /// Register a video frame: wrap `pixel_buffer` as a Metal texture and
-    /// blit it into an RGBA texture Vello can sample. Returns the fake
-    /// `ImageData` referencing the texture to embed in composed scenes.
+    /// Store a video frame for `paint_id` without touching the GPU: the
+    /// media callback keeps the latest decoded pixel buffer plus its
+    /// metadata here, and the compose-time import (blit) happens in
+    /// `submit_scene`. Returns the fake `ImageData` (empty blob, real
+    /// size) composed scenes embed as a plain image brush.
     #[cfg(target_os = "macos")]
-    fn import_video_frame(
+    fn store_video_frame(
         &mut self,
         paint_id: VideoPaintId,
         pixel_buffer: &Retained<CVPixelBuffer>,

@@ -1,20 +1,104 @@
-# embedder crate
+# embedder
 
-The embedder crate owns the top-level application lifecycle, window management,
+The embedder layer owns the top-level application lifecycle, window management,
 browser chrome, and the redraw loop. It delegates to content and net
 processes through the `webview` and `user_agent` crates.
 
-## Architecture
+## Crate layout
 
-### Two app implementations
+Three crates, sharing nothing but the `webview` crate API:
 
-- **`WindowedApp`** (`event_loop/windowed/mod.rs`): headed (GUI) application with
-  native windows, a Blitz-rendered browser chrome, and multi-window/multi-tab
-  support. Runs via winit's event loop.
+| Crate | Purpose |
+|-------|---------|
+| `embedder` (root) | Thin dispatcher: CLI entry points (`run_default`, `run_webdriver`, `run_cdp`) and the windowed-backend selection (AppKit on macOS by default, winit elsewhere or when `winit_embedder` is enabled). Builds the `formal-web-embedder` binary. |
+| `mac-embedder` | Self-contained AppKit app (macOS only): `NSApplication` lifecycle, native chrome, `CVDisplayLink` pacing, zero-copy IOSurface presentation. No winit, Blitz, or GPU dependencies. |
+| `winit-embedder` | Self-contained winit app: a windowed app with a Blitz-rendered chrome and a headless app for automation (WebDriver, CDP, WPT). The windowed app is gated behind the `windowed` feature (on by default); the headless app is always available and pulls no graphics dependencies. |
 
-- **`HeadlessEmbedderApp`** (`event_loop/headless.rs`): headless application for
-  automation-only hosting (WebDriver, CDP). No window, no chrome, just a fixed
-  viewport and event-loop plumbing.
+Each embedder owns its own user-event bus (`FormalWebUserEvent`, its own
+`UserEventSink`, and its own `webview::Embedder` implementation) and its own
+copy of the shared helpers (clipboard, screenshot encoding, startup URL
+resolution, viewport snapshot). The two embedders are deliberately
+independent so the AppKit app never builds winit/Blitz/GPU code.
+
+## Two app implementations
+
+- **AppKit app** (`mac-embedder/src/app.rs`): headed GUI on macOS, native
+  AppKit chrome. See below.
+
+- **`WindowedApp`** (`winit-embedder/src/windowed.rs`): headed winit GUI
+  with a Blitz-rendered browser chrome, multi-window/multi-tab support.
+  Runs via winit's event loop.
+
+- **`HeadlessEmbedderApp`** (`winit-embedder/src/headless.rs`): headless
+  winit application for automation-only hosting (WebDriver, CDP, WPT). No
+  window, no chrome, just a fixed viewport and event-loop plumbing.
+
+## Windowed backend selection
+
+The headed app is provided by one of two backends, selected at compile time
+in the root `embedder` crate: on macOS the AppKit backend is the default and
+the winit windowed backend is **not compiled** unless the `winit_embedder`
+feature is enabled (`--features winit_embedder`); on other platforms the
+winit windowed backend is the only option and the feature is a no-op. The
+headless app (winit) is always available, so WPT and the automation servers
+run on any configuration.
+
+- **`mac-embedder`** (AppKit): the default on macOS. Runs an `NSApplication`
+  with `NSWindow`/`NSView`/`CALayer` display; the web content is presented
+  zero-copy by setting the content layer's `contents` to the shared IOSurface
+  from the graphics process. The chrome is native AppKit controls: a main
+  menu bar (App/File/Edit/View/History/Window/Help), a real `NSToolbar` in a
+  unified (transparent-titlebar, full-size content) window, and a tab strip
+  as its own row below the toolbar. The toolbar hosts a joined
+  back/forward control, a reload item, the editable address field (which
+  shows the active tab's URL) centered between two flexible spaces, and a
+  new-tab button at the trailing edge; focusing the address field draws a
+  tight accent-colored border on the field (instead of the system focus
+  ring) and selects the whole URL on first focus. The tab strip row (a
+  header-view material) hosts pill-styled tabs (rounded, the active tab
+  filled in light grey, the close × always visible, and a hover fill
+  darker than the active pill so the hover stays visible on the active
+  tab) that show the page title, falling back to the truncated URL, and
+  shrink as more tabs open. The window title mirrors the active tab's
+  label. A `CVDisplayLink` paces
+  animated content via `WebviewProvider::frame_needed`.
+
+  Menu key equivalents are executed from the local event monitor via
+  `NSMenu::performKeyEquivalent`, which lets the menu own ⌘T/⌘W/⌘L/⌘R and
+  friends while unbound ⌘-combinations still reach the web content (pages
+  keep their own ⌘-shortcuts). The toolbar allows user customization
+  (drag-to-rearrange the navigation items, Customize Toolbar…) but the
+  address field is immovable. The web viewport is the window's
+  `contentLayoutRect` minus the tab strip row, and mouse events in the
+  titlebar/toolbar/tab-strip region pass through to AppKit. The content
+  process reports a top-level document's parsed `<title>` after parsing
+  (content → user agent → embedder), so tab labels and the window title
+  reflect page titles on load; titles changed later via JS
+  (`document.title = …`) are not yet propagated.
+
+- **`winit-embedder`**: winit windows with a Blitz-rendered chrome. The
+  only option on non-macOS platforms; on macOS it is built and used only
+  when the `winit_embedder` feature is enabled.
+
+Known gaps in the AppKit backend relative to winit:
+
+- **IME is not implemented.** The AppKit backend sends `KeyDown`/`KeyUp` events
+  only; text composition (CJK and other marked-text input) requires the
+  `NSTextInputClient` protocol on the web content view, which is not yet wired.
+  Basic ASCII text input into page fields works through `KeyDown` text.
+- **Touch events are not handled** (desktop macOS has no touch input; winit's
+  touch path is for trackpads/tablets).
+- **JS-driven titles are not propagated.** The content process reports a
+  top-level document's parsed `<title>` after parsing, but titles changed
+  later via JS (`document.title = …` or DOM manipulation of the title
+  element) are not sent, so a page that sets its title after load keeps the
+  parsed title.
+- **Session history is not implemented.** The History menu's Back/Forward items
+  are disabled; Reload re-navigates to the tab's committed URL because the
+  user agent has no reload command.
+- **Closing a tab does not tear down its traversable.** The user agent has no
+  webview-teardown path, so a closed tab's webview keeps living there (the
+  same situation as closing a window).
 
 ### Multi-window and multi-tab
 
@@ -83,7 +167,9 @@ references after HTML rebuilds.
 - [x] Tab labels show page URL (truncated) or "New Tab" for blank pages
 - [x] Viewport tracking and propagation to provider
 - [x] Automation (WebDriver/CDP) targets the active tab in the active window
-- [x] `about:blank` navigation fails (pre-existing content-process issue)
+- [x] Navigating an existing tab to `about:blank` logs a content-process
+  "unknown document id" error (pre-existing); new top-level traversables to
+  `about:blank` (new tabs, new windows, startup) work
 - [ ] Address-bar Enter opens new tab instead of navigating (under investigation)
 - [ ] Tab close button
 - [ ] Tab reordering
@@ -100,13 +186,16 @@ references after HTML rebuilds.
 - **URL bar spellcheck/suggestions**: Autocomplete or search-engine integration
   in the address bar.
 - **Window title update**: Sync the winit window title with the active tab's
-  page title (requires plumbing page title through the user agent).
+  page title. The content→UA title plumbing exists (parse-time titles); the
+  winit window title is not yet set from it.
 - **CDP multi-target support**: Expose each tab/window as a separate CDP target
   (`Target.getTargets`, `Target.attachToTarget`) so automation tools can
   interact with specific pages.
-- **About:blank fix**: The content process currently fails to handle
-  `about:blank` navigation ("builder error"). Fixing this would allow the CDP
-  server to start with a blank page instead of requiring a real URL.
+- **About:blank fix**: Navigating an *existing* tab to `about:blank` (e.g.
+  the address bar) logs a content-process "unknown document id" error during
+  navigation finalization, although the URL still ends up as `about:blank`.
+  New top-level traversables to `about:blank` (new tabs, new windows, CDP
+  startup) work; only the existing-tab path is affected.
 - **Browser history integration**: Remove the per-tab `committed_url` /
   `pending_url` tracking in favour of the user agent's session history once
   that's implemented.
@@ -121,10 +210,16 @@ references after HTML rebuilds.
 
 | File | Purpose |
 |------|---------|
-| `src/main.rs` | CLI entry point |
-| `src/event_loop.rs` | Event loop orchestration, shared types |
-| `src/event_loop/winit.rs` | Winit integration (shell provider, key/mouse mapping) |
-| `src/event_loop/windowed/mod.rs` | `WindowedApp` + `WindowState` |
-| `src/event_loop/windowed/chrome.rs` | `ChromeUi` — Blitz-based browser chrome |
-| `src/event_loop/headless.rs` | `HeadlessEmbedderApp` |
-| `src/ui_event.rs` | UI event serialization |
+| `embedder/src/main.rs` | `formal-web-embedder` CLI entry point |
+| `embedder/src/lib.rs` | CLI entry points + windowed-backend selection |
+| `mac-embedder/src/app.rs` | AppKit application, window/chrome/event routing |
+| `mac-embedder/src/window.rs` | Layer-hosting view, IOSurface presentation |
+| `mac-embedder/src/input.rs` | NSEvent → Blitz input mapping |
+| `mac-embedder/src/events.rs` | AppKit user-event bus + `webview::Embedder` impl |
+| `mac-embedder/src/platform.rs` | Clipboard, screenshot, startup/URL helpers |
+| `winit-embedder/src/windowed.rs` | `WindowedApp` — winit window/chrome/events |
+| `winit-embedder/src/headless.rs` | `HeadlessEmbedderApp` — automation-only winit app |
+| `winit-embedder/src/chrome.rs` | `ChromeUi` — Blitz-based browser chrome |
+| `winit-embedder/src/winit_integration.rs` | Winit integration (shell provider, key/mouse mapping) |
+| `winit-embedder/src/events.rs` | Winit user-event bus + `webview::Embedder` impl |
+| `winit-embedder/src/shared.rs` | Clipboard, screenshot, startup/URL helpers |

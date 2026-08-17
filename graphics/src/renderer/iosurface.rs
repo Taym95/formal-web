@@ -140,8 +140,9 @@ impl SurfaceRenderer for IosurfaceRenderer {
         );
 
         // The shared target texture comes from the webview's IOSurface ring,
-        // selected by `buffer_index`.
-        self.gpu.mark_video_textures_dirty();
+        // selected by `buffer_index`. The pending video frame imports
+        // (macOS) submit first (inside render_into), then Vello's render —
+        // two back-to-back submissions per composed frame.
         let target = &buffers.payload()[buffer_index].texture;
         if let Err(error) = self.gpu.render_into(&scene, target, width, height) {
             error!("[gpu-renderer] {error}");
@@ -150,8 +151,8 @@ impl SurfaceRenderer for IosurfaceRenderer {
 
         self.gpu.generation += 1;
         let generation = self.gpu.generation;
-        // Vello's render_to_texture submits internally; waiting for "all
-        // submitted work" (submission_index: None) covers that submission.
+        // Both submissions above are enqueued; waiting for "all
+        // submitted work" (submission_index: None) covers it.
         let done = SharedRenderData {
             webview_id,
             generation,
@@ -206,11 +207,16 @@ impl SurfaceRenderer for IosurfaceRenderer {
             return delivery;
         };
         let texture_id = texture.texture_id;
+        let surface_id = texture.surface_id();
         let port = texture.port_for_frame();
 
         let frame_event = GraphicsEvent::PixelFrameReady {
             webview_id,
-            payload: SurfacePayload::SharedTexture { texture_id, port },
+            payload: SurfacePayload::SharedTexture {
+                texture_id,
+                surface_id,
+                port,
+            },
             animating: metadata.animating,
             animating_frame_ids: metadata.animating_frame_ids,
             width,
@@ -235,7 +241,7 @@ impl SurfaceRenderer for IosurfaceRenderer {
         data.webview_id
     }
 
-    fn import_video_frame(
+    fn store_video_frame(
         &mut self,
         paint_id: VideoPaintId,
         pixel_buffer: &Retained<CVPixelBuffer>,
@@ -243,6 +249,6 @@ impl SurfaceRenderer for IosurfaceRenderer {
         height: u32,
     ) -> Option<peniko::ImageData> {
         self.gpu
-            .import_video_frame(paint_id, pixel_buffer, width, height)
+            .store_video_frame(paint_id, pixel_buffer, width, height)
     }
 }

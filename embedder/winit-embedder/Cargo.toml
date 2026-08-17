@@ -1,0 +1,57 @@
+[package]
+name = "winit-embedder"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[features]
+default = ["windowed"]
+# The windowed app (Blitz-rendered chrome, GPU presentation). Disabling it
+# leaves a headless-only build with no graphics dependencies, used by WPT
+# and the automation servers.
+windowed = [
+    "dep:anyrender",
+    "dep:anyrender_vello",
+    "dep:blitz-dom",
+    "dep:blitz-html",
+    "dep:blitz-paint",
+    "dep:blitz-traits",
+    "dep:cursor-icon",
+    "dep:kurbo",
+    "dep:peniko",
+    "dep:wgpu",
+    "objc2-io-surface",
+    "objc2-metal",
+]
+media = ["webview/media"]
+
+[dependencies]
+anyrender = { version = "0.10", features = ["serde"], optional = true }
+anyrender_vello = { version = "0.10.1", optional = true }
+arboard = { version = "3.6.1", default-features = false }
+automation = { path = "../../automation" }
+blitz-dom = { workspace = true, features = ["system_fonts", "svg"], optional = true }
+blitz-html = { workspace = true, optional = true }
+blitz-paint = { workspace = true, features = ["svg"], optional = true }
+blitz-traits = { workspace = true, optional = true }
+cursor-icon = { version = "1", optional = true }
+ipc = { path = "../../ipc" }
+ipc-channel = { git = "https://github.com/gterzian/ipc-channel", rev = "169da83" }
+ipc_messages = { path = "../../ipc_messages" }
+keyboard-types = "0.7"
+kurbo = { version = "0.13", optional = true }
+log = "0.4"
+peniko = { version = "0.6", optional = true }
+png = "0.17"
+serde_json = "1"
+uuid = { version = "1", features = ["v4"] }
+verification = { path = "../../verification" }
+webview = { path = "../../webview", default-features = false }
+wgpu = { version = "29", optional = true }
+winit = "0.30"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-core-foundation = "0.3"
+objc2-io-surface = { version = "0.3", optional = true }
+objc2-metal = { version = "0.3", features = ["objc2-io-surface"], optional = true }

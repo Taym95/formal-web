@@ -3,12 +3,9 @@ use blitz_dom::{BaseDocument, Document, DocumentConfig, qual_name};
 use blitz_html::HtmlDocument;
 use blitz_paint::paint_scene;
 use blitz_traits::events::{BlitzKeyEvent, UiEvent};
-use blitz_traits::shell::{ClipboardError, ShellProvider, Viewport};
-use cursor_icon::CursorIcon;
+use blitz_traits::shell::{ShellProvider, Viewport};
 use keyboard_types::Key;
 use std::sync::Arc;
-use winit::dpi::{LogicalPosition, LogicalSize};
-use winit::window::{Cursor, Window};
 
 const DEFAULT_CHROME_HEIGHT_CSS: f32 = 80.0;
 
@@ -433,54 +430,5 @@ fn is_submit_key(event: &BlitzKeyEvent) -> bool {
         Key::Enter => true,
         Key::Character(v) if v == "\n" => true,
         _ => false,
-    }
-}
-
-// ── Shell provider for the chrome document ────────────────────────────────
-
-pub struct WinitShellProvider {
-    window: Arc<Window>,
-}
-
-impl WinitShellProvider {
-    pub fn new(window: Arc<Window>) -> Self {
-        Self { window }
-    }
-}
-
-fn clipboard_read() -> Result<String, String> {
-    arboard::Clipboard::new()
-        .and_then(|mut c| c.get_text())
-        .map_err(|e| format!("clipboard read error: {e}"))
-}
-
-fn clipboard_write(text: String) -> Result<(), String> {
-    arboard::Clipboard::new()
-        .and_then(|mut c| c.set_text(text))
-        .map_err(|e| format!("clipboard write error: {e}"))
-}
-
-impl ShellProvider for WinitShellProvider {
-    fn request_redraw(&self) {
-        self.window.request_redraw();
-    }
-    fn set_cursor(&self, icon: CursorIcon) {
-        self.window.set_cursor(Cursor::Icon(icon));
-    }
-    fn set_window_title(&self, title: String) {
-        self.window.set_title(&title);
-    }
-    fn set_ime_enabled(&self, enabled: bool) {
-        self.window.set_ime_allowed(enabled);
-    }
-    fn set_ime_cursor_area(&self, x: f32, y: f32, w: f32, h: f32) {
-        self.window
-            .set_ime_cursor_area(LogicalPosition::new(x, y), LogicalSize::new(w, h));
-    }
-    fn get_clipboard_text(&self) -> Result<String, ClipboardError> {
-        clipboard_read().map_err(|_| ClipboardError)
-    }
-    fn set_clipboard_text(&self, text: String) -> Result<(), ClipboardError> {
-        clipboard_write(text).map_err(|_| ClipboardError)
     }
 }

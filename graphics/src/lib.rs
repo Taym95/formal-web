@@ -302,14 +302,19 @@ fn handle_media_event<R: SurfaceRenderer>(
             let Some(slot) = webviews.get_mut(&webview_id) else {
                 return;
             };
-            let Some(resource_id) = slot.renderer.import_video_frame(
+            // Store the raw frame on the renderer without touching the GPU:
+            // the blit (import) is deferred to the next compose, which blits
+            // only frames newer than the last imported one into the same
+            // encoder as the Vello render (a single submission per compose,
+            // so the import does not contend with the gpu poll thread).
+            let Some(resource_id) = slot.renderer.store_video_frame(
                 paint_id,
                 &frame.pixel_buffer,
                 frame.width,
                 frame.height,
             ) else {
                 error!(
-                    "[graphics] failed to import video texture pipeline={:?}",
+                    "[graphics] failed to store video texture pipeline={:?}",
                     pipeline_id
                 );
                 return;

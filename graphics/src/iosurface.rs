@@ -1,19 +1,26 @@
 #![cfg(all(target_os = "macos", not(feature = "cpu_readback")))]
 //! macOS zero-copy surface: a shared IOSurface the graphics process renders
 //! into and the embedder imports and blits, with no CPU readback and no IPC
-//! pixel bytes. The surface's Mach port travels in the `PixelFrameReady`
-//! payload via ipc-channel's `OsMachPort` transport (see the ipc-channel
-//! fork in ../ipc-channel).
+//! pixel bytes. The surface's global IOSurfaceID (plus a Mach port
+//! fallback) travels in the `PixelFrameReady` payload; the embedder looks
+//! the surface up by ID.
 
 use crate::renderer::IosurfaceRenderer;
 use ipc_channel::platform::OsMachPort;
 use log::{debug, error};
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
+use objc2_core_foundation::CFRetained;
 use objc2_core_foundation::{CFDictionary, CFNumber, CFString};
+// The producer opts every shared surface into the global namespace so the
+// embedder (and the WindowServer, which composites the layer contents) can
+// look it up by ID. Apple marks `kIOSurfaceIsGlobal` deprecated ("global
+// surfaces are insecure") but it is the only mechanism for cross-process
+// IOSurfaceID visibility; the surfaces carry page pixels, not secrets.
+#[allow(deprecated)]
 use objc2_io_surface::{
     IOSurfaceRef, kIOSurfaceAllocSize, kIOSurfaceBytesPerElement, kIOSurfaceHeight,
-    kIOSurfacePixelFormat, kIOSurfaceWidth,
+    kIOSurfaceIsGlobal, kIOSurfacePixelFormat, kIOSurfaceWidth,
 };
 use objc2_metal::{
     MTLDevice, MTLPixelFormat, MTLStorageMode, MTLTexture, MTLTextureDescriptor, MTLTextureUsage,
@@ -29,16 +36,27 @@ pub fn padded_width(width: u32) -> u32 {
 }
 
 /// One shared IOSurface texture in the ring: the Metal texture (kept alive
-/// by the imported wgpu texture; the Metal texture retains the IOSurface)
-/// and a Mach port (send right) that can be shipped to the embedder on
-/// every frame.
+/// by the imported wgpu texture; the Metal texture retains the IOSurface).
+/// The surface's global ID is shipped to the embedder on every frame.
 pub struct IosurfaceTexture {
     pub texture: Texture,
     pub texture_id: u64,
+    /// Retained for diagnostics and the delivery of the surface's global ID.
+    surface: CFRetained<IOSurfaceRef>,
+    /// A Mach port (send right) to the surface, shipped alongside the
+    /// global ID so the embedder can fall back to a port lookup.
     port: OsMachPort,
 }
 
 impl IosurfaceTexture {
+    /// The surface's global IOSurfaceID, shipped to the embedder so it can
+    /// look the surface up by ID (`IOSurfaceLookup`). A surface object
+    /// imported from its Mach port cannot be composited by CoreAnimation;
+    /// a by-ID lookup of the same surface composites correctly.
+    pub fn surface_id(&self) -> u32 {
+        self.surface.id()
+    }
+
     /// A fresh Mach port (send right) to the surface for this frame's
     /// delivery. The transport MOVE_SENDs the clone; the surface keeps its
     /// own port internally so it stays shareable.
@@ -77,7 +95,6 @@ pub fn create_shared_texture(
         return None;
     };
     let port = OsMachPort::from_name(surface.create_mach_port());
-
     // Metal texture from the IOSurface. The descriptor's format must match
     // the surface pixel format ('RGBA' ↔ RGBA8Unorm); the dimensions are the
     // padded surface dimensions.
@@ -143,47 +160,57 @@ pub fn create_shared_texture(
         )
     };
     debug!(
-        "[iosurface] created {}x{} (padded {}x{}) texture_id={} port={}",
+        "[iosurface] created {}x{} (padded {}x{}) texture_id={} surface_id={}",
         width,
         height,
         surface_width,
         height,
         texture_id,
-        port.name()
+        surface.id()
     );
     Some(IosurfaceTexture {
         texture,
         texture_id,
+        surface,
         port,
     })
 }
 
 /// Build the IOSurface creation properties dictionary: RGBA8, width, height.
+#[allow(deprecated)]
 fn surface_properties(width: u32, height: u32) -> Retained<CFDictionary> {
     let width_value = CFNumber::new_i64(i64::from(width));
     let height_value = CFNumber::new_i64(i64::from(height));
     let bytes_per_element_value = CFNumber::new_i64(4);
-    // 'RGBA' as a 32-bit big-endian FourCC: 0x52474441 ('R','G','B','A').
-    let pixel_format_value = CFNumber::new_i64(0x52474441);
+    // 'RGBA' as a 32-bit big-endian FourCC: 'R'=0x52, 'G'=0x47, 'B'=0x42,
+    // 'A'=0x41 -> 0x52474241. CoreAnimation composites IOSurfaces by their
+    // pixel format; an invalid FourCC makes the layer refuse the contents.
+    let pixel_format_value = CFNumber::new_i64(0x52474241);
     let alloc_size_value = CFNumber::new_i64(i64::from(width * height * 4));
+    // macOS 13+ keeps IOSurfaces process-local by default: other processes
+    // (the embedder, the WindowServer compositing the layer contents) can
+    // only look a surface up by its global ID when the creator opts in.
+    let is_global_value = CFNumber::new_i64(1);
 
     // SAFETY: the keys and values are the exact CF objects IOSurfaceCreate
     // expects; the statics are valid for the process lifetime.
-    let keys: [&CFString; 5] = unsafe {
+    let keys: [&CFString; 6] = unsafe {
         [
             kIOSurfaceWidth,
             kIOSurfaceHeight,
             kIOSurfaceBytesPerElement,
             kIOSurfacePixelFormat,
             kIOSurfaceAllocSize,
+            kIOSurfaceIsGlobal,
         ]
     };
-    let values: [&CFNumber; 5] = [
+    let values: [&CFNumber; 6] = [
         &width_value,
         &height_value,
         &bytes_per_element_value,
         &pixel_format_value,
         &alloc_size_value,
+        &is_global_value,
     ];
     let dictionary = CFDictionary::<CFString, CFNumber>::from_slices(&keys, &values);
     // SAFETY: CFDictionary<K, V> is a transparent wrapper over CFDictionaryRef;
