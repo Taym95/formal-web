@@ -51,8 +51,6 @@ fn main() -> ExitCode {
         return exit_code;
     }
 
-    embedder::install_default_windowed_backend();
-
     let cli = Cli::parse();
     let result = match cli.command {
         None => embedder::run_default(cli.verify, cli.headless),

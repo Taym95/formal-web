@@ -180,11 +180,22 @@ shared dependency resolution and incremental compilation.
 ### Components
 
 - **Root binary** (`formal-web`): runs the embedder directly in-process, creating the window and event loop.
-- **Embedder crate** (`embedder`): a library used by the root binary that
-  installs the platform windowed backend (AppKit on macOS by default, winit
-  elsewhere), owns the automation and event-loop plumbing, and runs the
-  app. A standalone `formal-web-embedder` binary is also produced for
-  direct use.
+- **Embedder** (`embedder/`, three independent crates sharing only the `webview`
+  crate API): the root `embedder` crate is a thin dispatcher — CLI entry
+  points plus the windowed-backend selection (AppKit on macOS by default,
+  winit elsewhere). `mac-embedder` is the self-contained AppKit app (no
+  winit/Blitz/GPU dependencies). `winit-embedder` holds the winit windowed
+  app (Blitz chrome, gated behind its `windowed` feature) **and** the
+  headless app used by WPT/WebDriver/CDP. A standalone
+  `formal-web-embedder` binary is also produced for direct use.
+
+  **Testing requires building winit.** WPT, WebDriver, CDP, and the TLA+
+  verification scripts all run the winit **headless** app, so those builds
+  compile the `winit-embedder` crate even on macOS. The AppKit app itself
+  never pulls winit: on macOS the winit embedder builds headless-only
+  (no `windowed` feature, hence no wgpu/Blitz) unless `winit_embedder` is
+  enabled. The headless build has no graphics dependencies at all —
+  automation screenshots in headless mode are a plain white PNG.
 - **Helper processes** (`formal-web-content`, `formal-web-net`, `formal-web-media`, `formal-web-graphics`): spawned by the embedder.
   - `formal-web-graphics` owns per-webview compositors and video/audio playback (media backend).
     It receives `PaintFrame` and `VideoFrame` payloads and sends back composed scenes with
@@ -201,7 +212,7 @@ shared dependency resolution and incremental compilation.
 | `jsc` | JavaScriptCore backend (macOS only, experimental) | no |
 | `wasm` | Wasmtime-based WebAssembly implementation (opt-in, Boa only) | no |
 | `media` | Video/audio playback support | yes |
-| `winit_embedder` | Build the winit windowed embedder on macOS (the AppKit backend is the default and the only one built there); no-op elsewhere, where winit is the only option | no |
+| `winit_embedder` | Build the winit **windowed** embedder on macOS (the AppKit backend is the default headed one there and the only one built without this feature); no-op elsewhere, where winit is the only option. On macOS the winit embedder always builds **headless-only** (no graphics deps) for WPT/automation; this feature adds its windowed app | no |
 
 V8 is the default backend for running WPT tests.  Wasm is a separate feature
 (and Boa-only) to avoid pulling in wasmtime when not needed.  JSC is

@@ -14,17 +14,26 @@ path = "src/main.rs"
 
 [features]
 default = ["media"]
-media = ["embedder-core/media"]
-# Build the winit windowed backend on macOS (the AppKit backend is the
+media = ["winit-embedder/media"]
+# Use the winit windowed backend on macOS (the AppKit backend is the
 # default there and the only one built without this feature). On other
-# platforms the winit backend is the only option.
-winit_embedder = ["embedder-backend/winit_embedder"]
+# platforms the winit windowed backend is the only option and this feature
+# is a no-op.
+winit_embedder = ["winit-embedder/windowed"]
 
 [dependencies]
 automation = { path = "../automation" }
 clap = { version = "4.5", features = ["derive"] }
-embedder-backend = { path = "backend" }
-embedder-core = { path = "core" }
 env_logger = "0.11"
 log = "0.4"
 verification = { path = "../verification" }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+mac-embedder = { path = "mac-embedder" }
+# On macOS the winit embedder builds headless-only by default (no graphics
+# dependencies); the `winit_embedder` feature enables its windowed app.
+winit-embedder = { path = "winit-embedder", default-features = false }
+
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+# Off macOS the winit windowed app is the only headed option.
+winit-embedder = { path = "winit-embedder", features = ["windowed"] }

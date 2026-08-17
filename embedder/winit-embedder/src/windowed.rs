@@ -1,5 +1,12 @@
 use log::{debug, error, info};
 
+use crate::chrome::{ChromeAction, ChromeTabInfo, ChromeUi, ChromeViewState};
+use crate::events::{FormalWebUserEvent, send_user_event};
+use crate::shared::{
+    apple_standard_keybinding_for_key_down, automation_screenshot_png,
+    normalize_browser_destination, read_clipboard_text, startup_destination_url,
+    update_window_viewport_snapshot, write_clipboard_text,
+};
 use crate::winit_integration::WinitShellProvider;
 use crate::winit_integration::{
     touch_pointer_details, viewport_of_snapshot, viewport_snapshot_for_window, winit_ime_to_blitz,
@@ -16,12 +23,6 @@ use blitz_traits::events::{
     MouseEventButtons, PointerCoords, PointerDetails, UiEvent,
 };
 use blitz_traits::shell::ShellProvider;
-use embedder_core::{
-    ChromeAction, ChromeTabInfo, ChromeUi, ChromeViewState, FormalWebUserEvent,
-    NavigationCompletion, apple_standard_keybinding_for_key_down, automation_screenshot_png,
-    event_loop_options, normalize_browser_destination, read_clipboard_text,
-    startup_destination_url, update_window_viewport_snapshot, write_clipboard_text,
-};
 #[cfg(target_os = "macos")]
 use ipc_channel::platform::deallocate_mach_port;
 use ipc_messages::content::WebviewId;
@@ -32,7 +33,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
-use webview::WebviewProvider;
+use webview::{NavigationCompletion, WebviewProvider};
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalPosition, PhysicalPosition};
 use winit::event::{
@@ -244,6 +245,8 @@ pub struct WindowedApp {
     pub(super) windows: HashMap<WindowId, WindowState>,
     pub(super) provider: Option<WebviewProvider>,
     pub(super) active_window_id: Option<WindowId>,
+    pub(super) startup_url: Option<String>,
+    pub(super) window_title: Option<String>,
 }
 
 // ── Static helpers ─────────────────────────────────────────────────────────
@@ -593,10 +596,11 @@ impl WindowedApp {
         }
     }
 
-    fn create_winit_window(event_loop: &ActiveEventLoop) -> Result<Arc<Window>, String> {
-        let title = event_loop_options()
-            .window_title
-            .unwrap_or_else(|| String::from("formal-web"));
+    fn create_winit_window(
+        event_loop: &ActiveEventLoop,
+        window_title: Option<String>,
+    ) -> Result<Arc<Window>, String> {
+        let title = window_title.unwrap_or_else(|| String::from("formal-web"));
         event_loop
             .create_window(Window::default_attributes().with_title(title))
             .map(Arc::new)
@@ -780,7 +784,7 @@ impl ApplicationHandler<FormalWebUserEvent> for WindowedApp {
             return;
         }
         let window_id = WindowId::new();
-        let window = match Self::create_winit_window(event_loop) {
+        let window = match Self::create_winit_window(event_loop, self.window_title.clone()) {
             Ok(window) => window,
             Err(_) => {
                 event_loop.exit();
@@ -819,7 +823,7 @@ impl ApplicationHandler<FormalWebUserEvent> for WindowedApp {
         }
         Self::resume_renderer(&mut state, &window);
         // Determine destination URL: provided startup URL, artifact, or fallback.
-        let destination = startup_destination_url(event_loop_options().startup_url.as_deref())
+        let destination = startup_destination_url(self.startup_url.as_deref())
             .unwrap_or_else(|_| String::from("about:blank"));
         if let Some(provider) = self.provider.as_ref() {
             let _ = provider.navigate(None, &destination);
@@ -912,7 +916,7 @@ impl ApplicationHandler<FormalWebUserEvent> for WindowedApp {
                 }
                 self.windows.remove(&window_id);
                 if self.windows.is_empty() {
-                    let _ = embedder_core::send_user_event(FormalWebUserEvent::Exit);
+                    let _ = send_user_event(FormalWebUserEvent::Exit);
                 }
             }
             WindowEvent::Ime(event) => {
@@ -1307,7 +1311,8 @@ impl ApplicationHandler<FormalWebUserEvent> for WindowedApp {
             }
             FormalWebUserEvent::CreateWindow => {
                 let window_id = WindowId::new();
-                let window = match Self::create_winit_window(event_loop) {
+                let window = match Self::create_winit_window(event_loop, self.window_title.clone())
+                {
                     Ok(window) => window,
                     Err(_) => return,
                 };
@@ -1647,7 +1652,7 @@ impl WindowedApp {
                 }
             }
             ChromeAction::NewWindow => {
-                let _ = embedder_core::send_user_event(FormalWebUserEvent::CreateWindow);
+                let _ = send_user_event(FormalWebUserEvent::CreateWindow);
             }
             ChromeAction::SwitchTab(index) => {
                 if let Some(state) = app.windows.get_mut(&window_id) {
@@ -1686,11 +1691,7 @@ impl AutomationHost for WindowedApp {
     }
 
     fn automation_screenshot(&mut self) -> Result<Vec<u8>, String> {
-        let webview_id = self
-            .active_window_id
-            .and_then(|id| self.windows.get(&id))
-            .and_then(|state| state.active_tab);
-        automation_screenshot_png(&mut self.provider, webview_id)
+        automation_screenshot_png()
     }
 
     fn begin_automation_navigation(&mut self, url: String) -> Result<(), String> {

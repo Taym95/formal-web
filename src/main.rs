@@ -63,8 +63,6 @@ fn main() -> ExitCode {
         other => (None, other),
     };
 
-    embedder::install_default_windowed_backend();
-
     if let Some(args) = wpt_args {
         return match wpt_runner::run(args, cli.verify) {
             Ok(()) => ExitCode::SUCCESS,

@@ -11,18 +11,17 @@
 //! display refresh rate, and the link runs only while the composed scene is
 //! animating.
 
+use crate::events::{EventLoopEmbedder, FormalWebUserEvent, UserEventSink};
 use crate::input;
+use crate::platform::{
+    automation_screenshot_png, encode_png_rgba, normalize_browser_destination, read_clipboard_text,
+    startup_destination_url, update_window_viewport_snapshot, write_clipboard_text,
+};
 use crate::window::{new_layer_hosted_view, present_shared_surface, surface_to_rgba};
 use automation::{
     AutomationController, AutomationHost, AutomationSnapshot, AutomationVisibleFrameViewport,
 };
 use block2::RcBlock;
-use embedder_core::{
-    EventLoopEmbedder, FormalWebUserEvent, NavigationCompleted, NavigationCompletion,
-    UserEventSink, automation_screenshot_png, encode_png_rgba, event_loop_options,
-    normalize_browser_destination, read_clipboard_text, startup_destination_url,
-    update_window_viewport_snapshot, write_clipboard_text,
-};
 use ipc_channel::platform::deallocate_mach_port;
 use ipc_messages::content::WebviewId;
 use ipc_messages::graphics::SurfaceFrame;
@@ -64,7 +63,7 @@ use verification::TraceSender;
 use webview::WebviewProvider;
 use webview::{
     BlitzPointerEvent, BlitzPointerId, BlitzWheelDelta, BlitzWheelEvent, ColorScheme,
-    MouseEventButton, MouseEventButtons, UiEvent,
+    MouseEventButton, MouseEventButtons, NavigationCompleted, NavigationCompletion, UiEvent,
 };
 
 const INITIAL_WINDOW_WIDTH: f64 = 1200.0;
@@ -355,7 +354,7 @@ enum TabPill {
 /// main thread. The explicit `Send`/`Sync` impls let the handle travel
 /// through dispatch blocks that run on the main queue.
 #[derive(Clone, Copy)]
-struct MainThreadHandle {
+pub(crate) struct MainThreadHandle {
     app: NonNull<MacApp>,
 }
 
@@ -372,25 +371,8 @@ impl MainThreadHandle {
 
     /// The app pointer. A method call (rather than field access) so that
     /// closures capture the whole `Send` handle, not the raw field.
-    fn app_ptr(self) -> *mut MacApp {
+    pub(crate) fn app_ptr(self) -> *mut MacApp {
         self.app.as_ptr()
-    }
-}
-
-/// The user-event sink for the AppKit app: posts each event to the main
-/// dispatch queue, where the app's run loop picks it up.
-struct MacEventSink {
-    handle: MainThreadHandle,
-}
-
-impl UserEventSink for MacEventSink {
-    fn send(&self, event: FormalWebUserEvent) -> Result<(), String> {
-        let handle = self.handle;
-        dispatch::Queue::main().exec_async(move || {
-            let app = unsafe { &mut *handle.app_ptr() };
-            app.process_user_event(event);
-        });
-        Ok(())
     }
 }
 
@@ -504,7 +486,7 @@ struct MacWindow {
     minimized: bool,
 }
 
-struct MacApp {
+pub(crate) struct MacApp {
     mtm: MainThreadMarker,
     ns_app: Retained<NSApplication>,
     delegate: Retained<Delegate>,
@@ -524,7 +506,12 @@ struct MacApp {
 impl MacApp {
     // ── Entry point ────────────────────────────────────────────────────────
 
-    fn run(mtm: MainThreadMarker, trace_sender: Option<TraceSender>) -> Result<(), String> {
+    fn run(
+        mtm: MainThreadMarker,
+        trace_sender: Option<TraceSender>,
+        startup_url: Option<String>,
+        window_title: Option<String>,
+    ) -> Result<(), String> {
         let ns_app = NSApplication::sharedApplication(mtm);
         ns_app.setActivationPolicy(NSApplicationActivationPolicy::Regular);
 
@@ -551,10 +538,10 @@ impl MacApp {
 
         // The sink must be installed before the user agent starts, so the
         // UA's initial events reach the app.
-        let sink: Arc<dyn UserEventSink> = Arc::new(MacEventSink {
+        let sink: Arc<dyn UserEventSink> = Arc::new(crate::events::MacEventSink {
             handle: app.handle.expect("app handle must be installed"),
         });
-        embedder_core::install_user_event_sink(sink.clone());
+        crate::events::install_user_event_sink(sink.clone());
         let embedder = Arc::new(EventLoopEmbedder::new(sink));
         let provider = WebviewProvider::new(embedder, trace_sender)?;
         app.provider = Some(provider);
@@ -563,10 +550,8 @@ impl MacApp {
         app.install_main_menu();
         app.create_display_link()?;
 
-        let title = event_loop_options()
-            .window_title
-            .unwrap_or_else(|| String::from("formal-web"));
-        let destination = startup_destination_url(event_loop_options().startup_url.as_deref())
+        let title = window_title.unwrap_or_else(|| String::from("formal-web"));
+        let destination = startup_destination_url(startup_url.as_deref())
             .unwrap_or_else(|_| String::from("about:blank"));
         let window_id = app.create_window(&title, &destination)?;
         app.active_window_id = Some(window_id);
@@ -580,7 +565,7 @@ impl MacApp {
         ns_app.run();
         info!("[mac-embedder] NSApplication run loop ended");
 
-        embedder_core::clear_user_event_sink();
+        crate::events::clear_user_event_sink();
         update_window_viewport_snapshot(None);
         Ok(())
     }
@@ -2548,7 +2533,7 @@ impl MacApp {
 
     // ── User events ────────────────────────────────────────────────────────
 
-    fn process_user_event(&mut self, event: FormalWebUserEvent) {
+    pub(crate) fn process_user_event(&mut self, event: FormalWebUserEvent) {
         if self.exiting {
             return;
         }
@@ -2847,7 +2832,7 @@ impl AutomationHost for MacApp {
             let rgba = surface_to_rgba(surface, surface_state.width, surface_state.height)?;
             return encode_png_rgba(&rgba, surface_state.width, surface_state.height);
         }
-        automation_screenshot_png(&mut self.provider, webview_id)
+        automation_screenshot_png()
     }
 
     fn begin_automation_navigation(&mut self, url: String) -> Result<(), String> {
@@ -2999,8 +2984,12 @@ impl AutomationHost for MacApp {
 }
 
 /// Entry point: run the AppKit windowed app until it exits.
-pub fn run_windowed_app(trace_sender: Option<TraceSender>) -> Result<(), String> {
+pub fn run_windowed_app(
+    trace_sender: Option<TraceSender>,
+    startup_url: Option<String>,
+    window_title: Option<String>,
+) -> Result<(), String> {
     let mtm = MainThreadMarker::new()
         .ok_or_else(|| String::from("the macOS embedder must run on the main thread"))?;
-    MacApp::run(mtm, trace_sender)
+    MacApp::run(mtm, trace_sender, startup_url, window_title)
 }

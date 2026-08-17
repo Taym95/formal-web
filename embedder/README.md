@@ -1,28 +1,47 @@
-# embedder crate
+# embedder
 
-The embedder crate owns the top-level application lifecycle, window management,
+The embedder layer owns the top-level application lifecycle, window management,
 browser chrome, and the redraw loop. It delegates to content and net
 processes through the `webview` and `user_agent` crates.
 
-## Architecture
+## Crate layout
 
-### Two app implementations
+Three crates, sharing nothing but the `webview` crate API:
 
-- **`WindowedApp`** (`event_loop/windowed/mod.rs`): headed (GUI) application with
-  native windows, a Blitz-rendered browser chrome, and multi-window/multi-tab
-  support. Runs via winit's event loop.
+| Crate | Purpose |
+|-------|---------|
+| `embedder` (root) | Thin dispatcher: CLI entry points (`run_default`, `run_webdriver`, `run_cdp`) and the windowed-backend selection (AppKit on macOS by default, winit elsewhere or when `winit_embedder` is enabled). Builds the `formal-web-embedder` binary. |
+| `mac-embedder` | Self-contained AppKit app (macOS only): `NSApplication` lifecycle, native chrome, `CVDisplayLink` pacing, zero-copy IOSurface presentation. No winit, Blitz, or GPU dependencies. |
+| `winit-embedder` | Self-contained winit app: a windowed app with a Blitz-rendered chrome and a headless app for automation (WebDriver, CDP, WPT). The windowed app is gated behind the `windowed` feature (on by default); the headless app is always available and pulls no graphics dependencies. |
 
-- **`HeadlessEmbedderApp`** (`event_loop/headless.rs`): headless application for
-  automation-only hosting (WebDriver, CDP). No window, no chrome, just a fixed
-  viewport and event-loop plumbing.
+Each embedder owns its own user-event bus (`FormalWebUserEvent`, its own
+`UserEventSink`, and its own `webview::Embedder` implementation) and its own
+copy of the shared helpers (clipboard, screenshot encoding, startup URL
+resolution, viewport snapshot). The two embedders are deliberately
+independent so the AppKit app never builds winit/Blitz/GPU code.
 
-### Windowed backend split (`embedder-backend`)
+## Two app implementations
 
-The headed app is provided by one of two backends selected at startup via
-`install_default_windowed_backend()`. On macOS the AppKit backend is the
-default and the winit backend is **not compiled** unless the
-`winit_embedder` feature is enabled (`--features winit_embedder`); on other
-platforms the winit backend is the only option and the feature is a no-op.
+- **AppKit app** (`mac-embedder/src/app.rs`): headed GUI on macOS, native
+  AppKit chrome. See below.
+
+- **`WindowedApp`** (`winit-embedder/src/windowed.rs`): headed winit GUI
+  with a Blitz-rendered browser chrome, multi-window/multi-tab support.
+  Runs via winit's event loop.
+
+- **`HeadlessEmbedderApp`** (`winit-embedder/src/headless.rs`): headless
+  winit application for automation-only hosting (WebDriver, CDP, WPT). No
+  window, no chrome, just a fixed viewport and event-loop plumbing.
+
+## Windowed backend selection
+
+The headed app is provided by one of two backends, selected at compile time
+in the root `embedder` crate: on macOS the AppKit backend is the default and
+the winit windowed backend is **not compiled** unless the `winit_embedder`
+feature is enabled (`--features winit_embedder`); on other platforms the
+winit windowed backend is the only option and the feature is a no-op. The
+headless app (winit) is always available, so WPT and the automation servers
+run on any configuration.
 
 - **`mac-embedder`** (AppKit): the default on macOS. Runs an `NSApplication`
   with `NSWindow`/`NSView`/`CALayer` display; the web content is presented
@@ -191,15 +210,16 @@ references after HTML rebuilds.
 
 | File | Purpose |
 |------|---------|
-| `src/main.rs` | CLI entry point |
-| `src/event_loop.rs` | Event loop orchestration, shared types |
-| `src/event_loop/winit.rs` | Winit integration (shell provider, key/mouse mapping) |
-| `src/event_loop/windowed/mod.rs` | `WindowedApp` + `WindowState` |
-| `src/event_loop/windowed/chrome.rs` | `ChromeUi` — Blitz-based browser chrome |
-| `src/event_loop/headless.rs` | `HeadlessEmbedderApp` |
-| `src/ui_event.rs` | UI event serialization |
-| `backend/src/lib.rs` | Backend selection (`install_default_windowed_backend`) |
+| `embedder/src/main.rs` | `formal-web-embedder` CLI entry point |
+| `embedder/src/lib.rs` | CLI entry points + windowed-backend selection |
 | `mac-embedder/src/app.rs` | AppKit application, window/chrome/event routing |
 | `mac-embedder/src/window.rs` | Layer-hosting view, IOSurface presentation |
 | `mac-embedder/src/input.rs` | NSEvent → Blitz input mapping |
+| `mac-embedder/src/events.rs` | AppKit user-event bus + `webview::Embedder` impl |
+| `mac-embedder/src/platform.rs` | Clipboard, screenshot, startup/URL helpers |
 | `winit-embedder/src/windowed.rs` | `WindowedApp` — winit window/chrome/events |
+| `winit-embedder/src/headless.rs` | `HeadlessEmbedderApp` — automation-only winit app |
+| `winit-embedder/src/chrome.rs` | `ChromeUi` — Blitz-based browser chrome |
+| `winit-embedder/src/winit_integration.rs` | Winit integration (shell provider, key/mouse mapping) |
+| `winit-embedder/src/events.rs` | Winit user-event bus + `webview::Embedder` impl |
+| `winit-embedder/src/shared.rs` | Clipboard, screenshot, startup/URL helpers |

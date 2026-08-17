@@ -75,17 +75,17 @@ different engine, add the engine flags, e.g.
 
 ### Windowed embedder (browser chrome)
 
-The headed app's window and browser chrome come from one windowed embedder
-backend, selected at startup:
+The headed app's window and browser chrome come from one of two independent
+embedder crates, selected at compile time:
 
-- **macOS**: the AppKit backend (`mac-embedder`) is the default **and the
-  only windowed backend built**. It runs an `NSApplication` with native
-  chrome (menu bar, toolbar, address field, tab strip) and zero-copy
-  IOSurface presentation.
+- **macOS**: the AppKit backend (`mac-embedder`) is the default. It runs an
+  `NSApplication` with native chrome (menu bar, toolbar, address field, tab
+  strip) and zero-copy IOSurface presentation, and has no winit, Blitz, or
+  GPU dependencies.
 - **Other platforms**: the winit backend (`winit-embedder`, winit windows
   with a Blitz-rendered chrome) is the only option.
 
-The winit backend is **not compiled or used on macOS by default**; pass the
+The winit windowed backend is **not compiled on macOS by default**; pass the
 `winit_embedder` feature to build and select it there:
 
 ```bash
@@ -93,9 +93,11 @@ cargo build --release --features winit_embedder
 cargo run --release --features winit_embedder
 ```
 
-Note that the `winit` crate itself remains a dependency for the headless
-automation loop (WebDriver/CDP/WPT run an event loop without a window); the
-feature only gates the winit *windowed* backend.
+The `winit-embedder` crate also provides the **headless** app (no window, no
+chrome) used by WebDriver/CDP/WPT; on macOS it builds headless-only by
+default, so the AppKit app never pulls winit graphics code. The headless
+build has no graphics dependencies at all — WPT and the automation servers
+compile without wgpu/Blitz. See `embedder/README.md` for the crate layout.
 
 ## Project architecture
 

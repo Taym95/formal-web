@@ -1,6 +1,6 @@
-use crate::event_loop::{
-    FormalWebUserEvent, NavigationCompleted, NavigationCompletion, automation_screenshot_png,
-    event_loop_options, read_clipboard_text, startup_destination_url,
+use crate::events::FormalWebUserEvent;
+use crate::shared::{
+    automation_screenshot_png, read_clipboard_text, startup_destination_url,
     update_window_viewport_snapshot, write_clipboard_text,
 };
 use ::winit::application::ApplicationHandler;
@@ -10,11 +10,6 @@ use ::winit::window::WindowId;
 use automation::{
     AutomationController, AutomationHost, AutomationSnapshot, AutomationVisibleFrameViewport,
 };
-use blitz_traits::events::{
-    BlitzPointerEvent, BlitzPointerId, BlitzWheelDelta, BlitzWheelEvent, MouseEventButton,
-    MouseEventButtons, PointerCoords, PointerDetails, UiEvent,
-};
-use blitz_traits::shell::ColorScheme;
 use ipc_messages::content::{FontTransportReceiver, RecordedScene, WebviewId};
 use keyboard_types::Modifiers as KeyboardModifiers;
 use log::{debug, error};
@@ -22,6 +17,11 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::time::Duration;
 use webview::WebviewProvider;
+use webview::{
+    BlitzPointerEvent, BlitzPointerId, BlitzWheelDelta, BlitzWheelEvent, ColorScheme,
+    MouseEventButton, MouseEventButtons, NavigationCompleted, NavigationCompletion, PointerCoords,
+    PointerDetails, UiEvent,
+};
 
 const HEADLESS_VIEWPORT_WIDTH: u32 = 800;
 const HEADLESS_VIEWPORT_HEIGHT: u32 = 600;
@@ -37,6 +37,7 @@ fn headless_viewport_snapshot() -> (u32, u32, f32, ColorScheme) {
 
 pub(super) struct HeadlessEmbedderApp {
     pub(super) started: bool,
+    pub(super) startup_url: Option<String>,
     pub(super) pending_url: Option<String>,
     pub(super) committed_url: Option<String>,
     pub(super) automation: AutomationController,
@@ -51,6 +52,7 @@ impl Default for HeadlessEmbedderApp {
     fn default() -> Self {
         Self {
             started: false,
+            startup_url: None,
             pending_url: None,
             committed_url: None,
             automation: AutomationController::default(),
@@ -77,7 +79,7 @@ impl HeadlessEmbedderApp {
         }
         self.started = true;
         self.apply_viewport_snapshot();
-        let startup_url = event_loop_options().startup_url;
+        let startup_url = self.startup_url.clone();
         if let Ok(destination_url) = startup_destination_url(startup_url.as_deref()) {
             self.pending_url = Some(destination_url);
             if let Some(provider) = self.provider.as_ref()
@@ -199,7 +201,7 @@ impl AutomationHost for HeadlessEmbedderApp {
     }
 
     fn automation_screenshot(&mut self) -> Result<Vec<u8>, String> {
-        automation_screenshot_png(&mut self.provider, self.current_webview_id)
+        automation_screenshot_png()
     }
 
     fn begin_automation_navigation(&mut self, url: String) -> Result<(), String> {
@@ -209,15 +211,6 @@ impl AutomationHost for HeadlessEmbedderApp {
     fn automation_click(&mut self, x: f32, y: f32) -> Result<(), String> {
         let mods = KeyboardModifiers::default();
         let coords = self.coords(x, y);
-        let _mk = |b: MouseEventButton, bt: MouseEventButtons, _is_down: bool| BlitzPointerEvent {
-            id: BlitzPointerId::Mouse,
-            is_primary: true,
-            coords,
-            button: b,
-            buttons: bt,
-            mods,
-            details: PointerDetails::default(),
-        };
         let move_ev = UiEvent::PointerMove(BlitzPointerEvent {
             id: BlitzPointerId::Mouse,
             is_primary: true,

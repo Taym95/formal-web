@@ -46,8 +46,6 @@ members = [
     "ipc",
     "ipc/xpc-sys",
     "embedder",
-    "embedder/core",
-    "embedder/backend",
     "embedder/winit-embedder",
     "embedder/mac-embedder",
     "ipc_messages",
