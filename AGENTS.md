@@ -180,7 +180,11 @@ shared dependency resolution and incremental compilation.
 ### Components
 
 - **Root binary** (`formal-web`): runs the embedder directly in-process, creating the window and event loop.
-- **Embedder crate** (`embedder`): a library used by the root binary that owns the winit event loop, window, chrome, and automation plumbing. A standalone `formal-web-embedder` binary is also produced for direct use.
+- **Embedder crate** (`embedder`): a library used by the root binary that
+  installs the platform windowed backend (AppKit on macOS by default, winit
+  elsewhere), owns the automation and event-loop plumbing, and runs the
+  app. A standalone `formal-web-embedder` binary is also produced for
+  direct use.
 - **Helper processes** (`formal-web-content`, `formal-web-net`, `formal-web-media`, `formal-web-graphics`): spawned by the embedder.
   - `formal-web-graphics` owns per-webview compositors and video/audio playback (media backend).
     It receives `PaintFrame` and `VideoFrame` payloads and sends back composed scenes with
@@ -197,6 +201,7 @@ shared dependency resolution and incremental compilation.
 | `jsc` | JavaScriptCore backend (macOS only, experimental) | no |
 | `wasm` | Wasmtime-based WebAssembly implementation (opt-in, Boa only) | no |
 | `media` | Video/audio playback support | yes |
+| `winit_embedder` | Build the winit windowed embedder on macOS (the AppKit backend is the default and the only one built there); no-op elsewhere, where winit is the only option | no |
 
 V8 is the default backend for running WPT tests.  Wasm is a separate feature
 (and Boa-only) to avoid pulling in wasmtime when not needed.  JSC is
@@ -253,6 +258,17 @@ RUST_LOG=error target/release/formal-web wpt <test-path>
 rustup run 1.94.0 cargo build --release --no-default-features --features v8
 rustup run 1.94.0 cargo run --release --no-default-features --features v8
 ```
+
+### Winit embedder (opt-in, macOS only)
+
+```bash
+rustup run 1.94.0 cargo build --release --features winit_embedder
+rustup run 1.94.0 cargo run --release --features winit_embedder
+```
+
+On macOS the AppKit backend is the default and the winit backend is not
+compiled unless `winit_embedder` is enabled. On other platforms the winit
+backend is the only option and needs no feature.
 
 ### Individual packages
 

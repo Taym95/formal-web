@@ -1,8 +1,10 @@
 //! Windowed embedder backend selection.
 //!
-//! The AppKit backend (`mac-embedder`) is the default on macOS; the winit
-//! backend (`winit-embedder`) is the default everywhere else and can be
-//! forced on macOS with the `winit_embedder` build config.
+//! On macOS the AppKit backend (`mac-embedder`) is the default and the only
+//! windowed backend compiled unless the `winit_embedder` feature is
+//! enabled; enabling it builds and selects the winit backend
+//! (`winit-embedder`) instead. On other platforms the winit backend is the
+//! only option and the feature is a no-op.
 
 /// Install the default windowed backend for the current platform and build
 /// config. Call once at startup, before running the headed app.

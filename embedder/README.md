@@ -19,7 +19,10 @@ processes through the `webview` and `user_agent` crates.
 ### Windowed backend split (`embedder-backend`)
 
 The headed app is provided by one of two backends selected at startup via
-`install_default_windowed_backend()`:
+`install_default_windowed_backend()`. On macOS the AppKit backend is the
+default and the winit backend is **not compiled** unless the
+`winit_embedder` feature is enabled (`--features winit_embedder`); on other
+platforms the winit backend is the only option and the feature is a no-op.
 
 - **`mac-embedder`** (AppKit): the default on macOS. Runs an `NSApplication`
   with `NSWindow`/`NSView`/`CALayer` display; the web content is presented
@@ -54,8 +57,9 @@ The headed app is provided by one of two backends selected at startup via
   reflect page titles on load; titles changed later via JS
   (`document.title = …`) are not yet propagated.
 
-- **`winit-embedder`**: winit windows with a Blitz-rendered chrome. The default
-  on non-macOS platforms; opt-in on macOS via the `winit_embedder` feature.
+- **`winit-embedder`**: winit windows with a Blitz-rendered chrome. The
+  only option on non-macOS platforms; on macOS it is built and used only
+  when the `winit_embedder` feature is enabled.
 
 Known gaps in the AppKit backend relative to winit:
 

@@ -15,8 +15,9 @@ path = "src/main.rs"
 [features]
 default = ["media"]
 media = ["embedder-core/media"]
-# Force the winit windowed backend on macOS (the default there is the
-# AppKit backend). On other platforms the winit backend is the only option.
+# Build the winit windowed backend on macOS (the AppKit backend is the
+# default there and the only one built without this feature). On other
+# platforms the winit backend is the only option.
 winit_embedder = ["embedder-backend/winit_embedder"]
 
 [dependencies]

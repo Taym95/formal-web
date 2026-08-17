@@ -6,9 +6,9 @@ publish = false
 
 [features]
 default = []
-# Opt into the winit windowed embedder on macOS (the default there is the
-# AppKit backend). On other platforms the winit backend is the only option
-# and this feature is a no-op.
+# On macOS the winit windowed embedder is not compiled unless this feature
+# is enabled (the AppKit backend is the default there). On other platforms
+# the winit backend is the only option and this feature is a no-op.
 winit_embedder = ["dep:winit-embedder"]
 
 [target.'cfg(target_os = "macos")'.dependencies]

@@ -73,6 +73,30 @@ and is the only backend on non-Apple platforms. To pair GStreamer with a
 different engine, add the engine flags, e.g.
 `cargo build --release --no-default-features --features boa,media,backend-gstreamer`.
 
+### Windowed embedder (browser chrome)
+
+The headed app's window and browser chrome come from one windowed embedder
+backend, selected at startup:
+
+- **macOS**: the AppKit backend (`mac-embedder`) is the default **and the
+  only windowed backend built**. It runs an `NSApplication` with native
+  chrome (menu bar, toolbar, address field, tab strip) and zero-copy
+  IOSurface presentation.
+- **Other platforms**: the winit backend (`winit-embedder`, winit windows
+  with a Blitz-rendered chrome) is the only option.
+
+The winit backend is **not compiled or used on macOS by default**; pass the
+`winit_embedder` feature to build and select it there:
+
+```bash
+cargo build --release --features winit_embedder
+cargo run --release --features winit_embedder
+```
+
+Note that the `winit` crate itself remains a dependency for the headless
+automation loop (WebDriver/CDP/WPT run an event loop without a window); the
+feature only gates the winit *windowed* backend.
+
 ## Project architecture
 
 A multiprocess approach is chosen by default, with the goal of having the possibility to meet [Apple's guidelines for an independent browser engine](https://developer.apple.com/documentation/BrowserEngineKit/designing-your-browser-architecture). 

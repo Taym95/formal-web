@@ -239,20 +239,11 @@ impl WindowState {
     }
 }
 
+#[derive(Default)]
 pub struct WindowedApp {
     pub(super) windows: HashMap<WindowId, WindowState>,
     pub(super) provider: Option<WebviewProvider>,
     pub(super) active_window_id: Option<WindowId>,
-}
-
-impl Default for WindowedApp {
-    fn default() -> Self {
-        Self {
-            windows: HashMap::new(),
-            provider: None,
-            active_window_id: None,
-        }
-    }
 }
 
 // ── Static helpers ─────────────────────────────────────────────────────────
