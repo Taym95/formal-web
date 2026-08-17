@@ -281,9 +281,11 @@ impl SurfaceRenderer for CpuRenderer {
             animating_frame_ids,
         );
 
-        // Step 1: Vello compute render into the intermediate texture.
+        // Step 1: Vello compute render into the intermediate texture. The
+        // pending video frame imports (macOS) submit first (inside
+        // render_into), then Vello's render — two back-to-back submissions
+        // per composed frame.
         let (src_tex, _, _) = self.render_tex.as_ref().ok_or(RenderError::Failed)?;
-        self.gpu.mark_video_textures_dirty();
         if let Err(error) = self.gpu.render_into(&scene, src_tex, width, height) {
             error!("[gpu-renderer] {error}");
             return Err(RenderError::Failed);
@@ -291,6 +293,7 @@ impl SurfaceRenderer for CpuRenderer {
 
         // Step 2: pick the next free readback slot and ensure its staging
         // buffer matches the current size.
+        let device_handle = &self.gpu.device_handle;
         let Some(readback_index) =
             (0..READBACK_SLOTS).find(|index| self.inflight_readbacks[*index].is_none())
         else {
@@ -300,7 +303,6 @@ impl SurfaceRenderer for CpuRenderer {
             );
             return Err(RenderError::Failed);
         };
-        let device_handle = &self.gpu.device_handle;
         let readback_buf = Self::ensure_readback_buffer(
             &mut self.readback_buffers[readback_index],
             device_handle,
@@ -495,7 +497,7 @@ impl SurfaceRenderer for CpuRenderer {
     }
 
     #[cfg(target_os = "macos")]
-    fn import_video_frame(
+    fn store_video_frame(
         &mut self,
         paint_id: VideoPaintId,
         pixel_buffer: &Retained<CVPixelBuffer>,
@@ -503,6 +505,6 @@ impl SurfaceRenderer for CpuRenderer {
         height: u32,
     ) -> Option<peniko::ImageData> {
         self.gpu
-            .import_video_frame(paint_id, pixel_buffer, width, height)
+            .store_video_frame(paint_id, pixel_buffer, width, height)
     }
 }
