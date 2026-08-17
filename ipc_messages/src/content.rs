@@ -245,7 +245,7 @@ pub struct TitleChanged {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DispatchEventEntry {
     pub document_id: DocumentId,
-    pub event: String,
+    pub event: Vec<u8>,
     /// Prefetched clipboard text attached by the embedder when it detects
     /// a paste shortcut before forwarding the event to content.
     /// Content stores this in a local cache so `ShellProvider::get_clipboard_text`

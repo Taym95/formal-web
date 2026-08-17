@@ -924,7 +924,7 @@ pub enum UserAgentCommand {
     },
     DispatchEventFor {
         traversable_id: NavigableId,
-        event: String,
+        event: Vec<u8>,
     },
     RenderingOpportunityFor {
         navigable_id: NavigableId,
@@ -946,7 +946,7 @@ pub enum UserAgentCommand {
 
     SendUiEvent {
         webview_id: WebviewId,
-        event_message: String,
+        event_message: Vec<u8>,
     },
     IframeTraversableRemoved {
         parent_traversable_id: NavigableId,
@@ -1074,7 +1074,7 @@ impl UserAgent {
     pub fn dispatch_event_for(
         &self,
         traversable_id: NavigableId,
-        event: String,
+        event: Vec<u8>,
     ) -> Result<(), String> {
         self.command_sender
             .send(UserAgentCommand::DispatchEventFor {
@@ -1088,7 +1088,7 @@ impl UserAgent {
     pub fn send_ui_event(
         &self,
         webview_id: WebviewId,
-        event_message: String,
+        event_message: Vec<u8>,
     ) -> Result<(), String> {
         self.command_sender
             .send(UserAgentCommand::SendUiEvent {
@@ -3427,7 +3427,7 @@ impl UserAgentWorker {
 
     /// queuing DOM event dispatch on the traversable's owning
     /// <https://html.spec.whatwg.org/multipage/#event-loop>.
-    fn handle_send_ui_event(&mut self, webview_id: WebviewId, event_message: String) {
+    fn handle_send_ui_event(&mut self, webview_id: WebviewId, event_message: Vec<u8>) {
         if input_debug_enabled() {
             trace!(
                 "[input-debug][user-agent] send_ui_event webview={:?} bytes={}",
@@ -3578,7 +3578,7 @@ impl UserAgentWorker {
         (root_webview_id, event, composed_frame_ids)
     }
 
-    fn handle_dispatch_event_for(&mut self, traversable_id: NavigableId, event: String) {
+    fn handle_dispatch_event_for(&mut self, traversable_id: NavigableId, event: Vec<u8>) {
         let Some(handle) = self.state.traversable_handles.get(&traversable_id).copied() else {
             return;
         };

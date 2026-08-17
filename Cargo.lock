@@ -938,6 +938,7 @@ dependencies = [
  "js_engine",
  "keyboard-types",
  "log",
+ "postcard",
  "serde",
  "serde_json",
  "stylo",
@@ -3271,7 +3272,6 @@ name = "mac-embedder"
 version = "0.1.0"
 dependencies = [
  "automation",
- "blitz-traits",
  "block2 0.6.2",
  "dispatch",
  "embedder-core",
@@ -6327,6 +6327,7 @@ dependencies = [
  "ipc_messages",
  "keyboard-types",
  "log",
+ "postcard",
  "psl",
  "serde",
  "serde_json",
@@ -7130,6 +7131,7 @@ dependencies = [
  "kurbo",
  "log",
  "peniko",
+ "postcard",
  "serde",
  "serde_json",
  "user_agent",

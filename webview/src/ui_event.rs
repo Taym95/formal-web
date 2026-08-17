@@ -7,7 +7,6 @@ use keyboard_types::{Code, Key, Location, Modifiers as KeyboardModifiers};
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize)]
-#[serde(tag = "type", content = "payload")]
 enum SerializableUiEvent {
     PointerMove(SerializablePointerEvent),
     PointerUp(SerializablePointerEvent),
@@ -31,7 +30,6 @@ struct SerializablePointerEvent {
 }
 
 #[derive(Serialize, Deserialize)]
-#[serde(tag = "kind", content = "value")]
 enum SerializablePointerId {
     Mouse,
     Pen,
@@ -68,7 +66,6 @@ struct SerializableWheelEvent {
 }
 
 #[derive(Serialize, Deserialize)]
-#[serde(tag = "kind", content = "value")]
 enum SerializableWheelDelta {
     Lines((f64, f64)),
     Pixels((f64, f64)),
@@ -87,7 +84,6 @@ struct SerializableKeyEvent {
 }
 
 #[derive(Serialize, Deserialize)]
-#[serde(tag = "kind", content = "value")]
 enum SerializableKey {
     Character(String),
     Named(String),
@@ -95,7 +91,6 @@ enum SerializableKey {
 }
 
 #[derive(Serialize, Deserialize)]
-#[serde(tag = "kind", content = "value")]
 enum SerializableImeEvent {
     Enabled,
     Preedit {
@@ -586,13 +581,99 @@ impl TryFrom<SerializableUiEvent> for UiEvent {
     }
 }
 
-pub fn serialize_ui_event(event: &UiEvent) -> Result<String, String> {
-    serde_json::to_string(&SerializableUiEvent::from(event))
+pub fn serialize_ui_event(event: &UiEvent) -> Result<Vec<u8>, String> {
+    postcard::to_allocvec(&SerializableUiEvent::from(event))
         .map_err(|error| format!("failed to serialize UI event: {error}"))
 }
 
-pub fn deserialize_ui_event(message: &str) -> Result<UiEvent, String> {
-    let event: SerializableUiEvent = serde_json::from_str(message)
+pub fn deserialize_ui_event(message: &[u8]) -> Result<UiEvent, String> {
+    let event: SerializableUiEvent = postcard::from_bytes(message)
         .map_err(|error| format!("failed to deserialize UI event: {error}"))?;
     event.try_into()
+}
+
+#[cfg(test)]
+mod tests {
+    use blitz_traits::SmolStr;
+    use blitz_traits::events::{
+        BlitzImeEvent, BlitzKeyEvent, BlitzPointerEvent, BlitzPointerId, BlitzWheelDelta,
+        BlitzWheelEvent, KeyState, MouseEventButton, MouseEventButtons, PointerCoords,
+        PointerDetails, UiEvent,
+    };
+    use keyboard_types::{Code, Key, Location, Modifiers};
+
+    use super::{deserialize_ui_event, serialize_ui_event};
+
+    fn pointer_event(button: MouseEventButton) -> BlitzPointerEvent {
+        BlitzPointerEvent {
+            id: BlitzPointerId::Mouse,
+            is_primary: true,
+            coords: PointerCoords {
+                page_x: 1.0,
+                page_y: 2.0,
+                screen_x: 3.0,
+                screen_y: 4.0,
+                client_x: 5.0,
+                client_y: 6.0,
+            },
+            button,
+            buttons: MouseEventButtons::from_bits_retain(1),
+            mods: Modifiers::default(),
+            details: PointerDetails::default(),
+        }
+    }
+
+    fn wheel_event() -> BlitzWheelEvent {
+        BlitzWheelEvent {
+            delta: BlitzWheelDelta::Pixels(1.0, 2.0),
+            coords: PointerCoords {
+                page_x: 10.0,
+                page_y: 20.0,
+                screen_x: 30.0,
+                screen_y: 40.0,
+                client_x: 50.0,
+                client_y: 60.0,
+            },
+            buttons: MouseEventButtons::from_bits_retain(0),
+            mods: Modifiers::default(),
+        }
+    }
+
+    fn key_event(state: KeyState) -> BlitzKeyEvent {
+        BlitzKeyEvent {
+            key: Key::Character(String::from("a")),
+            code: Code::KeyA,
+            modifiers: Modifiers::default(),
+            location: Location::Standard,
+            is_auto_repeating: false,
+            is_composing: false,
+            state,
+            text: Some(SmolStr::new("a")),
+        }
+    }
+
+    #[test]
+    fn round_trips_all_ui_event_variants() {
+        for event in [
+            UiEvent::PointerMove(pointer_event(MouseEventButton::Main)),
+            UiEvent::PointerUp(pointer_event(MouseEventButton::Secondary)),
+            UiEvent::PointerDown(pointer_event(MouseEventButton::Main)),
+            UiEvent::Wheel(wheel_event()),
+            UiEvent::KeyUp(key_event(KeyState::Released)),
+            UiEvent::KeyDown(key_event(KeyState::Pressed)),
+            UiEvent::Ime(BlitzImeEvent::Enabled),
+            UiEvent::Ime(BlitzImeEvent::Preedit(String::from("pre"), Some((1, 2)))),
+            UiEvent::Ime(BlitzImeEvent::Commit(String::from("commit"))),
+            UiEvent::Ime(BlitzImeEvent::Disabled),
+            UiEvent::AppleStandardKeybinding(SmolStr::new("selectAll:")),
+        ] {
+            let serialized = serialize_ui_event(&event).expect("serialize");
+            let deserialized = deserialize_ui_event(&serialized).expect("deserialize");
+            let reserialized = serialize_ui_event(&deserialized).expect("reserialize");
+            assert_eq!(
+                serialized, reserialized,
+                "round trip changed the encoded event: {event:?}"
+            );
+        }
+    }
 }

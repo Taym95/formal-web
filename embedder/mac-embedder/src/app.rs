@@ -16,11 +16,6 @@ use crate::window::{new_layer_hosted_view, present_shared_surface, surface_to_rg
 use automation::{
     AutomationController, AutomationHost, AutomationSnapshot, AutomationVisibleFrameViewport,
 };
-use blitz_traits::events::{
-    BlitzPointerEvent, BlitzPointerId, BlitzWheelEvent, MouseEventButton, MouseEventButtons,
-    UiEvent,
-};
-use blitz_traits::shell::ColorScheme;
 use block2::RcBlock;
 use embedder_core::{
     EventLoopEmbedder, FormalWebUserEvent, NavigationCompleted, NavigationCompletion,
@@ -67,6 +62,10 @@ use std::time::Duration;
 use uuid::Uuid;
 use verification::TraceSender;
 use webview::WebviewProvider;
+use webview::{
+    BlitzPointerEvent, BlitzPointerId, BlitzWheelDelta, BlitzWheelEvent, ColorScheme,
+    MouseEventButton, MouseEventButtons, UiEvent,
+};
 
 const INITIAL_WINDOW_WIDTH: f64 = 1200.0;
 const INITIAL_WINDOW_HEIGHT: f64 = 800.0;
@@ -1222,7 +1221,7 @@ impl MacApp {
             return;
         };
 
-        let key = input::ns_event_to_blitz_key(event);
+        let key = input::ns_event_to_key_event(event);
         let ui_event = if event.r#type() == NSEventType::KeyDown {
             UiEvent::KeyDown(key)
         } else {
@@ -2973,10 +2972,7 @@ impl AutomationHost for MacApp {
             .send_ui_event(
                 webview_id,
                 UiEvent::Wheel(BlitzWheelEvent {
-                    delta: blitz_traits::events::BlitzWheelDelta::Pixels(
-                        f64::from(dx),
-                        f64::from(dy),
-                    ),
+                    delta: BlitzWheelDelta::Pixels(f64::from(dx), f64::from(dy)),
                     coords,
                     buttons,
                     mods: modifiers,

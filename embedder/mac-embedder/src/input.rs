@@ -1,12 +1,12 @@
-//! NSEvent → Blitz input event mapping for the AppKit backend.
+//! NSEvent → input event mapping for the AppKit backend.
 
-use blitz_traits::events::{
-    BlitzKeyEvent, BlitzPointerEvent, BlitzPointerId, BlitzWheelDelta, KeyState, MouseEventButton,
-    PointerCoords, PointerDetails,
-};
 use keyboard_types::{Code, Key, Location, Modifiers as KeyboardModifiers};
 use objc2_app_kit::{NSEvent, NSEventModifierFlags, NSEventType};
 use objc2_foundation::NSInteger;
+use webview::{
+    BlitzKeyEvent, BlitzPointerEvent, BlitzPointerId, BlitzWheelDelta, KeyState, MouseEventButton,
+    MouseEventButtons, PointerCoords, PointerDetails, SmolStr,
+};
 
 /// Map a macOS virtual key code (NSEvent.keyCode) to a W3C keyboard code.
 pub(super) fn code_from_keycode(keycode: u16) -> Code {
@@ -156,12 +156,12 @@ pub(super) fn modifiers_from_flags(flags: NSEventModifierFlags) -> KeyboardModif
     modifiers
 }
 
-/// Build a Blitz key event from an NSEvent.
-pub(super) fn ns_event_to_blitz_key(event: &NSEvent) -> BlitzKeyEvent {
+/// Build a key event from an NSEvent.
+pub(super) fn ns_event_to_key_event(event: &NSEvent) -> BlitzKeyEvent {
     let pressed = event.r#type() == NSEventType::KeyDown;
     let characters = if pressed {
         event.characters().map(|text| {
-            let value: blitz_traits::SmolStr = text.to_string().into();
+            let value: SmolStr = text.to_string().into();
             value
         })
     } else {
@@ -183,7 +183,7 @@ pub(super) fn ns_event_to_blitz_key(event: &NSEvent) -> BlitzKeyEvent {
     }
 }
 
-/// Map an NSEvent mouse button number to a Blitz mouse button.
+/// Map an NSEvent mouse button number to a mouse button.
 pub(super) fn button_from_number(button_number: NSInteger) -> MouseEventButton {
     match button_number {
         1 => MouseEventButton::Secondary,
@@ -214,7 +214,7 @@ pub(super) fn pointer_event(
     is_primary: bool,
     coords: PointerCoords,
     button: MouseEventButton,
-    buttons: blitz_traits::events::MouseEventButtons,
+    buttons: MouseEventButtons,
     modifiers: KeyboardModifiers,
 ) -> BlitzPointerEvent {
     BlitzPointerEvent {

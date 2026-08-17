@@ -6,7 +6,6 @@ publish = false
 
 [dependencies]
 automation = { path = "../../automation" }
-blitz-traits = { workspace = true }
 embedder-core = { path = "../core" }
 ipc = { path = "../../ipc" }
 ipc-channel = { git = "https://github.com/gterzian/ipc-channel", rev = "169da83" }

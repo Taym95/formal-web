@@ -1,7 +1,12 @@
 pub mod ui_event;
 
-use blitz_traits::events::UiEvent;
-use blitz_traits::shell::ColorScheme;
+pub use blitz_traits::SmolStr;
+pub use blitz_traits::events::{
+    BlitzImeEvent, BlitzKeyEvent, BlitzPointerEvent, BlitzPointerId, BlitzWheelDelta,
+    BlitzWheelEvent, KeyState, MouseEventButton, MouseEventButtons, PointerCoords, PointerDetails,
+    UiEvent,
+};
+pub use blitz_traits::shell::ColorScheme;
 use ipc_messages::content::{NavigableId, NavigateRequest, UserNavigationInvolvement, WebviewId};
 use log::{debug, error, trace};
 use std::collections::HashMap;
