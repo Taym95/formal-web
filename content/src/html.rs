@@ -130,52 +130,36 @@ pub(crate) fn create_a_new_browsing_context_and_document(
     ),
     String,
 > {
-    // Note: This function runs the content-process portion of "create a new
-    // browsing context and document": steps 10 (create a new realm), 13 (set
-    // up a window environment settings object), 15 (new Document) and 22
-    // (populate with html/head/body).  The remaining steps operate on
-    // user-agent state — browsing context and group allocation (1-9), top-level
-    // creation URL/origin (11-12), load timing (14), referrer and ancestor
-    // state (16-19), document lifecycle (21, 23-24) — and run in the user
-    // agent when it catches up navigable state before navigating, in
-    // `UserAgent::create_a_new_browsing_context` — called from
-    // `UserAgent::create_a_new_child_navigable` (iframes) or
-    // `UserAgent::creating_a_new_top_level_traversable` (window.open) — or
-    // are not implemented.  Each step is addressed in order below.  The caller
-    // must keep the returned environment settings object alive — dropping it
-    // drops the realm execution context and invalidates JsObject handles.
-    //
     // Step 1: Let browsingContext be a new browsing context.
-    //         (user agent: allocates the browsing context and registers it in
-    //          the browsing context group; `traversable_id` is its navigable id)
     // Step 2: Let unsafeContextCreationTime be the unsafe shared current time.
-    //         (not implemented: document load timing info is not tracked)
     // Step 3: Let creatorOrigin be null.
     // Step 4: Let creatorBaseURL be null.
-    //         (not implemented: creator state is not tracked)
     // Step 5: If creator is non-null:
     // Step 5.1: Set creatorOrigin to creator's origin.
     // Step 5.2: Set creatorBaseURL to creator's document base URL.
     // Step 5.3: Set browsingContext's virtual browsing context group ID to
     //           creator's browsing context's top-level browsing context's
     //           virtual browsing context group ID.
-    //         (not implemented: creator-based state is not tracked)
+    // Note: Step 1 runs in the user agent: `UserAgent::create_a_new_browsing_context`
+    // allocates the browsing context and registers it in the browsing context
+    // group (`traversable_id` is its navigable id).  Steps 2-5 are not
+    // implemented: creation time and creator state are not tracked.
     // Step 6: Let sandboxFlags be the result of determining the creation
     //         sandboxing flags given browsingContext and embedder.
-    //         (not implemented: no sandboxing flags are tracked)
+    // Note: Not implemented: no sandboxing flags are tracked.
     // Step 7: Let origin be the result of determining the origin given
     //         about:blank, sandboxFlags, and creatorOrigin.
-    //         (partial: the environment settings object's origin is derived
-    //          from the about:blank URL in `new_in_realm`; the sandbox and
-    //          creator branches of "determine the origin" are not implemented)
+    // Note: Partial: the environment settings object's origin is derived from
+    // the about:blank URL in `new_in_realm`; the sandbox and creator branches
+    // of "determine the origin" are not implemented.
     // Step 8: Let permissionsPolicy be the result of creating a permissions
     //         policy given embedder and origin.
-    //         (not implemented)
+    // Note: Not implemented.
     // Step 9: Let agent be the result of obtaining a similar-origin window
     //         agent given origin, group, and false.
-    //         (user agent: allocates the agent and agent cluster; child
-    //          navigables reuse the parent's event loop — see
-    //          `UserAgent::creating_a_new_top_level_traversable`)
+    // Note: Runs in the user agent: `UserAgent::create_a_new_browsing_context`
+    // allocates the agent and agent cluster; child navigables reuse the
+    // parent's event loop.
     //
     // Step 15: Let document be a new Document, with: type "html"; content type
     // "text/html"; mode "quirks"; origin origin; browsing context
@@ -206,8 +190,16 @@ pub(crate) fn create_a_new_browsing_context_and_document(
     // realm execution context, null, topLevelCreationURL, and topLevelOrigin.
     // Note: Steps 10 and 13 run together in `create_a_new_realm`, which returns
     // the settings object whose realm execution context backs the new realm.
-    // Steps 11-12 (topLevelCreationURL, topLevelOrigin) and 14 (load timing
-    // info) are not implemented.
+    // Step 11: Let topLevelCreationURL be about:blank if embedder is null;
+    // otherwise embedder's relevant settings object's top-level creation URL.
+    // Step 12: Let topLevelOrigin be origin if embedder is null; otherwise
+    // embedder's relevant settings object's top-level origin.
+    // Step 14: Let loadTimingInfo be a new document load timing info with its
+    // navigation start time set to the result of calling coarsen time with
+    // unsafeContextCreationTime and the new environment settings object's
+    // cross-origin isolated capability.
+    // Note: Steps 11-12 and 14 are not implemented: top-level creation
+    // URL/origin and load timing info are not tracked.
     let (global_object, window, settings) = create_a_new_realm(
         parent_engine,
         event_sender,
@@ -223,7 +215,8 @@ pub(crate) fn create_a_new_browsing_context_and_document(
     //          creation steps given document and iframeReferrerPolicy.
     // Step 18: Set document's ancestor origins list to the result of running
     //          the ancestor origins list creation steps given document.
-    //         (not implemented: referrer and ancestor state is not tracked)
+    // Note: Steps 16-18 are not implemented: referrer and ancestor state is
+    // not tracked.
     // Step 19: If creator is non-null:
     // Step 19.1: Set document's referrer to the serialization of creator's URL.
     // Step 19.2: Set document's policy container to a clone of creator's policy
@@ -232,26 +225,28 @@ pub(crate) fn create_a_new_browsing_context_and_document(
     //            settings object's top-level origin, then set document's opener
     //            policy to creator's browsing context's top-level browsing
     //            context's active document's opener policy.
-    //         (not implemented: creator-based state is not tracked)
+    // Note: Not implemented: creator-based state is not tracked.
     // Step 20: Assert: document's URL and document's relevant settings object's
     //          creation URL are about:blank.
-    //         (holds: the creation URL passed to `new_in_realm` is about:blank)
+    // Note: Holds: the creation URL passed to `new_in_realm` is about:blank.
     // Step 21: Mark document as ready for post-load tasks.
-    //         (not implemented)
+    // Note: Not implemented.
     // Step 22: Populate with html/head/body given document.
     parse_html_into_document(&mut document.borrow_mut(), crate::EMPTY_HTML_DOCUMENT);
 
     // Step 23: Make active document.
-    //         (user agent: `set_navigable_active_document` and the navigable's
-    //          active document state; the caller of this function also records
-    //          the document in `active_documents_by_traversable`)
+    // Note: The user agent's `create_a_new_browsing_context` records the
+    // active document; the caller of this function also records the document
+    // in `active_documents_by_traversable`.
     // Step 24: Completely finish loading document.
-    //         (not run here: the user-agent-initiated path executes
-    //          parser-discovered scripts of the initial about:blank document in
-    //          content/src/main.rs)
+    // Note: Not run here: the user-agent-initiated path executes
+    // parser-discovered scripts of the initial about:blank document in
+    // content/src/main.rs.
     // Step 25: Return browsingContext and document.
-    //         (the browsing context is `traversable_id` on the user-agent side;
-    //          the document and realm handles are returned to the caller)
+    // Note: The browsing context is `traversable_id` on the user-agent side.
+    // The caller must keep the returned environment settings object alive —
+    // dropping it drops the realm execution context and invalidates JsObject
+    // handles.
     Ok((global_object, window, settings, document))
 }
 
@@ -303,9 +298,10 @@ pub(crate) fn create_a_new_realm(
         Some(document_id),
     )?;
 
-    // Step 10 customization: for the global object, create a new Window object.
-    // The Window platform object was created during realm setup; extract it
-    // from the new realm's global object while the realm is current.
+    // Note: The Window platform object for the step 10 customization (for the
+    // global object, create a new Window object) was created during realm
+    // setup; extract it from the new realm's global object while the realm is
+    // current.
     let global_object = settings.realm_execution_context.realm_global_object();
     let window = settings
         .realm_execution_context

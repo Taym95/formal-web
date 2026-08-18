@@ -392,14 +392,13 @@ fn create_a_new_child_navigable(
     // (`UserAgent::create_a_new_child_navigable`).
     // Step 3: "Let browsingContext and document be the result of creating a new browsing
     // context and document given element's node document, element, and group."
-    // <https://html.spec.whatwg.org/#creating-a-new-browsing-context>
-    // Note: Content-process portion only: the document, realm, Window and
-    // environment settings object (steps 10, 13, 15, 22 of the parent algorithm)
-    // are created below via `create_a_new_browsing_context_and_document`; the
-    // browsing-context allocation, group membership, agent and session-history
-    // steps (1-9, 11-12, 14, 16-21, 23-25) run in the user agent when it handles
-    // the CreateChildNavigable IPC (`UserAgent::create_a_new_child_navigable`),
-    // before navigation.
+    // Note: Content-process portion of this step: the document, realm, Window
+    // and environment settings object are created below via
+    // `create_a_new_browsing_context_and_document` (steps 10, 13, 15, 22 of
+    // "creating a new browsing context and document"); the browsing-context
+    // allocation, group membership, agent and session-history steps run in the
+    // user agent when it handles the CreateChildNavigable IPC
+    // (`UserAgent::create_a_new_child_navigable`), before navigation.
     let content_navigable = process.allocate_navigable_id()?;
     let new_document_id = DocumentId::new();
     let top_level_traversable_id = process
@@ -408,11 +407,6 @@ fn create_a_new_child_navigable(
         .map(|doc| doc.top_level_traversable_id)
         .unwrap_or(parent_navigable);
 
-    // Step 3 (continued): "creating a new browsing context and document",
-    // content-process portion — steps 10 (create a new realm), 13 (set up a
-    // window environment settings object), 15 (new Document) and 22 (populate
-    // with html/head/body) run here, in content.
-    // <https://html.spec.whatwg.org/#creating-a-new-browsing-context>
     let content_frame_id = process.allocate_child_frame_id();
     let event_sender = process.event_sender.clone();
     let parent_engine = &mut process
@@ -472,7 +466,7 @@ fn create_a_new_child_navigable(
     // already satisfied by the document created above. The UA-side document state (navigable
     // tree registration, session history) is set up in the CreateChildNavigable handler.
     // Step 7: "Let navigable be a new navigable."
-    // (allocated above as `content_navigable`)
+    // Note: The navigable id was allocated above as `content_navigable`.
 
     // Step 8: "Initialize the navigable navigable given documentState and parentNavigable."
     // Note: The UA initializes its navigable state upon receiving CreateChildNavigable.
