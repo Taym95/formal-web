@@ -823,7 +823,6 @@ pub enum WebviewProviderMessage {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Command {
-    SetEventLoopId(EventLoopId),
     SetViewport(ViewportSnapshot),
     SetTraversableViewport(TraversableViewport),
     CreateEmptyDocument {
@@ -894,6 +893,8 @@ pub enum Command {
     /// direct net→content response routing), the TLA trace sender, and initial
     /// configuration.
     ContentBootstrap {
+        /// The event loop this content process hosts.
+        event_loop_id: EventLoopId,
         net_sender: ipc::IpcSender<crate::network::Request>,
         /// Direct sender to the graphics process.
         graphics_sender: Option<ipc::IpcSender<crate::graphics::GraphicsCommand>>,

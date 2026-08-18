@@ -117,29 +117,6 @@ pub fn await_a_stable_state<F>(
 
 /// <https://html.spec.whatwg.org/#creating-a-new-browsing-context>
 pub(crate) fn create_a_new_browsing_context_and_document(
-    parent_engine: &mut Engine,
-    event_sender: &IpcSender<ContentEvent>,
-    traversable_id: NavigableId,
-    document_id: DocumentId,
-) -> Result<
-    (
-        JsObject,
-        Window,
-        EnvironmentSettingsObject,
-        Rc<RefCell<BaseDocument>>,
-    ),
-    String,
-> {
-    create_a_new_realm(
-        Some(parent_engine),
-        event_sender,
-        traversable_id,
-        document_id,
-    )
-}
-
-/// <https://html.spec.whatwg.org/#creating-a-new-browsing-context>
-pub(crate) fn create_a_new_realm(
     parent_engine: Option<&mut Engine>,
     event_sender: &IpcSender<ContentEvent>,
     traversable_id: NavigableId,
@@ -153,12 +130,49 @@ pub(crate) fn create_a_new_realm(
     ),
     String,
 > {
-    // Note: This function implements the content-process portion only.
-    // Steps requiring UA-side state (browsing context allocation, group
-    // membership, agent selection, session history) are delegated by the
-    // calling algorithm.  The caller must keep the returned ESO alive
-    // — dropping it drops the Context and invalidates JsObject handles.
-    // Step 15: Create a new Document with type "html", content type "text/html"
+    // Step 1: Let browsingContext be a new browsing context.
+    // Step 2: Let unsafeContextCreationTime be the unsafe shared current time.
+    // Step 3: Let creatorOrigin be null.
+    // Step 4: Let creatorBaseURL be null.
+    // Step 5: If creator is non-null:
+    // Step 5.1: Set creatorOrigin to creator's origin.
+    // Step 5.2: Set creatorBaseURL to creator's document base URL.
+    // Step 5.3: Set browsingContext's virtual browsing context group ID to
+    //           creator's browsing context's top-level browsing context's
+    //           virtual browsing context group ID.
+    // Note: Step 1 runs in the user agent: `UserAgent::create_a_new_browsing_context`
+    // allocates the browsing context and registers it in the browsing context
+    // group (`traversable_id` is its navigable id).  Steps 2-5 are not
+    // implemented: creation time and creator state are not tracked.
+    // Step 6: Let sandboxFlags be the result of determining the creation
+    //         sandboxing flags given browsingContext and embedder.
+    // Note: Not implemented: no sandboxing flags are tracked.
+    // Step 7: Let origin be the result of determining the origin given
+    //         about:blank, sandboxFlags, and creatorOrigin.
+    // Note: Partial: the environment settings object's origin is derived from
+    // the about:blank URL in `new_in_realm`; the sandbox and creator branches
+    // of "determine the origin" are not implemented.
+    // Step 8: Let permissionsPolicy be the result of creating a permissions
+    //         policy given embedder and origin.
+    // Note: Not implemented.
+    // Step 9: Let agent be the result of obtaining a similar-origin window
+    //         agent given origin, group, and false.
+    // Note: Runs in the user agent: `UserAgent::create_a_new_browsing_context`
+    // allocates the agent and agent cluster; child navigables reuse the
+    // parent's event loop.
+    //
+    // Step 15: Let document be a new Document, with: type "html"; content type
+    // "text/html"; mode "quirks"; origin origin; browsing context
+    // browsingContext; permissions policy permissionsPolicy; active sandboxing
+    // flag set sandboxFlags; load timing info loadTimingInfo; is initial
+    // about:blank true; about base URL creatorBaseURL; allow declarative shadow
+    // roots true; custom element registry a new CustomElementRegistry object.
+    // Note: Run ahead of steps 10 and 13, which the spec performs before
+    // creating the Document: the realm setup below needs the domain-level
+    // Document to build the Document and Window platform objects.  The
+    // platform Document object is created inside step 10, within the new
+    // realm.  "is initial about:blank" is tracked in the user agent's
+    // document state; the remaining Document properties are not implemented.
     let document = Rc::new(RefCell::new(BaseDocument::new(DocumentConfig {
         viewport: None,
         base_url: None,
@@ -168,30 +182,133 @@ pub(crate) fn create_a_new_realm(
         ..DocumentConfig::default()
     })));
 
-    // Steps 9-10, 13: Obtain agent, create realm, set up window environment
-    // settings object.
+    // Step 10: Let realm execution context be the result of creating a new realm
+    // given agent and the following customizations: for the global object, create
+    // a new Window object; for the global this binding, use browsingContext's
+    // WindowProxy object.
+    // Step 13: Set up a window environment settings object with about:blank,
+    // realm execution context, null, topLevelCreationURL, and topLevelOrigin.
+    // Note: Steps 10 and 13 run together in `create_a_new_realm`, which returns
+    // the settings object whose realm execution context backs the new realm.
+    // Step 11: Let topLevelCreationURL be about:blank if embedder is null;
+    // otherwise embedder's relevant settings object's top-level creation URL.
+    // Step 12: Let topLevelOrigin be origin if embedder is null; otherwise
+    // embedder's relevant settings object's top-level origin.
+    // Step 14: Let loadTimingInfo be a new document load timing info with its
+    // navigation start time set to the result of calling coarsen time with
+    // unsafeContextCreationTime and the new environment settings object's
+    // cross-origin isolated capability.
+    // Note: Steps 11-12 and 14 are not implemented: top-level creation
+    // URL/origin and load timing info are not tracked.
+    let (global_object, window, settings) = create_a_new_realm(
+        parent_engine,
+        event_sender,
+        traversable_id,
+        document_id,
+        Rc::clone(&document),
+    )?;
+
+    // Step 16: Let iframeReferrerPolicy be the result of determining the iframe
+    //          element referrer policy given embedder.
+    // Step 17: Set document's internal ancestor origin objects list to the
+    //          result of running the internal ancestor origin objects list
+    //          creation steps given document and iframeReferrerPolicy.
+    // Step 18: Set document's ancestor origins list to the result of running
+    //          the ancestor origins list creation steps given document.
+    // Note: Steps 16-18 are not implemented: referrer and ancestor state is
+    // not tracked.
+    // Step 19: If creator is non-null:
+    // Step 19.1: Set document's referrer to the serialization of creator's URL.
+    // Step 19.2: Set document's policy container to a clone of creator's policy
+    //            container.
+    // Step 19.3: If creator's origin is same origin with creator's relevant
+    //            settings object's top-level origin, then set document's opener
+    //            policy to creator's browsing context's top-level browsing
+    //            context's active document's opener policy.
+    // Note: Not implemented: creator-based state is not tracked.
+    // Step 20: Assert: document's URL and document's relevant settings object's
+    //          creation URL are about:blank.
+    // Note: Holds: the creation URL passed to `new_in_realm` is about:blank.
+    // Step 21: Mark document as ready for post-load tasks.
+    // Note: Not implemented.
+    // Step 22: Populate with html/head/body given document.
+    parse_html_into_document(&mut document.borrow_mut(), crate::EMPTY_HTML_DOCUMENT);
+
+    // Step 23: Make active document.
+    // Note: The user agent's `create_a_new_browsing_context` records the
+    // active document; the caller of this function also records the document
+    // in `active_documents_by_traversable`.
+    // Step 24: Completely finish loading document.
+    // Note: Not run here: the user-agent-initiated path executes
+    // parser-discovered scripts of the initial about:blank document in
+    // content/src/main.rs.
+    // Step 25: Return browsingContext and document.
+    // Note: The browsing context is `traversable_id` on the user-agent side.
+    // The caller must keep the returned environment settings object alive —
+    // dropping it drops the realm execution context and invalidates JsObject
+    // handles.
+    Ok((global_object, window, settings, document))
+}
+
+/// <https://html.spec.whatwg.org/#creating-a-new-javascript-realm>
+pub(crate) fn create_a_new_realm(
+    parent_engine: Option<&mut Engine>,
+    event_sender: &IpcSender<ContentEvent>,
+    traversable_id: NavigableId,
+    document_id: DocumentId,
+    document: Rc<RefCell<BaseDocument>>,
+) -> Result<(JsObject, Window, EnvironmentSettingsObject), String> {
+    // Step 1: Perform InitializeHostDefinedRealm() with the provided
+    // customizations for creating the global object and the global this binding.
+    // Note: The customizations come from step 10 of "create a new browsing
+    // context and document": for the global object, create a new Window object
+    // (created by the realm setup and extracted below); for the global this
+    // binding, use the browsing context's WindowProxy object (approximated —
+    // the global this binding is the realm's global object; WindowProxy
+    // platform objects are created lazily for cross-realm access).  The realm
+    // is built by `EnvironmentSettingsObject::new_in_realm` via
+    // build_realm/build_context, which also creates the Document platform
+    // object for `document` (step 15 of the parent algorithm).
+    // Steps 2-4: Let realm execution context be the running JavaScript
+    // execution context.  Remove realm execution context from the JavaScript
+    // execution context stack.  Let realm be realm execution context's Realm
+    // component.
+    // Note: Execution-context bookkeeping is performed inside the engine; the
+    // resulting realm execution context is exposed as
+    // `settings.realm_execution_context`.
+    // Step 5: If agent's agent cluster's cross-origin isolation mode is "none":
+    // Step 5.1: Let global be realm's global object.
+    // Step 5.2: Let status be ! global.[[Delete]]("SharedArrayBuffer").
+    // Step 5.3: Assert: status is true.
+    // Note: Not performed: the SharedArrayBuffer property is not deleted from
+    // the new realm's global object, even though the cross-origin isolation
+    // mode of the browsing context groups this browser creates is "none" (see
+    // `CrossOriginIsolationMode` in the user agent).
+    // Step 6: Return realm execution context.
+    // Note: Step 13 of the parent algorithm (set up a window environment
+    // settings object) is performed by the same call, which is why this
+    // function returns the settings object rather than a bare realm execution
+    // context.
     let settings = EnvironmentSettingsObject::new_in_realm(
         parent_engine,
-        Rc::clone(&document),
+        document,
         Url::parse("about:blank").map_err(|error| error.to_string())?,
         Some(event_sender.clone()),
         Some(traversable_id),
         Some(document_id),
     )?;
 
-    // Step 22: Populate with html/head/body given document.
-    parse_html_into_document(&mut document.borrow_mut(), crate::EMPTY_HTML_DOCUMENT);
-
-    // Step 10 (continued): global object is the Window.  The Window domain
-    // struct is extracted while the new realm is current, so its platform
-    // data is reachable from this execution context.
+    // Note: The Window platform object for the step 10 customization (for the
+    // global object, create a new Window object) was created during realm
+    // setup; extract it from the new realm's global object while the realm is
+    // current.
     let global_object = settings.realm_execution_context.realm_global_object();
     let window = settings
         .realm_execution_context
         .with_object_any(&global_object)
         .and_then(|data| data.downcast_ref::<Window>().cloned())
         .ok_or_else(|| String::from("realm global object is not a Window"))?;
-    Ok((global_object, window, settings, document))
+    Ok((global_object, window, settings))
 }
 
 /// <https://html.spec.whatwg.org/#navigate>

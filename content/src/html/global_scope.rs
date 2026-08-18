@@ -6,7 +6,10 @@ use std::{
 };
 
 use super::windowproxy::{WindowProxy, WindowProxyBacking};
-use super::{Window, create_a_new_realm, environment_settings_object::EnvironmentSettingsObject};
+use super::{
+    Window, create_a_new_browsing_context_and_document,
+    environment_settings_object::EnvironmentSettingsObject,
+};
 
 use blitz_dom::BaseDocument;
 use ipc::IpcSender;
@@ -897,7 +900,18 @@ impl GlobalScope {
         let event_sender = event_sender
             .as_ref()
             .ok_or_else(|| String::from("GlobalScope has no event sender"))?;
-        create_a_new_realm(
+        // Step 4: Let browsingContext and document be the result of creating a
+        // new browsing context and document with opener's active document, null,
+        // and group.
+        // Note: Content-process portion of this step: the document, realm,
+        // Window and environment settings object are created by
+        // `create_a_new_browsing_context_and_document` (steps 10, 13, 15, 22 of
+        // "creating a new browsing context and document").  The browsing
+        // context, group membership and agent are allocated by the user agent
+        // when it handles the `new_traversable_info` on NavigateRequest, and
+        // the opener relationship is set by `setup_opener_for_window_open`
+        // (see `UserAgent::creating_a_new_top_level_traversable`).
+        create_a_new_browsing_context_and_document(
             parent_engine,
             event_sender,
             new_traversable_id,

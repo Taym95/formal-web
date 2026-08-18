@@ -281,6 +281,7 @@ fn log_render_state_debug(message: impl AsRef<str>) {
 struct ContentNetProvider {
     local_state: LocalContentStateRef,
     content_document_id: DocumentId,
+    event_loop_id: EventLoopId,
     network_extension_sender: ipc::IpcSender<ipc_messages::network::Request>,
     content_command_sender: ipc::IpcSender<Command>,
 }
@@ -320,6 +321,7 @@ impl NetProvider for ContentNetProvider {
                     body: request_body_string(&request.body),
                 };
                 let network_request = ipc_messages::network::Request::Fetch {
+                    event_loop_id: self.event_loop_id,
                     request_id: uuid::Uuid::new_v4(),
                     request: fetch_request,
                     reply_to: ipc_messages::network::ResponseRecipient::ContentProcess {
@@ -510,6 +512,7 @@ impl ContentProcess {
             net_provider: Some(Arc::new(ContentNetProvider {
                 local_state: Arc::clone(&self.local_state),
                 content_document_id: document_id,
+                event_loop_id: self.event_loop_id,
                 network_extension_sender: self.network_extension_sender.clone(),
                 content_command_sender: self.content_command_sender.clone(),
             })),
@@ -606,6 +609,7 @@ impl ContentProcess {
             body: request_body_string(&request.body),
         };
         let network_request = ipc_messages::network::Request::Fetch {
+            event_loop_id: self.event_loop_id,
             request_id: uuid::Uuid::new_v4(),
             request: fetch_request,
             reply_to: ipc_messages::network::ResponseRecipient::ContentProcess {
@@ -983,20 +987,20 @@ impl ContentProcess {
         }
 
         // This block continues <https://html.spec.whatwg.org/#creating-a-new-browsing-context>.
-        // Step 7: "Mark document as ready for post-load tasks."
+        // Step 21: "Mark document as ready for post-load tasks."
         // TODO: Persist the document's post-load readiness state in the DOM model.
         let parser_scripts = {
             let mut document_guard = document.borrow_mut();
 
-            // Step 8: "Populate with html/head/body given document."
+            // Step 22: "Populate with html/head/body given document."
             // The content process drives the shared HTML parser with a fixed `about:blank` skeleton.
             parse_html_into_document(&mut document_guard, EMPTY_HTML_DOCUMENT)
         };
 
-        // Step 10: "Completely finish loading document."
+        // Step 24: "Completely finish loading document."
         // Execute parser-discovered classic scripts after the initial tree build.
         // TODO: Model the rest of the `completely finish loading` bookkeeping explicitly instead of relying on parser-discovered script execution alone.
-        // Step 9: "Make active document."
+        // Step 23: "Make active document."
         // Records the document as addressable under `document_id` after init completes.
         self.documents.insert(
             document_id,
@@ -2445,11 +2449,6 @@ impl ContentProcess {
 
     fn handle_command_inner(&mut self, command: Command) -> Result<bool, String> {
         match command {
-            Command::SetEventLoopId(event_loop_id) => {
-                self.event_loop_id = event_loop_id;
-                Ok(true)
-            }
-
             SetViewport(viewport) => {
                 self.set_viewport(viewport);
                 Ok(true)
@@ -2649,16 +2648,24 @@ pub fn run_content_process(token: String) -> Result<(), String> {
 
         let cmd_rx = ipc::crossbeam_proxy(server.connection.receiver);
 
-        let (network_extension_sender, graphics_sender, content_command_sender, trace_sender) = {
+        let (
+            event_loop_id,
+            network_extension_sender,
+            graphics_sender,
+            content_command_sender,
+            trace_sender,
+        ) = {
             match cmd_rx.recv() {
                 Ok(incoming) => match incoming.payload {
                     ContentBootstrap {
+                        event_loop_id,
                         net_sender,
                         graphics_sender,
                         content_command_sender,
                         trace_sender,
                         ..
                     } => (
+                        event_loop_id,
                         net_sender,
                         graphics_sender,
                         content_command_sender,
@@ -2676,7 +2683,6 @@ pub fn run_content_process(token: String) -> Result<(), String> {
         let _ = event_sender.send(ContentEvent::CommandCompleted);
 
         let mut process = {
-            let event_loop_id = EventLoopId::from_u128(0);
             ContentProcess::new(
                 event_sender.clone(),
                 wasm_signal_sender,

@@ -7,7 +7,7 @@ use ipc_messages::content::{
 };
 use ipc_messages::graphics::GraphicsCommand;
 use log::error;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::process::Child;
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use verification::TraceSender;
 
 use crate::timer::{TimerCommand, TimerCompletion};
-use crate::{Embedder, UserAgentCommand};
+use crate::{Agent, Embedder, UserAgentCommand};
 
 /// graceful shutdown of the content process owned by one HTML event loop.
 const CONTENT_SHUTDOWN_GRACE_TIMEOUT: Duration = Duration::from_millis(150);
@@ -48,15 +48,6 @@ pub enum EventLoopCommand {
     Stop {
         reply: Sender<Result<(), String>>,
     },
-}
-
-/// Implementation detail: thread handle plus routing state for one
-/// <https://html.spec.whatwg.org/multipage/#event-loop>.
-pub struct EventLoopEntry {
-    pub event_loop_id: EventLoopId,
-    pub command_sender: Sender<EventLoopCommand>,
-    pub join_handle: JoinHandle<()>,
-    pub traversable_ids: HashSet<NavigableId>,
 }
 
 /// navigation debug output related to HTML navigation continuations.
@@ -237,6 +228,7 @@ impl EventLoopWorker {
         };
 
         worker.send_command_inner(&ContentCommand::ContentBootstrap {
+            event_loop_id,
             net_sender: network_extension_sender_fwd,
             graphics_sender: graphics_sender_for_bootstrap,
             content_command_sender,
@@ -694,7 +686,7 @@ pub fn spawn_event_loop_entry(
     trace_sender: Option<TraceSender>,
     network_extension_sender: ipc::IpcSender<ipc_messages::network::Request>,
     graphics_extension_sender: Option<ipc::IpcSender<GraphicsCommand>>,
-) -> Result<EventLoopEntry, String> {
+) -> Result<(Sender<EventLoopCommand>, JoinHandle<()>), String> {
     let (command_sender, command_receiver) = unbounded();
     let mut worker = EventLoopWorker::new(
         event_loop_id,
@@ -711,18 +703,13 @@ pub fn spawn_event_loop_entry(
         .name(format!("formal-web-event-loop-{event_loop_id}"))
         .spawn(move || worker.run())
         .map_err(|error| format!("failed to spawn event-loop thread {event_loop_id}: {error}"))?;
-    Ok(EventLoopEntry {
-        event_loop_id,
-        command_sender,
-        join_handle,
-        traversable_ids: HashSet::new(),
-    })
+    Ok((command_sender, join_handle))
 }
 
-/// <https://html.spec.whatwg.org/multipage/#event-loop>
-pub fn stop_event_loop_entry(entry: EventLoopEntry) -> Result<(), String> {
+/// <https://html.spec.whatwg.org/multipage/#concept-agent-event-loop>
+pub fn stop_event_loop_entry(agent: Agent) -> Result<(), String> {
     let (reply_sender, reply_receiver) = bounded(1);
-    entry
+    agent
         .command_sender
         .send(EventLoopCommand::Stop {
             reply: reply_sender,
@@ -733,7 +720,7 @@ pub fn stop_event_loop_entry(entry: EventLoopEntry) -> Result<(), String> {
         .recv()
         .map_err(|error| format!("event-loop shutdown reply channel closed: {error}"))?;
 
-    entry
+    agent
         .join_handle
         .join()
         .map_err(|_| String::from("event-loop thread panicked"))?;

@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::process::Child;
 use std::time::Duration;
 
-use ipc_messages::content::NavigationFetchId;
+use ipc_messages::content::{EventLoopId, NavigationFetchId};
 use ipc_messages::network::{
     NavigationFetchRequest, Request as NetworkRequest, Response as NetworkResponse,
     ResponseRecipient,
@@ -74,11 +74,13 @@ impl NetConnection {
     pub(crate) fn start_navigation_fetch(
         &mut self,
         fetch_id: NavigationFetchId,
+        event_loop_id: EventLoopId,
         request: NavigationFetchRequest,
     ) -> Result<(), String> {
         let request_id = uuid::Uuid::new_v4();
         self.pending_fetches.insert(request_id, fetch_id);
         if let Err(error) = self.sender.send(NetworkRequest::NavigationFetch {
+            event_loop_id,
             request_id,
             request,
             reply_to: ResponseRecipient::UserAgent,

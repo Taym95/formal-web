@@ -139,10 +139,15 @@ pub fn run_net_process_v2(token: String) -> Result<(), String> {
                             let _ = trace_sender;
                         }
                         Request::Fetch {
+                            event_loop_id,
                             request_id,
                             request,
                             reply_to,
                         } => {
+                            log::debug!(
+                                "[net] fetch event_loop={event_loop_id} url={}",
+                                request.url
+                            );
                             let result = fetch_request(&client, &request);
                             if let Err(error) =
                                 route_response(request_id, reply_to, result, &response_sender)
@@ -152,10 +157,15 @@ pub fn run_net_process_v2(token: String) -> Result<(), String> {
                             }
                         }
                         Request::NavigationFetch {
+                            event_loop_id,
                             request_id,
                             request,
                             reply_to,
                         } => {
+                            log::debug!(
+                                "[net] navigation fetch event_loop={event_loop_id} url={}",
+                                request.url
+                            );
                             // Convert NavigationFetchRequest to FetchRequest for HTTP transport.
                             let fetch_req = FetchRequest {
                                 handler_id: DocumentFetchId::new(),

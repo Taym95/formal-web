@@ -93,6 +93,26 @@ for the definitive spec-annotation reference with examples and common mistakes.
    - NO blank line between the function/block opening `{` and the first step comment.
    - NO blank line between a step comment and its immediately following code.
    - Blank line AFTER the code, before the next step's comment.
+   **Per-step notes, not summaries.**  Each step gets its own `// Step N:`
+   comment, in step order, followed — when the step needs explanation (where
+   it runs, what is missing, a re-ordering) — by a `// Note:` below that
+   step's comment.  When the same note applies to several consecutive steps,
+   group those step comments together and write a single `// Note:` below
+   the group.  Do NOT write summarizing comments that describe the overall
+   split in place of per-step documentation (e.g. a preamble saying "steps
+   X, Y, Z run here; the rest run in the user agent") — the per-step
+   comments and their notes carry that information.  A function-level
+   contract that is not tied to any step (e.g. keeping a returned value
+   alive) belongs in the note of the step that returns it.
+   **Mirror the split on both sides.**  When an algorithm is split between
+   processes (e.g. content runs the document-owning steps, the user agent
+   the navigable-owning ones), each side documents **every** step of the
+   same algorithm with the same step numbers, and each step's note states
+   where it ran ("ran in content", "runs in the user agent", "not
+   implemented") — never "steps X-Y are handled elsewhere" without per-step
+   comments.  A step that ran entirely on the other side still gets its
+   `// Step N:` comment and a note saying so, so the two halves read as
+   mirrors of each other.
 2. **Anchor URLs** — Every function, struct, associated constant, and
    constant definition top doc comment has **only** the correct spec anchor
    URL (`<https://html.spec.whatwg.org/#...>`).  No description, no step
@@ -487,7 +507,7 @@ feature never worked, instead of checking whether it did.
 - **Reference URLs vs canonical URLs.** In web standards, every definition (`#dfn-foo`) has corresponding reference links (`#ref-for-dfn-foo`, `#ref-for-dfn-foo①`, …) at each usage site. When documenting code that implements a specific algorithm step, prefer the *reference URL* over the canonical concept URL — your code implements "the thing as used in a particular algorithm", not the thing itself. Use `spec_ref_links` to find all reference URLs for a concept.
 - Treat `vendor/` and vendored WPT resources as read-only unless the task explicitly requires vendor changes.
 - The words "runtime", "sidecar", "carrier", "root", and "domain document" (or "domain_document") are forbidden in this repo.
-- **Method doc comments:** A method that implements a spec algorithm should have only the spec link as its doc comment. All explanation, step references, and context belong in `//` comments inside the method body. A `// Note:` below the link is acceptable only for brief continuations of the algorithm that cannot be expressed as body comments. Why? Because the entire thing is a runtime, one that implements the Web, and so neither concept should ever be used to model or document some component of what is basically one big integrated system. No component is more or less of a "sidecar" than any other — each plays a specific role. Instead of reaching for these forbidden words, think about what the thing you want to name does, what its role in the system is, and come up with something descriptive.
+- **Method doc comments:** A method that implements a spec algorithm has only the spec link as its doc comment — no `/// Note:` continuation above the method. All explanation, step references, and context belong in `//` comments inside the method body, as notes below the relevant steps. Why? Because the entire thing is a runtime, one that implements the Web, and so neither concept should ever be used to model or document some component of what is basically one big integrated system. No component is more or less of a "sidecar" than any other — each plays a specific role. Instead of reaching for these forbidden words, think about what the thing you want to name does, what its role in the system is, and come up with something descriptive.
 - **Document only verified facts.** Never speculate about root causes, fixes, or
   explanations for observed behavior unless you have confirmed them through
   instrumentation, debugging, or testing.  When documenting an issue, state
@@ -554,6 +574,12 @@ The project uses the standard `log` crate with `env_logger` for structured loggi
 Repository READMEs track only the current state of the code: architecture,
 conventions, and things that still need fixing. They must never contain
 session logs, histories of what was done, or descriptions of past changes.
+
+Do not document in a README anything that is already obvious from the code
+and its comments.  In particular, the step-by-step split of a spec algorithm
+across processes (which steps run in content, which in the user agent) is
+carried by the `// Step N:` comments and notes on each side — the README must
+not duplicate it.
 
 The only past-tense content allowed is a note about a failed fix attempt for
 a still-unfixed issue — the symptom, what was tried, and what was ruled out —

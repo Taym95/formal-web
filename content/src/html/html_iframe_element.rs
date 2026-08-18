@@ -386,14 +386,19 @@ fn create_a_new_child_navigable(
 
     // Step 2: "Let group be element's node document's browsing context's top-level
     // browsing context's group."
-    // Note: This is the browsing context group of the current content process. We are
-    // already in this group, so we can proceed with document creation directly.
+    // Note: The browsing context group is user-agent state; the content process
+    // has no notion of it beyond being the same process. The UA resolves the
+    // parent's group when it catches up navigable state
+    // (`UserAgent::create_a_new_child_navigable`).
     // Step 3: "Let browsingContext and document be the result of creating a new browsing
     // context and document given element's node document, element, and group."
-    // <https://html.spec.whatwg.org/#creating-a-new-browsing-context>
-    // Note: We create the document (about:blank) immediately in the content process.
-    // The browsing context is represented by its ID on the UA side. The UA will set up
-    // its BC state when it receives the CreateChildNavigable IPC.
+    // Note: Content-process portion of this step: the document, realm, Window
+    // and environment settings object are created below via
+    // `create_a_new_browsing_context_and_document` (steps 10, 13, 15, 22 of
+    // "creating a new browsing context and document"); the browsing-context
+    // allocation, group membership, agent and session-history steps run in the
+    // user agent when it handles the CreateChildNavigable IPC
+    // (`UserAgent::create_a_new_child_navigable`), before navigation.
     let content_navigable = process.allocate_navigable_id()?;
     let new_document_id = DocumentId::new();
     let top_level_traversable_id = process
@@ -402,10 +407,6 @@ fn create_a_new_child_navigable(
         .map(|doc| doc.top_level_traversable_id)
         .unwrap_or(parent_navigable);
 
-    // <https://html.spec.whatwg.org/#creating-a-new-browsing-context>
-    // Steps 9-10, 13, 15, 22: Create a new Document, realm, Window, and
-    // environment settings object.  The content-process side handles this;
-    // the UA handles BC allocation, group membership, and session history.
     let content_frame_id = process.allocate_child_frame_id();
     let event_sender = process.event_sender.clone();
     let parent_engine = &mut process
@@ -416,7 +417,7 @@ fn create_a_new_child_navigable(
         .realm_execution_context;
     let (global_object, window, settings, new_document) =
         create_a_new_browsing_context_and_document(
-            parent_engine,
+            Some(parent_engine),
             &event_sender,
             content_navigable,
             new_document_id,
@@ -465,7 +466,7 @@ fn create_a_new_child_navigable(
     // already satisfied by the document created above. The UA-side document state (navigable
     // tree registration, session history) is set up in the CreateChildNavigable handler.
     // Step 7: "Let navigable be a new navigable."
-    // (allocated above as `content_navigable`)
+    // Note: The navigable id was allocated above as `content_navigable`.
 
     // Step 8: "Initialize the navigable navigable given documentState and parentNavigable."
     // Note: The UA initializes its navigable state upon receiving CreateChildNavigable.
@@ -509,11 +510,13 @@ fn create_a_new_child_navigable(
     // Step 12: "Append the following session history traversal steps to traversable."
     // Step 13: "Invoke WebDriver BiDi navigable created with traversable."
     //
-    // Note: Steps 10, 12-13 are delegated to the UA via the `new_child_navigable`
-    // field on the NavigateRequest. The UA sets up BC, BCG membership, navigable
-    // state, session history entries, event loop registration, and WebDriver
-    // notification. The destination URL is "about:blank" because the document
-    // already exists in the content process; no actual navigation is needed.
+    // Note: Steps 10-13 are delegated to the UA via the `new_child_navigable`
+    // field on the NavigateRequest: `UserAgent::create_a_new_child_navigable`
+    // catches up the navigable-owning state (browsing context, BCG membership,
+    // navigable state, session history entries, event loop and graphics
+    // registration) before the navigation proceeds. The destination URL is
+    // "about:blank" because the document already exists in the content process;
+    // no actual navigation is needed.
     let parent_traversable_id = parent_navigable;
     let child_navigable_info = NewChildNavigableInfo {
         parent_traversable_id,

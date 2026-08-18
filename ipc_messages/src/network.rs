@@ -1,4 +1,4 @@
-use crate::content::{Command, DocumentFetchId, FetchRequest, FetchResponse};
+use crate::content::{Command, DocumentFetchId, EventLoopId, FetchRequest, FetchResponse};
 use ipc::IpcSender;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -37,11 +37,15 @@ pub enum ResponseRecipient {
 pub enum Request {
     SetTraceSender(Option<TraceSender>),
     Fetch {
+        /// The event loop (content process) that initiated the fetch.
+        event_loop_id: EventLoopId,
         request_id: Uuid,
         request: FetchRequest,
         reply_to: ResponseRecipient,
     },
     NavigationFetch {
+        /// The event loop that owns the navigable being navigated.
+        event_loop_id: EventLoopId,
         request_id: Uuid,
         request: NavigationFetchRequest,
         reply_to: ResponseRecipient,
