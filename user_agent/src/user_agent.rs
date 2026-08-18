@@ -3055,11 +3055,6 @@ impl UserAgentWorker {
     }
 
     /// <https://html.spec.whatwg.org/multipage/#initialise-the-document-object>
-    /// Note: Only the user-agent-owned steps of this algorithm are executed here: determining
-    /// the browsing context to use (via
-    /// <https://html.spec.whatwg.org/multipage/#obtain-browsing-context-navigation>) and, for
-    /// cross-origin child navigables, selecting a new agent cluster and event loop (step 7).
-    /// Document object construction itself runs in the content process.
     fn initialise_the_document_object(
         &mut self,
         traversable_id: NavigableId,
@@ -3078,11 +3073,41 @@ impl UserAgentWorker {
             .get(&traversable_id)
             .and_then(|n| n.parent_navigable_id);
 
-        let needs_new_event_loop = if let Some(parent_id) = parent_traversable_id {
-            // Note: Child navigables check whether the parent document and the new document are
-            // cross-origin. If they are, step 7 ("Otherwise") of the algorithm requires a new
-            // agent, realized here as a new content process / event loop.
+        // Step 2: "Let permissionsPolicy be the result of creating a permissions policy from a
+        // response given navigationParams's navigable's container, navigationParams's origin,
+        // and navigationParams's response."
+        // Step 3: "Let creationURL be navigationParams's response's URL."
+        // Step 4: "If navigationParams's request is non-null, then set creationURL to
+        // navigationParams's request's current URL."
+        // Step 5: "Let window be null."
+        // Note: Steps 2-5 are not implemented and the state they feed (permissions policy,
+        // creation URL) is document-owning: it is set up by the content process's
+        // `initialise_the_document_object` when it handles the CreateLoadedDocument command.
 
+        // Step 6: "If browsingContext's active document's is initial about:blank is true, and
+        // browsingContext's active document's origin is same origin-domain with
+        // navigationParams's origin, then set window to browsingContext's active window."
+        // Note: The process-placement consequence of step 6 is approximated here: a
+        // top-level traversable whose active document is initial about:blank stays on its
+        // current event loop for the first navigation, so the new document lands in the same
+        // content process as the initial about:blank document, where the window reuse itself
+        // is implemented in `ContentProcess::initialise_the_document_object` (the initial
+        // about:blank realm/Window is re-pointed at the new document when the destination is
+        // same-origin with the initial about:blank's origin).  A cross-origin destination
+        // also keeps the same event loop in this branch — `swapped_group` is not consulted —
+        // so the spec's step-7 new-agent branch is not run for the initial-about:blank
+        // top-level case; the content-side origin check then falls through to a fresh realm
+        // there.
+        let needs_new_event_loop = if let Some(parent_id) = parent_traversable_id {
+            // Step 7: "Otherwise:" — the active document is not initial about:blank or is not
+            // same-origin-domain with the navigation origin, so a new agent is required.
+            // Note: Child navigables realize step 7 as a cross-origin comparison between the
+            // parent document and the new document.  The child's initial about:blank document
+            // inherits the parent's origin, so the parent-document URL approximates step 6's
+            // same-origin-domain condition; whether the child's own active document is
+            // initial about:blank is not consulted.  A cross-origin child navigation moves
+            // the traversable to a new agent, realized here as a new content process/event
+            // loop.
             let parent_document_url = self
                 .state
                 .active_documents_by_traversable
@@ -3091,15 +3116,13 @@ impl UserAgentWorker {
                 .map(|doc| doc.url.clone())
                 .ok_or_else(|| format!("missing parent document for traversable {parent_id}"))?;
             if parent_document_url == "about:blank" {
+                // Note: A parent whose active document is still the initial about:blank has no
+                // origin to compare the destination against; such a child navigation is
+                // rejected instead of approximated.
                 return Err(format!(
                     "unexpected initial about:blank parent while initialising child traversable {traversable_id}"
                 ));
             }
-
-            // Step 7: "Otherwise:" — the active document is not initial about:blank or is not
-            // same-origin-domain with the navigation origin, so a new agent is required.
-            // Note: The cross-origin check here approximates the same-origin-domain condition
-            // used in step 6 of the spec.
             is_cross_origin_navigation(&parent_document_url, final_url)?
         } else {
             let is_initial_about_blank = self
@@ -3120,10 +3143,19 @@ impl UserAgentWorker {
             return Ok(Some(browsing_context_selection.browsing_context_id));
         }
 
-        // Note: The step 7 branch requires a new agent/event loop: in this
-        // architecture that means spawning a new content process and
-        // reassigning the traversable to its event loop before
-        // `CreateLoadedDocument` is dispatched.
+        // Step 7.1: "Let oacHeader be the result of getting a structured field value given
+        // `Origin-Agent-Cluster` and "item" from navigationParams's response's header list."
+        // Step 7.2: "Let requestsOAC be true if oacHeader is not null and oacHeader[0] is the
+        // boolean true; otherwise false."
+        // Step 7.3: "If navigationParams's reserved environment is a non-secure context, then
+        // set requestsOAC to false."
+        // Note: Steps 7.1-7.3 are not implemented: Origin-Agent-Cluster is not tracked.
+        // Step 7.4: "Let agent be the result of obtaining a similar-origin window agent given
+        // navigationParams's origin, browsingContext's group, and requestsOAC."
+        // Note: Runs here: a fresh agent means spawning a new content process and reassigning
+        // the traversable to its event loop before `CreateLoadedDocument` is dispatched.
+        // Steps 7.5-7.10 (realm, Window and environment settings object) run in the content
+        // process (`ContentProcess::initialise_the_document_object`).
         let old_event_loop_id = self.state.traversable_handles.get(&traversable_id).copied();
         let agent = self.create_agent(false, content_process_label_from_url(final_url))?;
         let new_agent_id = agent.id;
@@ -3173,6 +3205,30 @@ impl UserAgentWorker {
         if let Some(old_event_loop_id) = old_event_loop_to_stop {
             self.stop_event_loop_handle(old_event_loop_id)?;
         }
+        // Step 8: "Let loadTimingInfo be a new document load timing info with its navigation
+        // start time set to navigationParams's response's timing info's start time."
+        // Step 9: "Let document be a new Document, with: type type; content type contentType;
+        // origin navigationParams's origin; browsing context browsingContext; ..."
+        // Step 10: "Set window's associated Document to document."
+        // Step 11: "Set document's internal ancestor origin objects list ..."
+        // Step 12: "Set document's ancestor origins list ..."
+        // Step 13: "Run CSP initialization for a Document given document."
+        // Step 14: "If navigationParams's request is non-null: ... Set document's referrer ..."
+        // Step 15: "If navigationParams's fetch controller is not null: ... Create the
+        // navigation timing entry ..."
+        // Step 16: "Create the navigation timing entry for document ..."
+        // Step 17: "If navigationParams's response has a `Refresh` header: ..."
+        // Step 18: "If navigationParams's commit early hints is not null, then call
+        // navigationParams's commit early hints with document."
+        // Step 19: "Process link headers given document, navigationParams's response, and
+        // "pre-media"."
+        // Step 20: "If navigationParams's navigable is a top-level traversable, then process
+        // the `Speculation-Rules` header given document and navigationParams's response."
+        // Step 21: "Potentially free deferred fetch quota for document."
+        // Step 22: "Return document."
+        // Note: Steps 8-22 run in the content process
+        // (`ContentProcess::initialise_the_document_object`) when it handles the
+        // CreateLoadedDocument command; steps 8 and 11-21 are not implemented there either.
         Ok(Some(browsing_context_selection.browsing_context_id))
     }
 

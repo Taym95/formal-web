@@ -121,6 +121,69 @@ Documents can be created either by the user agent (for startup, iframes, UA-orig
 
 Both paths converge to the same final state.
 
+## Iframe navigation flow
+
+A same-origin iframe navigation is the round trip that exercises the whole
+content → user agent → content split:
+
+1. **Content — process the iframe attributes** (`process_iframe_attributes`
+   in `html_iframe_element.rs`).  On iframe insertion or `src`/`srcdoc`
+   change, the element's content navigable is created if missing
+   (`create_a_new_child_navigable`): it allocates the navigable/document/frame
+   ids, creates the initial about:blank document + realm + Window via
+   `create_a_new_browsing_context_and_document` (the content-owning steps of
+   "creating a new browsing context and document"), records the container
+   state, and sends a `NavigateRequest` with `new_child_navigable` and
+   destination `about:blank`.  Then `navigate_an_iframe_or_frame` sends a
+   second `NavigateRequest` with the destination URL.  about:blank-only
+   iframes (`attach_iframe_about_blank`) and srcdoc iframes
+   (`attach_iframe_subdocument_from_html`) never leave the content process.
+2. **UA — navigable catch-up and navigate** (`handle_navigate` in
+   `user_agent/src/user_agent.rs`).  The `new_child_navigable` branch runs the
+   UA-side of "create a new child navigable": browsing context group
+   membership, document state, session history, and registration on the
+   parent's event loop (same process).  Then `navigate` runs the navigate
+   algorithm — `check_if_unloading_is_canceled` (beforeunload on the child's
+   active document), `create_navigation_params_by_fetching`, and the net
+   fetch.  A second navigation supersedes an in-flight one: the earlier
+   navigation's continuation sees its navigation id is no longer current and
+   aborts (so the child's initial about:blank navigation is usually replaced
+   by the real `src` navigation before it fetches).
+3. **UA — initialise the document object, UA steps**
+   (`UserAgent::initialise_the_document_object`): step 1 (obtain the
+   browsing context) and step 7 (agent selection).  For a child navigable the
+   cross-origin check decides: same-origin → the parent's event loop (same
+   process); cross-origin → a fresh agent = new content process/event loop,
+   and the traversable moves there before `CreateLoadedDocument` is
+   dispatched.
+4. **Content — document creation and parse**
+   (`create_loaded_document` → `ContentProcess::initialise_the_document_object`):
+   the content-side steps of "create and initialize a Document object"
+   (§7.5.1, steps 5-10 and 13) run here — the domain Document, realm, Window
+   and environment settings object — followed by the navigate-html parse.
+   `continue_document_load` runs parser-discovered scripts, fires the load
+   event, and reports the commit (`ContentFinalizeNavigation`) once resources
+   and deferred scripts are ready.
+5. **UA — finalize a cross-document navigation**
+   (`finalize_cross_document_navigation`): the active document is switched,
+   session history is pushed, the previous document is destroyed (routed by
+   its owning event loop, not the traversable's current one), and the
+   graphics process replaces the scene root.
+
+The §7.5.1 step 6 special case (reuse the initial about:blank Window for a
+same-origin first navigation) is implemented for process placement and for
+the window reuse itself: `ContentProcess::initialise_the_document_object`
+reuses the initial about:blank document's realm/Window when the destination
+is same-origin with it (the initial about:blank inherits its creator's
+origin — the parent's origin for child navigables, the opener's origin for
+window.open popups).  The WindowProxy backing is unchanged because the realm
+is unchanged.  A cross-origin destination from an initial about:blank
+top-level traversable also stays on the same event loop (the
+browsing-context-group swap is not combined with a new agent), but the
+content-side origin check then falls through to a fresh realm there, and a
+child navigable whose parent is still initial about:blank is rejected in
+`UserAgent::initialise_the_document_object` rather than approximated.
+
 ## Posting messages (`window_post_message_steps`)
 
 Implements <https://html.spec.whatwg.org/#window-post-message-steps>, split
@@ -355,8 +418,13 @@ Window, and navigation commit updates it:
    WindowProxy for that navigable is re-pointed:
    - if a new document for the navigable is already active in this process
      (same-process navigation), the backing is re-pointed at the new
-     document's Window (cross-realm proxy — §7.5.1 step 6 reuses the
-     initial about:blank Window for same-origin navigations);
+     document's Window (cross-realm proxy — the spec's §7.5.1 step 6
+     reuses the initial about:blank Window itself for same-origin
+     navigations: `ContentProcess::initialise_the_document_object` keeps
+     the initial about:blank realm/Window and re-points it at the new
+     document, so the backing is unchanged and only the proxy identity
+     stays; the cross-realm re-point below is for navigations that do not
+     qualify for step 6, where the new document gets a fresh realm/Window);
    - if the navigable's document was created in another content process
      (cross-origin navigation), `backing` becomes `CrossContentProcess`
      (cross-process forwarding via the user agent) while keeping the

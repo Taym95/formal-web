@@ -468,6 +468,7 @@ impl ContentProcess {
             Some(event_sender),
             Some(traversable_id),
             Some(document_id),
+            None,
         )
     }
 
@@ -1045,6 +1046,183 @@ impl ContentProcess {
         Ok(())
     }
 
+    /// <https://html.spec.whatwg.org/#initialise-the-document-object>
+    fn initialise_the_document_object(
+        &mut self,
+        traversable_id: NavigableId,
+        document_id: DocumentId,
+        final_url: &str,
+    ) -> Result<(Rc<RefCell<BaseDocument>>, EnvironmentSettingsObject), String> {
+        // Step 1: "Let browsingContext be the result of obtaining a browsing context to use for
+        // a navigation response given navigationParams."
+        // Note: Ran in the user agent: `UserAgent::initialise_the_document_object` resolved
+        // the browsing context and, for cross-origin loads, moved the traversable to a new
+        // event loop (a fresh content process).  This function runs in the process that
+        // receives the CreateLoadedDocument command.
+        // Step 2: "Let permissionsPolicy be the result of creating a permissions policy from a
+        // response given navigationParams's navigable's container, navigationParams's origin,
+        // and navigationParams's response."
+        // Note: Not implemented: permissions policy is not tracked.
+        // Step 3: "Let creationURL be navigationParams's response's URL."
+        // Step 4: "If navigationParams's request is non-null, then set creationURL to
+        // navigationParams's request's current URL."
+        // Note: Redirect chains are collapsed by the fetch layer: `final_url` is the
+        // response's final URL.
+        // Step 5: "Let window be null."
+        // Step 6: "If browsingContext's active document's is initial about:blank is true, and
+        // browsingContext's active document's origin is same origin-domain with
+        // navigationParams's origin, then set window to browsingContext's active window."
+        // Note: Implemented here: when the traversable's active document is the initial
+        // about:blank in this process and the destination is same-origin with it (the
+        // same-origin-domain condition is approximated by a same-origin comparison —
+        // document.domain is not modeled), the document below is created in the existing
+        // realm/Window instead of a fresh one: `take_initial_about_blank_settings` moves the
+        // initial about:blank document's settings object (realm/Window) out of
+        // `self.documents`, and `repoint_document` re-points it at the new document.  The
+        // WindowProxy keeps its identity because the realm is unchanged; a cross-origin
+        // destination, or an opaque-origin initial about:blank (a fresh top-level tab with
+        // no creator), falls through to step 7 and gets a fresh realm as before.
+        let reused_settings = self.take_initial_about_blank_settings(traversable_id, final_url);
+        // Step 7: "Otherwise:"
+        // Step 7.1: "Let oacHeader be the result of getting a structured field value given
+        // `Origin-Agent-Cluster` and "item" from navigationParams's response's header list."
+        // Step 7.2: "Let requestsOAC be true if oacHeader is not null and oacHeader[0] is the
+        // boolean true; otherwise false."
+        // Step 7.3: "If navigationParams's reserved environment is a non-secure context, then
+        // set requestsOAC to false."
+        // Note: Steps 7.1-7.3 are not implemented: Origin-Agent-Cluster is not tracked.
+        // Step 7.4: "Let agent be the result of obtaining a similar-origin window agent given
+        // navigationParams's origin, browsingContext's group, and requestsOAC."
+        // Note: Ran in the user agent: for same-process loads this event loop's agent is
+        // reused; for cross-origin loads the traversable was moved to a fresh agent (new
+        // content process) before CreateLoadedDocument was dispatched.
+        // Step 7.5: "Let realmExecutionContext be the result of creating a new realm given
+        // agent and the following customizations: For the global object, create a new Window
+        // object. For the global this binding, use browsingContext's WindowProxy object."
+        // Step 7.6: "Set window to the global object of realmExecutionContext's Realm
+        // component."
+        // Step 7.10: "Set up a window environment settings object with creationURL,
+        // realmExecutionContext, navigationParams's reserved environment, topLevelCreationURL,
+        // and topLevelOrigin."
+        // Note: Steps 7.5, 7.6 and 7.10 run together in
+        // `create_environment_settings_object`: it creates the realm, the Window and the
+        // environment settings object as one unit.  Steps 7.7-7.9 (top-level creation URL and
+        // origin) are not implemented.
+        // Step 8: "Let loadTimingInfo be a new document load timing info with its navigation
+        // start time set to navigationParams's response's timing info's start time."
+        // Note: Not implemented: load timing info is not tracked.
+        // Step 9: "Let document be a new Document, with: type type; content type contentType;
+        // origin navigationParams's origin; browsing context browsingContext; ..."
+        // Note: `BaseDocument::new` builds the domain Document; the Document properties
+        // (origin, policy container, permissions policy, sandboxing flags, ...) are not
+        // implemented.
+        // Step 10: "Set window's associated Document to document."
+        // Note: The settings object ties the domain Document to the realm; the platform
+        // Document object is stored on the GlobalScope.
+        // Step 11: "Set document's internal ancestor origin objects list to the result of
+        // running the internal ancestor origin objects list creation steps given document and
+        // navigationParams's iframe element referrer policy."
+        // Step 12: "Set document's ancestor origins list to the result of running the
+        // ancestor origins list creation steps given document."
+        // Step 13: "Run CSP initialization for a Document given document."
+        // Step 14: "If navigationParams's request is non-null: ... Set document's referrer ..."
+        // Step 15: "If navigationParams's fetch controller is not null: ... Create the
+        // navigation timing entry ..."
+        // Step 16: "Create the navigation timing entry for document ..."
+        // Step 17: "If navigationParams's response has a `Refresh` header: ..."
+        // Step 18: "If navigationParams's commit early hints is not null, then call
+        // navigationParams's commit early hints with document."
+        // Step 19: "Process link headers given document, navigationParams's response, and
+        // "pre-media"."
+        // Step 20: "If navigationParams's navigable is a top-level traversable, then process
+        // the `Speculation-Rules` header given document and navigationParams's response."
+        // Step 21: "Potentially free deferred fetch quota for document."
+        // Note: Steps 11-21 are not implemented.
+        // Step 22: "Return document."
+        // Note: The document and settings object are returned to the caller
+        // (`create_loaded_document`), which continues navigate-html with the parse.
+        let creation_url = Url::parse(final_url).map_err(|error| error.to_string())?;
+        let document = Rc::new(RefCell::new(BaseDocument::new(self.document_config(
+            traversable_id,
+            document_id,
+            Some(final_url.to_string()),
+        ))));
+        // Steps 7.5, 7.6 and 7.10 run in `create_environment_settings_object` for the
+        // otherwise branch; for the step-6 branch they already ran when the reused realm was
+        // created, and `repoint_document` re-points that realm at the new document.
+        let mut settings = match reused_settings {
+            Some(mut reused) => {
+                reused.repoint_document(
+                    Rc::clone(&document),
+                    creation_url,
+                    document_id,
+                    &self.event_sender,
+                )?;
+                reused
+            }
+            None => self.create_environment_settings_object(
+                Rc::clone(&document),
+                creation_url,
+                traversable_id,
+                document_id,
+            )?,
+        };
+
+        // The video-paint registry and graphics sender are engine integration, not spec
+        // steps: they wire the document's GlobalScope to the media and graphics pipelines.
+        if let Err(error) = with_global_scope(settings.ec(), |global_scope, _ec| {
+            global_scope.set_video_paint_registry(Rc::clone(&self.video_paint_registry));
+            if let Some(ref sender) = self.graphics_sender {
+                global_scope.set_graphics_sender(sender.clone());
+            }
+            Ok(())
+        }) {
+            error!(
+                "[media] failed to set video paint registry on GlobalScope: {}",
+                error.display()
+            );
+        }
+
+        Ok((document, settings))
+    }
+
+    /// <https://html.spec.whatwg.org/#initialise-the-document-object> — step 6
+    /// Returns the active document's settings object (realm/Window) when it can be reused
+    /// for the new document: the traversable's active document is the initial about:blank in
+    /// this process and the destination is same-origin with it.  The settings object is moved
+    /// out of `self.documents`; the caller re-points it at the new document (the old
+    /// document wrapper and its DOM are dropped).  The later DestroyDocument for the old
+    /// document becomes a no-op because it is no longer registered.
+    fn take_initial_about_blank_settings(
+        &mut self,
+        traversable_id: NavigableId,
+        final_url: &str,
+    ) -> Option<EnvironmentSettingsObject> {
+        let active_document_id = *self.active_documents_by_traversable.get(&traversable_id)?;
+        let (is_initial_about_blank, active_origin) = {
+            let active_document = self.documents.get(&active_document_id)?;
+            (
+                active_document.settings.creation_url.as_str() == "about:blank",
+                active_document.settings.origin.serialized.clone(),
+            )
+        };
+        if !is_initial_about_blank {
+            return None;
+        }
+        let destination_url = Url::parse(final_url).ok()?;
+        // Opaque origins are never same-origin: an opaque initial about:blank (no creator)
+        // or an about:blank destination must not reuse the Window.
+        if matches!(destination_url.origin(), url::Origin::Opaque(_)) {
+            return None;
+        }
+        if active_origin != destination_url.origin().unicode_serialization() {
+            return None;
+        }
+        self.documents
+            .remove(&active_document_id)
+            .map(|document| document.settings)
+    }
+
     /// <https://html.spec.whatwg.org/#navigate-html>
     fn create_loaded_document(
         &mut self,
@@ -1064,42 +1242,34 @@ impl ContentProcess {
         let viewport_state = self.document_viewport_state(traversable_id);
         let frame_id = frame_id.unwrap_or_else(FrameId::new);
         // This block continues <https://html.spec.whatwg.org/#navigate-html>.
-        // Step 1: "Let document be the result of creating and initializing a `Document` object given `html`, `text/html`, and navigationParams."
-        // BaseDocument::new and EnvironmentSettingsObject::new split document creation.
-        let document = Rc::new(RefCell::new(BaseDocument::new(self.document_config(
-            traversable_id,
-            document_id,
-            Some(final_url.clone()),
-        ))));
-        let mut settings = self.create_environment_settings_object(
-            Rc::clone(&document),
-            Url::parse(&final_url).map_err(|error| error.to_string())?,
-            traversable_id,
-            document_id,
-        )?;
-
-        // Set the video-paint registry on GlobalScope so that
-        // resource_selection_algorithm can register paint IDs.
-        if let Err(error) = with_global_scope(settings.ec(), |global_scope, _ec| {
-            global_scope.set_video_paint_registry(Rc::clone(&self.video_paint_registry));
-            if let Some(ref sender) = self.graphics_sender {
-                global_scope.set_graphics_sender(sender.clone());
-            }
-            Ok(())
-        }) {
-            error!(
-                "[media] failed to set video paint registry on GlobalScope: {}",
-                error.display()
-            );
-        }
+        // Step 1: "Let document be the result of creating and initializing a `Document` object
+        // given `html`, `text/html`, and navigationParams."
+        // Note: The content-side steps of `initialise-the-document-object` run in
+        // `Self::initialise_the_document_object`; the user-agent-side steps (browsing context
+        // and agent selection) ran in `UserAgent::initialise_the_document_object` before this
+        // command was dispatched.
+        let (document, settings) =
+            self.initialise_the_document_object(traversable_id, document_id, &final_url)?;
 
         let parser_scripts = {
             let mut document_guard = document.borrow_mut();
 
-            // Step 3: "Otherwise, create an HTML parser and associate it with the document."
-            // The embedder has buffered the response body; feed into parser immediately.
+            // Step 2: "If document's URL is about:blank, then populate with html/head/body
+            // given document."
+            // Note: Not implemented as a special case: an about:blank body is empty, and the
+            // HTML parser produces the same html/head/body skeleton from it below.
+            // Step 3: "Otherwise, create an HTML parser whose allow declarative shadow roots
+            // is true and associate it with document."
+            // Note: The embedder has buffered the response body; feed into parser immediately.
             parse_html_into_document(&mut document_guard, &body)
         };
+
+        // Step 4: "Return document."
+        // Note: navigate-html returns the document to "attempt to populate the history
+        // entry's document", whose content-side continuation runs below: the document is
+        // registered as the traversable's active document, parser-discovered scripts run, and
+        // `continue_document_load` fires the load event and reports the commit
+        // (ContentFinalizeNavigation) once resources and deferred scripts are ready.
 
         let deferred_scripts = parser_scripts
             .into_iter()

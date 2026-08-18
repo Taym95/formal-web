@@ -155,8 +155,12 @@ pub struct GlobalScope {
     pub kind: GlobalScopeKind,
 
     /// <https://html.spec.whatwg.org/#concept-document-window>
+    /// The DOM document the global scope resolves nodes against.  The outer
+    /// `Rc<RefCell<..>>` slot is shared across every `GlobalScope` clone so a
+    /// step-6 window reuse (a new document taking over an existing realm) can
+    /// re-point it for all clones.
     #[ignore_trace]
-    document: Rc<RefCell<BaseDocument>>,
+    document: Rc<RefCell<Rc<RefCell<BaseDocument>>>>,
 
     /// <https://dom.spec.whatwg.org/#interface-document>
     document_object: GcCell<Option<JsObject>>,
@@ -266,7 +270,7 @@ impl GlobalScope {
     ) -> Self {
         Self {
             kind,
-            document,
+            document: Rc::new(RefCell::new(document)),
             document_object: gc_cell_new(None, ec),
             location_object: gc_cell_new(None, ec),
             window_proxies: gc_cell_new(Vec::new(), ec),
@@ -324,7 +328,35 @@ impl GlobalScope {
     }
 
     pub(crate) fn document(&self) -> Rc<RefCell<BaseDocument>> {
-        Rc::clone(&self.document)
+        self.document.borrow().clone()
+    }
+
+    /// <https://html.spec.whatwg.org/#initialise-the-document-object> step 6
+    /// Re-point this realm's associated Document, origin and creation URL at a
+    /// new document that is taking over the (reused) Window: the DOM document
+    /// the global scope resolves nodes against, the stored platform Document
+    /// object, the document-scoped bookkeeping (timer host, creation URL), and
+    /// the per-document caches (node wrappers, location) so the new document's
+    /// nodes resolve to fresh wrappers and `location` reflects the new URL.
+    pub(crate) fn repoint_document(
+        &self,
+        document: Rc<RefCell<BaseDocument>>,
+        document_object: JsObject,
+        document_id: DocumentId,
+        event_sender: IpcSender<ContentEvent>,
+        creation_url: url::Url,
+        ec: &mut dyn ExecutionContext<Types>,
+    ) {
+        *self.document.borrow_mut() = document;
+        self.document_object.borrow_mut(ec).replace(document_object);
+        self.node_objects.borrow_mut(ec).clear();
+        self.location_object.borrow_mut(ec).take();
+        self.document_id.borrow_mut().replace(document_id);
+        self.timer_host.borrow_mut().replace(TimerHost {
+            document_id,
+            event_sender,
+        });
+        self.creation_url.borrow_mut().replace(creation_url);
     }
 
     pub(crate) fn set_navigation_info(
@@ -900,6 +932,19 @@ impl GlobalScope {
         let event_sender = event_sender
             .as_ref()
             .ok_or_else(|| String::from("GlobalScope has no event sender"))?;
+        // Step 7 of "creating a new browsing context and document": "Let origin be the
+        // result of determining the origin given about:blank, sandboxFlags, and
+        // creatorOrigin."
+        // Note: The about:blank document inherits the opener's origin (the creator
+        // origin of this window.open), so the initial about:blank Window can be reused for
+        // a later same-origin navigation (step 6 of `initialise-the-document-object`).
+        let creator_origin = self
+            .creation_url()
+            .map(|url| url.origin())
+            .filter(|origin| !matches!(origin, url::Origin::Opaque(_)))
+            .map(|origin| super::environment_settings_object::Origin {
+                serialized: origin.unicode_serialization(),
+            });
         // Step 4: Let browsingContext and document be the result of creating a
         // new browsing context and document with opener's active document, null,
         // and group.
@@ -916,6 +961,7 @@ impl GlobalScope {
             event_sender,
             new_traversable_id,
             new_document_id,
+            creator_origin,
         )
     }
 

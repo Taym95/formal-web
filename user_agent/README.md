@@ -55,3 +55,36 @@ with `features_json` set and an optional `chosen_navigable_id`. The user agent:
 WindowProxy return value is a null placeholder on the content side — the
 user agent only performs the navigation and does not need to maintain
 a reference for the caller.
+
+## Iframe navigation flow
+
+Iframe navigation is the content → UA → content round trip that exercises the
+navigable-owning half of the navigate algorithm; the content-side trace lives
+in `content/src/html/README.md` ("Iframe navigation flow").  The UA-side
+steps are:
+
+1. `handle_navigate` with `new_child_navigable` runs the UA-side of "create a
+   new child navigable": browsing context group membership, document state,
+   session history, and registration of the child on the parent's event loop
+   (same process, same agent cluster) — the child starts life as an
+   about:blank document created by the content process.
+2. `navigate` runs the shared navigate algorithm for the child
+   (`check_if_unloading_is_canceled` → `create_navigation_params_by_fetching`
+   → net fetch).  A newer navigation supersedes an in-flight one: the older
+   continuation's `navigation_is_current` check aborts it, which is how the
+   child's initial about:blank navigation yields to the real `src`
+   navigation.
+3. `initialise_the_document_object` runs the UA-side of
+   "create and initialize a Document object" — step 1 (obtain the browsing
+   context) and step 7 (agent selection).  For a child navigable the
+   cross-origin check between the parent document and the destination decides
+   between the parent's event loop (same process) and a fresh agent (new
+   content process, traversable moved before `CreateLoadedDocument` is
+   dispatched).  The initial about:blank Window reuse of spec step 6 is
+   implemented on the content side (`ContentProcess::initialise_the_document_object`):
+   the child's initial about:blank inherits the parent's origin, and a
+   same-origin destination reuses the child's realm/Window instead of
+   creating a fresh one.
+4. `finalize_cross_document_navigation` commits the new document: active
+   document switch, session history push, destroy of the previous document
+   (routed by its owning event loop), and graphics scene-root replacement.

@@ -442,6 +442,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .expect("build child settings object");
 

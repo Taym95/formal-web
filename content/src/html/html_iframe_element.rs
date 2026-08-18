@@ -407,6 +407,10 @@ fn create_a_new_child_navigable(
         .map(|doc| doc.top_level_traversable_id)
         .unwrap_or(parent_navigable);
 
+    let parent_origin = process
+        .documents
+        .get(&parent_document_id)
+        .map(|doc| doc.settings.origin.clone());
     let content_frame_id = process.allocate_child_frame_id();
     let event_sender = process.event_sender.clone();
     let parent_engine = &mut process
@@ -421,6 +425,7 @@ fn create_a_new_child_navigable(
             &event_sender,
             content_navigable,
             new_document_id,
+            parent_origin,
         )?;
 
     // Register the document in ContentProcess immediately.
