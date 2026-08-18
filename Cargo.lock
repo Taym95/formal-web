@@ -3414,6 +3414,7 @@ dependencies = [
 name = "net"
 version = "0.1.0"
 dependencies = [
+ "crossbeam-channel",
  "env_logger",
  "ipc",
  "ipc_messages",
@@ -3421,7 +3422,7 @@ dependencies = [
  "mime_guess",
  "reqwest",
  "url",
- "url_session",
+ "url_session_sys",
  "uuid",
 ]
 
@@ -6241,13 +6242,6 @@ dependencies = [
  "percent-encoding",
  "serde",
  "serde_derive",
-]
-
-[[package]]
-name = "url_session"
-version = "0.1.0"
-dependencies = [
- "url_session_sys",
 ]
 
 [[package]]

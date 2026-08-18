@@ -14,17 +14,25 @@
 //! Sessions are partitioned by event loop: each backend keeps one session
 //! (a reqwest client, or an NSURLSession with no shared cache) per
 //! [`NetworkPartitionKey`], the event loop id of the fetching event loop.
-//! Responses are routed inside the backends via [`route_response`], so a
-//! backend may deliver a response at any time after its fetch method
-//! returns: the tokio backend sends it before returning, the URLSession
-//! backend sends it from the data task's completion handler, on a
-//! background queue.
+//! Fetch outcomes are delivered on the [`FetchReplySender`] channel passed
+//! to each fetch call, so a backend may deliver a reply at any time after
+//! its fetch method returns: the tokio backend sends it before returning,
+//! the URLSession backend sends it from the data task's completion handler,
+//! on a background queue. The net process main loop receives those replies
+//! and routes them to the request's reply_to recipient.
 
-use ipc_messages::content::{Command as ContentCommand, EventLoopId, FetchRequest, FetchResponse};
-use ipc_messages::network::{Response, ResponseRecipient};
+use ipc_messages::content::{EventLoopId, FetchRequest, FetchResponse};
 use std::fs;
 use url::Url;
 use uuid::Uuid;
+
+/// The outcome of a fetch: the request id the outcome belongs to, and the
+/// response or error. Delivered on a [`FetchReplySender`].
+pub type FetchReply = (Uuid, Result<FetchResponse, String>);
+
+/// Reply channel handed to the backends for a fetch; the main loop routes
+/// the delivered outcome to the request's reply_to recipient.
+pub type FetchReplySender = crossbeam_channel::Sender<FetchReply>;
 
 /// <https://fetch.spec.whatwg.org/#network-partition-key>
 // Note: the spec key is a (topLevelSite, secondKey) tuple; this
@@ -34,19 +42,19 @@ use uuid::Uuid;
 pub struct NetworkPartitionKey(pub EventLoopId);
 
 /// The network mechanism behind the net process: executes fetches and
-/// delivers the outcomes to the reply channel. One implementation exists
-/// per build feature.
+/// delivers the outcomes on the reply channel passed to each call. One
+/// implementation exists per build feature.
 pub trait NetworkBackend {
     /// <https://fetch.spec.whatwg.org/#http-network-or-cache-fetch>
     // Note: coarse-grained — the backend runs the fetch for the request and
-    // routes the outcome to `reply_to`; the individual steps of the
+    // delivers the outcome on `reply_sender`; the individual steps of the
     // algorithm are not implemented.
     fn http_network_or_cache_fetch(
         &mut self,
         network_partition_key: NetworkPartitionKey,
         request_id: Uuid,
         request: &FetchRequest,
-        reply_to: ResponseRecipient,
+        reply_sender: FetchReplySender,
     ) -> Result<(), String>;
 
     /// <https://fetch.spec.whatwg.org/#fetch-controller-abort>
@@ -54,36 +62,6 @@ pub trait NetworkBackend {
     // fetches to abort.
     fn abort(&mut self, _request_id: Uuid) {
         unimplemented!("NetworkBackend::abort")
-    }
-}
-
-/// <https://fetch.spec.whatwg.org/#queue-a-fetch-task>
-fn route_response(
-    request_id: Uuid,
-    reply_to: ResponseRecipient,
-    result: Result<FetchResponse, String>,
-) -> Result<(), String> {
-    match reply_to {
-        ResponseRecipient::ContentProcess {
-            content_command_sender,
-            handler_id,
-        } => match result {
-            Ok(response) => content_command_sender
-                .send(ContentCommand::CompleteDocumentFetch {
-                    handler_id,
-                    response,
-                })
-                .map_err(|error| format!("failed to route response to content: {error}")),
-            Err(error) => {
-                log::error!("fetch failed: {error}");
-                content_command_sender
-                    .send(ContentCommand::FailDocumentFetch { handler_id })
-                    .map_err(|error| format!("failed to route fetch failure to content: {error}"))
-            }
-        },
-        ResponseRecipient::UserAgent { response_sender } => response_sender
-            .send(Response { request_id, result })
-            .map_err(|error| format!("failed to route response to UA: {error}")),
     }
 }
 

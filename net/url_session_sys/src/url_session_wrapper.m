@@ -17,7 +17,16 @@ struct fw_url_session {
 fw_url_session_t fw_url_session_create(void) {
     NSURLSessionConfiguration *configuration =
         [NSURLSessionConfiguration ephemeralSessionConfiguration];
-    // No shared cache.
+    // Deliberate: disable the URLCache entirely. `ephemeralSessionConfiguration`
+    // alone only avoids persistent storage — it still keeps a non-persistent
+    // (in-memory) cache, which would let the session serve cached responses
+    // for repeated URLs. The net backend contracts one session per network
+    // partition key (event loop) with no shared cache, and does not model
+    // HTTP caching (net/README.md: "Will host HTTP cache logic when the Fetch
+    // spec reaches that layer"), so every fetch must reach the transport.
+    // Re-enabling the URLCache here would change fetch semantics (cached
+    // responses with no cache-control handling); do so deliberately, with
+    // tests.
     configuration.URLCache = nil;
 
     NSURLSession *session = [NSURLSession sessionWithConfiguration:configuration];
@@ -69,7 +78,12 @@ int fw_url_session_fetch(
                 const char *message = [[error localizedDescription] UTF8String];
                 char *message_copy = message ? strdup(message) : NULL;
                 if (completion) {
-                    completion(context, 0, NULL, NULL, NULL, 0, message_copy);
+                    // The callback must never see a NULL error on the error
+                    // path: the Rust trampoline treats NULL as success. A
+                    // static literal stays valid for the duration of the
+                    // call when strdup failed.
+                    completion(context, 0, NULL, NULL, NULL, 0,
+                               message_copy ? message_copy : "URLSession fetch failed");
                 }
                 free(message_copy);
                 return;

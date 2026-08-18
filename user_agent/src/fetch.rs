@@ -27,9 +27,6 @@ pub(crate) struct NetConnection {
     child: Option<Child>,
     /// Maps net request_id to NavigationFetchId for response routing.
     pending_fetches: HashMap<uuid::Uuid, NavigationFetchId>,
-    /// Sender end of the net→UA response channel, retained at launch so it
-    /// can be embedded into `ResponseRecipient::UserAgent` reply_to values.
-    response_sender: ipc::IpcSender<NetworkResponse>,
 }
 
 impl NetConnection {
@@ -50,9 +47,6 @@ impl NetConnection {
                 .map_err(|error| format!("failed to send trace sender to net: {error}"))?;
         }
 
-        let response_sender = connection.incoming_sender().cloned().ok_or_else(|| {
-            String::from("ipc backend did not expose an incoming response sender")
-        })?;
         let sender = connection.sender.clone();
         let receiver = connection.receiver;
         let child = handle.take_child();
@@ -61,7 +55,6 @@ impl NetConnection {
             receiver: ipc::crossbeam_proxy(receiver),
             child,
             pending_fetches: HashMap::new(),
-            response_sender,
         })
     }
 
@@ -90,9 +83,7 @@ impl NetConnection {
             event_loop_id,
             request_id,
             request,
-            reply_to: ResponseRecipient::UserAgent {
-                response_sender: self.response_sender.clone(),
-            },
+            reply_to: ResponseRecipient::UserAgent,
         }) {
             self.pending_fetches.remove(&request_id);
             return Err(format!("failed to start navigation fetch: {error}"));

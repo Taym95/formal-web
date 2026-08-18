@@ -386,33 +386,11 @@ pub fn crossbeam_proxy<T: IpcSerialize + IpcDeserialize + Send + 'static>(
 pub struct IpcConnection<Out: IpcSerialize + IpcDeserialize, In: IpcSerialize + IpcDeserialize> {
     pub sender: IpcSender<Out>,
     pub receiver: IpcReceiver<In>,
-    /// The sender end of the child→parent channel, retained on the parent so
-    /// it can hand a live reply channel back to the child inside a message
-    /// (e.g. `ResponseRecipient::UserAgent`). `None` on backends that cannot
-    /// expose it.
-    incoming_sender: Option<IpcSender<In>>,
 }
 
 impl<Out: IpcSerialize + IpcDeserialize, In: IpcSerialize + IpcDeserialize> IpcConnection<Out, In> {
     pub fn new(sender: IpcSender<Out>, receiver: IpcReceiver<In>) -> Self {
-        IpcConnection {
-            sender,
-            receiver,
-            incoming_sender: None,
-        }
-    }
-
-    /// Attach the sender end of the child→parent response channel, so the
-    /// parent can embed it into messages sent to the child.
-    pub fn with_incoming_sender(mut self, incoming_sender: IpcSender<In>) -> Self {
-        self.incoming_sender = Some(incoming_sender);
-        self
-    }
-
-    /// The sender end of the child→parent response channel, if the backend
-    /// exposed it.
-    pub fn incoming_sender(&self) -> Option<&IpcSender<In>> {
-        self.incoming_sender.as_ref()
+        IpcConnection { sender, receiver }
     }
 
     pub fn into_split(self) -> (IpcSender<Out>, IpcReceiver<In>) {

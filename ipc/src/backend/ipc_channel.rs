@@ -17,9 +17,6 @@ type ChannelMessage<T> = (T, HashMap<usize, IpcSharedMemory>);
 struct BootstrapMessage<Out, In> {
     parent_to_child_tx: IpcChannelSender<ChannelMessage<Out>>,
     child_to_parent_rx: ipc::IpcReceiver<ChannelMessage<In>>,
-    /// Sender end of the child→parent channel, retained by the parent so it
-    /// can hand a live reply channel back to the child inside a message.
-    child_to_parent_tx: IpcChannelSender<ChannelMessage<In>>,
 }
 
 pub fn launch_extension<M, Out, In>(
@@ -54,10 +51,6 @@ where
 
     let receiver = IpcReceiver::from_ipc_channel(bootstrap.child_to_parent_rx);
 
-    let incoming_sender = IpcSender {
-        transport: IpcTransport::IpcChannel(bootstrap.child_to_parent_tx),
-    };
-
     let handle = ExtensionHandle {
         inner: ExtensionHandleImpl::IpcChannel {
             child: Some(child),
@@ -65,10 +58,7 @@ where
         },
     };
 
-    Ok((
-        handle,
-        IpcConnection::new(sender, receiver).with_incoming_sender(incoming_sender),
-    ))
+    Ok((handle, IpcConnection::new(sender, receiver)))
 }
 
 pub fn run_extension<Out, In>(token: &str) -> Result<ExtensionServer<In, Out>, IpcError>
@@ -102,7 +92,6 @@ where
         .send(BootstrapMessage {
             parent_to_child_tx,
             child_to_parent_rx,
-            child_to_parent_tx: child_to_parent_tx.clone(),
         })
         .map_err(|error| IpcError::Transport(format!("failed to send bootstrap: {error}")))?;
 

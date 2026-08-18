@@ -7,14 +7,13 @@ use std::collections::hash_map::Entry;
 use std::net::{Ipv4Addr, SocketAddr};
 
 use ipc_messages::content::{FetchRequest, FetchResponse};
-use ipc_messages::network::ResponseRecipient;
 use reqwest::Method;
 use reqwest::blocking::Client;
 use reqwest::header::CONTENT_TYPE;
 use url::Url;
 use uuid::Uuid;
 
-use super::{NetworkBackend, NetworkPartitionKey, handle_local_schemes, route_response};
+use super::{FetchReplySender, NetworkBackend, NetworkPartitionKey, handle_local_schemes};
 
 /// <https://fetch.spec.whatwg.org/#http-network-fetch>
 pub struct TokioBackend {
@@ -97,10 +96,12 @@ impl NetworkBackend for TokioBackend {
         key: NetworkPartitionKey,
         request_id: Uuid,
         request: &FetchRequest,
-        reply_to: ResponseRecipient,
+        reply_sender: FetchReplySender,
     ) -> Result<(), String> {
         let result = self.fetch(key, request);
-        route_response(request_id, reply_to, result)
+        reply_sender
+            .send((request_id, result))
+            .map_err(|error| format!("failed to send fetch reply: {error}"))
     }
 }
 

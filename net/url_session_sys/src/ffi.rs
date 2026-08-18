@@ -1,5 +1,5 @@
-//! Apple-specific Foundation URLSession FFI bindings.
-//! Only compiled when `target_vendor = "apple"`.
+//! Raw Objective-C URLSession FFI declarations. Crate-private: the public
+//! surface of this crate is the safe [`crate::UrlSession`] API.
 
 use std::os::raw::{c_char, c_int, c_void};
 
