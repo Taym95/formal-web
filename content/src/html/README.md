@@ -121,6 +121,35 @@ Documents can be created either by the user agent (for startup, iframes, UA-orig
 
 Both paths converge to the same final state.
 
+Both top-level paths (UA-initiated `create_new_top_level_traversable` and
+content-initiated `creating_a_new_top_level_traversable`) run the
+user-agent-owning steps of `#creating-a-new-browsing-context` through the
+shared `UserAgent::create_a_new_browsing_context` (browsing context group
+membership, document state, active-document mapping).  The child-navigable
+path runs the same method with the parent's group.
+
+### Child navigable creation (`create_a_new_child_navigable`)
+
+`create a new child navigable` (iframe) is split the same way as the
+browsing-context creation above, with the two halves mirroring each other's
+step documentation:
+
+| Spec step | Content (`html_iframe_element.rs`) | User agent (`user_agent.rs:create_a_new_child_navigable`) |
+|---|---|---|
+| 1 parent navigable | iframe element's node navigable | received as `parent_navigable_id` |
+| 2 group | none (no group state in content) | parent's browsing context group |
+| 3 new browsing context and document | steps 10, 13, 15, 22 (document, realm, Window, ESO) via `create_a_new_browsing_context_and_document` | steps 1, 9, 23 (BC group membership, agent reuse, doc state, make active document) via `create_a_new_browsing_context` |
+| 4-5 target name | iframe `name` attribute | received as `target_name` |
+| 6 document state | document reference, origin | navigable target name, URL, event loop |
+| 7-8 new navigable + initialize | navigable id allocated | navigable record, parent, SHE, event loop |
+| 9 element's content navigable | `navigable_container_states` | — (done in content) |
+| 10-12 history entry / traversal steps | — (delegated via `new_child_navigable` IPC) | initial session history entry (nested histories not modeled) |
+| 13 WebDriver BiDi navigable created | — | not performed for child navigables (top-level only) |
+
+Both halves annotate every step with `// Step N:` and a note saying where the
+step ran, so the split is discoverable from either side.  The UA runs its
+catch-up inside `handle_navigate` phase 1, before the navigation fetch.
+
 ## Posting messages (`window_post_message_steps`)
 
 Implements <https://html.spec.whatwg.org/#window-post-message-steps>, split

@@ -1673,11 +1673,28 @@ impl UserAgentWorker {
         &mut self,
         target_name: String,
     ) -> Result<NavigableId, String> {
+        // Note: UA-initiated path (new tab or window, startup): there is no
+        // script driving this, so creation starts here, in the user agent, and
+        // the document-owning steps continue in the content process via the
+        // CreateEmptyDocument IPC.  This is the mirror of the content-initiated
+        // path (`creating_a_new_top_level_traversable`), where the content
+        // process creates the document first and the UA catches up afterwards.
         let traversable_id = NavigableId::new();
         let iframe_parent_traversable_id = None;
         let frame_id = None;
 
-        // Step 2: With a null opener, create a new top-level browsing context and document.
+        // Step 1: Let document be null.
+        // Step 2: If opener is null, then set document to the second return
+        // value of creating a new top-level browsing context and document.
+        // Note: Null-opener branch.  The UA-side of "creating a new top-level
+        // browsing context and document" — a new browsing context group and
+        // browsing context ("creating a new browsing context group and
+        // document", steps 1-2, 4), the agent (step 9 of "creating a new
+        // browsing context and document") and the active-document mapping —
+        // runs below and in `create_a_new_browsing_context`; the
+        // document-owning steps (10, 13, 15, 22) run in the content process
+        // via the CreateEmptyDocument IPC below, and step 24 ("completely
+        // finish loading") runs there too.
         let browsing_context_group_id = self.state.browsing_context_group_set.next_group_id();
         let browsing_context_id = BrowsingContextId::new();
         let agent_cluster_id = AgentClusterId::new();
@@ -1697,11 +1714,14 @@ impl UserAgentWorker {
             );
         }
 
-        // Step 4: Let documentState be a new document state, with
-        // The Rust model splits document-state fields across `Traversable`,
-        // `DocumentState`, and `traversable_target_names`.
-        // Step 5: Let traversable be a new traversable navigable.
-        // Step 6: Initialize the navigable traversable given documentState.
+        // Step 3: Let documentState be a new document state, with document,
+        // initiator origin, origin, navigable target name, and about base URL.
+        // Note: The Rust model splits document-state fields across the
+        // traversable maps, `DocumentState`, and `traversable_target_names`;
+        // the fields that live in content (document reference, origin) are
+        // created by the content process when it handles CreateEmptyDocument.
+        // Step 4: Let traversable be a new traversable navigable.
+        // Step 5: Initialize the navigable traversable given documentState.
         self.send_event_loop_command(
             &command_sender,
             ContentCommand::CreateEmptyDocument {
@@ -1733,23 +1753,13 @@ impl UserAgentWorker {
             .traversable_target_names
             .insert(traversable_id, target_name.clone());
         self.state
-            .set_navigable_active_document(traversable_id, document_id);
-        self.state
             .top_level_browsing_context_group_ids
             .insert(browsing_context_id, browsing_context_group_id);
         self.state.browsing_context_group_set.members.insert(
             browsing_context_group_id,
             BrowsingContextGroup {
                 id: browsing_context_group_id,
-                browsing_context_set: HashMap::from([(
-                    browsing_context_id,
-                    BrowsingContext {
-                        id: browsing_context_id,
-                        is_auxiliary: false,
-                        opener_browsing_context: None,
-                        is_popup: false,
-                    },
-                )]),
+                browsing_context_set: HashMap::new(),
                 agent_cluster_map: HashMap::from([(
                     AgentClusterKey::Site(String::from("about:blank")),
                     AgentCluster {
@@ -1763,18 +1773,30 @@ impl UserAgentWorker {
                 cross_origin_isolation_mode: CrossOriginIsolationMode::None,
             },
         );
-        // Step 7: Let initialHistoryEntry be traversable's active session history entry.
+        // Step 2 (continued): the UA-side portion of "creating a new browsing
+        // context and document" (steps 1, 9, 23 — the browsing context's
+        // group membership and the active-document mapping) runs in
+        // `create_a_new_browsing_context`.
+        self.create_a_new_browsing_context(
+            traversable_id,
+            document_id,
+            agent.event_loop_id,
+            browsing_context_group_id,
+            browsing_context_id,
+            false,
+        )?;
+        // Step 6: Let initialHistoryEntry be traversable's active session history entry.
         // Note: The initial session history entry is materialized directly in the literal below
         // instead of through a separate temporary binding.
-        // Step 8: Set initialHistoryEntry's step to 0.
+        // Step 7: Set initialHistoryEntry's step to 0.
         // Note: The same literal below stores step `0` directly on the inserted entry.
-        // Step 9: Append initialHistoryEntry to traversable's session history entries.
+        // Step 8: Append initialHistoryEntry to traversable's session history entries.
         // Note: The `session_history_entries` vector below performs the initial append.
-        // Step 10: If opener is non-null, then legacy-clone a traversable storage shed given
+        // Step 9: If opener is non-null, then legacy-clone a traversable storage shed given
         // opener's top-level traversable and traversable.
         // Note: This helper models the null-opener branch only, so it intentionally skips storage
         // shed cloning.
-        // Step 11: Append traversable to the user agent's top-level traversable set.
+        // Step 10: Append traversable to the user agent's top-level traversable set.
         self.state.navigables.insert(
             traversable_id,
             Navigable {
@@ -1810,18 +1832,8 @@ impl UserAgentWorker {
         if target_name_keeps_browser_ui_focus(&target_name) {
             self.state.set_active_top_level_traversable(traversable_id);
         }
-        self.state.documents.insert(
-            document_id,
-            DocumentState {
-                traversable_id,
-                browsing_context_id: Some(browsing_context_id),
-                event_loop_id: agent.event_loop_id,
-                url: String::from("about:blank"),
-                is_initial_about_blank: true,
-            },
-        );
 
-        // Step 12: Invoke WebDriver BiDi navigable created with traversable and
+        // Step 11: Invoke WebDriver BiDi navigable created with traversable and
         // openerNavigableForWebDriver.
         // The embedder notification is the model's observable hook for a new top-level
         // traversable.
@@ -1843,15 +1855,133 @@ impl UserAgentWorker {
                 error!("failed to register webview with graphics process: {error}");
             }
         }
-        // Step 13: Return traversable.
+        // Step 12: Return traversable.
         Ok(traversable_id)
     }
 
+    /// <https://html.spec.whatwg.org/#creating-a-new-browsing-context>
+    /// Note: UA-side portion of the algorithm: runs the user-agent-owning steps
+    /// for a navigable whose document was already created by the content process
+    /// (steps 10, 13, 15, 22 — via the CreateEmptyDocument IPC for the
+    /// UA-initiated path, before the NavigateRequest was sent for the
+    /// content-initiated paths).  Called by `create_new_top_level_traversable`,
+    /// `creating_a_new_top_level_traversable` and `create_a_new_child_navigable`;
+    /// the caller resolves the browsing context group (new or the parent's) and
+    /// the agent (a new event loop or an existing one).
+    fn create_a_new_browsing_context(
+        &mut self,
+        navigable_id: NavigableId,
+        document_id: DocumentId,
+        event_loop_id: EventLoopId,
+        browsing_context_group_id: BrowsingContextGroupId,
+        browsing_context_id: BrowsingContextId,
+        is_auxiliary: bool,
+    ) -> Result<(), String> {
+        // Note: This method runs the user-agent-owning steps of "create a new
+        // browsing context and document".  The content process already created
+        // the document, realm, Window and environment settings object (steps
+        // 10, 13, 15, 22 — see `create_a_new_browsing_context_and_document` in
+        // content/src/html.rs), so the steps below are the remaining ones:
+        // the browsing context (step 1), the agent (step 9, resolved by the
+        // caller) and the active-document mapping (step 23).  Steps 2-8,
+        // 11-12, 14, 16-21 and 24 are not implemented or run elsewhere, as
+        // noted per step.
+        //
+        // Step 1: Let browsingContext be a new browsing context.
+        // Note: The browsing context id was allocated by the caller (it also
+        // needs it for the navigable record); the record is registered in its
+        // browsing context group below.
+        // Step 2: Let unsafeContextCreationTime be the unsafe shared current
+        //         time.
+        // Step 3: Let creatorOrigin be null.
+        // Step 4: Let creatorBaseURL be null.
+        // Step 5: If creator is non-null:
+        // Step 5.1: Set creatorOrigin to creator's origin.
+        // Step 5.2: Set creatorBaseURL to creator's document base URL.
+        // Step 5.3: Set browsingContext's virtual browsing context group ID to
+        //           creator's browsing context's top-level browsing context's
+        //           virtual browsing context group ID.
+        // Step 6: Let sandboxFlags be the result of determining the creation
+        //         sandboxing flags given browsingContext and embedder.
+        // Step 7: Let origin be the result of determining the origin given
+        //         about:blank, sandboxFlags, and creatorOrigin.
+        // Step 8: Let permissionsPolicy be the result of creating a permissions
+        //         policy given embedder and origin.
+        //         (steps 2-8 not implemented: creation time, creator state,
+        //          sandboxing and permissions policy are not tracked)
+        // Step 9: Let agent be the result of obtaining a similar-origin window
+        //         agent given origin, group, and false.
+        // Note: The caller resolved the agent: a new agent and event loop for a
+        // fresh top-level traversable, the content process's event loop for a
+        // content-initiated traversable, or the parent's event loop for a child
+        // navigable.
+        // Steps 10, 13, 15, 22: (content process — the document, realm, Window
+        // and environment settings object; see the note above.)
+        // Step 11: Let topLevelCreationURL be about:blank if embedder is null;
+        //         otherwise embedder's relevant settings object's top-level
+        //         creation URL.
+        // Step 12: Let topLevelOrigin be origin if embedder is null; otherwise
+        //         embedder's relevant settings object's top-level origin.
+        // Step 14: Let loadTimingInfo be a new document load timing info with
+        //         its navigation start time ...
+        // Step 16: Let iframeReferrerPolicy be the result of determining the
+        //         iframe element referrer policy given embedder.
+        // Step 17: Set document's internal ancestor origin objects list ...
+        // Step 18: Set document's ancestor origins list ...
+        // Step 19: If creator is non-null: ... referrer, policy container,
+        //         opener policy ...
+        // Step 20: Assert: document's URL and document's relevant settings
+        //         object's creation URL are about:blank.
+        // Step 21: Mark document as ready for post-load tasks.
+        //         (steps 11-12, 14, 16-21 not implemented)
+        // Step 23: Make active document.
+        let group = self
+            .state
+            .browsing_context_group_set
+            .members
+            .get_mut(&browsing_context_group_id)
+            .ok_or_else(|| format!("missing browsing context group {browsing_context_group_id}"))?;
+        // Step 5 ("creating a new auxiliary browsing context and document"):
+        // Set browsingContext's is auxiliary to true. / Step 6: Append
+        // browsingContext to group.
+        group.browsing_context_set.insert(
+            browsing_context_id,
+            BrowsingContext {
+                id: browsing_context_id,
+                is_auxiliary,
+                opener_browsing_context: None,
+                is_popup: false,
+            },
+        );
+        // Step 23: Make active document.
+        // Note: The UA-side active-document mapping; the content process tracks
+        // its own via `active_documents_by_traversable`.  The UA-side document
+        // state maps the navigable to the content-created document for
+        // navigation and session history purposes.
+        self.state
+            .set_navigable_active_document(navigable_id, document_id);
+        self.state.documents.insert(
+            document_id,
+            DocumentState {
+                traversable_id: navigable_id,
+                browsing_context_id: Some(browsing_context_id),
+                event_loop_id,
+                url: String::from("about:blank"),
+                is_initial_about_blank: true,
+            },
+        );
+        // Step 24: Completely finish loading document.
+        //         (content process: the UA-initiated path's CreateEmptyDocument
+        //          handling executes parser-discovered scripts; the
+        //          content-initiated paths already ran it)
+        // Step 25: Return browsingContext and document.
+        //         (the document is identified by `document_id`; the browsing
+        //          context by `browsing_context_id`)
+        Ok(())
+    }
+
     /// <https://html.spec.whatwg.org/#create-a-new-child-navigable>
-    /// Note: This helper materializes the user-agent state for an iframe's initial about:blank
-    /// child navigable and reuses the parent's event loop until a later cross-origin navigation
-    /// causes `initialise_the_document_object` to move it.
-    fn create_new_child_navigable(
+    fn create_a_new_child_navigable(
         &mut self,
         parent_navigable_id: NavigableId,
         content_navigable_id: NavigableId,
@@ -1859,6 +1989,22 @@ impl UserAgentWorker {
         document_id: DocumentId,
         target_name: Option<String>,
     ) -> Result<NavigableId, String> {
+        // Note: This method is the user-agent half of "create a new child
+        // navigable" — the navigable-owning steps that the spec runs on the
+        // HTML event loop (the content process) but that this architecture
+        // runs in the user agent before navigating.  The content process
+        // already ran the document-owning steps before sending the
+        // CreateChildNavigable IPC: the content-process portion of step 3's
+        // "creating a new browsing context and document" (steps 10, 13, 15, 22
+        // — see `create_a_new_browsing_context_and_document` in
+        // content/src/html.rs), steps 4-5 (target name), step 6's
+        // document-state fields that live in content, and step 9 (the
+        // element's content navigable).  Each spec step below states where it
+        // ran.
+        //
+        // Step 1: Let parentNavigable be element's node navigable.
+        //         (content: the iframe element's node navigable, passed as
+        //          `parent_navigable_id`)
         let _requested_target_name = target_name;
         // TODO: Store requested iframe `name` attribute on document state once child-target
         // lookup uses document-state target names.
@@ -1868,6 +2014,12 @@ impl UserAgentWorker {
             return Ok(navigable_id);
         }
 
+        // Step 2: Let group be element's node document's browsing context's
+        //         top-level browsing context's group.
+        // Note: The group already exists — it is the parent navigable's browsing
+        // context group, resolved below from the parent's top-level browsing
+        // context.  The content process has no group state: being in the same
+        // process is its only notion of "same group".
         let parent_navigable = self
             .state
             .navigables
@@ -1888,6 +2040,15 @@ impl UserAgentWorker {
         let browsing_context_id = BrowsingContextId::new();
         let traversable_id = content_navigable_id;
 
+        // Step 3 (user-agent portion of "creating a new browsing context and
+        // document"): the browsing context's group membership, document state
+        // and active-document mapping (steps 1, 9, 23 of that algorithm) run in
+        // `create_a_new_browsing_context` below; the document-owning steps
+        // (10, 13, 15, 22) already ran in content via
+        // `create_a_new_browsing_context_and_document`.  Child navigables
+        // reuse the parent's event loop ("obtaining a similar-origin window
+        // agent", step 9) until a cross-origin navigation moves them via
+        // `initialise_the_document_object`.
         let group_id = self
             .state
             .top_level_browsing_context_group_ids
@@ -1898,43 +2059,37 @@ impl UserAgentWorker {
                     "missing browsing context group for top-level browsing context {top_level_browsing_context_id}"
                 )
             })?;
-        self.state
-            .browsing_context_group_set
-            .members
-            .get_mut(&group_id)
-            .ok_or_else(|| format!("missing browsing context group {group_id}"))?
-            .browsing_context_set
-            .insert(
-                browsing_context_id,
-                BrowsingContext {
-                    id: browsing_context_id,
-                    is_auxiliary: false,
-                    opener_browsing_context: None,
-                    is_popup: false,
-                },
-            );
 
+        // Step 6: Let documentState be a new document state, with document,
+        //         initiator origin, origin, navigable target name, and about base
+        //         URL.
+        // Step 7: Let navigable be a new navigable.
+        // Step 8: Initialize the navigable navigable given documentState and
+        //         parentNavigable.
+        // <https://html.spec.whatwg.org/#initialize-the-navigable>
+        // Note: The document reference and origin live in content; the
+        // navigable-target-name and about-base-URL fields are not tracked.  The
+        // navigable's parent, active document, current/active session history
+        // entry, event loop and target name (steps 7-8) are set up below; the
+        // navigable id `content_navigable_id` was allocated by content.
         self.state
             .traversable_handles
             .insert(traversable_id, parent_event_loop_id);
         self.state
             .traversable_target_names
             .insert(traversable_id, target_name.clone());
-        self.state
-            .set_navigable_active_document(traversable_id, document_id);
-        // Note: The content process has already created the document and registered it.
-        // The UA-side document state tracks the navigable-to-document mapping for
-        // navigation and session history purposes.
-        self.state.documents.insert(
+        // Step 3 (continued): the UA-side portion of "creating a new browsing
+        // context and document" — the browsing context's group membership,
+        // document state and active-document mapping — runs in
+        // `create_a_new_browsing_context`.
+        self.create_a_new_browsing_context(
+            traversable_id,
             document_id,
-            DocumentState {
-                traversable_id,
-                browsing_context_id: Some(browsing_context_id),
-                event_loop_id: parent_event_loop_id,
-                url: String::from("about:blank"),
-                is_initial_about_blank: true,
-            },
-        );
+            parent_event_loop_id,
+            group_id,
+            browsing_context_id,
+            false,
+        )?;
 
         self.state.navigables.insert(
             traversable_id,
@@ -1958,6 +2113,17 @@ impl UserAgentWorker {
                 }],
             },
         );
+        // Step 10: Let historyEntry be navigable's active session history entry.
+        // Step 11: Let traversable be parentNavigable's traversable navigable.
+        // Note: This codebase routes every navigable through the traversable
+        // maps, so the child navigable's own id serves as its traversable id;
+        // the parent's traversable is the `parent_traversable_id` carried by
+        // the CreateChildNavigable IPC.
+        // Step 12: Append the following session history traversal steps to
+        //          traversable.
+        // Note: Partial: the initial session history entry (step 0, above)
+        // stands in for the appended traversal steps; nested histories and
+        // "update for navigable creation/destruction" are not modeled.
         verification::tla_log!(
             self.tla_tracer,
             "CreateChildNavigable",
@@ -1982,6 +2148,11 @@ impl UserAgentWorker {
             .traversable_ids
             .insert(traversable_id);
 
+        // Step 13: Invoke WebDriver BiDi navigable created with traversable.
+        // Note: Not performed for child navigables: the embedder notification
+        // (`new_webview`) and the graphics registration below are the
+        // observable creation hooks; the WebDriver notification exists only
+        // for top-level traversables (`create_new_top_level_traversable`).
         // Register the child navigable with the graphics process.
         if let Some(graphics_sender) = &self.graphics_extension_sender {
             if let Err(error) = graphics_sender.send(
@@ -2441,9 +2612,10 @@ impl UserAgentWorker {
     }
 
     /// <https://html.spec.whatwg.org/multipage/#create-a-fresh-top-level-traversable>
-    /// Note: This helper creates the initial traversable/document shell immediately and then
-    /// continues through the normal user-agent `navigate` / fetch / finalization path for the
-    /// supplied startup URL.
+    /// Note: UA-initiated creation of the initial top-level traversable (startup, new
+    /// tab or window): creation starts here, in the user agent, and the document-owning
+    /// steps of "creating a new browsing context and document" continue in the content
+    /// process via the CreateEmptyDocument IPC.
     fn create_a_fresh_top_level_traversable(&mut self, destination_url: String) {
         if startup_debug_enabled() {
             trace!(
@@ -2451,17 +2623,26 @@ impl UserAgentWorker {
                 destination_url
             );
         }
-        let result = (|| {
+        let result: Result<(), String> = (|| {
             // Step 1: Let traversable be the result of creating a new top-level traversable given
             // null and the empty string.
+            // Note: `create_new_top_level_traversable` implements the UA-side of "creating a
+            // new top-level traversable": the new browsing context group, browsing context and
+            // traversable state, plus the CreateEmptyDocument IPC that runs the document-owning
+            // steps in the content process.
             let traversable_id = self.create_new_top_level_traversable(String::new())?;
-            // Step 2: Navigate traversable to initialNavigationURL using traversable's active document.
+            // Step 2: Navigate traversable to initialNavigationURL using traversable's active
+            // document, with documentResource set to initialNavigationPostResource.
+            // Note: The navigate call below is the UA-side navigate; the documentResource
+            // parameter is not modeled.
             self.navigate(
                 traversable_id,
                 destination_url,
                 UserNavigationInvolvement::BrowserUi,
                 NavigationId::new(),
-            )
+            )?;
+            // Step 3: Return traversable.
+            Ok(())
         })();
         if let Err(error) = result {
             error!("failed to create a fresh top-level traversable: {error}");
@@ -2505,11 +2686,11 @@ impl UserAgentWorker {
     }
 
     /// <https://html.spec.whatwg.org/#creating-a-new-top-level-traversable>
-    ///
-    /// Content-initiated path: the content process already created the about:blank
-    /// document, Window, and JS Context.  The UA sets up its side (navigable, BCG,
-    /// agent, event-loop reg, doc state, session history) without sending
-    /// `CreateEmptyDocument` back to content.
+    /// Note: Content-initiated path: the content process already created the
+    /// about:blank document, Window, and JS Context (steps 10, 13, 15, 22 of
+    /// "creating a new browsing context and document").  The UA sets up its side
+    /// (navigable, BCG, agent, event-loop reg, doc state, session history)
+    /// without sending `CreateEmptyDocument` back to content.
     fn creating_a_new_top_level_traversable(
         &mut self,
         traversable_id: NavigableId,
@@ -2519,8 +2700,46 @@ impl UserAgentWorker {
         let document_id = info.document_id;
         let target_name = &info.target_name;
 
-        // Step 4: "Let documentState be a new document state..."
-        // Step 5: "Let traversable be a new traversable navigable."
+        // Step 1: Let document be null.
+        // Note: The document is the content-created about:blank document
+        // (`document_id`); the opener branch of step 2 fills the document.
+        // Step 2: Otherwise, set document to the second return value of
+        // creating a new auxiliary browsing context and document given opener.
+        // Note: Opener branch (window.open without noopener).  The UA-side of
+        // "creating a new auxiliary browsing context and document" runs below
+        // and in `create_a_new_browsing_context`: a new browsing context in a
+        // browsing context group (step 6 of that algorithm appends it to the
+        // group), the is-auxiliary flag (step 5), and the opener relationship
+        // (step 7, set afterwards by `setup_opener_for_window_open`).  The
+        // document-owning steps (10, 13, 15, 22 of "creating a new browsing
+        // context and document") already ran in content before the
+        // NavigateRequest was sent.
+        // Note: The spec appends the auxiliary browsing context to the
+        // opener's browsing context group; here a fresh browsing context
+        // group is created instead, because the opener's group is not
+        // threaded through the `new_traversable_info` on NavigateRequest.
+        let browsing_context_group_id = self.state.browsing_context_group_set.next_group_id();
+        let browsing_context_id = BrowsingContextId::new();
+        let agent_cluster_id = AgentClusterId::new();
+
+        // Step 9 ("obtaining a similar-origin window agent", of "creating a
+        // new browsing context and document"): the new traversable runs on
+        // the opener's event loop — the content process that created the
+        // document.
+        let agent = Agent {
+            id: AgentId::new(),
+            can_block: false,
+            event_loop_id,
+        };
+
+        // Step 3: Let documentState be a new document state, with document,
+        // initiator origin, origin, navigable target name, and about base URL.
+        // Step 4: Let traversable be a new traversable navigable.
+        // Step 5: Initialize the navigable traversable given documentState.
+        // Note: The traversable's UA-side state (event loop registration,
+        // traversable maps) is set up below; the document-state fields that
+        // live in content (document reference, origin) were created by the
+        // content process.
         if let Some(entry) = self.state.event_loops.get_mut(&event_loop_id) {
             entry.traversable_ids.insert(traversable_id);
         }
@@ -2530,20 +2749,6 @@ impl UserAgentWorker {
         self.state
             .traversable_target_names
             .insert(traversable_id, target_name.clone());
-
-        // Step 1 (partial): browsing context, BCG, agent cluster — UA-side state.
-        let browsing_context_group_id = self.state.browsing_context_group_set.next_group_id();
-        let browsing_context_id = BrowsingContextId::new();
-        let agent_cluster_id = AgentClusterId::new();
-
-        let agent = Agent {
-            id: AgentId::new(),
-            can_block: false,
-            event_loop_id,
-        };
-
-        self.state
-            .set_navigable_active_document(traversable_id, document_id);
         self.state
             .top_level_browsing_context_group_ids
             .insert(browsing_context_id, browsing_context_group_id);
@@ -2551,15 +2756,7 @@ impl UserAgentWorker {
             browsing_context_group_id,
             BrowsingContextGroup {
                 id: browsing_context_group_id,
-                browsing_context_set: HashMap::from([(
-                    browsing_context_id,
-                    BrowsingContext {
-                        id: browsing_context_id,
-                        is_auxiliary: false,
-                        opener_browsing_context: None,
-                        is_popup: false,
-                    },
-                )]),
+                browsing_context_set: HashMap::new(),
                 agent_cluster_map: HashMap::from([(
                     AgentClusterKey::Site(String::from("about:blank")),
                     AgentCluster {
@@ -2573,8 +2770,30 @@ impl UserAgentWorker {
                 cross_origin_isolation_mode: CrossOriginIsolationMode::None,
             },
         );
+        // Step 2 (continued): the UA-side portion of "creating a new browsing
+        // context and document" (steps 1, 9, 23 — the browsing context's
+        // group membership and the active-document mapping) runs in
+        // `create_a_new_browsing_context`, with the auxiliary browsing
+        // context's is-auxiliary flag set to true (step 5 of "creating a new
+        // auxiliary browsing context and document").
+        self.create_a_new_browsing_context(
+            traversable_id,
+            document_id,
+            event_loop_id,
+            browsing_context_group_id,
+            browsing_context_id,
+            true,
+        )?;
 
-        // Step 6: "Initialize the navigable traversable given documentState."
+        // Step 6: Let initialHistoryEntry be traversable's active session history entry.
+        // Step 7: Set initialHistoryEntry's step to 0.
+        // Step 8: Append initialHistoryEntry to traversable's session history entries.
+        // Note: The initial session history entry is materialized directly in
+        // the literal below (step 0).
+        // Step 9: If opener is non-null, then legacy-clone a traversable
+        // storage shed given opener's top-level traversable and traversable.
+        // Note: Not implemented: storage sheds are not modeled.
+        // Step 10: Append traversable to the user agent's top-level traversable set.
         self.state.navigables.insert(
             traversable_id,
             Navigable {
@@ -2598,17 +2817,6 @@ impl UserAgentWorker {
             },
         );
 
-        self.state.documents.insert(
-            document_id,
-            DocumentState {
-                traversable_id,
-                browsing_context_id: Some(browsing_context_id),
-                event_loop_id,
-                url: String::from("about:blank"),
-                is_initial_about_blank: true,
-            },
-        );
-
         verification::tla_log!(self.tla_tracer, "CreateNavigable", traversable_id);
         // The frame is the graphics-side effect of the navigable's creation;
         // traced for the RenderingOpportunity spec too (top-level frame: no
@@ -2623,7 +2831,12 @@ impl UserAgentWorker {
         if target_name_keeps_browser_ui_focus(target_name) {
             self.state.set_active_top_level_traversable(traversable_id);
         }
-
+        // Step 11: Invoke WebDriver BiDi navigable created with traversable
+        // and openerNavigableForWebDriver.
+        // Note: The embedder notification (`new_webview`) is invoked by the
+        // caller — `handle_navigate` calls
+        // `create_webview_for_new_top_level_traversable` after this returns.
+        // Step 12: Return traversable.
         Ok(())
     }
 
@@ -2738,11 +2951,25 @@ impl UserAgentWorker {
         let result: Result<(), String> = (|| {
             let is_window_open = request.features_json.is_some();
 
+            // Phase 1 — navigable creation, before navigation.
+            // "create a new child navigable" / "create a new top-level
+            // traversable" are separate spec steps that run on the HTML event
+            // loop (the content process) before the navigate step; in this
+            // architecture their navigable-owning steps run here, in the user
+            // agent, ahead of the navigation that follows.  The content
+            // process already created the document, realm, Window and
+            // environment settings object (steps 10, 13, 15, 22 of "creating a
+            // new browsing context and document"), and the methods below catch
+            // up the browsing context, group membership, document state and
+            // session history — internally via the UA-side
+            // `create_a_new_browsing_context` — so that by the time
+            // `self.navigate` runs below, the navigable and its browsing
+            // context fully exist.
             let (navigable_id, window_type) =
                 // ---- Child navigable creation (iframe) ----
                 if let Some(ref child_info) = request.new_child_navigable {
                     let child_navigable_id = child_info.content_navigable_id;
-                    self.create_new_child_navigable(
+                    self.create_a_new_child_navigable(
                         child_info.parent_traversable_id,
                         child_navigable_id,
                         child_info.content_frame_id,

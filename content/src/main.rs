@@ -983,20 +983,20 @@ impl ContentProcess {
         }
 
         // This block continues <https://html.spec.whatwg.org/#creating-a-new-browsing-context>.
-        // Step 7: "Mark document as ready for post-load tasks."
+        // Step 21: "Mark document as ready for post-load tasks."
         // TODO: Persist the document's post-load readiness state in the DOM model.
         let parser_scripts = {
             let mut document_guard = document.borrow_mut();
 
-            // Step 8: "Populate with html/head/body given document."
+            // Step 22: "Populate with html/head/body given document."
             // The content process drives the shared HTML parser with a fixed `about:blank` skeleton.
             parse_html_into_document(&mut document_guard, EMPTY_HTML_DOCUMENT)
         };
 
-        // Step 10: "Completely finish loading document."
+        // Step 24: "Completely finish loading document."
         // Execute parser-discovered classic scripts after the initial tree build.
         // TODO: Model the rest of the `completely finish loading` bookkeeping explicitly instead of relying on parser-discovered script execution alone.
-        // Step 9: "Make active document."
+        // Step 23: "Make active document."
         // Records the document as addressable under `document_id` after init completes.
         self.documents.insert(
             document_id,
