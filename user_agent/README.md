@@ -28,6 +28,15 @@ Hit-testing info (`FrameHitInfo`) from each composed scene is stored in
 `UserAgentState::frame_hit_info`, keyed by webview id. This data enables
 UI event routing without the embedder needing access to the compositor tree.
 
+During a cross-origin navigation the traversable's event loop (and content
+process) switches before the UA-side active document does: the active
+document only changes at finalization, so in the migration window
+`traversable_handles` and `active_documents_by_traversable` disagree.
+Commands pairing those two maps (e.g. `UpdateTheRendering`) must verify the
+active document is owned by the traversable's current event loop and skip
+otherwise — a stale send fails in the new content process and, because no
+paint frame is produced, leaves the render loop's pending flag stuck.
+
 ## Window.open flow
 
 `window.open()` goes through the shared `navigate` path. The content process

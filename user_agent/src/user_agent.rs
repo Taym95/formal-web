@@ -4002,6 +4002,30 @@ impl UserAgentWorker {
             self.pending_update_the_rendering.remove(&navigable_id);
             return;
         };
+        // A top-level traversable moves to a new event loop (a fresh content
+        // process) when a cross-origin navigation is prepared, while the
+        // UA-side active document only switches at finalization. In that
+        // window the active document is owned by the old event loop;
+        // commanding update-the-rendering for it on the new process fails
+        // there with "unknown document id", and since no paint frame is
+        // produced the pending flag is never cleared — the navigable stops
+        // rendering permanently. Skip the update when the active document is
+        // not owned by the navigable's current event loop; the finalization's
+        // rendering-opportunity note resumes rendering with the committed
+        // document.
+        let document_owned_by_target_event_loop = self
+            .state
+            .documents
+            .get(document_id)
+            .is_some_and(|document| document.event_loop_id == handle);
+        if !document_owned_by_target_event_loop {
+            info!(
+                "[render-pipe] UA note_rendering_opportunity: active document {} not owned by event loop {} for navigable={}",
+                document_id, handle, navigable_id
+            );
+            self.pending_update_the_rendering.remove(&navigable_id);
+            return;
+        }
         let Some(agent) = self
             .state
             .agents
@@ -4012,6 +4036,7 @@ impl UserAgentWorker {
                 "[render-pipe] UA note_rendering_opportunity: no agent for event loop handle={}",
                 handle
             );
+            self.pending_update_the_rendering.remove(&navigable_id);
             return;
         };
 
