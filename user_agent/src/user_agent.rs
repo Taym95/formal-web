@@ -2343,10 +2343,17 @@ impl UserAgentWorker {
                 allow_post: false,
                 user_involvement: user_involvement.clone(),
             });
-        if let Err(error) = self
-            .net_connection
-            .start_navigation_fetch(fetch_id, request.to_navigation_fetch_request())
-        {
+        let navigation_event_loop_id = self
+            .state
+            .traversable_handles
+            .get(&traversable_id)
+            .copied()
+            .ok_or_else(|| format!("no event loop owns traversable {traversable_id}"))?;
+        if let Err(error) = self.net_connection.start_navigation_fetch(
+            fetch_id,
+            navigation_event_loop_id,
+            request.to_navigation_fetch_request(),
+        ) {
             let _ = self
                 .state
                 .take_pending_navigation_fetch_by_navigation_id(navigation_id);
