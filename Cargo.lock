@@ -3421,8 +3421,8 @@ dependencies = [
  "mime_guess",
  "reqwest",
  "url",
+ "url_session",
  "uuid",
- "verification",
 ]
 
 [[package]]
@@ -6241,6 +6241,20 @@ dependencies = [
  "percent-encoding",
  "serde",
  "serde_derive",
+]
+
+[[package]]
+name = "url_session"
+version = "0.1.0"
+dependencies = [
+ "url_session_sys",
+]
+
+[[package]]
+name = "url_session_sys"
+version = "0.1.0"
+dependencies = [
+ "cc",
 ]
 
 [[package]]

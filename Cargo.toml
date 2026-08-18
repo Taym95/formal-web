@@ -53,6 +53,8 @@ members = [
     "js_engine_macros",
     "media",
     "net",
+    "net/url_session",
+    "net/url_session_sys",
     "user_agent",
     "verification",
     "webview",

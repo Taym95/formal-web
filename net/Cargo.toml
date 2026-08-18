@@ -7,6 +7,15 @@ autobins = false
 
 [features]
 default = []
+# The tokio/reqwest backend. On non-Apple platforms it is the default (and
+# only) backend and reqwest is always compiled (see the target-specific
+# dependency tables); on Apple it is opt-in.
+tokio = ["dep:reqwest"]
+# Apple URLSession backend (macOS/iOS only). Marker feature: the url_session
+# crate is always compiled on Apple (see the target-specific dependency
+# tables), so this flag just selects the backend when the default
+# (`url_session_default` from build.rs) is not what is wanted.
+url_session = []
 
 [lib]
 path = "src/main.rs"
@@ -19,9 +28,20 @@ path = "src/bin/net_process.rs"
 ipc = { path = "../ipc" }
 ipc_messages = { path = "../ipc_messages" }
 mime_guess = "2"
-reqwest = { version = "0.12.28", default-features = false, features = ["blocking", "rustls-tls"] }
 log = "0.4"
 env_logger = "0.11"
 url = "2"
 uuid = { version = "1", features = ["serde", "v4"] }
-verification = { path = "../verification" }
+
+# --- tokio/reqwest backend ---
+# On non-Apple platforms, reqwest is always compiled (non-optional) — it is
+# the only backend there. On Apple platforms, reqwest is optional — enabled
+# by the tokio feature.
+[target.'cfg(not(any(target_os = "macos", target_os = "ios")))'.dependencies]
+reqwest = { version = "0.12.28", default-features = false, features = ["blocking", "rustls-tls"] }
+
+[target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
+reqwest = { version = "0.12.28", default-features = false, features = ["blocking", "rustls-tls"], optional = true }
+# The URLSession backend is always available on Apple: the default backend
+# (url_session_default from build.rs) and the feature share the same crate.
+url_session = { path = "url_session" }
