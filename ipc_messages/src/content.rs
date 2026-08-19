@@ -1,5 +1,5 @@
 use crate::media::{VideoEmbedData, VideoPaintId};
-use crate::safe_passing_of_structured_data::PostMessageRequest;
+use crate::safe_passing_of_structured_data::{PortMessagePayload, PostMessageRequest};
 use anyrender::{
     Scene,
     recording::{GlyphRunCommand, RenderCommand},
@@ -53,6 +53,8 @@ uuid_id!(BeforeUnloadCheckId);
 uuid_id!(NavigableId);
 uuid_id!(FrameId);
 uuid_id!(NavigationId);
+uuid_id!(PortId);
+uuid_id!(MessageId);
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub enum ColorScheme {
@@ -915,7 +917,62 @@ pub enum Command {
     /// loop after the source content process ran steps 1–7.
     /// <https://html.spec.whatwg.org/#window-post-message-steps>
     PostMessage(PostMessageRequest),
+    /// The user-agent half of the port message routing (RouteMessage in the
+    /// MessagePortExtraFG TLA model): a routing item processed by the user
+    /// agent is delivered to the port's owning event loop as a queued task.
+    /// `NewTask` is the message task for a routed "Single" item; `Buffer` is
+    /// the transfer-completion task carrying the messages that were buffered
+    /// while the port was in transit.
+    /// <https://html.spec.whatwg.org/#message-port-post-message-steps>
+    PortTask {
+        port: PortId,
+        task: PortTaskKind,
+    },
+    /// The task slot for firing one queued message event on a port whose
+    /// message queue is enabled (the message task of the
+    /// <https://html.spec.whatwg.org/#port-message-queue>).  Each queued
+    /// message fires in its own task, so the event loop can interleave other
+    /// tasks between messages.
+    RunPortMessageTask {
+        port: PortId,
+    },
     Shutdown,
+}
+
+/// A task queued on a port's owning event loop by the user agent's
+/// routing (the `el_tasks` of the MessagePortExtraFG TLA model).
+/// <https://html.spec.whatwg.org/#message-ports>
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum PortTaskKind {
+    /// A routed "Single" message: run the message task for `msg`.
+    NewTask {
+        msg: PortMessagePayload,
+    },
+    /// A transfer-completion task: append the buffered messages to the
+    /// port's queue (the TLA model's `RunTask` with a "Buffer" task).
+    Buffer {
+        buf: Vec<PortMessagePayload>,
+    },
+}
+
+/// The transfer state of a port (the `TS_*` constants of the
+/// MessagePortExtraFG TLA model).
+/// <https://html.spec.whatwg.org/#message-ports:transfer-steps>
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TransferState {
+    /// The port is managed by an event loop and can receive messages.
+    Managed,
+    /// The port was transferred out of its owning event loop and has not
+    /// been received anywhere yet.
+    TransferInProgress,
+    /// The port was received by a new event loop and its transfer is
+    /// completing (a completion task is pending).
+    CompletionInProgress,
+    /// The port was transferred again while a previous transfer was
+    /// completing.
+    CompletionFailed,
+    /// A new event loop requested completion after a failed transfer.
+    CompletionRequested,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -942,6 +999,58 @@ pub enum Event {
     /// window's event loop.
     /// <https://html.spec.whatwg.org/#window-post-message-steps>
     PostMessageRequested(PostMessageRequest),
+    /// The two ports of a newly created MessageChannel, registered with the
+    /// user agent so its routing can deliver messages to either port's
+    /// owning event loop (the `NewChannel` action of the MessagePortExtraFG
+    /// TLA model).
+    /// <https://html.spec.whatwg.org/#dom-messagechannel>
+    PortChannelCreated {
+        port1: PortId,
+        port2: PortId,
+    },
+    /// A port was transferred out of its owning event loop during
+    /// structured serialization (the `Transfer` action of the
+    /// MessagePortExtraFG TLA model).
+    /// <https://html.spec.whatwg.org/#message-ports:transfer-steps>
+    PortTransferStarted {
+        port: PortId,
+    },
+    /// A transferred port was received in an event loop during structured
+    /// deserialization (the `TransferReceive` action of the MessagePortExtraFG
+    /// TLA model).
+    /// <https://html.spec.whatwg.org/#message-ports:transfer-receiving-steps>
+    PortTransferReceived {
+        port: PortId,
+    },
+    /// The message port post message steps could not deliver a message
+    /// directly because the target port is not managed by the source event
+    /// loop; the message is appended to the user agent's routing queue as a
+    /// "Single" item.
+    /// <https://html.spec.whatwg.org/#message-port-post-message-steps>
+    PortMessageRouted {
+        tgt: PortId,
+        msg: PortMessagePayload,
+    },
+    /// A transfer-completion task ran on an event loop whose port was
+    /// transferred away before the task ran; the task's buffer is returned
+    /// to the user agent's routing queue as a "ReturnedBuffer" item.
+    PortBufferReturned {
+        tgt: PortId,
+        buf: Vec<PortMessagePayload>,
+    },
+    /// A transfer-completion task ran on the port's owning event loop and
+    /// the port is now managed; the "Success" routing item completes the
+    /// transfer at the user agent.
+    PortTransferCompleted {
+        tgt: PortId,
+    },
+    /// A message was queued on an enabled port message queue and needs a
+    /// task slot to fire its message event; the event loop bridge replies
+    /// with a `RunPortMessageTask` command.
+    /// <https://html.spec.whatwg.org/#port-message-queue>
+    PortMessageTaskPending {
+        port: PortId,
+    },
     /// The parsed title of a top-level document, reported after parsing so
     /// the embedder can label the corresponding tab and window.
     /// <https://html.spec.whatwg.org/#the-title-element>

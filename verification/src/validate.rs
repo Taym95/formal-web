@@ -690,8 +690,75 @@ fn collect_trace_ids_for_spec(
     match spec_name {
         "Navigation" => collect_navigation_trace_ids(trace_events),
         "RenderingOpportunity" => collect_rendering_opportunity_trace_ids(trace_events),
+        "MessagePort" => collect_message_port_trace_ids(trace_events),
         _ => BTreeMap::new(),
     }
+}
+
+/// The id universes of the MessagePortExtraFG model derived from the
+/// recorded trace: every port id, event loop id, and message id referenced
+/// by a MessagePort trace event.
+fn collect_message_port_trace_ids(trace_events: &[TraceEvent]) -> BTreeMap<String, BTreeSet<String>> {
+    let mut port_ids = BTreeSet::new();
+    let mut event_loop_ids = BTreeSet::new();
+    let mut message_ids = BTreeSet::new();
+
+    for event in trace_events {
+        match event.event.as_str() {
+            "NewChannel" => {
+                if let Some(port1) = event.event_args.first() {
+                    port_ids.insert(port1.clone());
+                }
+                if let Some(port2) = event.event_args.get(1) {
+                    port_ids.insert(port2.clone());
+                }
+                if let Some(el) = event.event_args.get(2) {
+                    event_loop_ids.insert(el.clone());
+                }
+            }
+            "PostMessage" | "RouteMessage" => {
+                if let Some(src) = event.event_args.first() {
+                    port_ids.insert(src.clone());
+                }
+                if let Some(mid) = event.event_args.get(2) {
+                    message_ids.insert(mid.clone());
+                }
+            }
+            "ReceiveMessage" | "Transfer" | "TransferReceive" => {
+                if let Some(port) = event.event_args.first() {
+                    port_ids.insert(port.clone());
+                }
+                if let Some(el) = event.event_args.get(1) {
+                    event_loop_ids.insert(el.clone());
+                }
+            }
+            "RunTask" => {
+                if let Some(el) = event.event_args.first() {
+                    event_loop_ids.insert(el.clone());
+                }
+                if let Some(port) = event.event_args.get(1) {
+                    port_ids.insert(port.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // PostMessage's third argument and RouteMessage's third argument are
+    // message ids; also collect them from those events' arg positions.
+    for event in trace_events {
+        if event.event.as_str() == "PostMessage"
+            && let Some(mid) = event.event_args.get(2)
+        {
+            message_ids.insert(mid.clone());
+        }
+    }
+
+    let mut sets = BTreeMap::new();
+    sets.insert(String::from("TracePortIDs"), port_ids);
+    sets.insert(String::from("TraceEventLoopIDs"), event_loop_ids);
+    sets.insert(String::from("TraceMessageIDs"), message_ids);
+    sets
 }
 
 fn collect_navigation_trace_ids(trace_events: &[TraceEvent]) -> BTreeMap<String, BTreeSet<String>> {

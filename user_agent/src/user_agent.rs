@@ -1,3 +1,4 @@
+mod channel_messaging;
 mod event_loop;
 mod fetch;
 pub(crate) mod ipc_manifest;
@@ -902,6 +903,11 @@ pub enum UserAgentCommand {
     PostMessage {
         request: PostMessageRequest,
     },
+    /// A port event forwarded from a content process's event loop (the
+    /// MessagePortExtraFG model actions as observed at the user agent).
+    PortEvent {
+        event: crate::channel_messaging::PortEvent,
+    },
     CompleteBeforeUnload {
         result: BeforeUnloadResult,
     },
@@ -1339,6 +1345,9 @@ struct UserAgentWorker {
     /// Tracks which navigables have a queued update the rendering in
     /// flight (TLA spec: pending[f] > composed[f]).
     pending_update_the_rendering: HashSet<NavigableId>,
+    /// The user-agent-side channel messaging state: the routing queue and
+    /// per-port transfer state of the MessagePortExtraFG model.
+    channel_messaging: crate::channel_messaging::ChannelMessaging,
     /// Batched rendering opportunities noted while an update was pending
     /// or no frame was needed yet (TLA spec op_count), with the epoch
     /// millisecond time the opportunity was noted (the event loop's "last
@@ -1431,6 +1440,7 @@ impl UserAgentWorker {
             epoch_anchor,
             epoch_anchor_wall_ms,
             pending_update_the_rendering: HashSet::new(),
+            channel_messaging: crate::channel_messaging::ChannelMessaging::new(trace_sender.clone()),
             queued_rendering_opportunities: HashMap::new(),
             frame_needed: HashSet::new(),
             trace_sender,
@@ -1457,6 +1467,9 @@ impl UserAgentWorker {
                     }
                     UserAgentCommand::PostMessage { request } => {
                         self.handle_post_message(request);
+                    }
+                    UserAgentCommand::PortEvent { event } => {
+                        self.handle_port_event(event);
                     }
                     UserAgentCommand::CompleteBeforeUnload { result } => {
                         self.handle_complete_before_unload(result);
@@ -3966,6 +3979,37 @@ impl UserAgentWorker {
         }) {
             error!("postMessage: failed to queue message task: {error}");
         }
+    }
+
+    /// <https://html.spec.whatwg.org/#message-ports>
+    /// The user-agent half of the port workflow: register channels and
+    /// transfers and process the routing queue (the model's `NewChannel`,
+    /// `Transfer`, `TransferReceive`, and `RouteMessage` actions).
+    fn handle_port_event(&mut self, event: crate::channel_messaging::PortEvent) {
+        let state = &self.state;
+        let mut send_task = |event_loop_id: EventLoopId, command: ContentCommand| {
+            match state
+                .agents
+                .values()
+                .find(|agent| agent.event_loop_id == event_loop_id)
+            {
+                Some(agent) => {
+                    if let Err(error) = agent.command_sender.send(EventLoopCommand::FireAndForget {
+                        command,
+                    }) {
+                        error!("port routing: failed to queue task: {error}");
+                    }
+                }
+                None => {
+                    error!("port routing: missing agent for event loop {event_loop_id}");
+                }
+            }
+        };
+        crate::channel_messaging::handle_port_event(
+            &mut self.channel_messaging,
+            event,
+            &mut send_task,
+        );
     }
 
     /// Milliseconds since the Unix epoch of `instant`, measured on the

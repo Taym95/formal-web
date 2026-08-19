@@ -178,6 +178,8 @@ fn requires_command_completed_wakeup(command: &ContentCommand) -> bool {
             | ContentCommand::CompleteDocumentFetch { .. }
             | ContentCommand::FailDocumentFetch { .. }
             | ContentCommand::PostMessage { .. }
+            | ContentCommand::PortTask { .. }
+            | ContentCommand::RunPortMessageTask { .. }
     )
 }
 
@@ -439,6 +441,80 @@ impl EventLoopWorker {
                 self.user_agent_command_sender
                     .send(UserAgentCommand::PostMessage { request })
                     .map_err(|error| format!("failed to send postMessage request: {error}"))?;
+            }
+
+            ContentEvent::PortChannelCreated { port1, port2 } => {
+                // `MessagePortExtraFG.tla`'s `NewChannel`: register the pair with the user
+                // agent so its routing can reach either port.
+                self.user_agent_command_sender
+                    .send(UserAgentCommand::PortEvent {
+                        event: crate::channel_messaging::PortEvent::ChannelCreated {
+                            port1,
+                            port2,
+                            event_loop: self.event_loop_id,
+                        },
+                    })
+                    .map_err(|error| format!("failed to forward port channel: {error}"))?;
+            }
+            ContentEvent::PortTransferStarted { port } => {
+                // `MessagePortExtraFG.tla`'s `Transfer`: the port is in transit.
+                self.user_agent_command_sender
+                    .send(UserAgentCommand::PortEvent {
+                        event: crate::channel_messaging::PortEvent::TransferStarted { port },
+                    })
+                    .map_err(|error| format!("failed to forward port transfer: {error}"))?;
+            }
+            ContentEvent::PortTransferReceived { port } => {
+                // `MessagePortExtraFG.tla`'s `TransferReceive`: the port was received by
+                // this event loop.
+                self.user_agent_command_sender
+                    .send(UserAgentCommand::PortEvent {
+                        event: crate::channel_messaging::PortEvent::TransferReceived {
+                            port,
+                            event_loop: self.event_loop_id,
+                        },
+                    })
+                    .map_err(|error| format!("failed to forward port receive: {error}"))?;
+            }
+            ContentEvent::PortMessageRouted { tgt, msg } => {
+                // `MessagePortExtraFG.tla`'s `PostMessage` routed branch: the message is
+                // appended to the routing queue.
+                self.user_agent_command_sender
+                    .send(UserAgentCommand::PortEvent {
+                        event: crate::channel_messaging::PortEvent::MessageRouted { tgt, msg },
+                    })
+                    .map_err(|error| format!("failed to forward port message: {error}"))?;
+            }
+            ContentEvent::PortBufferReturned { tgt, buf } => {
+                self.user_agent_command_sender
+                    .send(UserAgentCommand::PortEvent {
+                        event: crate::channel_messaging::PortEvent::BufferReturned { tgt, buf },
+                    })
+                    .map_err(|error| format!("failed to forward returned buffer: {error}"))?;
+            }
+            ContentEvent::PortTransferCompleted { tgt } => {
+                self.user_agent_command_sender
+                    .send(UserAgentCommand::PortEvent {
+                        event: crate::channel_messaging::PortEvent::TransferCompleted { tgt },
+                    })
+                    .map_err(|error| format!("failed to forward transfer completion: {error}"))?;
+            }
+            ContentEvent::PortMessageTaskPending { port } => {
+                // A message was queued on an enabled port message queue of
+                // this event loop; queue a task slot to fire it.  The
+                // requester is the owner (direct delivery implies the port
+                // is managed by this event loop), so the task is queued on
+                // this same event loop.
+                log::debug!(
+                    "[port] message task pending port={port} event_loop={}",
+                    self.event_loop_id
+                );
+                self.pending_task_commands
+                    .push_back(PendingTaskCommand {
+                        command: ContentCommand::RunPortMessageTask { port },
+                        reply: None,
+                    });
+                self.flush_next_task_command();
             }
 
             ContentEvent::BeforeUnloadCompleted(result) => {

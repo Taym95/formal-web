@@ -232,7 +232,7 @@ RouteMessage ==
 \* Run a task on an event-loop, either
 \* to complete a tranfer or handling an incoming message. 
 \* Note: All actions taking `el` are also implicit event-loop task,
-\* but are modelled as independent to avoid a massive RunTask action.
+\* but are modelled as independent actions to avoid a massive RunTask action.
 RunTask(el) ==
     /\ el_tasks[el] /= <<>>
     /\ LET task    == Head(el_tasks[el])

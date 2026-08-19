@@ -15,7 +15,21 @@ The verification crate owns trace recording, TLA+ validation, and the shutdown w
 |---|---|---|
 | `Navigation` | UA navigation lifecycle | navigable/navigation state machine |
 | `RenderingOpportunity` | UA `CreateFrame` (the navigable-creation part of the navigation path, traced from `CreateNavigable`/`CreateChildNavigable`) /`NoteRenderingOpportunity`/`FrameNeeded`, content `UpdateTheRendering`, graphics `GraphicsComputed` (traced when the pixels are actually sent) | FrameNeeded-gated render cycle with double buffering: a render starts only when the embedder needs a frame (paced by vsync) AND a rendering opportunity was noted; the paint consumes the composed frames, and the pipeline never holds more than `BufferCount` (2) renders in flight (one displayed, one being rendered) |
-| `MessagePort*` | (not written yet) | — |
+| `MessagePort` | content `NewChannel`/`PostMessage`/`ReceiveMessage`/`Transfer`/`TransferReceive`/`RunTask`, UA `RouteMessage` (the actions of `MessagePortExtraFG.tla`) | the cross-process port workflow: channel creation, direct vs routed delivery, the per-port transfer state machine, the routing queue, and the per-event-loop task queues |
+
+### MessagePort scope
+
+The trace consumer replays the recorded events against
+`MessagePortExtraFG.tla`, the concrete model of the cross-process
+MessagePort workflow (the abstract `MessagePort.tla` model is the
+refinement target; `MessagePortFG.tla` is the finite-state variant).
+`verification/messageport-trace.html` drives the actions in the
+verification session: it creates channels, delivers messages, transfers a
+port via `structuredClone`, and delivers through the transferred port.  The
+trace page sequences its stages with timers so each transfer completes
+before the next message is posted — the model's `Transfer` action requires
+no pending tasks for the port, and `PostMessage` requires a managed source
+port, so the page keeps each action quiescent.
 
 ### RenderingOpportunity scope
 

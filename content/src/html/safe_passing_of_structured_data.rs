@@ -21,6 +21,9 @@ use ipc_messages::safe_passing_of_structured_data::{
     PrimitiveValue, SerializedRecord, TransferDataHolder,
 };
 
+use crate::html::create_transferred_port_object;
+use crate::html::MessagePort;
+
 use js_engine::{
     Completion, EcmascriptHost, ExecutionContext, JsTypes, enums::TypedArrayElementType,
 };
@@ -91,7 +94,11 @@ pub trait Transferable: std::fmt::Debug {
 /// <https://html.spec.whatwg.org/#structuredserializeinternal> step 1.
 #[derive(Default)]
 pub struct MemoryMap {
-    serialized: HashMap<usize, SerializedRecord>,
+    /// Object → serialized record, keyed by object identity (the spec's
+    /// `memory` map).  Completed records are removed when their
+    /// serialization finishes; entries stay only for in-progress objects
+    /// (cycle detection) and transfer-list references.
+    serialized: Vec<(JsObject, SerializedRecord)>,
     deserialized: HashMap<usize, JsObject>,
     /// Values rebuilt from the transfer data holders by
     /// StructuredDeserializeWithTransfer step 3, indexed by transfer-list
@@ -102,15 +109,31 @@ pub struct MemoryMap {
 
 impl MemoryMap {
     fn get_serialized(&self, object: &JsObject) -> Option<&SerializedRecord> {
-        let addr = std::ptr::from_ref(object).addr();
-        self.serialized.get(&addr)
+        self.serialized
+            .iter()
+            .find(|(key, _)| key == object)
+            .map(|(_, record)| record)
     }
     fn insert_serialized(&mut self, object: &JsObject, record: SerializedRecord) {
-        let addr = std::ptr::from_ref(object).addr();
-        self.serialized.insert(addr, record);
+        if let Some((_, existing)) = self
+            .serialized
+            .iter_mut()
+            .find(|(key, _)| key == object)
+        {
+            *existing = record;
+        } else {
+            self.serialized.push((object.clone(), record));
+        }
     }
-    fn get_serialized_by_addr_mut(&mut self, addr: usize) -> Option<&mut SerializedRecord> {
-        self.serialized.get_mut(&addr)
+    fn get_serialized_mut(&mut self, object: &JsObject) -> Option<&mut SerializedRecord> {
+        self.serialized
+            .iter_mut()
+            .find(|(key, _)| key == object)
+            .map(|(_, record)| record)
+    }
+    fn remove_serialized(&mut self, object: &JsObject) -> Option<SerializedRecord> {
+        let index = self.serialized.iter().position(|(key, _)| key == object)?;
+        Some(self.serialized.remove(index).1)
     }
     fn get_deserialized(&self, record: &SerializedRecord) -> Option<JsObject> {
         let addr = std::ptr::from_ref(record).addr();
@@ -323,7 +346,6 @@ fn structured_serialize_internal(
     //   { [[Type]]: "Object", [[Properties]]: a new empty List }.
     // Step 25: Set memory[value] to serialized.
     let serialized = SerializedRecord::Object(Vec::new());
-    let addr = std::ptr::from_ref(&object).addr();
     memory.insert_serialized(&object, serialized);
 
     // Step 26 ("If deep is true" block for the Object case):
@@ -355,12 +377,11 @@ fn structured_serialize_internal(
     }
 
     // Step 28 (spec): Return serialized.
-    if let Some(SerializedRecord::Object(props)) = memory.get_serialized_by_addr_mut(addr) {
+    if let Some(SerializedRecord::Object(props)) = memory.get_serialized_mut(&object) {
         *props = properties;
     }
     Ok(memory
-        .serialized
-        .remove(&addr)
+        .remove_serialized(&object)
         .expect("entry must exist in memory"))
 }
 
@@ -550,7 +571,6 @@ fn serialize_map_contents(
     let serialized = SerializedRecord::Map(Vec::new());
 
     // Step 15.2: Set memory[value] to serialized.
-    let addr = std::ptr::from_ref(object).addr();
     memory.insert_serialized(object, serialized);
 
     // Step 15.3: Let copiedList be a new empty List.
@@ -571,12 +591,11 @@ fn serialize_map_contents(
     }
 
     // Update the entry in memory with the serialized entries.
-    if let Some(SerializedRecord::Map(entry_list)) = memory.get_serialized_by_addr_mut(addr) {
+    if let Some(SerializedRecord::Map(entry_list)) = memory.get_serialized_mut(object) {
         *entry_list = entries;
     }
     Ok(memory
-        .serialized
-        .remove(&addr)
+        .remove_serialized(object)
         .expect("Map entry must exist in memory"))
 }
 
@@ -601,7 +620,6 @@ fn serialize_set_contents(
     let serialized = SerializedRecord::Set(Vec::new());
 
     // Step 16.2: Set memory[value] to serialized.
-    let addr = std::ptr::from_ref(object).addr();
     memory.insert_serialized(object, serialized);
 
     // Step 16.3: Let copiedList be a new empty List.
@@ -618,12 +636,11 @@ fn serialize_set_contents(
         entries.push(sv);
     }
 
-    if let Some(SerializedRecord::Set(entry_list)) = memory.get_serialized_by_addr_mut(addr) {
+    if let Some(SerializedRecord::Set(entry_list)) = memory.get_serialized_mut(object) {
         *entry_list = entries;
     }
     Ok(memory
-        .serialized
-        .remove(&addr)
+        .remove_serialized(object)
         .expect("Set entry must exist in memory"))
 }
 
@@ -729,7 +746,6 @@ fn serialize_array(
     };
 
     // Step 18.4: Set memory[value] to serialized.
-    let addr = std::ptr::from_ref(&object).addr();
     memory.insert_serialized(&object, serialized);
 
     // Step 18.5: For each key of ! EnumerableOwnProperties(value, key):
@@ -757,13 +773,12 @@ fn serialize_array(
 
     if let Some(SerializedRecord::Array {
         properties: props, ..
-    }) = memory.get_serialized_by_addr_mut(addr)
+    }) = memory.get_serialized_mut(&object)
     {
         *props = properties;
     }
     Ok(memory
-        .serialized
-        .remove(&addr)
+        .remove_serialized(&object)
         .expect("Array entry must exist in memory"))
 }
 
@@ -816,7 +831,7 @@ pub fn structured_serialize_with_transfer(
 
         // Step 2.1: If transferable has neither an [[ArrayBufferData]] internal slot nor a
         //             [[Detached]] internal slot, then throw.
-        if !has_ab && !has_sab && !is_transferable_platform_object(&object) {
+        if !has_ab && !has_sab && !is_transferable_platform_object(&object, ec) {
             return Err(crate::webidl::data_clone_error_value(ec));
         }
 
@@ -871,9 +886,20 @@ pub fn structured_serialize_with_transfer(
                 max_byte_length: None,
             });
         } else {
-            // Step 5.2: Otherwise (platform object with [[Detached]] internal slot).
-            // TODO: platform object transfer.
-            return Err(crate::webidl::data_clone_error_value(ec));
+            // Step 5.2: Otherwise (platform object with a [[Detached]]
+            //           internal slot): perform the transfer steps for the
+            //           interface identified by interfaceName.
+            let transfer_data = crate::html::message_port_transfer_steps(&object, ec)?
+                .ok_or_else(|| crate::webidl::data_clone_error_value(ec))?;
+            // Step 5.2.x: Set transferable.[[Detached]] to true.
+            // Note: The record was removed by the transfer steps, so the
+            // source object's [[Detached]] state is implicit (its record is
+            // gone).
+            transfer_data_holders.push(TransferDataHolder::MessagePort {
+                port_id: transfer_data.port_id,
+                queue: transfer_data.queue,
+                remote_port: transfer_data.remote_port,
+            });
         }
     }
 
@@ -884,8 +910,17 @@ pub fn structured_serialize_with_transfer(
     })
 }
 
-fn is_transferable_platform_object(_object: &JsObject) -> bool {
-    false // TODO
+/// <https://html.spec.whatwg.org/#message-ports:transfer-steps>
+/// Whether a transferable is a MessagePort platform object (which has a
+/// [[Detached]] internal slot, satisfying StructuredSerializeWithTransfer
+/// step 2.1).
+fn is_transferable_platform_object(
+    object: &JsObject,
+    ec: &mut dyn ExecutionContext<Types>,
+) -> bool {
+    ec.with_object_any(object)
+        .and_then(|data| data.downcast_ref::<MessagePort>().cloned())
+        .is_some()
 }
 
 // StructuredDeserialize
@@ -1333,6 +1368,22 @@ pub fn structured_deserialize_with_transfer(
                 }
                 let buf_obj = Types::object_from_array_buffer(buf);
                 Types::value_from_object(buf_obj)
+            }
+            // Step 3.2: If transferDataHolder.[[Type]] is "MessagePort", then
+            //           run the transfer-receiving steps for MessagePort given
+            //           dataHolder and a new MessagePort in targetRealm.
+            // Note: The new MessagePort platform object is created in the
+            // target realm (the current realm) by
+            // `create_transferred_port_object`, which also re-entangles it
+            // with the remote port and registers it with the user agent.
+            TransferDataHolder::MessagePort {
+                port_id,
+                queue,
+                remote_port,
+            } => {
+                let object =
+                    create_transferred_port_object(*port_id, *remote_port, queue.clone(), ec)?;
+                Types::value_from_object(object)
             }
         };
 

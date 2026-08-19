@@ -58,8 +58,9 @@ use ipc_messages::content::{
     EmbedLayout, EmbedSite, EmbedSiteId, Event as ContentEvent, EventLoopId,
     FetchRequest as ContentFetchRequest, FetchResponse as ContentFetchResponse,
     FontTransportSender, FrameCompositionMetadata, FrameId, IframeEmbedSite,
-    LoadedDocumentResponse, NavigableId, NavigationId, PaintFrame, ScriptEvaluationResult,
-    TitleChanged, TraversableViewport, ViewportSnapshot, WebviewId, WindowTimerKey,
+    LoadedDocumentResponse, NavigableId, NavigationId, PaintFrame, PortId, PortTaskKind,
+    ScriptEvaluationResult, TitleChanged, TraversableViewport, ViewportSnapshot, WebviewId,
+    WindowTimerKey,
 };
 use ipc_messages::media::{VideoEmbedData, VideoPaintId};
 use ipc_messages::safe_passing_of_structured_data::PostMessageRequest;
@@ -402,6 +403,9 @@ pub(crate) struct ContentProcess {
     /// Wall-clock milliseconds since the Unix epoch at the moment
     /// `epoch_anchor` was captured.
     epoch_anchor_wall_ms: f64,
+    /// Raw TLA trace sender, forwarded to each realm's GlobalScope for the
+    /// MessagePort spec trace (the Navigation tracer above is separate).
+    trace_sender: Option<TraceSender>,
     realm_parent: Engine,
 }
 
@@ -437,7 +441,7 @@ impl ContentProcess {
             active_documents_by_traversable: HashMap::new(),
             font_namespace: new_font_namespace(),
             font_sender: FontTransportSender::default(),
-            tla_tracer: TLATracer::new("Navigation", "formal-web:content", trace_sender),
+            tla_tracer: TLATracer::new("Navigation", "formal-web:content", trace_sender.clone()),
             clipboard_cache: clipboard_cache.clone(),
             new_document_registry: Rc::new(RefCell::new(HashMap::new())),
             video_paint_registry: Rc::new(RefCell::new(HashMap::new())),
@@ -449,6 +453,7 @@ impl ContentProcess {
             content_command_sender,
             epoch_anchor,
             epoch_anchor_wall_ms,
+            trace_sender,
             realm_parent: Engine::new(),
         }
     }
@@ -461,7 +466,7 @@ impl ContentProcess {
         document_id: DocumentId,
     ) -> Result<EnvironmentSettingsObject, String> {
         let event_sender = self.event_sender.clone();
-        EnvironmentSettingsObject::new_in_realm(
+        let mut settings = EnvironmentSettingsObject::new_in_realm(
             Some(&mut self.realm_parent),
             document,
             creation_url,
@@ -469,7 +474,18 @@ impl ContentProcess {
             Some(traversable_id),
             Some(document_id),
             None,
-        )
+        )?;
+        // The realm belongs to this content process's event loop; the global
+        // scope needs the id for channel messaging (per-event-loop port
+        // management) and the trace sender for the MessagePort TLA spec.
+        let trace_sender = self.trace_sender.clone();
+        with_global_scope(&mut settings.realm_execution_context, |global_scope, _ec| {
+            global_scope.set_event_loop_id(self.event_loop_id);
+            global_scope.set_trace_sender(trace_sender.clone());
+            Ok(())
+        })
+        .map_err(|error| format!("failed to set event loop id: {}", error.display()))?;
+        Ok(settings)
     }
 
     /// Set the clipboard cache from a prefetched clipboard text.
@@ -778,6 +794,15 @@ impl ContentProcess {
             })
             .map_err(|error| format!("failed to read new traversable id: {}", error.display()))?
             .unwrap_or_else(NavigableId::new);
+            // The new realm shares this process's event loop and trace
+            // sender (channel messaging needs both).
+            let trace_sender = self.trace_sender.clone();
+            with_global_scope(settings.ec(), |global_scope, _ec| {
+                global_scope.set_event_loop_id(self.event_loop_id);
+                global_scope.set_trace_sender(trace_sender.clone());
+                Ok(())
+            })
+            .map_err(|error| format!("failed to set event loop id: {}", error.display()))?;
 
             self.documents.insert(
                 document_id,
@@ -1828,6 +1853,105 @@ impl ContentProcess {
         Ok(())
     }
 
+    /// Find the document whose realm manages a port record.
+    fn find_port_document(&mut self, port_id: PortId) -> Option<DocumentId> {
+        let mut found = None;
+        for (document_id, document) in self.documents.iter_mut() {
+            let result = with_global_scope(document.settings.ec(), |global_scope, ec| {
+                Ok(global_scope
+                    .channel_messaging(ec)
+                    .map(|messaging| messaging.has_port(port_id, ec))
+                    .unwrap_or(false))
+            });
+            if matches!(result, Ok(true)) {
+                found = Some(*document_id);
+                break;
+            }
+        }
+        found
+    }
+
+    /// The channel messaging of the first realm in this process, used to
+    /// return tasks to the user agent's routing queue when the port is no
+    /// longer managed by this event loop.
+    fn any_channel_messaging(
+        &mut self,
+    ) -> Option<crate::html::ChannelMessaging> {
+        let (_, document) = self.documents.iter_mut().next()?;
+        let messaging = with_global_scope(document.settings.ec(), |global_scope, ec| {
+            Ok(global_scope.channel_messaging(ec))
+        })
+        .ok()
+        .flatten()?;
+        Some(messaging)
+    }
+
+    /// Run a task queued on this event loop by the user agent's routing
+    /// (`MessagePortExtraFG.tla`'s `RunTask`).  The task is appended to the port's queue or
+    /// returned to the routing queue when the port left this event loop.
+    fn handle_port_task(&mut self, port_id: PortId, task: PortTaskKind) -> Result<(), String> {
+        let event_sender = self.event_sender.clone();
+        let Some(document_id) = self.find_port_document(port_id) else {
+            // The port is no longer managed by this event loop; return the
+            // task to the user agent's routing queue.
+            let messaging = self.any_channel_messaging().ok_or_else(|| {
+                format!("port task: no realm to return the task for port {port_id}")
+            })?;
+            messaging
+                .return_task_to_ua(port_id, task, &event_sender, &mut self.realm_parent)
+                .map_err(|error| format!("port task return failed: {error}"))?;
+            return Ok(());
+        };
+        let content_document = self
+            .documents
+            .get_mut(&document_id)
+            .ok_or_else(|| format!("port task: unknown document {document_id}"))?;
+        with_global_scope(content_document.settings.ec(), |global_scope, ec| {
+            let Some(messaging) = global_scope.channel_messaging(ec) else {
+                return Ok(());
+            };
+            messaging
+                .handle_port_task(port_id, task, &event_sender, ec)
+                .map_err(|error| ec.new_type_error(&format!("port task: {error}")))
+        })
+        .map_err(|error| format!("port task failed: {}", error.display()))?;
+        Ok(())
+    }
+
+    /// Fire one queued message event on a port (the message task of the
+    /// message port post message steps).
+    fn handle_run_port_message_task(&mut self, port_id: PortId) -> Result<(), String> {
+        let Some(document_id) = self.find_port_document(port_id) else {
+            return Ok(());
+        };
+        let time_millis = self
+            .documents
+            .get(&document_id)
+            .map(|document| document.settings.current_time_millis())
+            .unwrap_or(0.0);
+        let content_document = self
+            .documents
+            .get_mut(&document_id)
+            .ok_or_else(|| format!("port message task: unknown document {document_id}"))?;
+        with_global_scope(content_document.settings.ec(), |global_scope, ec| {
+            let Some(messaging) = global_scope.channel_messaging(ec) else {
+                return Ok(());
+            };
+            let Some(object) = messaging.port_object(port_id, ec) else {
+                return Ok(());
+            };
+            let port: Option<crate::html::MessagePort> = ec
+                .with_object_any(&object)
+                .and_then(|data| data.downcast_ref::<crate::html::MessagePort>().cloned());
+            let Some(port) = port else {
+                return Ok(());
+            };
+            port.run_message_task(time_millis, ec)
+        })
+        .map_err(|error| format!("port message task failed: {}", error.display()))?;
+        Ok(())
+    }
+
     fn run_before_unload(
         &mut self,
         document_id: DocumentId,
@@ -2721,6 +2845,14 @@ impl ContentProcess {
                 self.dispatch_post_message(request)?;
                 Ok(true)
             }
+            Command::PortTask { port, task } => {
+                self.handle_port_task(port, task)?;
+                Ok(true)
+            }
+            Command::RunPortMessageTask { port } => {
+                self.handle_run_port_message_task(port)?;
+                Ok(true)
+            }
             Command::RunBeforeUnload {
                 document_id,
                 check_id,
@@ -2891,6 +3023,8 @@ fn run_content_message_loop(
                                 | CompleteDocumentFetch { .. }
                                 | FailDocumentFetch { .. }
                                 | Command::PostMessage { .. }
+                                | Command::PortTask { .. }
+                                | Command::RunPortMessageTask { .. }
                         );
                         match process.handle_command(command) {
                             Ok(true) => {

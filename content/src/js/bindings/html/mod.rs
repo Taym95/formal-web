@@ -8,6 +8,7 @@ pub(crate) mod html_video_element;
 pub(crate) mod hyperlink_element_utils;
 mod location;
 pub(crate) mod message_event;
+pub(crate) mod messageport;
 pub(crate) mod window;
 pub(crate) mod windowproxy;
 

@@ -15,6 +15,8 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+use crate::content::{MessageId, PortId};
+
 /// A primitive JavaScript value in a portable, serializable form.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum PrimitiveValue {
@@ -132,6 +134,33 @@ pub enum TransferDataHolder {
         byte_length: u64,
         max_byte_length: Option<u64>,
     },
+    /// { [[Type]]: "MessagePort", [[PortMessageQueue]]: queue,
+    ///   [[RemotePort]]: remotePort }
+    /// A transferred MessagePort: the port id, its pending message queue
+    /// (the tasks that are to fire message events, moved with the transfer
+    /// per the transfer steps), and the id of the port it was entangled
+    /// with, if any (re-entangled on transfer-receiving).
+    /// <https://html.spec.whatwg.org/#message-ports:transfer-steps>
+    MessagePort {
+        port_id: PortId,
+        queue: Vec<PortMessagePayload>,
+        remote_port: Option<PortId>,
+    },
+}
+
+/// One queued message on a port message queue (pure data, IPC-safe).
+/// Carries the serialized message produced by the message port post message
+/// steps plus a unique message id for the MessagePortExtraFG TLA trace.
+/// <https://html.spec.whatwg.org/#message-port-post-message-steps>
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PortMessagePayload {
+    /// Unique id of this message, used by the TLA trace to identify the
+    /// message in `MessagePortExtraFG.tla` (the `MessageId` of MessagePortExtraFG.tla).
+    pub message_id: MessageId,
+    /// `serializeWithTransferResult.[[Serialized]]` (step 5).
+    pub serialized: SerializedRecord,
+    /// `serializeWithTransferResult.[[TransferDataHolders]]` (step 5).
+    pub transfer_data_holders: Vec<TransferDataHolder>,
 }
 
 /// Payload of the window post message steps carried between the source

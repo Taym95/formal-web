@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>MessagePort trace page</title>
+  </head>
+  <body>
+    <h1>MessagePort trace page</h1>
+    <p id="log"></p>
+    <script>
+      // Exercise the MessagePortExtraFG cross-process workflow: channel
+      // creation, message delivery, a port transfer, and delivery through
+      // the transferred port.  The content processes and the user agent
+      // trace the model's actions (NewChannel, PostMessage, RouteMessage,
+      // RunTask, ReceiveMessage, Transfer, TransferReceive).  The stages are
+      // separated by timers so each transfer completes (its Buffer task runs
+      // and the port is managed again) before the next message is posted.
+      var log = document.getElementById('log');
+      var channel = new MessageChannel();
+      channel.port2.onmessage = function (event) {
+        log.textContent = 'port2 got: ' + event.data;
+      };
+      channel.port1.postMessage('hello');
+      setTimeout(function () {
+        var second = new MessageChannel();
+        var transferred = structuredClone(second.port1, {
+          transfer: [second.port1],
+        });
+        setTimeout(function () {
+          transferred.postMessage('through');
+        }, 50);
+      }, 50);
+    </script>
+  </body>
+</html>

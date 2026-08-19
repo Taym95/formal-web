@@ -72,6 +72,7 @@ impl DOMException {
             "SecurityError" => 18,
             "AbortError" => 20,
             "TimeoutError" => 23,
+            "DataCloneError" => 25,
             _ => 0,
         }
     }

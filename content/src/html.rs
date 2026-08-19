@@ -6,6 +6,8 @@ type JsValue = <Types as JsTypes>::JsValue;
 type JsObject = <Types as JsTypes>::JsObject;
 use log::error;
 mod activation_behavior;
+pub(crate) mod channel_messaging;
+pub(crate) use channel_messaging::ChannelMessaging;
 pub(crate) mod dispatch;
 mod environment_settings_object;
 pub(crate) mod event_handler;
@@ -21,6 +23,7 @@ pub(crate) mod html_video_element;
 mod hyperlink_element_utils;
 mod location;
 pub(crate) mod message_event;
+pub(crate) mod messageport;
 pub(crate) mod safe_passing_of_structured_data;
 pub(crate) mod ui_events;
 mod window;
@@ -59,6 +62,9 @@ pub(crate) use hyperlink_element_utils::HyperlinkElementUtils;
 pub use location::Location;
 pub(crate) use location::LocationError;
 pub(crate) use message_event::{MessageEvent, MessageEventInit};
+pub(crate) use messageport::{
+    MessageChannel, MessagePort, create_transferred_port_object, message_port_transfer_steps,
+};
 pub use window::Window;
 pub(crate) use window::window_computed_style_properties_for_element;
 pub(crate) use window::{PostMessageOptions, window_post_message_steps};
