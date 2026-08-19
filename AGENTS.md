@@ -209,13 +209,19 @@ shared dependency resolution and incremental compilation.
   headless app used by WPT/WebDriver/CDP. A standalone
   `formal-web-embedder` binary is also produced for direct use.
 
-  **Testing requires building winit.** WPT, WebDriver, CDP, and the TLA+
-  verification scripts all run the winit **headless** app, so those builds
-  compile the `winit-embedder` crate even on macOS. The AppKit app itself
-  never pulls winit: on macOS the winit embedder builds headless-only
-  (no `windowed` feature, hence no wgpu/Blitz) unless `winit_embedder` is
-  enabled. The headless build has no graphics dependencies at all —
-  automation screenshots in headless mode are a plain white PNG.
+  **Automation always runs on the winit embedder — never the AppKit one.**
+  WPT, WebDriver, CDP, and the TLA+ verification scripts route through
+  `winit-embedder` exclusively: `run_cdp`/`run_webdriver` in the root
+  `embedder` crate dispatch to winit unconditionally, and mac-embedder has
+  no automation entry points at all. Headless automation works on any
+  build; **headed** automation (a visible window under CDP/WebDriver) on
+  macOS requires building with `--features winit_embedder` (the winit
+  windowed app is otherwise not compiled, and the command fails with a
+  clear error). The AppKit app itself never pulls winit: on macOS the
+  winit embedder builds headless-only (no `windowed` feature, hence no
+  wgpu/Blitz) unless `winit_embedder` is enabled. The headless build has
+  no graphics dependencies at all — automation screenshots in headless
+  mode are a plain white PNG.
 - **Helper processes** (`formal-web-content`, `formal-web-net`, `formal-web-media`, `formal-web-graphics`): spawned by the embedder.
   - `formal-web-graphics` owns per-webview compositors and video/audio playback (media backend).
     It receives `PaintFrame` and `VideoFrame` payloads and sends back composed scenes with
@@ -232,7 +238,7 @@ shared dependency resolution and incremental compilation.
 | `jsc` | JavaScriptCore backend (macOS only, experimental) | no |
 | `wasm` | Wasmtime-based WebAssembly implementation (opt-in, Boa only) | no |
 | `media` | Video/audio playback support | yes |
-| `winit_embedder` | Build the winit **windowed** embedder on macOS (the AppKit backend is the default headed one there and the only one built without this feature); no-op elsewhere, where winit is the only option. On macOS the winit embedder always builds **headless-only** (no graphics deps) for WPT/automation; this feature adds its windowed app | no |
+| `winit_embedder` | Build the winit **windowed** embedder on macOS (the AppKit backend is the default headed one there and the only one built without this feature); no-op elsewhere, where winit is the only option. On macOS the winit embedder always builds **headless-only** (no graphics deps) for automation (WPT/WebDriver/CDP/verification); this feature adds its windowed app, which headed automation also requires — automation never runs on the AppKit backend | no |
 
 V8 is the default backend for running WPT tests.  Wasm is a separate feature
 (and Boa-only) to avoid pulling in wasmtime when not needed.  JSC is
@@ -299,7 +305,10 @@ rustup run 1.94.0 cargo run --release --features winit_embedder
 
 On macOS the AppKit backend is the default and the winit backend is not
 compiled unless `winit_embedder` is enabled. On other platforms the winit
-backend is the only option and needs no feature.
+backend is the only option and needs no feature. Automation (WebDriver,
+CDP, WPT, TLA+ verification) always uses the winit embedder: headless
+automation works on any build, and headed automation on macOS needs this
+feature (the AppKit backend is never used for automation).
 
 ### Individual packages
 

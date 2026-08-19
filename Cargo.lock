@@ -3198,7 +3198,6 @@ name = "mac-embedder"
 version = "0.1.0"
 dependencies = [
  "arboard",
- "automation",
  "block2 0.6.2",
  "dispatch",
  "ipc",
@@ -3214,8 +3213,6 @@ dependencies = [
  "objc2-foundation 0.3.2",
  "objc2-io-surface",
  "objc2-quartz-core 0.3.2",
- "png 0.17.16",
- "serde_json",
  "uuid",
  "verification",
  "webview",

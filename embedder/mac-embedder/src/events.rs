@@ -2,7 +2,6 @@
 //! thread) hands events to the app's main-thread run loop.
 
 use crate::platform::{clipboard_get_text, clipboard_set_text, window_viewport_snapshot};
-use automation::AutomationCommand;
 use ipc_messages::content::WebviewId;
 use log::error;
 use std::collections::HashMap;
@@ -60,13 +59,6 @@ pub fn send_user_event(event: FormalWebUserEvent) -> Result<(), String> {
     }
 }
 
-pub fn event_loop_is_ready() -> bool {
-    USER_EVENT_SINK
-        .lock()
-        .expect("user event sink mutex poisoned")
-        .is_some()
-}
-
 pub enum FormalWebUserEvent {
     RequestRedraw(WebviewId),
     NewWebContentScene {
@@ -102,7 +94,6 @@ pub enum FormalWebUserEvent {
     /// chrome creates windows directly.
     #[allow(dead_code)]
     CreateWindow,
-    Automation(AutomationCommand),
     ClipboardRead {
         reply: mpsc::Sender<Result<String, String>>,
     },
@@ -115,7 +106,6 @@ pub enum FormalWebUserEvent {
         webview_id: WebviewId,
         title: String,
     },
-    Exit,
 }
 
 /// Routes `webview::Embedder` callbacks into `FormalWebUserEvent` events on

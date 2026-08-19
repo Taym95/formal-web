@@ -39,9 +39,15 @@ The headed app is provided by one of two backends, selected at compile time
 in the root `embedder` crate: on macOS the AppKit backend is the default and
 the winit windowed backend is **not compiled** unless the `winit_embedder`
 feature is enabled (`--features winit_embedder`); on other platforms the
-winit windowed backend is the only option and the feature is a no-op. The
-headless app (winit) is always available, so WPT and the automation servers
-run on any configuration.
+winit windowed backend is the only option and the feature is a no-op.
+
+**Automation always runs on the winit embedder — never the AppKit one.**
+`run_cdp`/`run_webdriver` dispatch to winit unconditionally (headless or
+headed), and `mac-embedder` has no automation entry points; the AppKit
+app is only ever the headed default browser. Headless automation works on
+any configuration; headed automation on macOS requires the `winit_embedder`
+feature (without it the winit windowed app is not compiled and the command
+fails with a clear error).
 
 - **`mac-embedder`** (AppKit): the default on macOS. Runs an `NSApplication`
   with `NSWindow`/`NSView`/`CALayer` display; the web content is presented

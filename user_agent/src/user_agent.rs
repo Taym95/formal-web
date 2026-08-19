@@ -3532,6 +3532,14 @@ impl UserAgentWorker {
         if let Err(error) = send_result {
             let _ = error_reply.send(Err(error));
         }
+
+        // Note a rendering opportunity so the content renders the state
+        // produced by the script (DOM mutations, React commits, ...). The
+        // EvaluateScript command was queued ahead of the update-the-rendering
+        // on the same event loop, so the render runs after the script.
+        // Automation script evaluation is a NoteRenderingOpportunity per the
+        // TLA spec, mirroring handle_click_element.
+        self.note_rendering_opportunity(traversable_id);
     }
 
     /// the automation-only selector-click bridge into the owning event loop.
