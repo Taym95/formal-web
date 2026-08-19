@@ -28,21 +28,11 @@ Hit-testing info (`FrameHitInfo`) from each composed scene is stored in
 `UserAgentState::frame_hit_info`, keyed by webview id. This data enables
 UI event routing without the embedder needing access to the compositor tree.
 
-## Window.open flow
-
-`window.open()` goes through the shared `navigate` path. The content process
-resolves the easy cases (`_self`) directly and sends a `NavigateRequest` IPC
-with `features_json` set and an optional `chosen_navigable_id`. The user agent:
-
-1. When `chosen_navigable_id` is `Some`, uses it directly.
-2. When `chosen_navigable_id` is `None`, runs the remaining rules-for-choosing
-   steps: find-by-target-name (cross-process), or create a new top-level
-   traversable.
-3. Notifies the embedder to open a new tab for new top-level traversables.
-4. Sets up the opener relationship (`opener_browsing_context`) for
-   `"new and unrestricted"` window types (step 15.3 of window-open-steps).
-5. Navigates the target navigable.
-
-WindowProxy return value is a null placeholder on the content side — the
-user agent only performs the navigation and does not need to maintain
-a reference for the caller.
+During a cross-origin navigation the traversable's event loop (and content
+process) switches before the UA-side active document does: the active
+document only changes at finalization, so in the migration window
+`traversable_handles` and `active_documents_by_traversable` disagree.
+Commands pairing those two maps (e.g. `UpdateTheRendering`) must verify the
+active document is owned by the traversable's current event loop and skip
+otherwise — a stale send fails in the new content process and, because no
+paint frame is produced, leaves the render loop's pending flag stuck.

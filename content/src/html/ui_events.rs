@@ -375,6 +375,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .expect("build child settings object");
         execute_parser_scripts(&mut child_settings, scripts).expect("execute child script");

@@ -59,34 +59,6 @@ pub fn window_viewport_snapshot() -> Option<(u32, u32, f32, ColorScheme)> {
     *WINDOW_VIEWPORT_SNAPSHOT.lock().expect("poisoned")
 }
 
-/// A white placeholder screenshot, used when no shared IOSurface is
-/// available yet for the active tab.
-pub fn automation_screenshot_png() -> Result<Vec<u8>, String> {
-    let Some((width, height, _, _)) = window_viewport_snapshot() else {
-        return Err(String::from("content viewport is not initialized"));
-    };
-    if width == 0 || height == 0 {
-        return Err(String::from("content viewport is zero-sized"));
-    }
-    let rgba = vec![255u8; (width as usize) * (height as usize) * 4];
-    encode_png_rgba(&rgba, width, height)
-}
-
-pub fn encode_png_rgba(rgba: &[u8], width: u32, height: u32) -> Result<Vec<u8>, String> {
-    let mut png_data = Vec::new();
-    let mut encoder = png::Encoder::new(&mut png_data, width, height);
-    encoder.set_color(png::ColorType::Rgba);
-    encoder.set_depth(png::BitDepth::Eight);
-    let mut writer = encoder
-        .write_header()
-        .map_err(|error| format!("failed to encode screenshot header: {error}"))?;
-    writer
-        .write_image_data(rgba)
-        .map_err(|error| format!("failed to encode screenshot pixels: {error}"))?;
-    drop(writer);
-    Ok(png_data)
-}
-
 pub fn startup_destination_url(startup_url: Option<&str>) -> Result<String, String> {
     match startup_url {
         Some(url) => Ok(url.to_owned()),

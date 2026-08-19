@@ -28,8 +28,11 @@ pub enum ResponseRecipient {
         content_command_sender: IpcSender<Command>,
         handler_id: DocumentFetchId,
     },
-    /// Net sends Response through the bidirectional IPC response channel
-    /// (the user agent's event loop receives on this channel).
+    /// Net sends Response on its persistent net→UA channel (the sender end
+    /// of its own bootstrap connection). Modelled on the fetch spec's
+    /// parallel queue: the UA channel is where fetch responses are
+    /// delivered.
+    /// <https://fetch.spec.whatwg.org/#fetch-useparallelqueue>
     UserAgent,
 }
 

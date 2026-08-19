@@ -28,7 +28,7 @@ use ipc_channel::platform::deallocate_mach_port;
 use ipc_messages::content::WebviewId;
 use kurbo::Affine;
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -245,6 +245,10 @@ pub struct WindowedApp {
     pub(super) windows: HashMap<WindowId, WindowState>,
     pub(super) provider: Option<WebviewProvider>,
     pub(super) active_window_id: Option<WindowId>,
+    /// Script-opened traversables (window.open) whose navigation has not
+    /// committed yet.  They are not shown as tabs until the commit arrives,
+    /// so the intermediate about:blank document is never visible.
+    pub(super) pending_script_webviews: HashSet<WebviewId>,
     pub(super) startup_url: Option<String>,
     pub(super) window_title: Option<String>,
 }
@@ -1215,6 +1219,12 @@ impl ApplicationHandler<FormalWebUserEvent> for WindowedApp {
                 webview_id,
                 destination_url,
             } => {
+                // A script-opened traversable is not a tab yet; it is
+                // revealed on navigation commit.  Skip it here so the
+                // unknown-webview branch below does not add it early.
+                if self.pending_script_webviews.contains(&webview_id) {
+                    return;
+                }
                 // Update pending URL for any known webview (active tab or not).
                 // If the webview is not in any window, create a new tab for it.
                 if let Some(window) = Self::window_for_webview(self, webview_id) {
@@ -1237,6 +1247,32 @@ impl ApplicationHandler<FormalWebUserEvent> for WindowedApp {
                 }
             }
             FormalWebUserEvent::NavigationCompleted(completion) => {
+                // A script-opened traversable (window.open) becomes a tab
+                // when its navigation commits, so the intermediate
+                // about:blank document is never shown.  An aborted
+                // navigation leaves it unopened.
+                if self
+                    .pending_script_webviews
+                    .contains(&completion.webview_id)
+                {
+                    match &completion.status {
+                        NavigationCompletion::Committed { .. } => {
+                            self.pending_script_webviews.remove(&completion.webview_id);
+                            if let Some(active_window) = self.active_window_id
+                                && let Some(state) = self.windows.get_mut(&active_window)
+                            {
+                                Self::add_tab(state, completion.webview_id);
+                                Self::sync_chrome(state);
+                                Self::update_provider_viewport(state, &mut self.provider);
+                                Self::request_visible_redraw(state);
+                            }
+                        }
+                        NavigationCompletion::Aborted { .. } => {
+                            self.pending_script_webviews.remove(&completion.webview_id);
+                            return;
+                        }
+                    }
+                }
                 let window_opt = Self::window_for_webview(self, completion.webview_id);
                 let Some(window) = window_opt else {
                     // Ignore: child traversables (iframes) fire their own
@@ -1287,15 +1323,28 @@ impl ApplicationHandler<FormalWebUserEvent> for WindowedApp {
                     }
                 }
             }
-            FormalWebUserEvent::NewWebview(webview_id, _) => {
-                debug!("[embedder] NewWebview webview={:?}", webview_id);
-                if let Some(active_window) = self.active_window_id
-                    && let Some(state) = self.windows.get_mut(&active_window)
-                {
-                    Self::add_tab(state, webview_id);
-                    Self::sync_chrome(state);
-                    Self::update_provider_viewport(state, &mut self.provider);
-                    Self::request_visible_redraw(state);
+            FormalWebUserEvent::NewWebview(webview_id, target_name) => {
+                debug!(
+                    "[embedder] NewWebview webview={:?} target={}",
+                    webview_id, target_name
+                );
+                if target_name.is_empty() {
+                    // Embedder-opened traversable (startup page, new-tab
+                    // button): show the tab immediately.
+                    if let Some(active_window) = self.active_window_id
+                        && let Some(state) = self.windows.get_mut(&active_window)
+                    {
+                        Self::add_tab(state, webview_id);
+                        Self::sync_chrome(state);
+                        Self::update_provider_viewport(state, &mut self.provider);
+                        Self::request_visible_redraw(state);
+                    }
+                } else {
+                    // Script-opened traversable (window.open with a target
+                    // name): defer until the navigation commits, so the
+                    // intermediate about:blank document is never shown as
+                    // a tab.
+                    self.pending_script_webviews.insert(webview_id);
                 }
             }
             FormalWebUserEvent::TitleChanged { webview_id, title } => {

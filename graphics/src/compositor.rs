@@ -307,10 +307,16 @@ impl Compositor {
         ids
     }
 
-    /// Whether every embedded frame the latest top-level frame references has
-    /// arrived: child frames must be in the committed set, and video frames
+    /// Whether the latest top-level frame can be composed now: video frames
     /// must be present or not expected (no live pipeline for the paint id,
-    /// or the pipeline ended/failed).
+    /// or the pipeline ended/failed).  Child frames do not gate composition:
+    /// a child whose navigation is still in flight (or failed) may never
+    /// produce a frame, and waiting for it would block the parent's
+    /// composition forever (the child's rendering opportunities only arrive
+    /// via the parent's composed scene, so the deadlock is permanent).  The
+    /// parent composes without a late child frame; the child's own render
+    /// (from the published child viewport) propagates a top-level re-render
+    /// that includes the frame when it arrives.
     pub fn composition_ready(&self, expected_videos: &HashSet<VideoPaintId>) -> bool {
         let Some(top_level_frame_id) = self.root_frame_id else {
             return false;
@@ -320,20 +326,7 @@ impl Compositor {
         };
         for site in &top_level_frame.composition.embed_sites {
             match site {
-                EmbedSite::Frame(iframe_site) => {
-                    // A removed child (its navigable was torn down) is
-                    // treated as satisfied: no frame from it will ever
-                    // arrive, so waiting would block composition forever.
-                    if !self
-                        .committed_frames
-                        .contains_key(&iframe_site.child_frame_id)
-                        && !self
-                            .removed_child_frames
-                            .contains(&iframe_site.child_frame_id)
-                    {
-                        return false;
-                    }
-                }
+                EmbedSite::Frame(_iframe_site) => {}
                 EmbedSite::Video(video_data) => {
                     if expected_videos.contains(&video_data.paint_id)
                         && !self.video_frames.contains_key(&video_data.paint_id)

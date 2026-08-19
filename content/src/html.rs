@@ -121,6 +121,7 @@ pub(crate) fn create_a_new_browsing_context_and_document(
     event_sender: &IpcSender<ContentEvent>,
     traversable_id: NavigableId,
     document_id: DocumentId,
+    creator_origin: Option<environment_settings_object::Origin>,
 ) -> Result<
     (
         JsObject,
@@ -149,9 +150,12 @@ pub(crate) fn create_a_new_browsing_context_and_document(
     // Note: Not implemented: no sandboxing flags are tracked.
     // Step 7: Let origin be the result of determining the origin given
     //         about:blank, sandboxFlags, and creatorOrigin.
-    // Note: Partial: the environment settings object's origin is derived from
-    // the about:blank URL in `new_in_realm`; the sandbox and creator branches
-    // of "determine the origin" are not implemented.
+    // Note: Implemented: the creator branch is threaded through as
+    // `creator_origin` (the parent's origin for child navigables, the opener's
+    // origin for window.open popups); the sandbox branch is not implemented.
+    // The inherited origin is what lets the initial about:blank Window be
+    // reused for a same-origin first navigation (step 6 of
+    // `initialise-the-document-object`).
     // Step 8: Let permissionsPolicy be the result of creating a permissions
     //         policy given embedder and origin.
     // Note: Not implemented.
@@ -206,6 +210,7 @@ pub(crate) fn create_a_new_browsing_context_and_document(
         traversable_id,
         document_id,
         Rc::clone(&document),
+        creator_origin,
     )?;
 
     // Step 16: Let iframeReferrerPolicy be the result of determining the iframe
@@ -257,6 +262,7 @@ pub(crate) fn create_a_new_realm(
     traversable_id: NavigableId,
     document_id: DocumentId,
     document: Rc<RefCell<BaseDocument>>,
+    creator_origin: Option<environment_settings_object::Origin>,
 ) -> Result<(JsObject, Window, EnvironmentSettingsObject), String> {
     // Step 1: Perform InitializeHostDefinedRealm() with the provided
     // customizations for creating the global object and the global this binding.
@@ -296,6 +302,7 @@ pub(crate) fn create_a_new_realm(
         Some(event_sender.clone()),
         Some(traversable_id),
         Some(document_id),
+        creator_origin,
     )?;
 
     // Note: The Window platform object for the step 10 customization (for the

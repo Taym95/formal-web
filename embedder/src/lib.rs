@@ -65,40 +65,22 @@ fn run_headed_app(
     winit_embedder::run_windowed_app(trace_sender, startup_url, window_title)
 }
 
+/// Automation (WebDriver, CDP) always runs on the winit embedder, never
+/// the AppKit embedder: the winit backend is the single automation port.
+/// Headed automation on macOS requires the `winit_embedder` feature (the
+/// winit windowed app is otherwise not compiled); headless automation
+/// works on any build.
 pub fn run_webdriver(args: WebDriverArgs, verify: bool, headless: bool) -> Result<(), String> {
-    if args.headless || headless {
-        winit_embedder::run_webdriver(args, verify, true)
-    } else {
-        run_headed_webdriver(args, verify)
-    }
+    winit_embedder::run_webdriver(args, verify, headless)
 }
 
-#[cfg(all(target_os = "macos", not(feature = "winit_embedder")))]
-fn run_headed_webdriver(args: WebDriverArgs, verify: bool) -> Result<(), String> {
-    mac_embedder::run_webdriver(args, verify)
-}
-
-#[cfg(any(not(target_os = "macos"), feature = "winit_embedder"))]
-fn run_headed_webdriver(args: WebDriverArgs, verify: bool) -> Result<(), String> {
-    winit_embedder::run_webdriver(args, verify, false)
-}
-
+/// Automation (WebDriver, CDP) always runs on the winit embedder, never
+/// the AppKit embedder: the winit backend is the single automation port.
+/// Headed automation on macOS requires the `winit_embedder` feature (the
+/// winit windowed app is otherwise not compiled); headless automation
+/// works on any build.
 pub fn run_cdp(args: CdpArgs, verify: bool, headless: bool) -> Result<(), String> {
-    if args.headless || headless {
-        winit_embedder::run_cdp(args, verify, true)
-    } else {
-        run_headed_cdp(args, verify)
-    }
-}
-
-#[cfg(all(target_os = "macos", not(feature = "winit_embedder")))]
-fn run_headed_cdp(args: CdpArgs, verify: bool) -> Result<(), String> {
-    mac_embedder::run_cdp(args, verify)
-}
-
-#[cfg(any(not(target_os = "macos"), feature = "winit_embedder"))]
-fn run_headed_cdp(args: CdpArgs, verify: bool) -> Result<(), String> {
-    winit_embedder::run_cdp(args, verify, false)
+    winit_embedder::run_cdp(args, verify, headless)
 }
 
 fn combine_results(

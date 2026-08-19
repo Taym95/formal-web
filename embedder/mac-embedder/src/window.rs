@@ -12,9 +12,8 @@ use objc2::msg_send;
 use objc2::rc::Retained;
 use objc2_app_kit::NSView;
 use objc2_foundation::MainThreadMarker;
-use objc2_io_surface::{IOSurfaceLockOptions, IOSurfaceRef};
+use objc2_io_surface::IOSurfaceRef;
 use objc2_quartz_core::CALayer;
-use std::slice;
 
 /// Create a layer-hosting view for web content: the view owns an explicit
 /// `CALayer` whose `contents` the app sets directly (the zero-copy
@@ -93,36 +92,6 @@ pub(super) fn present_shared_surface(
     objc2_quartz_core::CATransaction::commit();
     // Force the transaction to the render server immediately.
     objc2_quartz_core::CATransaction::flush();
-}
-
-/// Read a shared IOSurface back into a top-down RGBA8 buffer (used by the
-/// automation screenshot). The surface is padded to a 64-multiple width, so
-/// rows are copied individually with the surface's row stride.
-pub(super) fn surface_to_rgba(
-    surface: &IOSurfaceRef,
-    logical_width: u32,
-    height: u32,
-) -> Result<Vec<u8>, String> {
-    let surface_width = surface.width() as u32;
-    let lock_options = IOSurfaceLockOptions::ReadOnly;
-    let lock_result = unsafe { surface.lock(lock_options, std::ptr::null_mut()) };
-    if lock_result != 0 {
-        return Err(format!("IOSurfaceLock failed: {lock_result}"));
-    }
-    let base = surface.base_address();
-    let bytes_per_row = surface_width * 4;
-    let mut rgba = Vec::with_capacity((logical_width as usize) * (height as usize) * 4);
-    for row in 0..height {
-        let row_ptr = unsafe { base.as_ptr().add((row as usize) * (bytes_per_row as usize)) };
-        let row_bytes =
-            unsafe { slice::from_raw_parts(row_ptr as *const u8, (logical_width as usize) * 4) };
-        rgba.extend_from_slice(row_bytes);
-    }
-    let unlock_result = unsafe { surface.unlock(lock_options, std::ptr::null_mut()) };
-    if unlock_result != 0 {
-        return Err(format!("IOSurfaceUnlock failed: {unlock_result}"));
-    }
-    Ok(rgba)
 }
 
 use objc2_foundation::{NSPoint, NSRect, NSSize};

@@ -1,6 +1,6 @@
 //! The AppKit application: NSApplication lifecycle, windows, a native
-//! AppKit chrome (tab strip and address field), event routing, display-link
-//! pacing, and the automation host.
+//! AppKit chrome (tab strip and address field), event routing, and
+//! display-link pacing.
 //!
 //! The app runs an `NSApplication` with the web content in a layer-hosting
 //! view whose layer `contents` is set to the shared IOSurface from the
@@ -14,13 +14,10 @@
 use crate::events::{EventLoopEmbedder, FormalWebUserEvent, UserEventSink};
 use crate::input;
 use crate::platform::{
-    automation_screenshot_png, encode_png_rgba, normalize_browser_destination, read_clipboard_text,
-    startup_destination_url, update_window_viewport_snapshot, write_clipboard_text,
+    normalize_browser_destination, read_clipboard_text, startup_destination_url,
+    update_window_viewport_snapshot, write_clipboard_text,
 };
-use crate::window::{new_layer_hosted_view, present_shared_surface, surface_to_rgba};
-use automation::{
-    AutomationController, AutomationHost, AutomationSnapshot, AutomationVisibleFrameViewport,
-};
+use crate::window::{new_layer_hosted_view, present_shared_surface};
 use block2::RcBlock;
 use ipc_channel::platform::deallocate_mach_port;
 use ipc_messages::content::WebviewId;
@@ -51,19 +48,17 @@ use objc2_foundation::{
 };
 use objc2_io_surface::IOSurfaceRef;
 use objc2_quartz_core::{CAAutoresizingMask, CALayer};
-use serde_json::Value;
 use std::cell::UnsafeCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::ptr::NonNull;
 use std::sync::Arc;
-use std::time::Duration;
 use uuid::Uuid;
 use verification::TraceSender;
 use webview::WebviewProvider;
 use webview::{
-    BlitzPointerEvent, BlitzPointerId, BlitzWheelDelta, BlitzWheelEvent, ColorScheme,
-    MouseEventButton, MouseEventButtons, NavigationCompleted, NavigationCompletion, UiEvent,
+    BlitzPointerEvent, BlitzPointerId, BlitzWheelEvent, ColorScheme, MouseEventButtons,
+    NavigationCompleted, NavigationCompletion, UiEvent,
 };
 
 const INITIAL_WINDOW_WIDTH: f64 = 1200.0;
@@ -444,7 +439,6 @@ impl TabState {
 struct SurfaceState {
     surface: CFRetained<IOSurfaceRef>,
     width: u32,
-    height: u32,
     /// The IOSurface's padded (64-multiple) width.
     padded_width: u32,
     animating: bool,
@@ -494,8 +488,11 @@ pub(crate) struct MacApp {
     handle: Option<MainThreadHandle>,
     windows: HashMap<WindowId, MacWindow>,
     active_window_id: Option<WindowId>,
+    /// Script-opened traversables (window.open) whose navigation has not
+    /// committed yet.  They are not shown as tabs until the commit arrives,
+    /// so the intermediate about:blank document is never visible.
+    pending_script_webviews: HashSet<WebviewId>,
     provider: Option<WebviewProvider>,
-    automation: AutomationController,
     display_link: Option<CFRetained<CVDisplayLink>>,
     display_link_context: Option<Box<DisplayLinkContext>>,
     display_link_running: bool,
@@ -522,8 +519,8 @@ impl MacApp {
             handle: None,
             windows: HashMap::new(),
             active_window_id: None,
+            pending_script_webviews: HashSet::new(),
             provider: None,
-            automation: AutomationController::default(),
             display_link: None,
             display_link_context: None,
             display_link_running: false,
@@ -2545,6 +2542,12 @@ impl MacApp {
                 webview_id,
                 destination_url,
             } => {
+                // A script-opened traversable is not a tab yet; it is
+                // revealed on navigation commit.  Skip it here so the
+                // unknown-webview branch below does not add it early.
+                if self.pending_script_webviews.contains(&webview_id) {
+                    return;
+                }
                 if let Some(window_id) = self.window_for_webview(webview_id) {
                     if let Some(window_state) = self.windows.get_mut(&window_id)
                         && let Some(tab) = window_state.tabs.get_mut(&webview_id)
@@ -2568,12 +2571,25 @@ impl MacApp {
             FormalWebUserEvent::NavigationCompleted(completion) => {
                 self.handle_navigation_completed(completion);
             }
-            FormalWebUserEvent::NewWebview(webview_id, _) => {
-                debug!("[mac-embedder] NewWebview webview={webview_id:?}");
-                if let Some(active_window) = self.active_window_id {
-                    self.add_tab(active_window, webview_id);
-                    self.refresh_chrome(active_window);
-                    self.update_provider_viewport(active_window);
+            FormalWebUserEvent::NewWebview(webview_id, target_name) => {
+                debug!(
+                    "[mac-embedder] NewWebview webview={webview_id:?} target={}",
+                    target_name
+                );
+                if target_name.is_empty() {
+                    // Embedder-opened traversable (startup page, new-tab
+                    // button): show the tab immediately.
+                    if let Some(active_window) = self.active_window_id {
+                        self.add_tab(active_window, webview_id);
+                        self.refresh_chrome(active_window);
+                        self.update_provider_viewport(active_window);
+                    }
+                } else {
+                    // Script-opened traversable (window.open with a target
+                    // name): defer until the navigation commits, so the
+                    // intermediate about:blank document is never shown as
+                    // a tab.
+                    self.pending_script_webviews.insert(webview_id);
                 }
             }
             FormalWebUserEvent::TitleChanged { webview_id, title } => {
@@ -2597,11 +2613,6 @@ impl MacApp {
             FormalWebUserEvent::CreateWindow => {
                 let _ = self.create_window("formal-web", "about:blank");
             }
-            FormalWebUserEvent::Automation(command) => {
-                let mut automation = std::mem::take(&mut self.automation);
-                automation.handle_command(self, command);
-                self.automation = automation;
-            }
             FormalWebUserEvent::ClipboardRead { reply } => {
                 let _ = reply.send(read_clipboard_text());
             }
@@ -2624,11 +2635,33 @@ impl MacApp {
             } => {
                 self.handle_new_surface(webview_id, frame, width, height, animating);
             }
-            FormalWebUserEvent::Exit => self.post_exit(),
         }
     }
 
     fn handle_navigation_completed(&mut self, completion: NavigationCompleted) {
+        // A script-opened traversable (window.open) becomes a tab when its
+        // navigation commits, so the intermediate about:blank document is
+        // never shown.  An aborted navigation leaves it unopened.
+        if self
+            .pending_script_webviews
+            .contains(&completion.webview_id)
+        {
+            match &completion.status {
+                NavigationCompletion::Committed { .. } => {
+                    self.pending_script_webviews.remove(&completion.webview_id);
+                    if let Some(active_window) = self.active_window_id {
+                        self.add_tab(active_window, completion.webview_id);
+                        self.refresh_chrome(active_window);
+                        self.update_provider_viewport(active_window);
+                        self.frame_needed(completion.webview_id);
+                    }
+                }
+                NavigationCompletion::Aborted { .. } => {
+                    self.pending_script_webviews.remove(&completion.webview_id);
+                    return;
+                }
+            }
+        }
         let Some(window_id) = self.window_for_webview(completion.webview_id) else {
             // Child traversables (iframes) fire their own completions and
             // don't create tabs.
@@ -2658,11 +2691,8 @@ impl MacApp {
                     self.frame_needed(completion.webview_id);
                 }
             }
-            NavigationCompletion::Aborted { message } => {
+            NavigationCompletion::Aborted { .. } => {
                 if is_current {
-                    let mut automation = std::mem::take(&mut self.automation);
-                    automation.abort_pending_navigation(message.clone());
-                    self.automation = automation;
                     if let Some(window_state) = self.windows.get_mut(&window_id)
                         && let Some(tab) = window_state.tabs.get_mut(&completion.webview_id)
                     {
@@ -2723,7 +2753,6 @@ impl MacApp {
         let surface_state = SurfaceState {
             surface,
             width,
-            height,
             padded_width: padded_surface_width(width),
             animating,
         };
@@ -2742,14 +2771,19 @@ impl MacApp {
             width, height
         );
 
-        // Pacing: animated content runs the display link; a static scene
-        // just needs the next frame on demand.
+        // Pacing: animated content runs the display link; a static scene is
+        // presented once and only re-renders on demand (input, navigation,
+        // resize, or the UA's request-redraw note), so the next frame is not
+        // requested here.  Requesting one unconditionally would turn every
+        // surface into a frame request: with any queued rendering opportunity
+        // (a mouse move, a viewport update) the UA re-renders, producing
+        // another surface, another frame request — a render loop that never
+        // stops while opportunities keep arriving.
         if animating {
             self.start_display_link();
         } else {
             self.stop_display_link();
         }
-        self.frame_needed(webview_id);
     }
 }
 
@@ -2766,221 +2800,6 @@ enum UiEventKind {
     PointerUp,
     PointerMove,
     Wheel,
-}
-
-// ── AutomationHost ─────────────────────────────────────────────────────────
-
-impl AutomationHost for MacApp {
-    fn automation_snapshot(&mut self) -> AutomationSnapshot {
-        let window_id = self.active_window_id;
-        let (active_tab, committed_url, displayed_url) = if let Some(window_id) = window_id
-            && let Some(window_state) = self.windows.get(&window_id)
-        {
-            (
-                window_state.active_tab,
-                window_state
-                    .active_tab
-                    .and_then(|webview_id| window_state.tabs.get(&webview_id))
-                    .and_then(|tab| tab.committed_url.clone()),
-                window_state
-                    .active_tab
-                    .and_then(|webview_id| window_state.tabs.get(&webview_id))
-                    .map(TabState::display_url)
-                    .unwrap_or_default(),
-            )
-        } else {
-            (None, None, String::new())
-        };
-        AutomationSnapshot {
-            webview_id: active_tab,
-            current_url: committed_url,
-            displayed_url,
-            navigable_id: None,
-            has_top_level_traversable: active_tab.is_some(),
-        }
-    }
-
-    fn automation_visible_frame_viewports(
-        &mut self,
-    ) -> Result<Vec<AutomationVisibleFrameViewport>, String> {
-        Ok(Vec::new())
-    }
-
-    fn automation_screenshot(&mut self) -> Result<Vec<u8>, String> {
-        // Real screenshot: read the active tab's shared IOSurface back.
-        let window_id = self.active_window_id;
-        let (webview_id, surface) = if let Some(window_id) = window_id
-            && let Some(window_state) = self.windows.get(&window_id)
-            && let Some(webview_id) = window_state.active_tab
-            && let Some(surface) = window_state.surfaces.get(&webview_id)
-        {
-            (Some(webview_id), Some(&surface.surface))
-        } else {
-            (None, None)
-        };
-        if let (Some(webview_id), Some(surface)) = (webview_id, surface) {
-            let window_id = self
-                .active_window_id
-                .ok_or_else(|| String::from("no window state"))?;
-            let Some(surface_state) = self
-                .windows
-                .get(&window_id)
-                .and_then(|w| w.surfaces.get(&webview_id))
-            else {
-                return Err(String::from("no surface state"));
-            };
-            let rgba = surface_to_rgba(surface, surface_state.width, surface_state.height)?;
-            return encode_png_rgba(&rgba, surface_state.width, surface_state.height);
-        }
-        automation_screenshot_png()
-    }
-
-    fn begin_automation_navigation(&mut self, url: String) -> Result<(), String> {
-        let window_id = self
-            .active_window_id
-            .ok_or_else(|| String::from("no window"))?;
-        let webview_id = self
-            .windows
-            .get(&window_id)
-            .and_then(|w| w.active_tab)
-            .ok_or_else(|| String::from("no active tab"))?;
-        let provider = self
-            .provider
-            .as_ref()
-            .ok_or_else(|| String::from("no provider"))?;
-        provider.navigate(Some(webview_id), &url)?;
-        if let Some(window_state) = self.windows.get_mut(&window_id)
-            && let Some(tab) = window_state.tabs.get_mut(&webview_id)
-        {
-            tab.pending_url = Some(url);
-        }
-        Ok(())
-    }
-
-    fn automation_click(&mut self, x: f32, y: f32) -> Result<(), String> {
-        let window_id = self
-            .active_window_id
-            .ok_or_else(|| String::from("no window"))?;
-        let (webview_id, buttons, modifiers) = {
-            let window_state = self
-                .windows
-                .get_mut(&window_id)
-                .ok_or_else(|| String::from("no window state"))?;
-            let webview_id = window_state
-                .active_tab
-                .ok_or_else(|| String::from("no active tab"))?;
-            let buttons = window_state.buttons;
-            let modifiers = window_state.keyboard_modifiers;
-            (webview_id, buttons, modifiers)
-        };
-        let provider = self
-            .provider
-            .as_mut()
-            .ok_or_else(|| String::from("no provider"))?;
-        let coords = input::content_coords(f64::from(x), f64::from(y));
-        let send_event = |provider: &mut WebviewProvider, webview_id: WebviewId, ui_event| {
-            provider.send_ui_event(webview_id, ui_event).ok();
-        };
-        let make_pointer = |button: MouseEventButton, buttons: MouseEventButtons| {
-            input::pointer_event(
-                BlitzPointerId::Mouse,
-                true,
-                coords,
-                button,
-                buttons,
-                modifiers,
-            )
-        };
-        send_event(
-            provider,
-            webview_id,
-            UiEvent::PointerMove(make_pointer(Default::default(), buttons)),
-        );
-        send_event(
-            provider,
-            webview_id,
-            UiEvent::PointerDown(make_pointer(MouseEventButton::Main, buttons)),
-        );
-        send_event(
-            provider,
-            webview_id,
-            UiEvent::PointerUp(make_pointer(MouseEventButton::Main, buttons)),
-        );
-        Ok(())
-    }
-
-    fn automation_click_element(&mut self, selector: String) -> Result<(), String> {
-        let webview_id = self
-            .active_window_id
-            .and_then(|window_id| self.windows.get(&window_id))
-            .and_then(|w| w.active_tab)
-            .ok_or_else(|| String::from("no tab"))?;
-        self.provider
-            .as_ref()
-            .ok_or_else(|| String::from("no provider"))?
-            .click_element(webview_id, selector)
-    }
-
-    fn automation_scroll(&mut self, x: f32, y: f32, dx: f32, dy: f32) -> Result<(), String> {
-        let window_id = self
-            .active_window_id
-            .ok_or_else(|| String::from("no window"))?;
-        let (webview_id, buttons, modifiers) = {
-            let window_state = self
-                .windows
-                .get_mut(&window_id)
-                .ok_or_else(|| String::from("no window state"))?;
-            let webview_id = window_state
-                .active_tab
-                .ok_or_else(|| String::from("no active tab"))?;
-            let buttons = window_state.buttons;
-            let modifiers = window_state.keyboard_modifiers;
-            (webview_id, buttons, modifiers)
-        };
-        let provider = self
-            .provider
-            .as_mut()
-            .ok_or_else(|| String::from("no provider"))?;
-        let coords = input::content_coords(f64::from(x), f64::from(y));
-        let pointer = input::pointer_event(
-            BlitzPointerId::Mouse,
-            true,
-            coords,
-            Default::default(),
-            buttons,
-            modifiers,
-        );
-        provider
-            .send_ui_event(webview_id, UiEvent::PointerMove(pointer))
-            .ok();
-        provider
-            .send_ui_event(
-                webview_id,
-                UiEvent::Wheel(BlitzWheelEvent {
-                    delta: BlitzWheelDelta::Pixels(f64::from(dx), f64::from(dy)),
-                    coords,
-                    buttons,
-                    mods: modifiers,
-                }),
-            )
-            .map_err(|error| format!("wheel event error: {error}"))
-    }
-
-    fn automation_evaluate_script(
-        &mut self,
-        source: String,
-        timeout: Duration,
-    ) -> Result<Value, String> {
-        let webview_id = self
-            .active_window_id
-            .and_then(|window_id| self.windows.get(&window_id))
-            .and_then(|w| w.active_tab)
-            .ok_or_else(|| String::from("no tab"))?;
-        self.provider
-            .as_ref()
-            .ok_or_else(|| String::from("no provider"))?
-            .evaluate_script(webview_id, source, timeout)
-    }
 }
 
 /// Entry point: run the AppKit windowed app until it exits.

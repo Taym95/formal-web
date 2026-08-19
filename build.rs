@@ -96,10 +96,20 @@ fn prebuild_binaries(prebuild_list: &[(&str, &str)]) -> Result<(), String> {
         JavascriptBackend::Jsc => "jsc",
         JavascriptBackend::V8 => "v8",
     };
-    let content_features = if has_media {
-        format!("{backend_feature},media")
+    // The prebuild runs with `--no-default-features`, which would otherwise
+    // leave net with no backend feature, so net's backend feature is enabled
+    // here explicitly, matching the platform default: URLSession on Apple,
+    // tokio elsewhere.
+    let target_vendor = std::env::var("CARGO_CFG_TARGET_VENDOR").unwrap_or_default();
+    let net_backend_feature = if target_vendor == "apple" {
+        "url_session"
     } else {
-        backend_feature.to_owned()
+        "tokio"
+    };
+    let content_features = if has_media {
+        format!("{backend_feature},{net_backend_feature},media")
+    } else {
+        format!("{backend_feature},{net_backend_feature}")
     };
     command.args(["--no-default-features", "--features", &content_features]);
     command.arg("--target-dir").arg(&prebuild_target_root);

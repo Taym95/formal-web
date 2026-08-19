@@ -7,6 +7,7 @@ use ipc_messages::content::{DocumentId, Event as ContentEvent, NavigableId, Wind
 use url::Url;
 
 use crate::html::{TimerHandler, Window};
+use crate::js::bindings::dom::document::create_document_platform_object;
 use crate::js::build_context::{build_context, build_realm};
 use crate::js::platform_objects::with_global_scope;
 use crate::js::{
@@ -79,6 +80,7 @@ impl EnvironmentSettingsObject {
             event_sender,
             source_navigable_id,
             document_id,
+            None,
         )
     }
 
@@ -91,6 +93,7 @@ impl EnvironmentSettingsObject {
         event_sender: Option<IpcSender<ContentEvent>>,
         source_navigable_id: Option<NavigableId>,
         document_id: Option<DocumentId>,
+        creator_origin: Option<Origin>,
     ) -> Result<Self, String> {
         // Build the engine (fresh or child realm).
         let mut engine = match parent {
@@ -193,10 +196,10 @@ impl EnvironmentSettingsObject {
 
         Ok(Self {
             realm_execution_context: engine,
-            document: document,
-            origin: Origin {
+            document,
+            origin: creator_origin.unwrap_or_else(|| Origin {
                 serialized: creation_url.origin().unicode_serialization(),
-            },
+            }),
             creation_url,
             referrer_policy: ReferrerPolicy::NoReferrerWhenDowngrade,
             time_origin: Instant::now(),
@@ -206,6 +209,53 @@ impl EnvironmentSettingsObject {
     /// Access the execution context for generic ECMA-262 operations.
     pub fn ec(&mut self) -> &mut dyn ExecutionContext<crate::js::Types> {
         &mut self.realm_execution_context
+    }
+
+    /// <https://html.spec.whatwg.org/#initialise-the-document-object> — step 6 continuation
+    /// Re-point this (reused) realm's associated Document, origin and creation URL at a new
+    /// document that is taking over the Window (step 10: "Set window's associated Document to
+    /// document").  Used when the initial about:blank document of a navigable is navigated
+    /// same-origin and its Window is reused instead of creating a fresh realm.
+    pub(crate) fn repoint_document(
+        &mut self,
+        document: Rc<RefCell<BaseDocument>>,
+        creation_url: Url,
+        document_id: DocumentId,
+        event_sender: &IpcSender<ContentEvent>,
+    ) -> Result<(), String> {
+        // The platform Document object is created in the reused realm; its JS handle replaces
+        // the old document's in the global scope and the global `document` property.
+        let (document_object, platform_document) = create_document_platform_object(
+            Rc::clone(&document),
+            creation_url.clone(),
+            &mut self.realm_execution_context,
+        )
+        .map_err(|error| format!("failed to create replacement document object: {:?}", error))?;
+        with_global_scope(&mut self.realm_execution_context, |global_scope, ec| {
+            global_scope.repoint_document(
+                Rc::clone(&document),
+                document_object,
+                document_id,
+                event_sender.clone(),
+                creation_url.clone(),
+                ec,
+            );
+            Ok(())
+        })
+        .map_err(|error| {
+            format!(
+                "failed to re-point document on reused realm: {}",
+                error.display()
+            )
+        })?;
+        install_document_property(&mut self.realm_execution_context)
+            .map_err(|error| format!("failed to re-install document property: {:?}", error))?;
+        self.document = platform_document;
+        self.origin = Origin {
+            serialized: creation_url.origin().unicode_serialization(),
+        };
+        self.creation_url = creation_url;
+        Ok(())
     }
 
     /// Convert a JsValue error (Completion error) to a displayable String.

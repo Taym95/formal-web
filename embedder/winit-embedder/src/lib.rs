@@ -67,7 +67,7 @@ pub fn run_windowed_app(
     {
         let _ = (trace_sender, startup_url, window_title);
         Err(String::from(
-            "the winit windowed app is not compiled (enable the `windowed` feature)",
+            "the winit windowed app is not compiled: on macOS build the embedder with --features winit_embedder (headless automation with --headless works on any build)",
         ))
     }
 }
