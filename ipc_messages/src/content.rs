@@ -945,14 +945,10 @@ pub enum Command {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum PortTaskKind {
     /// A routed "Single" message: run the message task for `msg`.
-    NewTask {
-        msg: PortMessagePayload,
-    },
+    NewTask { msg: PortMessagePayload },
     /// A transfer-completion task: append the buffered messages to the
     /// port's queue (the TLA model's `RunTask` with a "Buffer" task).
-    Buffer {
-        buf: Vec<PortMessagePayload>,
-    },
+    Buffer { buf: Vec<PortMessagePayload> },
 }
 
 /// The transfer state of a port (the `TS_*` constants of the

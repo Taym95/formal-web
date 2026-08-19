@@ -509,11 +509,10 @@ impl EventLoopWorker {
                     "[port] message task pending port={port} event_loop={}",
                     self.event_loop_id
                 );
-                self.pending_task_commands
-                    .push_back(PendingTaskCommand {
-                        command: ContentCommand::RunPortMessageTask { port },
-                        reply: None,
-                    });
+                self.pending_task_commands.push_back(PendingTaskCommand {
+                    command: ContentCommand::RunPortMessageTask { port },
+                    reply: None,
+                });
                 self.flush_next_task_command();
             }
 

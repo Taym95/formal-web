@@ -1440,7 +1440,9 @@ impl UserAgentWorker {
             epoch_anchor,
             epoch_anchor_wall_ms,
             pending_update_the_rendering: HashSet::new(),
-            channel_messaging: crate::channel_messaging::ChannelMessaging::new(trace_sender.clone()),
+            channel_messaging: crate::channel_messaging::ChannelMessaging::new(
+                trace_sender.clone(),
+            ),
             queued_rendering_opportunities: HashMap::new(),
             frame_needed: HashSet::new(),
             trace_sender,
@@ -3987,22 +3989,21 @@ impl UserAgentWorker {
     /// `Transfer`, `TransferReceive`, and `RouteMessage` actions).
     fn handle_port_event(&mut self, event: crate::channel_messaging::PortEvent) {
         let state = &self.state;
-        let mut send_task = |event_loop_id: EventLoopId, command: ContentCommand| {
-            match state
-                .agents
-                .values()
-                .find(|agent| agent.event_loop_id == event_loop_id)
-            {
-                Some(agent) => {
-                    if let Err(error) = agent.command_sender.send(EventLoopCommand::FireAndForget {
-                        command,
-                    }) {
-                        error!("port routing: failed to queue task: {error}");
-                    }
+        let mut send_task = |event_loop_id: EventLoopId, command: ContentCommand| match state
+            .agents
+            .values()
+            .find(|agent| agent.event_loop_id == event_loop_id)
+        {
+            Some(agent) => {
+                if let Err(error) = agent
+                    .command_sender
+                    .send(EventLoopCommand::FireAndForget { command })
+                {
+                    error!("port routing: failed to queue task: {error}");
                 }
-                None => {
-                    error!("port routing: missing agent for event loop {event_loop_id}");
-                }
+            }
+            None => {
+                error!("port routing: missing agent for event loop {event_loop_id}");
             }
         };
         crate::channel_messaging::handle_port_event(

@@ -8,28 +8,78 @@
     <h1>MessagePort trace page</h1>
     <p id="log"></p>
     <script>
-      // Exercise the MessagePortExtraFG cross-process workflow: channel
-      // creation, message delivery, a port transfer, and delivery through
-      // the transferred port.  The content processes and the user agent
-      // trace the model's actions (NewChannel, PostMessage, RouteMessage,
-      // RunTask, ReceiveMessage, Transfer, TransferReceive).  The stages are
-      // separated by timers so each transfer completes (its Buffer task runs
-      // and the port is managed again) before the next message is posted.
+      // Exercise the MessagePort workflow mapped to `MessagePort.tla` (the
+      // HTML spec's channel messaging steps): channel creation, direct
+      // delivery, the multi-transfer ordering flow (messages posted at
+      // various transfer steps are received in post order — the FIFO
+      // property of the port message queue), and delivery through a
+      // transferred port.  The content processes trace NewChannel /
+      // PostMessage / ReceiveMessage / Transfer / TransferReceive, the user
+      // agent traces RouteMessage, and the trace consumer replays the
+      // recorded events against MessagePort.tla, whose per-port abstract
+      // queue preserves the ordering the message tasks must respect.
       var log = document.getElementById('log');
+      var received = [];
+      function record(value) {
+        received.push(value);
+        log.textContent = received.join(',');
+      }
+
       var channel = new MessageChannel();
       channel.port2.onmessage = function (event) {
-        log.textContent = 'port2 got: ' + event.data;
+        record('hello');
       };
       channel.port1.postMessage('hello');
+
+      // The multi-transfer ordering flow of
+      // Channel_postMessage_with_transfer_incoming_messages.any.js: messages
+      // posted while the port is transferred (and completing its transfers)
+      // land in its queue in post order and fire in that order once the port
+      // is enabled.
+      setTimeout(function () {
+        var channel1 = new MessageChannel();
+        var channel2 = new MessageChannel();
+        var channel3 = new MessageChannel();
+        channel2.port2.onmessage = function (evt) {
+          channel3.port1.onmessage = function (evt) {
+            evt.ports[0].onmessage = function (evt) {
+              record(evt.data);
+            };
+            channel1.port2.postMessage('Fourth');
+          };
+          channel1.port2.postMessage('Second');
+          channel1.port2.postMessage('Third');
+          channel3.port2.postMessage('2', evt.ports);
+        };
+        channel1.port2.postMessage('First');
+        channel2.port1.postMessage('1', [channel1.port1]);
+      }, 50);
+
+      // Delivery through a transferred port: the transfer completes and the
+      // message posted through the transferred port is received by its
+      // entangled partner.
       setTimeout(function () {
         var second = new MessageChannel();
+        second.port2.onmessage = function (event) {
+          record('through');
+        };
         var transferred = structuredClone(second.port1, {
           transfer: [second.port1],
         });
         setTimeout(function () {
           transferred.postMessage('through');
         }, 50);
-      }, 50);
+      }, 150);
+
+      // Report the received order once the flows have settled.
+      setTimeout(function () {
+        var expected = 'hello,First,Second,Third,Fourth,through';
+        if (received.join(',') === expected) {
+          log.textContent = 'OK ' + expected;
+        } else {
+          log.textContent = 'FAIL got [' + received.join(',') + ']';
+        }
+      }, 800);
     </script>
   </body>
 </html>

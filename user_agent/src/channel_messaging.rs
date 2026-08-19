@@ -10,7 +10,9 @@
 
 use std::collections::{HashMap, VecDeque};
 
-use ipc_messages::content::{Command as ContentCommand, EventLoopId, PortId, PortTaskKind, TransferState};
+use ipc_messages::content::{
+    Command as ContentCommand, EventLoopId, PortId, PortTaskKind, TransferState,
+};
 use ipc_messages::safe_passing_of_structured_data::PortMessagePayload;
 use log::warn;
 
@@ -69,7 +71,8 @@ impl ChannelMessaging {
         let Some(sender) = &self.trace_sender else {
             return;
         };
-        let mut tracer = TLATracer::new("MessagePort", "formal-web:user-agent", Some(sender.clone()));
+        let mut tracer =
+            TLATracer::new("MessagePort", "formal-web:user-agent", Some(sender.clone()));
         tracer.log_with_location(Some("MessagePort"), event, args, file!(), line!());
     }
 
@@ -151,7 +154,10 @@ impl ChannelMessaging {
                 state.owner = Some(event_loop);
             }
             _ => {
-                warn!("transfer receive: port {port} is not in transit ({:?})", state.ts);
+                warn!(
+                    "transfer receive: port {port} is not in transit ({:?})",
+                    state.ts
+                );
             }
         }
     }
@@ -218,8 +224,9 @@ impl ChannelMessaging {
                         (TransferState::CompletionInProgress, RoutingItem::Success { tgt }) => {
                             state.ts = TransferState::Managed;
                             // The completion task queued the transfer's
-                            // buffered messages on the port's queue.  Any
-                            // messages buffered at the user agent (routed
+                            // buffered messages on the port's queue, and the
+                            // content process schedules their message tasks.
+                            // Any messages buffered at the user agent (routed
                             // while the port was completing or in transit,
                             // with no event loop to complete via a returned
                             // buffer — e.g. a same-realm re-transfer) are
@@ -237,12 +244,7 @@ impl ChannelMessaging {
                                     )
                                 })
                             } else {
-                                state.owner.map(|owner| {
-                                    (
-                                        owner,
-                                        ContentCommand::RunPortMessageTask { port: tgt },
-                                    )
-                                })
+                                None
                             };
                             RouteDecision {
                                 kind: "Success",
@@ -279,12 +281,7 @@ impl ChannelMessaging {
                                     )
                                 })
                             } else {
-                                state.owner.map(|owner| {
-                                    (
-                                        owner,
-                                        ContentCommand::RunPortMessageTask { port: tgt },
-                                    )
-                                })
+                                None
                             };
                             RouteDecision {
                                 kind: "Success",
@@ -353,9 +350,7 @@ impl ChannelMessaging {
                                     owner,
                                     ContentCommand::PortTask {
                                         port: tgt,
-                                        task: PortTaskKind::Buffer {
-                                            buf: merged.into(),
-                                        },
+                                        task: PortTaskKind::Buffer { buf: merged.into() },
                                     },
                                 )
                             });

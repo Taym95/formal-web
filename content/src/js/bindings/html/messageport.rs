@@ -1,8 +1,6 @@
 use crate::html::{MessageChannel, MessagePort};
 use crate::js::Types;
-use crate::webidl::bindings::{
-    AttributeDef, InterfaceDefinition, OperationDef, WebIdlInterface,
-};
+use crate::webidl::bindings::{AttributeDef, InterfaceDefinition, OperationDef, WebIdlInterface};
 use crate::webidl::{callback_function_value, nullable_value};
 use js_engine::{Completion, ExecutionContext, JsTypes};
 
@@ -11,10 +9,7 @@ type JsValue = <Types as JsTypes>::JsValue;
 fn with_message_port_ref(
     this: &JsValue,
     ec: &mut dyn ExecutionContext<Types>,
-    f: impl FnOnce(
-        &MessagePort,
-        &mut dyn ExecutionContext<Types>,
-    ) -> Completion<JsValue, Types>,
+    f: impl FnOnce(&MessagePort, &mut dyn ExecutionContext<Types>) -> Completion<JsValue, Types>,
 ) -> Completion<JsValue, Types> {
     let object = Types::value_as_object(this)
         .ok_or_else(|| ec.new_type_error("MessagePort receiver is not an object"))?;
@@ -198,7 +193,10 @@ fn options_dict_transfer(
 }
 
 /// Convert the `transfer` argument (a `sequence<object>`) to a list of
-/// values.
+/// values per Web IDL: an absent or `undefined` value converts to the
+/// default empty sequence, a non-object or non-iterable value throws a
+/// TypeError, and each iterated element must be an object.
+/// <https://webidl.spec.whatwg.org/#es-sequence>
 fn parse_transfer_sequence(
     transfer_value: Option<&JsValue>,
     ec: &mut dyn ExecutionContext<Types>,
@@ -206,17 +204,30 @@ fn parse_transfer_sequence(
     let Some(transfer_value) = transfer_value else {
         return Ok(Vec::new());
     };
-    let Some(transfer_object) = Types::value_as_object(transfer_value) else {
+    if Types::value_is_undefined(transfer_value) {
         return Ok(Vec::new());
-    };
-    let length_key = ec.property_key_from_str("length");
-    let length_value = ExecutionContext::get(ec, transfer_object.clone(), length_key)?;
-    let length = ec.to_length(length_value)?;
-    let mut transfer = Vec::with_capacity(length as usize);
-    for i in 0..length {
-        let index_key = ec.property_key_from_str(&i.to_string());
-        let item = ExecutionContext::get(ec, transfer_object.clone(), index_key)?;
-        transfer.push(item);
+    }
+    if Types::value_as_object(transfer_value).is_none() {
+        // Step 1: If V is not an Object, throw a TypeError.
+        return Err(ec.new_type_error("transfer is not an object"));
+    }
+    // Step 2: Let method be ? GetMethod(V, %Symbol.iterator%).
+    // Step 3: If method is undefined, throw a TypeError.
+    // Step 4: Return the result of creating a sequence from V and method.
+    let mut iterator =
+        ec.get_iterator(transfer_value.clone(), js_engine::IteratorKind::Sync, None)?;
+    let mut transfer = Vec::new();
+    loop {
+        let next = ec.iterator_step_value(&mut iterator)?;
+        let Some(next) = next else {
+            break;
+        };
+        // <https://webidl.spec.whatwg.org/#es-object>
+        // Each element converts to the `object` IDL type.
+        if Types::value_as_object(&next).is_none() {
+            return Err(ec.new_type_error("transfer element is not an object"));
+        }
+        transfer.push(next);
     }
     Ok(transfer)
 }
@@ -290,7 +301,8 @@ fn event_handler_setter(
     };
     let previous = port.event_target.event_handler_value(event_type, ec);
     if let Some(previous) = previous {
-        port.event_target.remove_event_listener_entry(event_type, &previous, false, ec);
+        port.event_target
+            .remove_event_listener_entry(event_type, &previous, false, ec);
     }
     if let Some(callback) = callback.clone() {
         port.event_target.add_event_listener(
@@ -304,7 +316,8 @@ fn event_handler_setter(
             ec,
         );
     }
-    port.event_target.set_event_handler_value(event_type, callback, ec);
+    port.event_target
+        .set_event_handler_value(event_type, callback, ec);
     if enable_queue {
         // <https://html.spec.whatwg.org/#message-ports>
         // "The first time a MessagePort object's onmessage IDL attribute is

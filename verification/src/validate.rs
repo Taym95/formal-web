@@ -698,7 +698,9 @@ fn collect_trace_ids_for_spec(
 /// The id universes of the MessagePortExtraFG model derived from the
 /// recorded trace: every port id, event loop id, and message id referenced
 /// by a MessagePort trace event.
-fn collect_message_port_trace_ids(trace_events: &[TraceEvent]) -> BTreeMap<String, BTreeSet<String>> {
+fn collect_message_port_trace_ids(
+    trace_events: &[TraceEvent],
+) -> BTreeMap<String, BTreeSet<String>> {
     let mut port_ids = BTreeSet::new();
     let mut event_loop_ids = BTreeSet::new();
     let mut message_ids = BTreeSet::new();
@@ -716,7 +718,7 @@ fn collect_message_port_trace_ids(trace_events: &[TraceEvent]) -> BTreeMap<Strin
                     event_loop_ids.insert(el.clone());
                 }
             }
-            "PostMessage" | "RouteMessage" => {
+            "PostMessage" => {
                 if let Some(src) = event.event_args.first() {
                     port_ids.insert(src.clone());
                 }
@@ -724,7 +726,31 @@ fn collect_message_port_trace_ids(trace_events: &[TraceEvent]) -> BTreeMap<Strin
                     message_ids.insert(mid.clone());
                 }
             }
-            "ReceiveMessage" | "Transfer" | "TransferReceive" => {
+            "RouteMessage" => {
+                // The user agent traces [kind, tgt] (and the message id as a
+                // third argument for "Single" items); the target port id is
+                // the second argument.
+                if let Some(tgt) = event.event_args.get(1) {
+                    port_ids.insert(tgt.clone());
+                }
+                if let Some(mid) = event.event_args.get(2) {
+                    message_ids.insert(mid.clone());
+                }
+            }
+            "ReceiveMessage" => {
+                // The content process traces [port, el, message-id]: the
+                // popped message is the third argument.
+                if let Some(port) = event.event_args.first() {
+                    port_ids.insert(port.clone());
+                }
+                if let Some(el) = event.event_args.get(1) {
+                    event_loop_ids.insert(el.clone());
+                }
+                if let Some(mid) = event.event_args.get(2) {
+                    message_ids.insert(mid.clone());
+                }
+            }
+            "Transfer" | "TransferReceive" => {
                 if let Some(port) = event.event_args.first() {
                     port_ids.insert(port.clone());
                 }

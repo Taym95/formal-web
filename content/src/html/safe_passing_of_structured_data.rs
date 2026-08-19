@@ -21,8 +21,8 @@ use ipc_messages::safe_passing_of_structured_data::{
     PrimitiveValue, SerializedRecord, TransferDataHolder,
 };
 
-use crate::html::create_transferred_port_object;
 use crate::html::MessagePort;
+use crate::html::create_transferred_port_object;
 
 use js_engine::{
     Completion, EcmascriptHost, ExecutionContext, JsTypes, enums::TypedArrayElementType,
@@ -94,12 +94,19 @@ pub trait Transferable: std::fmt::Debug {
 /// <https://html.spec.whatwg.org/#structuredserializeinternal> step 1.
 #[derive(Default)]
 pub struct MemoryMap {
-    /// Object → serialized record, keyed by object identity (the spec's
-    /// `memory` map).  Completed records are removed when their
-    /// serialization finishes; entries stay only for in-progress objects
-    /// (cycle detection) and transfer-list references.
-    serialized: Vec<(JsObject, SerializedRecord)>,
+    /// Object → (memory index, serialized record), keyed by object identity
+    /// (the spec's `memory` map).  Every object serialized into the graph
+    /// gets a stable index; a later occurrence of the same object (a cycle
+    /// or a shared DAG node) serializes as a `BackReference(index)`.  The
+    /// records are kept for the whole serialization (never removed), so a
+    /// completed record is still reachable by index.
+    serialized: Vec<(JsObject, usize, SerializedRecord)>,
+    next_serialized_index: usize,
+    /// Memory index → deserialized object, built in the same pre-order the
+    /// serialization assigned the indices.  `BackReference(index)` resolves
+    /// here to the object already built for that record.
     deserialized: HashMap<usize, JsObject>,
+    next_deserialized_index: usize,
     /// Values rebuilt from the transfer data holders by
     /// StructuredDeserializeWithTransfer step 3, indexed by transfer-list
     /// position; `SerializedRecord::TransferredValue(index)` resolves here.
@@ -111,37 +118,46 @@ impl MemoryMap {
     fn get_serialized(&self, object: &JsObject) -> Option<&SerializedRecord> {
         self.serialized
             .iter()
-            .find(|(key, _)| key == object)
-            .map(|(_, record)| record)
+            .find(|(key, _, _)| key == object)
+            .map(|(_, _, record)| record)
+    }
+    fn get_serialized_index(&self, object: &JsObject) -> Option<usize> {
+        self.serialized
+            .iter()
+            .find(|(key, _, _)| key == object)
+            .map(|(_, index, _)| *index)
     }
     fn insert_serialized(&mut self, object: &JsObject, record: SerializedRecord) {
-        if let Some((_, existing)) = self
-            .serialized
-            .iter_mut()
-            .find(|(key, _)| key == object)
+        if let Some((_, _, existing)) = self.serialized.iter_mut().find(|(key, _, _)| key == object)
         {
             *existing = record;
         } else {
-            self.serialized.push((object.clone(), record));
+            let index = self.next_serialized_index;
+            self.next_serialized_index += 1;
+            self.serialized.push((object.clone(), index, record));
         }
     }
     fn get_serialized_mut(&mut self, object: &JsObject) -> Option<&mut SerializedRecord> {
         self.serialized
             .iter_mut()
-            .find(|(key, _)| key == object)
-            .map(|(_, record)| record)
+            .find(|(key, _, _)| key == object)
+            .map(|(_, _, record)| record)
     }
-    fn remove_serialized(&mut self, object: &JsObject) -> Option<SerializedRecord> {
-        let index = self.serialized.iter().position(|(key, _)| key == object)?;
-        Some(self.serialized.remove(index).1)
+    /// The completed record of an object, leaving the memory-map entry in
+    /// place so a later occurrence of the same object (a shared DAG node)
+    /// still resolves by index.
+    fn take_record(&self, object: &JsObject) -> Option<SerializedRecord> {
+        self.get_serialized(object).cloned()
     }
-    fn get_deserialized(&self, record: &SerializedRecord) -> Option<JsObject> {
-        let addr = std::ptr::from_ref(record).addr();
-        self.deserialized.get(&addr).cloned()
+    fn get_deserialized(&self, index: &usize) -> Option<JsObject> {
+        self.deserialized.get(index).cloned()
     }
-    fn insert_deserialized(&mut self, record: &SerializedRecord, object: JsObject) {
-        let addr = std::ptr::from_ref(record).addr();
-        self.deserialized.insert(addr, object);
+    /// Assign the next memory index to a deserialized object (the record
+    /// types the serialization indexes, in the same pre-order).
+    fn reserve_deserialized_index(&mut self, object: JsObject) {
+        let index = self.next_deserialized_index;
+        self.next_deserialized_index += 1;
+        self.deserialized.insert(index, object);
     }
     fn transferred_value(&self, index: usize) -> Option<JsValue> {
         self.transferred_values.get(index).cloned()
@@ -211,10 +227,12 @@ fn structured_serialize_internal(
     // Step 1: If memory was not supplied, let memory be an empty map.
     //         (memory is always supplied here.)
     // Step 2: If memory[value] exists, then return memory[value].
-    if let Some(object) = Types::value_as_object(value) {
-        if let Some(record) = memory.get_serialized(&object) {
-            return Ok(record.clone());
-        }
+    if let Some(index) =
+        Types::value_as_object(value).and_then(|object| memory.get_serialized_index(&object))
+    {
+        // The object was already serialized (a cycle or a shared DAG node);
+        // reference it by its memory index.
+        return Ok(SerializedRecord::BackReference(index));
     }
 
     // Step 3: Let deep be false.
@@ -381,7 +399,7 @@ fn structured_serialize_internal(
         *props = properties;
     }
     Ok(memory
-        .remove_serialized(&object)
+        .take_record(&object)
         .expect("entry must exist in memory"))
 }
 
@@ -595,7 +613,7 @@ fn serialize_map_contents(
         *entry_list = entries;
     }
     Ok(memory
-        .remove_serialized(object)
+        .take_record(object)
         .expect("Map entry must exist in memory"))
 }
 
@@ -640,7 +658,7 @@ fn serialize_set_contents(
         *entry_list = entries;
     }
     Ok(memory
-        .remove_serialized(object)
+        .take_record(object)
         .expect("Set entry must exist in memory"))
 }
 
@@ -778,7 +796,7 @@ fn serialize_array(
         *props = properties;
     }
     Ok(memory
-        .remove_serialized(&object)
+        .take_record(&object)
         .expect("Array entry must exist in memory"))
 }
 
@@ -899,6 +917,7 @@ pub fn structured_serialize_with_transfer(
                 port_id: transfer_data.port_id,
                 queue: transfer_data.queue,
                 remote_port: transfer_data.remote_port,
+                in_flight: transfer_data.in_flight,
             });
         }
     }
@@ -935,7 +954,10 @@ fn structured_deserialize(
     // Step 1: If memory was not supplied, let memory be an empty map.
     //         (memory is always supplied here.)
     // Step 2: If memory[serialized] exists, then return memory[serialized].
-    if let Some(object) = memory.get_deserialized(serialized) {
+    if let SerializedRecord::BackReference(index) = serialized {
+        let object = memory
+            .get_deserialized(index)
+            .ok_or_else(|| ec.new_type_error("structured clone: unresolved back reference"))?;
         return Ok(Types::value_from_object(object));
     }
 
@@ -1158,11 +1180,29 @@ fn structured_deserialize(
         SerializedRecord::PlatformObject { .. } => {
             return Err(crate::webidl::data_clone_error_value(ec));
         }
+        // Back references resolve at step 2 (the memory map); a reference to
+        // an index not yet built is a malformed record.
+        SerializedRecord::BackReference(index) => {
+            return Err(ec.new_type_error(&format!(
+                "structured clone: dangling back reference {index}"
+            )));
+        }
     }
 
-    // Step 23: Set memory[serialized] to value.
-    if let Some(obj) = Types::value_as_object(&value) {
-        memory.insert_deserialized(serialized, obj);
+    // Step 23: Set memory[serialized] to value.  The serialization assigns
+    // memory indices to exactly the record kinds that can be back-referenced
+    // (object containers and the transfer placeholders); the same kinds get
+    // their deserialized object reserved here, in the same pre-order.
+    let needs_index = matches!(
+        serialized,
+        SerializedRecord::Object(_)
+            | SerializedRecord::Map(_)
+            | SerializedRecord::Set(_)
+            | SerializedRecord::Array { .. }
+            | SerializedRecord::TransferredValue(_)
+    );
+    if needs_index && let Some(obj) = Types::value_as_object(&value) {
+        memory.reserve_deserialized_index(obj);
     }
 
     // Step 24: If deep is true:
@@ -1380,9 +1420,15 @@ pub fn structured_deserialize_with_transfer(
                 port_id,
                 queue,
                 remote_port,
+                in_flight,
             } => {
-                let object =
-                    create_transferred_port_object(*port_id, *remote_port, queue.clone(), ec)?;
+                let object = create_transferred_port_object(
+                    *port_id,
+                    *remote_port,
+                    queue.clone(),
+                    *in_flight,
+                    ec,
+                )?;
                 Types::value_from_object(object)
             }
         };
@@ -1392,7 +1438,13 @@ pub fn structured_deserialize_with_transfer(
         // Record identity cannot cross an IPC boundary, so the transferred
         // values are kept in a list indexed by transfer-list position; the
         // `TransferredValue(index)` records in the serialized graph resolve
-        // here.
+        // here.  The transfer placeholders are the first entries the
+        // serialization indexed, so each transferred value reserves the same
+        // memory index, and a `BackReference` to a placeholder resolves to
+        // the value itself.
+        if let Some(obj) = Types::value_as_object(&value) {
+            memory.reserve_deserialized_index(obj);
+        }
         transferred_values.push(value);
     }
     memory.transferred_values = transferred_values.clone();

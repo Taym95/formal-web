@@ -479,11 +479,14 @@ impl ContentProcess {
         // scope needs the id for channel messaging (per-event-loop port
         // management) and the trace sender for the MessagePort TLA spec.
         let trace_sender = self.trace_sender.clone();
-        with_global_scope(&mut settings.realm_execution_context, |global_scope, _ec| {
-            global_scope.set_event_loop_id(self.event_loop_id);
-            global_scope.set_trace_sender(trace_sender.clone());
-            Ok(())
-        })
+        with_global_scope(
+            &mut settings.realm_execution_context,
+            |global_scope, _ec| {
+                global_scope.set_event_loop_id(self.event_loop_id);
+                global_scope.set_trace_sender(trace_sender.clone());
+                Ok(())
+            },
+        )
         .map_err(|error| format!("failed to set event loop id: {}", error.display()))?;
         Ok(settings)
     }
@@ -1812,6 +1815,7 @@ impl ContentProcess {
                     origin,
                     Some(source),
                     data,
+                    Vec::new(),
                 )?;
                 fire_event_at_window(&mut document.settings, &message_event.event)?;
                 return Ok(());
@@ -1824,8 +1828,11 @@ impl ContentProcess {
         // Step 8.6: Let newPorts be a new frozen array consisting of all
         //           MessagePort objects in deserializeRecord.[[TransferredValues]],
         //           if any, maintaining their relative order.
-        // Note: The current transfer support only produces ArrayBuffers, never
-        // MessagePorts, so newPorts is always empty here.
+        let new_ports: Vec<JsObject> = deserialize_result
+            .transferred_values
+            .iter()
+            .filter_map(crate::js::Types::value_as_object)
+            .collect();
 
         // Step 8.7: Fire an event named message at targetWindow, using
         //           MessageEvent, with its origin initialized to origin, the
@@ -1838,6 +1845,7 @@ impl ContentProcess {
             origin,
             Some(source),
             message_clone,
+            new_ports,
         )?;
         fire_event_at_window(&mut document.settings, &message_event.event)?;
 
@@ -1874,9 +1882,7 @@ impl ContentProcess {
     /// The channel messaging of the first realm in this process, used to
     /// return tasks to the user agent's routing queue when the port is no
     /// longer managed by this event loop.
-    fn any_channel_messaging(
-        &mut self,
-    ) -> Option<crate::html::ChannelMessaging> {
+    fn any_channel_messaging(&mut self) -> Option<crate::html::ChannelMessaging> {
         let (_, document) = self.documents.iter_mut().next()?;
         let messaging = with_global_scope(document.settings.ec(), |global_scope, ec| {
             Ok(global_scope.channel_messaging(ec))
@@ -1889,6 +1895,10 @@ impl ContentProcess {
     /// Run a task queued on this event loop by the user agent's routing
     /// (`MessagePortExtraFG.tla`'s `RunTask`).  The task is appended to the port's queue or
     /// returned to the routing queue when the port left this event loop.
+    /// When the port is enabled, the message task (the substeps 7.1-7.7 of
+    /// the message port post message steps) runs here, within the delivering
+    /// task's slot: the message event fires without a further round-trip to
+    /// request a task.
     fn handle_port_task(&mut self, port_id: PortId, task: PortTaskKind) -> Result<(), String> {
         let event_sender = self.event_sender.clone();
         let Some(document_id) = self.find_port_document(port_id) else {
@@ -1902,19 +1912,26 @@ impl ContentProcess {
                 .map_err(|error| format!("port task return failed: {error}"))?;
             return Ok(());
         };
-        let content_document = self
-            .documents
-            .get_mut(&document_id)
-            .ok_or_else(|| format!("port task: unknown document {document_id}"))?;
-        with_global_scope(content_document.settings.ec(), |global_scope, ec| {
-            let Some(messaging) = global_scope.channel_messaging(ec) else {
-                return Ok(());
-            };
-            messaging
-                .handle_port_task(port_id, task, &event_sender, ec)
-                .map_err(|error| ec.new_type_error(&format!("port task: {error}")))
-        })
-        .map_err(|error| format!("port task failed: {}", error.display()))?;
+        let fire = {
+            let content_document = self
+                .documents
+                .get_mut(&document_id)
+                .ok_or_else(|| format!("port task: unknown document {document_id}"))?;
+            with_global_scope(content_document.settings.ec(), |global_scope, ec| {
+                let Some(messaging) = global_scope.channel_messaging(ec) else {
+                    return Ok(false);
+                };
+                messaging
+                    .handle_port_task(port_id, task, &event_sender, ec)
+                    .map_err(|error| ec.new_type_error(&format!("port task: {error}")))
+            })
+            .map_err(|error| format!("port task failed: {}", error.display()))?
+        };
+        if fire {
+            // The delivery task runs the message task itself (the message
+            // event fires within this task's slot).
+            self.handle_run_port_message_task(port_id)?;
+        }
         Ok(())
     }
 
@@ -3080,6 +3097,7 @@ fn build_message_event(
     origin: String,
     source: Option<JsObject>,
     data: JsValue,
+    ports: Vec<JsObject>,
 ) -> Result<MessageEvent, String> {
     let time_millis = settings.current_time_millis();
     let ec = &mut settings.realm_execution_context;
@@ -3093,7 +3111,7 @@ fn build_message_event(
             origin,
             last_event_id: String::new(),
             source,
-            ports: Vec::new(),
+            ports,
         },
         ec,
     );

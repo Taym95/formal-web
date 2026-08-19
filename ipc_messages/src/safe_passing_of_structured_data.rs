@@ -102,6 +102,14 @@ pub enum SerializedRecord {
     },
     /// { [[Type]]: "Object" }
     Object(Vec<(Vec<u16>, SerializedRecord)>),
+    /// A back-reference to a record that was serialized earlier in the
+    /// graph, by its memory-map index: a cyclic or shared (DAG) object is
+    /// serialized once and every other occurrence becomes this reference.
+    /// On deserialization the reference resolves to the object already
+    /// built for that record (the port message queue of the structured
+    /// clone memory map keys by this index).
+    /// <https://html.spec.whatwg.org/#structuredserializeinternal> step 2
+    BackReference(usize),
     /// A reference to the transfer-list entry at the given (0-based) index.
     ///
     /// StructuredSerializeWithTransfer step 2.4 places this record in the
@@ -145,6 +153,12 @@ pub enum TransferDataHolder {
         port_id: PortId,
         queue: Vec<PortMessagePayload>,
         remote_port: Option<PortId>,
+        /// Routed messages still in flight toward the port (messages posted
+        /// while the port was in transit or completing, not yet delivered to
+        /// its queue).  Moves with the transfer so a direct delivery in the
+        /// receiving process cannot jump ahead of them (the port message
+        /// queue is FIFO).
+        in_flight: u32,
     },
 }
 
