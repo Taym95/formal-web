@@ -929,10 +929,9 @@ pub fn structured_serialize_with_transfer(
     })
 }
 
-/// <https://html.spec.whatwg.org/#message-ports:transfer-steps>
-/// Whether a transferable is a MessagePort platform object (which has a
-/// [[Detached]] internal slot, satisfying StructuredSerializeWithTransfer
-/// step 2.1).
+/// Whether a transferable is a MessagePort platform object, which has a
+/// [[Detached]] internal slot and therefore satisfies the check of
+/// StructuredSerializeWithTransfer step 2.1.
 fn is_transferable_platform_object(
     object: &JsObject,
     ec: &mut dyn ExecutionContext<Types>,

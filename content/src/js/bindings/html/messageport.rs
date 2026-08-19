@@ -392,7 +392,7 @@ fn get_port1(
     };
     let port_object = channel
         .port1
-        .object(ec)
+        .object()
         .ok_or_else(|| ec.new_type_error("MessageChannel port1 is missing its object"))?;
     Ok(Types::value_from_object(port_object))
 }
@@ -413,7 +413,7 @@ fn get_port2(
     };
     let port_object = channel
         .port2
-        .object(ec)
+        .object()
         .ok_or_else(|| ec.new_type_error("MessageChannel port2 is missing its object"))?;
     Ok(Types::value_from_object(port_object))
 }

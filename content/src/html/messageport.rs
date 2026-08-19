@@ -25,13 +25,17 @@ type JsObject = <Types as JsTypes>::JsObject;
 /// <https://html.spec.whatwg.org/#messageport>
 #[gc_struct]
 pub(crate) struct MessagePort {
-    /// <https://dom.spec.whatwg.org/#interface-eventtarget>
+    /// The port's EventTarget base; as the port's message event target
+    /// defaults to the port itself, message and messageerror events are
+    /// dispatched through this target.
     pub(crate) event_target: EventTarget,
 
-    /// <https://html.spec.whatwg.org/#global-object>
+    /// The global scope of the realm the port was created in: the port's
+    /// ChannelMessaging and its IPC event sender are per-global.
     pub(crate) global_scope: GlobalScope,
 
-    /// <https://html.spec.whatwg.org/#message-ports>
+    /// The id under which the user agent's channel messaging state and
+    /// this realm's ChannelMessaging know the port.
     #[ignore_trace]
     pub(crate) port_id: PortId,
 }
@@ -43,27 +47,33 @@ impl EventTargetAccess for MessagePort {
 }
 
 impl MessagePort {
-    /// <https://html.spec.whatwg.org/#message-ports>
-    pub(crate) fn object(&self, ec: &mut dyn ExecutionContext<Types>) -> Option<JsObject> {
-        self.messaging(ec)
-            .and_then(|messaging| messaging.port_object(self.port_id, ec))
+    /// The port's platform object, resolved through the reflector stored
+    /// on the port's event target.
+    pub(crate) fn object(&self) -> Option<JsObject> {
+        self.event_target.reflector.clone()
     }
 
-    /// <https://html.spec.whatwg.org/#dom-messagechannel>
-    pub(crate) fn new_port(
-        ec: &mut dyn ExecutionContext<Types>,
-    ) -> Completion<(Self, JsObject), Types> {
+    /// Create a new MessagePort platform object in the current realm (the
+    /// "a new MessagePort in this's relevant realm" of the MessageChannel
+    /// constructor steps and of the transfer-receiving steps), with a
+    /// fresh id not yet registered with the user agent.
+    pub(crate) fn new_port(ec: &mut dyn ExecutionContext<Types>) -> Completion<Self, Types> {
         let global_scope = with_global_scope(ec, |global_scope, _ec| Ok(global_scope.clone()))?;
         let port = Self {
             event_target: EventTarget::new(ec),
             global_scope,
             port_id: PortId::new(),
         };
-        let object = create_interface_instance::<Types, MessagePort>(port.clone(), ec)?;
-        Ok((port, object))
+        let object = create_interface_instance::<Types, MessagePort>(port, ec)?;
+        // The port returned to the caller is re-read from its wrapper,
+        // whose reflector was set by the interface instance creation.
+        ec.with_object_any(&object)
+            .and_then(|data| data.downcast_ref::<MessagePort>().cloned())
+            .ok_or_else(|| ec.new_type_error("MessagePort instance is not a MessagePort"))
     }
 
-    /// <https://html.spec.whatwg.org/#channel-messaging>
+    /// This realm's ChannelMessaging, created on first use; `None` when
+    /// the realm has no event loop yet.
     fn messaging(&self, ec: &mut dyn ExecutionContext<Types>) -> Option<ChannelMessaging> {
         self.global_scope.channel_messaging(ec)
     }
@@ -151,6 +161,11 @@ impl MessagePort {
 
     /// <https://html.spec.whatwg.org/#dom-messageport-start>
     pub(crate) fn start(&self, ec: &mut dyn ExecutionContext<Types>) {
+        // Step 1: The start() method steps are to enable this's port
+        //         message queue, if it is not already enabled.
+        // Note: The enabling runs in the per-global ChannelMessaging
+        // (`messaging.start`), which also requests message tasks for any
+        // pending messages.
         let Some(messaging) = self.messaging(ec) else {
             return;
         };
@@ -161,11 +176,18 @@ impl MessagePort {
 
     /// <https://html.spec.whatwg.org/#dom-messageport-close>
     pub(crate) fn close(&self, ec: &mut dyn ExecutionContext<Types>) -> Completion<(), Types> {
+        // Step 1: Set this's [[Detached]] internal slot value to true.
+        // Step 2: If this is entangled, disentangle it.
+        // Note: Steps 1-3 run in the per-global ChannelMessaging
+        // (`messaging.close`), which detaches the record and returns the
+        // entangled twin; step 4 of the disentangle steps (fire an event
+        // named close at otherPort) runs below.
         let Some(messaging) = self.messaging(ec) else {
             return Ok(());
         };
         let other = messaging.close(self.port_id, ec);
         if let Some(other) = other {
+            // Step 4: Fire an event named close at otherPort.
             if let Some(other_object) = messaging.port_object(other, ec) {
                 let other_port: Option<MessagePort> = ec
                     .with_object_any(&other_object)
@@ -178,7 +200,8 @@ impl MessagePort {
         Ok(())
     }
 
-    /// <https://html.spec.whatwg.org/#message-ports>
+    /// Enable the port's message queue, as when start() is called or the
+    /// first onmessage handler is set.
     pub(crate) fn enable_queue(&self, ec: &mut dyn ExecutionContext<Types>) {
         let Some(messaging) = self.messaging(ec) else {
             return;
@@ -298,15 +321,15 @@ impl MessageChannel {
     pub(crate) fn new_channel(ec: &mut dyn ExecutionContext<Types>) -> Completion<Self, Types> {
         // Step 1: Set this's port 1 to a new MessagePort in this's relevant
         //         realm.
-        let (port1, object1) = MessagePort::new_port(ec)?;
+        let port1 = MessagePort::new_port(ec)?;
         // Step 2: Set this's port 2 to a new MessagePort in this's relevant
         //         realm.
-        let (port2, object2) = MessagePort::new_port(ec)?;
+        let port2 = MessagePort::new_port(ec)?;
         // Step 3: Entangle this's port 1 and this's port 2.
         let Some(messaging) = port1.messaging(ec) else {
             return Err(ec.new_type_error("MessageChannel: no event loop"));
         };
-        messaging.entangle_pair(port1.port_id, port2.port_id, object1, object2, ec);
+        messaging.entangle_pair(port1.clone(), port2.clone(), ec);
         // The user agent must know both ports to route messages to either
         // one's owning event loop (`MessagePortExtraFG.tla`'s `NewChannel`).
         if let Some(event_sender) = port1.global_scope.event_sender()
@@ -329,6 +352,27 @@ pub(crate) fn create_transferred_port_object(
     in_flight: u32,
     ec: &mut dyn ExecutionContext<Types>,
 ) -> Completion<JsObject, Types> {
+    // Step 1: Set value's has been shipped flag to true.
+    // Note: The user agent is told the port was received
+    // (`PortTransferReceived`) so it stops buffering messages for the port;
+    // the shipped flag itself is not modelled, and the record registered by
+    // `receive_transferred_port` tracks the hand-over
+    // (`CompletionInProgress`).
+    // Step 2: Move all the tasks that are to fire message events in
+    //         dataHolder.[[PortMessageQueue]] to the port message queue
+    //         of value, if any, leaving value's port message queue in
+    //         its initial disabled state, and, if value's relevant
+    //         global object is a Window, associating the moved tasks
+    //         with value's relevant global object's associated Document.
+    // Step 3: If dataHolder.[[RemotePort]] is not null, then entangle
+    //         dataHolder.[[RemotePort]] and value. (This will disentangle
+    //         dataHolder.[[RemotePort]] from the original port that was
+    //         transferred.)
+    // Note: Steps 2-3 run in `receive_transferred_port`, which moves the
+    // transferred queue into the new port's record (left disabled) and
+    // entangles the record with the remote port.  The new port's wrapper is
+    // created here (in the receiving realm) before the record is
+    // registered.
     let global_scope = with_global_scope(ec, |global_scope, _ec| Ok(global_scope.clone()))?;
     let Some(messaging) = global_scope.channel_messaging(ec) else {
         return Err(ec.new_type_error("transfer receive: no event loop"));
@@ -339,8 +383,14 @@ pub(crate) fn create_transferred_port_object(
         port_id,
     };
     let event_sender = port.global_scope.event_sender();
-    let object = create_interface_instance::<Types, MessagePort>(port, ec)?;
-    messaging.receive_transferred_port(port_id, object.clone(), remote_port, queue, in_flight, ec);
+    let object = create_interface_instance::<Types, MessagePort>(port.clone(), ec)?;
+    // The record stores the port re-read from its wrapper, whose reflector
+    // was set by the interface instance creation.
+    let port = ec
+        .with_object_any(&object)
+        .and_then(|data| data.downcast_ref::<MessagePort>().cloned())
+        .ok_or_else(|| ec.new_type_error("transfer receive: wrapper is not a MessagePort"))?;
+    messaging.receive_transferred_port(port, remote_port, queue, in_flight, ec);
     if let Some(event_sender) = event_sender
         && let Err(error) = event_sender.send(ContentEvent::PortTransferReceived { port: port_id })
     {
@@ -367,13 +417,13 @@ pub(crate) struct PortTransferData {
 }
 
 /// <https://html.spec.whatwg.org/#message-ports:transfer-steps>
-/// The transfer steps of a MessagePort, run during structured serialization:
-/// the port leaves its realm (`MessagePortExtraFG.tla`'s `Transfer`).  Returns `None` when
-/// the object is not a MessagePort.
 pub(crate) fn message_port_transfer_steps(
     object: &JsObject,
     ec: &mut dyn ExecutionContext<Types>,
 ) -> Completion<Option<PortTransferData>, Types> {
+    // Note: The transfer steps are invoked with a MessagePort value; the
+    // caller only runs them for MessagePort platform objects, so `None`
+    // here is a defensive fallback.
     let port: Option<MessagePort> = ec
         .with_object_any(object)
         .and_then(|data| data.downcast_ref::<MessagePort>().cloned());
@@ -386,9 +436,27 @@ pub(crate) fn message_port_transfer_steps(
     let Some(event_sender) = port.global_scope.event_sender() else {
         return Ok(None);
     };
+    // Step 3: If value is entangled with another port remotePort:
+    // Step 3.1: Set remotePort's has been shipped flag to true.
+    // Note: The user agent, informed of the transfer, routes messages for
+    // the port away while it is in transit, which covers the remote port
+    // as well.
+    // Step 3.2: Set dataHolder.[[RemotePort]] to remotePort.
+    // Step 4: Otherwise, set dataHolder.[[RemotePort]] to null.
+    // Note: The entanglement is read before `transfer_port` removes the
+    // record (steps 1-2 below), since the record no longer exists after.
     let remote_port = messaging
         .port_record(port.port_id, ec)
         .and_then(|record| record.entangled);
+    // Step 1: Set value's has been shipped flag to true.
+    // Step 2: Set dataHolder.[[PortMessageQueue]] to value's port message
+    //         queue.
+    // Note: These run in `transfer_port` (`MessagePortExtraFG.tla`'s
+    // `Transfer`): the record leaves this realm and its queue is drained
+    // into the transfer data holder.  The user agent is informed there so
+    // it buffers or re-routes messages while the port is in transit (the
+    // shipped flag's cross-process effect; step 3.1's remote port is
+    // covered by the same notification).
     let (queue, in_flight) = messaging
         .transfer_port(port.port_id, &event_sender, ec)
         .map_err(|_error| crate::webidl::data_clone_error_value(ec))?;
@@ -401,14 +469,20 @@ pub(crate) fn message_port_transfer_steps(
 }
 
 /// <https://dom.spec.whatwg.org/#concept-event-fire>
-/// Fire a pre-built MessageEvent at a port's event target, with the trusted
-/// flag and current timestamp of a user-agent-fired event.
 fn fire_message_event(
     target: &EventTarget,
     message_event: MessageEvent,
     time_millis: f64,
     ec: &mut dyn ExecutionContext<Types>,
 ) -> Completion<(), Types> {
+    // Step 2: Let event be the result of creating an event given
+    //         eventConstructor, in the relevant realm of target.
+    // Note: eventConstructor (MessageEvent) is given, so step 1 does not
+    // apply; the event's type, data, and ports attributes were initialized
+    // by the caller (`run_message_task`'s step 7.7, the fire algorithm's
+    // steps 3-4).  Creating the event also initializes its isTrusted
+    // attribute to true and its timeStamp attribute to the time of the
+    // occurrence.
     let event_object = create_interface_instance::<Types, MessageEvent>(message_event, ec)?;
     let message_event: MessageEvent = ec
         .with_object_any(&event_object)
@@ -416,6 +490,8 @@ fn fire_message_event(
         .ok_or_else(|| ec.new_type_error("event_object is not a MessageEvent"))?;
     *message_event.event.is_trusted.borrow_mut(ec) = true;
     *message_event.event.time_stamp.borrow_mut(ec) = time_millis;
+    // Step 5: Return the result of dispatching event at target, with
+    //         legacy target override flag set if set.
     let path = simple_path(target, ec);
     dispatch_with_path(ec, &path, &message_event.event)
         .map(|_| ())
@@ -423,12 +499,14 @@ fn fire_message_event(
 }
 
 /// <https://html.spec.whatwg.org/#disentangle>
-/// Fire an event named close at otherPort (the last step of the disentangle
-/// steps).
 fn fire_close_event(
     other_port: &MessagePort,
     ec: &mut dyn ExecutionContext<Types>,
 ) -> Completion<(), Types> {
+    // Step 4: Fire an event named close at otherPort.
+    // Note: Steps 1-3 of the disentangle steps (otherPort, the assertion,
+    // and the disentangling of the pair) run in the caller
+    // (`MessagePort::close` via `ChannelMessaging::close`).
     let event = Event::new(String::from("close"), false, false, false, true, 0.0, ec);
     let path = simple_path(&other_port.event_target, ec);
     dispatch_with_path(ec, &path, &event)

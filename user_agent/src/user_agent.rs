@@ -3983,7 +3983,6 @@ impl UserAgentWorker {
         }
     }
 
-    /// <https://html.spec.whatwg.org/#message-ports>
     /// The user-agent half of the port workflow: register channels and
     /// transfers and process the routing queue (the model's `NewChannel`,
     /// `Transfer`, `TransferReceive`, and `RouteMessage` actions).

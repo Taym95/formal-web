@@ -207,7 +207,6 @@ pub struct GlobalScope {
     #[ignore_trace]
     event_loop_id: Rc<Cell<Option<ipc_messages::content::EventLoopId>>>,
 
-    /// <https://html.spec.whatwg.org/#channel-messaging>
     /// Per-realm channel messaging state (ports, message queues, transfer
     /// state), created lazily on first port use.
     channel_messaging: GcCell<Option<ChannelMessaging>>,
@@ -426,7 +425,6 @@ impl GlobalScope {
         self.trace_sender.borrow().clone()
     }
 
-    /// <https://html.spec.whatwg.org/#channel-messaging>
     /// The per-realm channel messaging state, created on first use.
     pub(crate) fn channel_messaging(
         &self,

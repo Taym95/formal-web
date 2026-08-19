@@ -25,49 +25,60 @@ use js_engine::gc_struct;
 use js_engine::{ExecutionContext, JsTypes};
 use log::warn;
 
+use crate::html::messageport::MessagePort;
 use crate::js::Types;
 
 use verification::{TLATracer, TraceSender};
 
 type JsObject = <Types as JsTypes>::JsObject;
 
-/// <https://html.spec.whatwg.org/#message-ports>
+/// One MessagePort managed by this event loop: the content-process half of
+/// the spec's per-port state (its port message queue, its entanglement,
+/// its detached flag), keyed by a [`PortId`] shared with the user agent's
+/// routing state.
 #[gc_struct]
 pub(crate) struct PortRecord {
-    /// <https://html.spec.whatwg.org/#message-ports>
+    /// The id under which the user agent's channel messaging state knows
+    /// this port.
     #[ignore_trace]
     pub(crate) port_id: PortId,
 
-    /// <https://html.spec.whatwg.org/#message-ports>
-    pub(crate) object: Option<JsObject>,
+    /// The port's platform object, held so the port can be resolved by id
+    /// (e.g. to dispatch close at the entangled twin).
+    pub(crate) object: Option<MessagePort>,
 
-    /// <https://html.spec.whatwg.org/#message-ports:transfer-steps>
+    /// The port's transfer state, mirroring the user agent's per-port
+    /// state (`MessagePortExtraFG.tla`'s `ts`).
     #[ignore_trace]
     pub(crate) ts: TransferState,
 
-    /// <https://html.spec.whatwg.org/#entangle>
+    /// The port this port is entangled with, if any.
     #[ignore_trace]
     pub(crate) entangled: Option<PortId>,
 
-    /// <https://html.spec.whatwg.org/#port-message-queue>
+    /// The port's message queue: messages delivered to the port, fired as
+    /// message events while the queue is enabled.
     #[ignore_trace]
     pub(crate) queue: VecDeque<PortMessagePayload>,
 
-    /// <https://html.spec.whatwg.org/#port-message-queue>
+    /// Whether the port's message queue is enabled (a port message queue
+    /// can be enabled, and is initially disabled).
     #[ignore_trace]
     pub(crate) enabled: bool,
 
-    /// <https://html.spec.whatwg.org/#dom-messageport-close>
+    /// Whether the port was closed: the port's [[Detached]] internal slot.
     #[ignore_trace]
     pub(crate) detached: bool,
 
-    /// Routed messages still in flight toward this port.
+    /// Routed messages still in flight toward this port, not yet landed in
+    /// its queue.
     #[ignore_trace]
     in_flight: u32,
 }
 
 impl PortRecord {
-    /// <https://html.spec.whatwg.org/#message-ports:transfer-steps>
+    /// Whether the port is managed by (or completing a transfer to) this
+    /// event loop, so messages can be delivered to its queue directly.
     fn is_local(&self) -> bool {
         matches!(
             self.ts,
@@ -76,23 +87,27 @@ impl PortRecord {
     }
 }
 
-/// <https://html.spec.whatwg.org/#channel-messaging>
+/// Per-global channel messaging state: the records of the ports whose
+/// queues are managed by this event loop, plus the IPC wiring (event loop
+/// id, trace sender) needed to route messages and report transfer state to
+/// the user agent.
 #[gc_struct]
 pub(crate) struct ChannelMessaging {
-    /// <https://html.spec.whatwg.org/#channel-messaging>
+    /// The id of the event loop this channel messaging belongs to, reported
+    /// to the user agent so it can queue tasks on the right event loop.
     #[ignore_trace]
     event_loop_id: EventLoopId,
 
-    /// <https://html.spec.whatwg.org/#channel-messaging>
+    /// TLA trace sender for the MessagePort specs.
     #[ignore_trace]
     trace_sender: Option<TraceSender>,
 
-    /// <https://html.spec.whatwg.org/#channel-messaging>
+    /// The records of the ports managed by this event loop.
     ports: GcCell<Vec<PortRecord>>,
 }
 
 impl ChannelMessaging {
-    /// <https://html.spec.whatwg.org/#channel-messaging>
+    /// Create the channel messaging state for an event loop.
     pub(crate) fn new(
         event_loop_id: EventLoopId,
         trace_sender: Option<TraceSender>,
@@ -105,7 +120,8 @@ impl ChannelMessaging {
         }
     }
 
-    /// <https://html.spec.whatwg.org/#channel-messaging>
+    /// Emit a MessagePort trace event (the actions of the MessagePort TLA
+    /// specs).
     fn trace(&self, event: &str, args: Vec<String>) {
         let Some(sender) = &self.trace_sender else {
             return;
@@ -117,28 +133,33 @@ impl ChannelMessaging {
     /// <https://html.spec.whatwg.org/#entangle>
     pub(crate) fn entangle_pair(
         &self,
-        port1: PortId,
-        port2: PortId,
-        object1: JsObject,
-        object2: JsObject,
+        port1: MessagePort,
+        port2: MessagePort,
         ec: &mut dyn ExecutionContext<Types>,
     ) {
+        // Step 1: If one of the ports is already entangled, then disentangle
+        //         it and the port that it was entangled with.
+        // Note: The ports are always fresh here (the MessageChannel
+        // constructor creates them immediately before entangling), so there
+        // is no prior entanglement to disentangle.
+        // Step 2: Associate the two ports to be entangled, so that they form
+        //         the two parts of a new channel.
         let mut ports = self.ports.borrow_mut(ec);
         ports.push(PortRecord {
-            port_id: port1,
-            object: Some(object1),
+            port_id: port1.port_id,
+            object: Some(port1.clone()),
             ts: TransferState::Managed,
-            entangled: Some(port2),
+            entangled: Some(port2.port_id),
             queue: VecDeque::new(),
             enabled: false,
             detached: false,
             in_flight: 0,
         });
         ports.push(PortRecord {
-            port_id: port2,
-            object: Some(object2),
+            port_id: port2.port_id,
+            object: Some(port2.clone()),
             ts: TransferState::Managed,
-            entangled: Some(port1),
+            entangled: Some(port1.port_id),
             queue: VecDeque::new(),
             enabled: false,
             detached: false,
@@ -148,8 +169,8 @@ impl ChannelMessaging {
         self.trace(
             "NewChannel",
             vec![
-                port1.to_string(),
-                port2.to_string(),
+                port1.port_id.to_string(),
+                port2.port_id.to_string(),
                 self.event_loop_id.to_string(),
             ],
         );
@@ -158,17 +179,40 @@ impl ChannelMessaging {
     /// <https://html.spec.whatwg.org/#message-ports:transfer-receiving-steps>
     pub(crate) fn receive_transferred_port(
         &self,
-        port_id: PortId,
-        object: JsObject,
+        port: MessagePort,
         remote_port: Option<PortId>,
         queue: Vec<PortMessagePayload>,
         in_flight: u32,
         ec: &mut dyn ExecutionContext<Types>,
     ) {
+        // Step 1: Set value's has been shipped flag to true.
+        // Note: The port is registered with a `CompletionInProgress`
+        // transfer state and the user agent is told the port was received
+        // (`PortTransferReceived`, sent by the caller), so the user agent
+        // stops buffering messages for it; the shipped flag itself is not
+        // modelled.
+        // Step 2: Move all the tasks that are to fire message events in
+        //         dataHolder.[[PortMessageQueue]] to the port message queue
+        //         of value, if any, leaving value's port message queue in
+        //         its initial disabled state, and, if value's relevant
+        //         global object is a Window, associating the moved tasks
+        //         with value's relevant global object's associated Document.
+        // Note: The queue that moved with the transfer lands in the new
+        // record's queue, left disabled until start() or an onmessage
+        // handler enables it.  The Window-document association of the moved
+        // tasks is not modelled; the receiving realm's document is the
+        // port's document.
+        // Step 3: If dataHolder.[[RemotePort]] is not null, then entangle
+        //         dataHolder.[[RemotePort]] and value. (This will disentangle
+        //         dataHolder.[[RemotePort]] from the original port that was
+        //         transferred.)
+        // Note: The record is created entangled with the remote port; the
+        // original port's record was removed by the transfer steps, so the
+        // remote port is no longer entangled with it.
         let mut ports = self.ports.borrow_mut(ec);
         ports.push(PortRecord {
-            port_id,
-            object: Some(object),
+            port_id: port.port_id,
+            object: Some(port.clone()),
             ts: TransferState::CompletionInProgress,
             entangled: remote_port,
             queue: queue.into(),
@@ -179,7 +223,7 @@ impl ChannelMessaging {
         drop(ports);
         self.trace(
             "TransferReceive",
-            vec![port_id.to_string(), self.event_loop_id.to_string()],
+            vec![port.port_id.to_string(), self.event_loop_id.to_string()],
         );
     }
 
@@ -190,7 +234,21 @@ impl ChannelMessaging {
         event_sender: &IpcSender<ContentEvent>,
         ec: &mut dyn ExecutionContext<Types>,
     ) -> Result<(Vec<PortMessagePayload>, u32), String> {
-        let (queue, in_flight, removed) = {
+        // Step 1: Set value's has been shipped flag to true.
+        // Step 2: Set dataHolder.[[PortMessageQueue]] to value's port
+        //         message queue.
+        // Note: The record is removed (the port leaves this realm, so its
+        // queue stops being a task source here) and its queue is drained
+        // into the transfer data holder returned to the caller.  This is
+        // the cross-process equivalent of `MessagePortExtraFG.tla`'s
+        // `Transfer` (which keeps the record with `owner` set to
+        // `NoEventLoopId`): the user agent is informed below so it can
+        // buffer or re-route messages for the port while it is in transit
+        // (the shipped flag's effect, covering step 3.1's remote port).
+        // Steps 3-4 (the dataHolder's [[RemotePort]]) run in the caller,
+        // which reads the record's entanglement before this function
+        // removes it.
+        let (queue, in_flight) = {
             let mut ports = self.ports.borrow_mut(ec);
             let Some(index) = ports.iter().position(|record| record.port_id == port_id) else {
                 return Err(format!("transfer: unknown port {port_id}"));
@@ -207,19 +265,8 @@ impl ChannelMessaging {
             let queue: Vec<PortMessagePayload> = ports[index].queue.drain(..).collect();
             let in_flight = ports[index].in_flight;
             ports.remove(index);
-            (queue, in_flight, true)
+            (queue, in_flight)
         };
-        // The record leaves this realm; the transfer data holder carries the
-        // queue to the receiving realm.
-        if !removed {
-            return Err(format!("transfer: unknown port {port_id}"));
-        }
-        // Note: `MessagePortExtraFG.tla`'s `Transfer` keeps the record (with the `buf`
-        // cleared and `owner` set to `NoEventLoopId`); here the record is
-        // removed and the queue shipped in the transfer data holder, which
-        // is the cross-process equivalent of the record moving to the new
-        // owner.  The user agent is informed so it can buffer or re-route
-        // messages for the port while it is in transit.
         self.trace(
             "Transfer",
             vec![port_id.to_string(), self.event_loop_id.to_string()],
@@ -266,10 +313,11 @@ impl ChannelMessaging {
                 });
             (direct, target_index)
         };
-        // `MessagePort.tla`'s `PostMessage` (the message port post message steps' step 7:
-        // add a task to the port message queue of targetPort).  The source is
-        // managed by this event loop whenever its record is held here, so the
-        // action is recorded for both direct and routed delivery.
+        // Step 7: Add a task that runs the following steps to the port
+        //         message queue of targetPort.
+        // Note: The source is managed by this event loop whenever its record
+        // is held here, so the action is recorded for both direct and
+        // routed delivery (`MessagePort.tla`'s `PostMessage`).
         self.trace(
             "PostMessage",
             vec![
@@ -313,6 +361,11 @@ impl ChannelMessaging {
         event_sender: &IpcSender<ContentEvent>,
         ec: &mut dyn ExecutionContext<Types>,
     ) {
+        // Step 1: The start() method steps are to enable this's port
+        //         message queue, if it is not already enabled.
+        // Note: Enabling the queue makes the event loop use it as a task
+        // source; here that also requests message tasks for any pending
+        // messages.
         let was_enabled = {
             let mut ports = self.ports.borrow_mut(ec);
             let Some(index) = ports.iter().position(|record| record.port_id == port_id) else {
@@ -322,10 +375,8 @@ impl ChannelMessaging {
             ports[index].enabled = true;
             was_enabled
         };
-        if !was_enabled {
-            if let Err(error) = self.request_message_tasks(port_id, event_sender, ec) {
-                warn!("failed to request port message tasks after start: {error}");
-            }
+        if !was_enabled && let Err(error) = self.request_message_tasks(port_id, event_sender, ec) {
+            warn!("failed to request port message tasks after start: {error}");
         }
     }
 
@@ -336,12 +387,14 @@ impl ChannelMessaging {
         ec: &mut dyn ExecutionContext<Types>,
     ) -> Option<PortId> {
         let mut ports = self.ports.borrow_mut(ec);
-        let Some(index) = ports.iter().position(|record| record.port_id == port_id) else {
-            return None;
-        };
+        let index = ports.iter().position(|record| record.port_id == port_id)?;
         // Step 1: Set this's [[Detached]] internal slot value to true.
         ports[index].detached = true;
         // Step 2: If this is entangled, disentangle it.
+        // Note: The disentangle steps run here: step 1 (let otherPort be
+        // the port this was entangled with) is the `other` returned below,
+        // step 3 (disentangle the pair) clears both records, and step 4
+        // (fire an event named close at otherPort) runs in the caller.
         let other = ports[index].entangled.take();
         if let Some(other) = other
             && let Some(other_index) = ports.iter().position(|record| record.port_id == other)
@@ -351,7 +404,8 @@ impl ChannelMessaging {
         other
     }
 
-    /// <https://html.spec.whatwg.org/#port-message-queue>
+    /// Enable a port's message queue (once enabled it stays enabled) and
+    /// request message tasks for its pending messages.
     pub(crate) fn enable_queue(
         &self,
         port_id: PortId,
@@ -367,14 +421,16 @@ impl ChannelMessaging {
             ports[index].enabled = true;
             was_enabled
         };
-        if !was_enabled {
-            if let Err(error) = self.request_message_tasks(port_id, event_sender, ec) {
-                warn!("failed to request port message tasks after enabling: {error}");
-            }
+        if !was_enabled && let Err(error) = self.request_message_tasks(port_id, event_sender, ec) {
+            warn!("failed to request port message tasks after enabling: {error}");
         }
     }
 
-    /// <https://html.spec.whatwg.org/#message-port-post-message-steps>
+    /// Handle a port task queued by the user agent: deliver a routed
+    /// message to the port's queue or land a transfer buffer, returning
+    /// whether a message task should fire.  When the port is no longer
+    /// managed by this event loop the task is left for the caller to
+    /// return to the routing queue.
     pub(crate) fn handle_port_task(
         &self,
         port_id: PortId,
@@ -497,7 +553,8 @@ impl ChannelMessaging {
         }
     }
 
-    /// <https://html.spec.whatwg.org/#message-port-post-message-steps>
+    /// Return a port task to the user agent's routing queue when the port
+    /// is no longer managed by this event loop.
     pub(crate) fn return_task_to_ua(
         &self,
         port_id: PortId,
@@ -538,6 +595,14 @@ impl ChannelMessaging {
         event_sender: &IpcSender<ContentEvent>,
         ec: &mut dyn ExecutionContext<Types>,
     ) -> Result<Option<PortMessagePayload>, String> {
+        // Step 7: Add a task that runs the following steps to the port
+        //         message queue of targetPort.
+        // Note: The task's queue removal runs here: the message at the head
+        // of the port's queue is popped (only while the queue is enabled,
+        // i.e. while the event loop uses it as a task source) so
+        // `run_message_task` can run steps 7.1-7.7 with it.  When the queue
+        // still holds messages another message task is requested; each
+        // message fires in its own task.
         let popped = {
             let mut ports = self.ports.borrow_mut(ec);
             let Some(index) = ports.iter().position(|record| record.port_id == port_id) else {
@@ -566,7 +631,7 @@ impl ChannelMessaging {
         Ok(popped)
     }
 
-    /// <https://html.spec.whatwg.org/#message-ports>
+    /// The record of a port managed by this event loop, if any.
     pub(crate) fn port_record(
         &self,
         port_id: PortId,
@@ -579,20 +644,22 @@ impl ChannelMessaging {
             .cloned()
     }
 
-    /// <https://html.spec.whatwg.org/#message-ports>
+    /// The platform object of a port managed by this event loop, if any.
     pub(crate) fn port_object(
         &self,
         port_id: PortId,
         ec: &mut dyn ExecutionContext<Types>,
     ) -> Option<JsObject> {
-        self.ports
+        let port = self
+            .ports
             .borrow(ec)
             .iter()
             .find(|record| record.port_id == port_id)
-            .and_then(|record| record.object.clone())
+            .and_then(|record| record.object.clone());
+        port.as_ref().and_then(|port| port.object())
     }
 
-    /// <https://html.spec.whatwg.org/#message-ports>
+    /// Whether a port is managed by this event loop.
     pub(crate) fn has_port(&self, port_id: PortId, ec: &mut dyn ExecutionContext<Types>) -> bool {
         self.ports
             .borrow(ec)
@@ -600,7 +667,8 @@ impl ChannelMessaging {
             .any(|record| record.port_id == port_id)
     }
 
-    /// <https://html.spec.whatwg.org/#port-message-queue>
+    /// Ask the user agent to queue a message task for a port whose queue
+    /// is enabled and non-empty.
     fn request_message_tasks(
         &self,
         port_id: PortId,
