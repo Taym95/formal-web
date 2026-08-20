@@ -1,7 +1,7 @@
 use crate::dom::EventTarget;
 use crate::js::Types;
 use crate::webidl::Callback;
-use js_engine::ExecutionContext;
+use js_engine::{Completion, ExecutionContext, JsTypes};
 
 /// <https://html.spec.whatwg.org/#event-handler-idl-attributes>
 /// The getter of an event handler IDL attribute. The receiver's EventTarget
@@ -78,8 +78,51 @@ fn get_current_value_of_event_handler(
     // Step 1: Let handlerMap be eventTarget's event handler map.
     // Step 2: Let eventHandler be handlerMap[name].
     // Step 3: If eventHandler's value is an internal raw uncompiled handler:
-    // (Event handler content attributes are not yet compiled into handlers;
-    // the map only holds IDL-assigned callbacks.)
+    // (Event handler content attributes are compiled when the element's
+    // platform object is created, so the map holds callbacks only.)
     // Step 4: Return eventHandler's value.
     event_target.event_handler_value(name, ec)
+}
+
+/// <https://html.spec.whatwg.org/#event-handler-content-attributes>
+/// Compile an event handler content attribute's value into a handler
+/// function in the current realm (the element's realm): a function of one
+/// argument named `event` whose body is the attribute value.
+pub(crate) fn compile_event_handler_content_attribute(
+    source: &str,
+    ec: &mut dyn ExecutionContext<Types>,
+) -> Completion<Callback, Types> {
+    let wrapper = format!("(function(event) {{\n{source}\n}})");
+    let function = ec.evaluate_script(&wrapper)?;
+    let object = <Types as JsTypes>::value_as_object(&function).ok_or_else(|| {
+        ec.new_type_error("event handler content attribute did not compile to a function")
+    })?;
+    Ok(Callback::from_object(object, ec))
+}
+
+/// <https://html.spec.whatwg.org/#event-handler-content-attributes>
+/// Activate or deactivate the event handler for an `on*` content attribute
+/// on the element's event target: compile the attribute value and register
+/// the handler (and its listener) via the event handler IDL setter path, or
+/// deactivate the handler when the attribute is absent.  When the body
+/// fails to compile the error is reported and the handler stays inactive,
+/// matching the spec's "uncompiled" handler state.
+pub(crate) fn sync_event_handler_content_attribute(
+    event_target: &EventTarget,
+    event_type: &str,
+    value: Option<&str>,
+    ec: &mut dyn ExecutionContext<Types>,
+) -> Completion<(), Types> {
+    let callback = match value {
+        Some(source) => match compile_event_handler_content_attribute(source, ec) {
+            Ok(callback) => Some(callback),
+            Err(error) => {
+                ec.report_exception(error);
+                return Ok(());
+            }
+        },
+        None => None,
+    };
+    event_handler_idl_attribute_setter(event_target, event_type, callback, ec);
+    Ok(())
 }

@@ -240,6 +240,11 @@ pub(crate) struct NavigableContainerState {
     pub(crate) content_frame_id: FrameId,
     pub(crate) current_key: String,
     pub(crate) cross_origin: bool,
+    /// Whether the child document finished loading before the parent's
+    /// document load completion; when true, the iframe load event is
+    /// deferred and fired by the parent's load completion after its
+    /// deferred scripts have run.
+    pub(crate) child_document_loaded: bool,
 }
 
 struct PendingDocumentLoad {
@@ -959,6 +964,11 @@ impl ContentProcess {
         self.active_documents_by_traversable
             .insert(traversable_id, document_id);
         run_iframe_load_event_steps_for_traversable(self, traversable_id)?;
+        // Fire the iframe load events the child load completions deferred
+        // until the parent's load completion (the parent's deferred parser
+        // scripts have now run, so the iframe's onload handler can resolve
+        // them).
+        crate::html::fire_deferred_iframe_load_events(self, document_id)?;
         log_render_state_debug(format!(
             "finalize document load document={} traversable={} url={}",
             document_id, traversable_id, pending_document_load.finalize_url,
@@ -1954,13 +1964,7 @@ impl ContentProcess {
             let Some(messaging) = global_scope.channel_messaging(ec) else {
                 return Ok(());
             };
-            let Some(object) = messaging.port_object(port_id, ec) else {
-                return Ok(());
-            };
-            let port: Option<crate::html::MessagePort> = ec
-                .with_object_any(&object)
-                .and_then(|data| data.downcast_ref::<crate::html::MessagePort>().cloned());
-            let Some(port) = port else {
+            let Some(port) = messaging.port_object(port_id, ec) else {
                 return Ok(());
             };
             port.run_message_task(time_millis, ec)

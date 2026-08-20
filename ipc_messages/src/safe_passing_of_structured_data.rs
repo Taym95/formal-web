@@ -144,22 +144,34 @@ pub enum TransferDataHolder {
     },
     /// { [[Type]]: "MessagePort", [[PortMessageQueue]]: queue,
     ///   [[RemotePort]]: remotePort }
-    /// A transferred MessagePort: the port id, its pending message queue
-    /// (the tasks that are to fire message events, moved with the transfer
-    /// per the transfer steps), and the id of the port it was entangled
-    /// with, if any (re-entangled on transfer-receiving).
+    /// A transferred MessagePort (see [`PortTransferData`]): the port id, its
+    /// pending message queue (the tasks that are to fire message events,
+    /// moved with the transfer per the transfer steps), and the id of the
+    /// port it was entangled with, if any (re-entangled on
+    /// transfer-receiving).
     /// <https://html.spec.whatwg.org/#message-ports:transfer-steps>
-    MessagePort {
-        port_id: PortId,
-        queue: Vec<PortMessagePayload>,
-        remote_port: Option<PortId>,
-        /// Routed messages still in flight toward the port (messages posted
-        /// while the port was in transit or completing, not yet delivered to
-        /// its queue).  Moves with the transfer so a direct delivery in the
-        /// receiving process cannot jump ahead of them (the port message
-        /// queue is FIFO).
-        in_flight: u32,
-    },
+    MessagePort(PortTransferData),
+}
+
+/// The data holder of the MessagePort transfer steps (the dataHolder of
+/// <https://html.spec.whatwg.org/#message-ports:transfer-steps>), carried
+/// as pure IPC-safe data so a transfer can cross processes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PortTransferData {
+    /// The id of the transferred port.
+    pub port_id: PortId,
+    /// The port's pending message queue, moved with the transfer
+    /// (dataHolder.[[PortMessageQueue]]).
+    pub queue: Vec<PortMessagePayload>,
+    /// The port the transferred port was entangled with, if any
+    /// (dataHolder.[[RemotePort]]).
+    pub remote_port: Option<PortId>,
+    /// Routed messages still in flight toward the port (messages posted
+    /// while the port was in transit or completing, not yet delivered to
+    /// its queue).  Moves with the transfer so a direct delivery in the
+    /// receiving process cannot jump ahead of them (the port message
+    /// queue is FIFO).
+    pub in_flight: u32,
 }
 
 /// One queued message on a port message queue (pure data, IPC-safe).

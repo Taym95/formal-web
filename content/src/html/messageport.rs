@@ -1,5 +1,6 @@
+use ipc::IpcSender;
 use ipc_messages::content::{Event as ContentEvent, MessageId, PortId};
-use ipc_messages::safe_passing_of_structured_data::PortMessagePayload;
+use ipc_messages::safe_passing_of_structured_data::{PortMessagePayload, PortTransferData};
 use js_engine::gc_struct;
 use js_engine::{Completion, ExecutionContext, JsTypes};
 
@@ -8,14 +9,14 @@ use crate::dom::dispatch_with_path;
 use crate::dom::event::{EventTarget, EventTargetAccess};
 use crate::dom::simple_path;
 use crate::html::safe_passing_of_structured_data::{
-    SerializeWithTransferResult, structured_deserialize_with_transfer,
+    SerializeWithTransferResult, Transferable, structured_deserialize_with_transfer,
     structured_serialize_with_transfer,
 };
 use crate::js::Types;
 use crate::js::platform_objects::with_global_scope;
 use crate::webidl::bindings::create_interface_instance;
 
-use super::{GlobalScope, MessageEvent, MessageEventInit};
+use super::{MessageEvent, MessageEventInit};
 
 use crate::html::channel_messaging::ChannelMessaging;
 
@@ -29,10 +30,6 @@ pub(crate) struct MessagePort {
     /// defaults to the port itself, message and messageerror events are
     /// dispatched through this target.
     pub(crate) event_target: EventTarget,
-
-    /// The global scope of the realm the port was created in: the port's
-    /// ChannelMessaging and its IPC event sender are per-global.
-    pub(crate) global_scope: GlobalScope,
 
     /// The id under which the user agent's channel messaging state and
     /// this realm's ChannelMessaging know the port.
@@ -53,16 +50,25 @@ impl MessagePort {
         self.event_target.reflector.clone()
     }
 
-    /// Create a new MessagePort platform object in the current realm (the
-    /// "a new MessagePort in this's relevant realm" of the MessageChannel
-    /// constructor steps and of the transfer-receiving steps), with a
-    /// fresh id not yet registered with the user agent.
+    /// Create a new MessagePort platform object in the current realm with a
+    /// fresh id not yet registered with the user agent (the "a new
+    /// MessagePort in this's relevant realm" of the MessageChannel
+    /// constructor steps).
     pub(crate) fn new_port(ec: &mut dyn ExecutionContext<Types>) -> Completion<Self, Types> {
-        let global_scope = with_global_scope(ec, |global_scope, _ec| Ok(global_scope.clone()))?;
+        Self::new_port_with_id(PortId::new(), ec)
+    }
+
+    /// Create a new MessagePort platform object in the current realm with
+    /// the given id (the "a new MessagePort in targetRealm" of
+    /// StructuredDeserializeWithTransfer step 3.2), returning the port
+    /// re-read from its wrapper.
+    pub(crate) fn new_port_with_id(
+        port_id: PortId,
+        ec: &mut dyn ExecutionContext<Types>,
+    ) -> Completion<Self, Types> {
         let port = Self {
             event_target: EventTarget::new(ec),
-            global_scope,
-            port_id: PortId::new(),
+            port_id,
         };
         let object = create_interface_instance::<Types, MessagePort>(port, ec)?;
         // The port returned to the caller is re-read from its wrapper,
@@ -72,10 +78,44 @@ impl MessagePort {
             .ok_or_else(|| ec.new_type_error("MessagePort instance is not a MessagePort"))
     }
 
-    /// This realm's ChannelMessaging, created on first use; `None` when
-    /// the realm has no event loop yet.
-    fn messaging(&self, ec: &mut dyn ExecutionContext<Types>) -> Option<ChannelMessaging> {
-        self.global_scope.channel_messaging(ec)
+    /// The current realm's ChannelMessaging, created on first use; `None`
+    /// when the realm has no event loop yet.  Port operations all run in
+    /// the port's own realm (the bindings run in the creation realm, and a
+    /// transferred port is created in the receiving realm before use), so
+    /// the current realm is the port's realm.
+    fn messaging(ec: &mut dyn ExecutionContext<Types>) -> Option<ChannelMessaging> {
+        with_global_scope(
+            ec,
+            |global_scope, ec| Ok(global_scope.channel_messaging(ec)),
+        )
+        .ok()
+        .flatten()
+    }
+
+    /// The current realm's content-to-user-agent event sender, if set.
+    fn event_sender(ec: &mut dyn ExecutionContext<Types>) -> Option<IpcSender<ContentEvent>> {
+        with_global_scope(ec, |global_scope, _ec| Ok(global_scope.event_sender()))
+            .ok()
+            .flatten()
+    }
+
+    /// Whether `transfer` contains a MessagePort wrapping `port_id`: the
+    /// platform-object equivalent of the spec's JS object identity
+    /// membership, sound because each port id is unique to one platform
+    /// object in a realm.
+    fn transfer_contains_port(
+        transfer: &[JsValue],
+        port_id: PortId,
+        ec: &mut dyn ExecutionContext<Types>,
+    ) -> bool {
+        transfer
+            .iter()
+            .filter_map(Types::value_as_object)
+            .any(|object| {
+                ec.with_object_any(&object)
+                    .and_then(|data| data.downcast_ref::<MessagePort>().cloned())
+                    .is_some_and(|port| port.port_id == port_id)
+            })
     }
 
     /// <https://html.spec.whatwg.org/#message-port-post-message-steps>
@@ -83,13 +123,12 @@ impl MessagePort {
         &self,
         message: JsValue,
         transfer: Vec<JsValue>,
-        source_object: JsObject,
         ec: &mut dyn ExecutionContext<Types>,
     ) -> Completion<(), Types> {
-        let Some(messaging) = self.messaging(ec) else {
+        let Some(messaging) = Self::messaging(ec) else {
             return Ok(());
         };
-        let Some(event_sender) = self.global_scope.event_sender() else {
+        let Some(event_sender) = Self::event_sender(ec) else {
             return Ok(());
         };
 
@@ -101,11 +140,7 @@ impl MessagePort {
 
         // Step 2: If transfer contains sourcePort, then throw a
         //         "DataCloneError" DOMException.
-        let transfer_contains_source = transfer
-            .iter()
-            .filter_map(Types::value_as_object)
-            .any(|object| object == source_object);
-        if transfer_contains_source {
+        if Self::transfer_contains_port(&transfer, self.port_id, ec) {
             return Err(crate::webidl::data_clone_error_value(ec));
         }
 
@@ -114,18 +149,12 @@ impl MessagePort {
         //         then set doomed to true and optionally report to a developer
         //         console that the target port was posted to itself, causing
         //         the communication channel to be lost.
-        // Note: The target port's object is resolved by id through the
-        // records; comparing the transferred objects against the target's
-        // platform object decides doom.
-        let target_object: Option<JsObject> =
-            target_port.and_then(|port| messaging.port_object(port, ec));
-        let doomed = match target_object {
-            Some(target_object) => transfer
-                .iter()
-                .filter_map(Types::value_as_object)
-                .any(|object| object == target_object),
-            None => false,
-        };
+        // Note: Membership in `transfer` is decided by the transferred
+        // objects' platform objects (a MessagePort matches when it carries
+        // the target port's id), the platform-object equivalent of the
+        // spec's JS identity comparison.
+        let doomed = target_port
+            .is_some_and(|target_id| Self::transfer_contains_port(&transfer, target_id, ec));
 
         // Step 5: Let serializeWithTransferResult be
         //         StructuredSerializeWithTransfer(message, transfer). Rethrow
@@ -166,10 +195,10 @@ impl MessagePort {
         // Note: The enabling runs in the per-global ChannelMessaging
         // (`messaging.start`), which also requests message tasks for any
         // pending messages.
-        let Some(messaging) = self.messaging(ec) else {
+        let Some(messaging) = Self::messaging(ec) else {
             return;
         };
-        if let Some(event_sender) = self.global_scope.event_sender() {
+        if let Some(event_sender) = Self::event_sender(ec) {
             messaging.start(self.port_id, &event_sender, ec);
         }
     }
@@ -182,19 +211,14 @@ impl MessagePort {
         // (`messaging.close`), which detaches the record and returns the
         // entangled twin; step 4 of the disentangle steps (fire an event
         // named close at otherPort) runs below.
-        let Some(messaging) = self.messaging(ec) else {
+        let Some(messaging) = Self::messaging(ec) else {
             return Ok(());
         };
         let other = messaging.close(self.port_id, ec);
         if let Some(other) = other {
             // Step 4: Fire an event named close at otherPort.
-            if let Some(other_object) = messaging.port_object(other, ec) {
-                let other_port: Option<MessagePort> = ec
-                    .with_object_any(&other_object)
-                    .and_then(|data| data.downcast_ref::<MessagePort>().cloned());
-                if let Some(other_port) = other_port {
-                    fire_close_event(&other_port, ec)?;
-                }
+            if let Some(other_port) = messaging.port_object(other, ec) {
+                fire_close_event(&other_port, ec)?;
             }
         }
         Ok(())
@@ -203,10 +227,10 @@ impl MessagePort {
     /// Enable the port's message queue, as when start() is called or the
     /// first onmessage handler is set.
     pub(crate) fn enable_queue(&self, ec: &mut dyn ExecutionContext<Types>) {
-        let Some(messaging) = self.messaging(ec) else {
+        let Some(messaging) = Self::messaging(ec) else {
             return;
         };
-        if let Some(event_sender) = self.global_scope.event_sender() {
+        if let Some(event_sender) = Self::event_sender(ec) {
             messaging.enable_queue(self.port_id, &event_sender, ec);
         }
     }
@@ -217,10 +241,10 @@ impl MessagePort {
         time_millis: f64,
         ec: &mut dyn ExecutionContext<Types>,
     ) -> Completion<(), Types> {
-        let Some(messaging) = self.messaging(ec) else {
+        let Some(messaging) = Self::messaging(ec) else {
             return Ok(());
         };
-        let Some(event_sender) = self.global_scope.event_sender() else {
+        let Some(event_sender) = Self::event_sender(ec) else {
             return Ok(());
         };
         let payload = match messaging.pop_queued_message(self.port_id, &event_sender, ec) {
@@ -326,13 +350,13 @@ impl MessageChannel {
         //         realm.
         let port2 = MessagePort::new_port(ec)?;
         // Step 3: Entangle this's port 1 and this's port 2.
-        let Some(messaging) = port1.messaging(ec) else {
+        let Some(messaging) = MessagePort::messaging(ec) else {
             return Err(ec.new_type_error("MessageChannel: no event loop"));
         };
         messaging.entangle_pair(port1.clone(), port2.clone(), ec);
         // The user agent must know both ports to route messages to either
         // one's owning event loop (`MessagePortExtraFG.tla`'s `NewChannel`).
-        if let Some(event_sender) = port1.global_scope.event_sender()
+        if let Some(event_sender) = MessagePort::event_sender(ec)
             && let Err(error) = event_sender.send(ContentEvent::PortChannelCreated {
                 port1: port1.port_id,
                 port2: port2.port_id,
@@ -344,128 +368,97 @@ impl MessageChannel {
     }
 }
 
-/// <https://html.spec.whatwg.org/#message-ports:transfer-receiving-steps>
-pub(crate) fn create_transferred_port_object(
-    port_id: PortId,
-    remote_port: Option<PortId>,
-    queue: Vec<PortMessagePayload>,
-    in_flight: u32,
-    ec: &mut dyn ExecutionContext<Types>,
-) -> Completion<JsObject, Types> {
-    // Step 1: Set value's has been shipped flag to true.
-    // Note: The user agent is told the port was received
-    // (`PortTransferReceived`) so it stops buffering messages for the port;
-    // the shipped flag itself is not modelled, and the record registered by
-    // `receive_transferred_port` tracks the hand-over
-    // (`CompletionInProgress`).
-    // Step 2: Move all the tasks that are to fire message events in
-    //         dataHolder.[[PortMessageQueue]] to the port message queue
-    //         of value, if any, leaving value's port message queue in
-    //         its initial disabled state, and, if value's relevant
-    //         global object is a Window, associating the moved tasks
-    //         with value's relevant global object's associated Document.
-    // Step 3: If dataHolder.[[RemotePort]] is not null, then entangle
-    //         dataHolder.[[RemotePort]] and value. (This will disentangle
-    //         dataHolder.[[RemotePort]] from the original port that was
-    //         transferred.)
-    // Note: Steps 2-3 run in `receive_transferred_port`, which moves the
-    // transferred queue into the new port's record (left disabled) and
-    // entangles the record with the remote port.  The new port's wrapper is
-    // created here (in the receiving realm) before the record is
-    // registered.
-    let global_scope = with_global_scope(ec, |global_scope, _ec| Ok(global_scope.clone()))?;
-    let Some(messaging) = global_scope.channel_messaging(ec) else {
-        return Err(ec.new_type_error("transfer receive: no event loop"));
-    };
-    let port = MessagePort {
-        event_target: EventTarget::new(ec),
-        global_scope,
-        port_id,
-    };
-    let event_sender = port.global_scope.event_sender();
-    let object = create_interface_instance::<Types, MessagePort>(port.clone(), ec)?;
-    // The record stores the port re-read from its wrapper, whose reflector
-    // was set by the interface instance creation.
-    let port = ec
-        .with_object_any(&object)
-        .and_then(|data| data.downcast_ref::<MessagePort>().cloned())
-        .ok_or_else(|| ec.new_type_error("transfer receive: wrapper is not a MessagePort"))?;
-    messaging.receive_transferred_port(port, remote_port, queue, in_flight, ec);
-    if let Some(event_sender) = event_sender
-        && let Err(error) = event_sender.send(ContentEvent::PortTransferReceived { port: port_id })
-    {
-        log::error!("failed to notify the user agent of port receive: {error}");
+impl Transferable for MessagePort {
+    type TransferDataHolder = PortTransferData;
+
+    /// <https://html.spec.whatwg.org/#message-ports:transfer-steps>
+    fn transfer_steps(
+        &self,
+        data_holder: &mut PortTransferData,
+        ec: &mut dyn ExecutionContext<Types>,
+    ) -> Completion<(), Types> {
+        let Some(messaging) = MessagePort::messaging(ec) else {
+            return Err(crate::webidl::data_clone_error_value(ec));
+        };
+        let Some(event_sender) = MessagePort::event_sender(ec) else {
+            return Err(crate::webidl::data_clone_error_value(ec));
+        };
+        // Step 3: If value is entangled with another port remotePort:
+        // Step 3.1: Set remotePort's has been shipped flag to true.
+        // Note: The user agent, informed of the transfer, routes messages for
+        // the port away while it is in transit, which covers the remote port
+        // as well.
+        // Step 3.2: Set dataHolder.[[RemotePort]] to remotePort.
+        // Step 4: Otherwise, set dataHolder.[[RemotePort]] to null.
+        // Note: The entanglement is read before `transfer_port` removes the
+        // record (steps 1-2 below), since the record no longer exists after.
+        data_holder.remote_port = messaging
+            .port_record(self.port_id, ec)
+            .and_then(|record| record.entangled);
+        // Step 1: Set value's has been shipped flag to true.
+        // Step 2: Set dataHolder.[[PortMessageQueue]] to value's port message
+        //         queue.
+        // Note: These run in `transfer_port` (`MessagePortExtraFG.tla`'s
+        // `Transfer`): the record leaves this realm and its queue is drained
+        // into the transfer data holder.  The user agent is informed there so
+        // it buffers or re-routes messages while the port is in transit (the
+        // shipped flag's cross-process effect; step 3.1's remote port is
+        // covered by the same notification).
+        let (queue, in_flight) = messaging
+            .transfer_port(self.port_id, &event_sender, ec)
+            .map_err(|_error| crate::webidl::data_clone_error_value(ec))?;
+        data_holder.queue = queue;
+        data_holder.in_flight = in_flight;
+        Ok(())
     }
-    Ok(object)
-}
 
-/// The data produced by the MessagePort transfer steps (the dataHolder of
-/// <https://html.spec.whatwg.org/#message-ports:transfer-steps>).
-pub(crate) struct PortTransferData {
-    /// The id of the transferred port.
-    pub(crate) port_id: PortId,
-    /// The port's pending message queue, moved with the transfer
-    /// (dataHolder.[[PortMessageQueue]]).
-    pub(crate) queue: Vec<PortMessagePayload>,
-    /// The port the transferred port was entangled with, if any
-    /// (dataHolder.[[RemotePort]]).
-    pub(crate) remote_port: Option<PortId>,
-    /// Routed messages still in flight toward the port (not yet delivered
-    /// to its queue), moved with the transfer so the receiving process's
-    /// direct-delivery guard stays correct.
-    pub(crate) in_flight: u32,
-}
-
-/// <https://html.spec.whatwg.org/#message-ports:transfer-steps>
-pub(crate) fn message_port_transfer_steps(
-    object: &JsObject,
-    ec: &mut dyn ExecutionContext<Types>,
-) -> Completion<Option<PortTransferData>, Types> {
-    // Note: The transfer steps are invoked with a MessagePort value; the
-    // caller only runs them for MessagePort platform objects, so `None`
-    // here is a defensive fallback.
-    let port: Option<MessagePort> = ec
-        .with_object_any(object)
-        .and_then(|data| data.downcast_ref::<MessagePort>().cloned());
-    let Some(port) = port else {
-        return Ok(None);
-    };
-    let Some(messaging) = port.messaging(ec) else {
-        return Ok(None);
-    };
-    let Some(event_sender) = port.global_scope.event_sender() else {
-        return Ok(None);
-    };
-    // Step 3: If value is entangled with another port remotePort:
-    // Step 3.1: Set remotePort's has been shipped flag to true.
-    // Note: The user agent, informed of the transfer, routes messages for
-    // the port away while it is in transit, which covers the remote port
-    // as well.
-    // Step 3.2: Set dataHolder.[[RemotePort]] to remotePort.
-    // Step 4: Otherwise, set dataHolder.[[RemotePort]] to null.
-    // Note: The entanglement is read before `transfer_port` removes the
-    // record (steps 1-2 below), since the record no longer exists after.
-    let remote_port = messaging
-        .port_record(port.port_id, ec)
-        .and_then(|record| record.entangled);
-    // Step 1: Set value's has been shipped flag to true.
-    // Step 2: Set dataHolder.[[PortMessageQueue]] to value's port message
-    //         queue.
-    // Note: These run in `transfer_port` (`MessagePortExtraFG.tla`'s
-    // `Transfer`): the record leaves this realm and its queue is drained
-    // into the transfer data holder.  The user agent is informed there so
-    // it buffers or re-routes messages while the port is in transit (the
-    // shipped flag's cross-process effect; step 3.1's remote port is
-    // covered by the same notification).
-    let (queue, in_flight) = messaging
-        .transfer_port(port.port_id, &event_sender, ec)
-        .map_err(|_error| crate::webidl::data_clone_error_value(ec))?;
-    Ok(Some(PortTransferData {
-        port_id: port.port_id,
-        queue,
-        remote_port,
-        in_flight,
-    }))
+    /// <https://html.spec.whatwg.org/#message-ports:transfer-receiving-steps>
+    fn transfer_receiving_steps(
+        &self,
+        data_holder: &PortTransferData,
+        ec: &mut dyn ExecutionContext<Types>,
+    ) -> Completion<(), Types> {
+        // Step 1: Set value's has been shipped flag to true.
+        // Note: The user agent is told the port was received
+        // (`PortTransferReceived`) so it stops buffering messages for the
+        // port; the shipped flag itself is not modelled, and the record
+        // registered by `receive_transferred_port` tracks the hand-over
+        // (`CompletionInProgress`).
+        // Step 2: Move all the tasks that are to fire message events in
+        //         dataHolder.[[PortMessageQueue]] to the port message queue
+        //         of value, if any, leaving value's port message queue in
+        //         its initial disabled state, and, if value's relevant
+        //         global object is a Window, associating the moved tasks
+        //         with value's relevant global object's associated Document.
+        // Step 3: If dataHolder.[[RemotePort]] is not null, then entangle
+        //         dataHolder.[[RemotePort]] and value. (This will disentangle
+        //         dataHolder.[[RemotePort]] from the original port that was
+        //         transferred.)
+        // Note: Steps 2-3 run in `receive_transferred_port`, which moves the
+        // transferred queue into the new port's record (left disabled) and
+        // entangles the record with the remote port.  The new port (value, "a
+        // new MessagePort in targetRealm" of StructuredDeserializeWithTransfer
+        // step 3.2) was created by the deserializer before the steps ran on
+        // it.
+        let Some(messaging) = MessagePort::messaging(ec) else {
+            return Err(ec.new_type_error("transfer receive: no event loop"));
+        };
+        let event_sender = MessagePort::event_sender(ec);
+        messaging.receive_transferred_port(
+            self.clone(),
+            data_holder.remote_port,
+            data_holder.queue.clone(),
+            data_holder.in_flight,
+            ec,
+        );
+        if let Some(event_sender) = event_sender
+            && let Err(error) =
+                event_sender.send(ContentEvent::PortTransferReceived { port: self.port_id })
+        {
+            log::error!("failed to notify the user agent of port receive: {error}");
+        }
+        Ok(())
+    }
 }
 
 /// <https://dom.spec.whatwg.org/#concept-event-fire>

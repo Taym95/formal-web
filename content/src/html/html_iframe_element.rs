@@ -485,6 +485,7 @@ fn create_a_new_child_navigable(
                 content_frame_id,
                 current_key: String::new(),
                 cross_origin: false,
+                child_document_loaded: false,
             },
         );
         // Register the iframe node -> content navigable mapping on the
@@ -700,7 +701,61 @@ pub(crate) fn run_iframe_load_event_steps_for_traversable(
         return Ok(());
     };
 
+    // The child document finished loading.  Per the spec this fires the
+    // iframe load event, but the parent's parser-blocking inline scripts
+    // must have run first (they are deferred to the parent's document load
+    // completion here).  When the parent has not finished loading yet, mark
+    // the iframe's load event as pending; the parent's load completion
+    // fires it once its scripts have run.
+    let parent_not_loaded = process
+        .documents
+        .get(&parent_document_id)
+        .map(|document| document.pending_document_load.is_some())
+        .unwrap_or(false);
+    if parent_not_loaded {
+        if let Some(content_document) = process.documents.get_mut(&parent_document_id)
+            && let Some(state) = content_document
+                .navigable_container_states
+                .get_mut(&iframe_node_id)
+        {
+            state.child_document_loaded = true;
+        }
+        return Ok(());
+    }
+
     run_iframe_load_event_steps(process, parent_document_id, iframe_node_id)
+}
+
+/// Fire the iframe load events that the child's load completion deferred
+/// until the parent's document load completion (so the parent's deferred
+/// parser scripts have run first).  Called by the parent's load
+/// completion.
+pub(crate) fn fire_deferred_iframe_load_events(
+    process: &mut ContentProcess,
+    parent_document_id: DocumentId,
+) -> Result<(), String> {
+    let pending: Vec<usize> = {
+        let Some(content_document) = process.documents.get(&parent_document_id) else {
+            return Ok(());
+        };
+        content_document
+            .navigable_container_states
+            .iter()
+            .filter(|(_, state)| state.child_document_loaded)
+            .map(|(node_id, _)| *node_id)
+            .collect()
+    };
+    for iframe_node_id in pending {
+        if let Some(content_document) = process.documents.get_mut(&parent_document_id)
+            && let Some(state) = content_document
+                .navigable_container_states
+                .get_mut(&iframe_node_id)
+        {
+            state.child_document_loaded = false;
+        }
+        run_iframe_load_event_steps(process, parent_document_id, iframe_node_id)?;
+    }
+    Ok(())
 }
 
 /// <https://html.spec.whatwg.org/#the-iframe-element:html-element-post-connection-steps>
@@ -946,6 +1001,7 @@ fn process_iframe_attributes(
                             content_frame_id,
                             current_key: desired_key.clone(),
                             cross_origin: false,
+                            child_document_loaded: false,
                         },
                     );
                 }
@@ -965,6 +1021,7 @@ fn process_iframe_attributes(
                             content_frame_id,
                             current_key: desired_key.clone(),
                             cross_origin: false,
+                            child_document_loaded: false,
                         },
                     );
                 }
@@ -989,6 +1046,7 @@ fn process_iframe_attributes(
                 content_frame_id,
                 current_key: desired_key.clone(),
                 cross_origin,
+                child_document_loaded: false,
             },
         );
     }

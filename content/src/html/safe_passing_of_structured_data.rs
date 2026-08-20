@@ -10,19 +10,19 @@
 
 // The traits, variants, and fields below that trigger dead_code warnings
 // are intentionally defined as the spec-required extension points for
-// future [Serializable]/[Transferable] platform objects and resizable
-// ArrayBuffer support. All of them will be used once those features are
-// wired up.
+// future [Serializable] platform objects and resizable ArrayBuffer
+// support. All of them will be used once those features are wired up.
+// (`Transferable` is implemented by `MessagePort` and used by the
+// structured serialize/deserialize flows.)
 #![allow(dead_code)]
 
 use std::collections::HashMap;
 
 use ipc_messages::safe_passing_of_structured_data::{
-    PrimitiveValue, SerializedRecord, TransferDataHolder,
+    PortTransferData, PrimitiveValue, SerializedRecord, TransferDataHolder,
 };
 
 use crate::html::MessagePort;
-use crate::html::create_transferred_port_object;
 
 use js_engine::{
     Completion, EcmascriptHost, ExecutionContext, JsTypes, enums::TypedArrayElementType,
@@ -65,18 +65,22 @@ pub trait Serializable: std::fmt::Debug {
 ///
 /// A platform object whose primary interface is decorated with the `[Transferable]`
 /// Web IDL extended attribute must implement this trait.
-pub trait Transferable: std::fmt::Debug {
-    /// <https://html.spec.whatwg.org/#transfer-steps>
+pub trait Transferable {
+    /// The data holder carried with the transfer (the spec's dataHolder),
+    /// as serde/IPC-safe pure data so a transfer can cross processes.
+    type TransferDataHolder: std::fmt::Debug;
+
+    /// <https://html.spec.whatwg.org/#transferable-objects:transfer-steps>
     fn transfer_steps(
         &self,
-        data_holder: &mut HashMap<String, JsValue>,
+        data_holder: &mut Self::TransferDataHolder,
         ec: &mut dyn ExecutionContext<Types>,
     ) -> Completion<(), Types>;
 
-    /// <https://html.spec.whatwg.org/#transfer-receiving-steps>
+    /// <https://html.spec.whatwg.org/#transferable-objects:transfer-receiving-steps>
     fn transfer_receiving_steps(
         &self,
-        data_holder: &HashMap<String, JsValue>,
+        data_holder: &Self::TransferDataHolder,
         ec: &mut dyn ExecutionContext<Types>,
     ) -> Completion<(), Types>;
 }
@@ -907,18 +911,22 @@ pub fn structured_serialize_with_transfer(
             // Step 5.2: Otherwise (platform object with a [[Detached]]
             //           internal slot): perform the transfer steps for the
             //           interface identified by interfaceName.
-            let transfer_data = crate::html::message_port_transfer_steps(&object, ec)?
+            let port: MessagePort = ec
+                .with_object_any(&object)
+                .and_then(|data| data.downcast_ref::<MessagePort>().cloned())
                 .ok_or_else(|| crate::webidl::data_clone_error_value(ec))?;
             // Step 5.2.x: Set transferable.[[Detached]] to true.
             // Note: The record was removed by the transfer steps, so the
             // source object's [[Detached]] state is implicit (its record is
             // gone).
-            transfer_data_holders.push(TransferDataHolder::MessagePort {
-                port_id: transfer_data.port_id,
-                queue: transfer_data.queue,
-                remote_port: transfer_data.remote_port,
-                in_flight: transfer_data.in_flight,
-            });
+            let mut data_holder = PortTransferData {
+                port_id: port.port_id,
+                queue: Vec::new(),
+                remote_port: None,
+                in_flight: 0,
+            };
+            port.transfer_steps(&mut data_holder, ec)?;
+            transfer_data_holders.push(TransferDataHolder::MessagePort(data_holder));
         }
     }
 
@@ -1412,22 +1420,17 @@ pub fn structured_deserialize_with_transfer(
             //           run the transfer-receiving steps for MessagePort given
             //           dataHolder and a new MessagePort in targetRealm.
             // Note: The new MessagePort platform object is created in the
-            // target realm (the current realm) by
-            // `create_transferred_port_object`, which also re-entangles it
-            // with the remote port and registers it with the user agent.
-            TransferDataHolder::MessagePort {
-                port_id,
-                queue,
-                remote_port,
-                in_flight,
-            } => {
-                let object = create_transferred_port_object(
-                    *port_id,
-                    *remote_port,
-                    queue.clone(),
-                    *in_flight,
-                    ec,
-                )?;
+            // target realm (the current realm) first ("a new MessagePort in
+            // targetRealm"), then the transfer-receiving steps
+            // (`Transferable::transfer_receiving_steps`) run on it: they
+            // re-entangle it with the remote port and register it with the
+            // user agent.
+            TransferDataHolder::MessagePort(holder) => {
+                let port = MessagePort::new_port_with_id(holder.port_id, ec)?;
+                port.transfer_receiving_steps(holder, ec)?;
+                let object = port
+                    .object()
+                    .ok_or_else(|| crate::webidl::data_clone_error_value(ec))?;
                 Types::value_from_object(object)
             }
         };

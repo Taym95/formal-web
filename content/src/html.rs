@@ -52,7 +52,9 @@ pub(crate) use html_element::{
 };
 pub use html_iframe_element::HTMLIFrameElement;
 pub(crate) use html_iframe_element::attach_same_origin_child_document_for_traversable;
-pub(crate) use html_iframe_element::run_iframe_load_event_steps_for_traversable;
+pub(crate) use html_iframe_element::{
+    fire_deferred_iframe_load_events, run_iframe_load_event_steps_for_traversable,
+};
 pub use html_input_element::HTMLInputElement;
 pub use html_media_element::{HTMLMediaElement, MediaError};
 pub(crate) use html_parser::PendingParserScript;
@@ -62,9 +64,7 @@ pub(crate) use hyperlink_element_utils::HyperlinkElementUtils;
 pub use location::Location;
 pub(crate) use location::LocationError;
 pub(crate) use message_event::{MessageEvent, MessageEventInit};
-pub(crate) use messageport::{
-    MessageChannel, MessagePort, create_transferred_port_object, message_port_transfer_steps,
-};
+pub(crate) use messageport::{MessageChannel, MessagePort};
 pub use window::Window;
 pub(crate) use window::window_computed_style_properties_for_element;
 pub(crate) use window::{PostMessageOptions, window_post_message_steps};

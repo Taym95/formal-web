@@ -20,17 +20,15 @@ use ipc_messages::content::{
     Event as ContentEvent, EventLoopId, PortId, PortTaskKind, TransferState,
 };
 use ipc_messages::safe_passing_of_structured_data::PortMessagePayload;
+use js_engine::ExecutionContext;
 use js_engine::gc::{GcCell, gc_cell_new};
 use js_engine::gc_struct;
-use js_engine::{ExecutionContext, JsTypes};
 use log::warn;
 
 use crate::html::messageport::MessagePort;
 use crate::js::Types;
 
 use verification::{TLATracer, TraceSender};
-
-type JsObject = <Types as JsTypes>::JsObject;
 
 /// One MessagePort managed by this event loop: the content-process half of
 /// the spec's per-port state (its port message queue, its entanglement,
@@ -649,14 +647,12 @@ impl ChannelMessaging {
         &self,
         port_id: PortId,
         ec: &mut dyn ExecutionContext<Types>,
-    ) -> Option<JsObject> {
-        let port = self
-            .ports
+    ) -> Option<MessagePort> {
+        self.ports
             .borrow(ec)
             .iter()
             .find(|record| record.port_id == port_id)
-            .and_then(|record| record.object.clone());
-        port.as_ref().and_then(|port| port.object())
+            .and_then(|record| record.object.clone())
     }
 
     /// Whether a port is managed by this event loop.

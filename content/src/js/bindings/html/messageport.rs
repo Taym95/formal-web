@@ -166,15 +166,11 @@ fn post_message(
     } else {
         options_dict_transfer(args.get(1), ec)?
     };
-    let source_object = Types::value_as_object(this)
-        .ok_or_else(|| ec.new_type_error("MessagePort receiver is not an object"))?;
-    let object = source_object.clone();
-    with_message_port_ref(this, ec, move |port, ec| {
-        port.post_message(message, transfer, object, ec)?;
+    with_message_port_ref(this, ec, |port, ec| {
+        port.post_message(message, transfer, ec)?;
         Ok(ec.value_undefined())
     })
 }
-
 /// Read the `transfer` member (a `sequence<object>`) from the
 /// StructuredSerializeOptions dictionary.
 fn options_dict_transfer(
