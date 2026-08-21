@@ -48,12 +48,56 @@ Avoid `sleep` commands longer than a few seconds in bash. A long `sleep N` (N > 
 # Documentation Chain
 
 Read repository documentation from general to specific:
-1. `AGENTS.md` (top-level)
-3. `<subdir>/{<nested-sub-dir/}README.md`
 
-The above should form a chain of readmes, based on the directories where you are working for the task at hand. Essentially, when you are reading or writing to a file, you must take into account all readmes in the path to that file.
+1. `AGENTS.md` (top-level).
+2. Every `README.md` found by walking from the repo root down to the
+   directory containing the file(s) your task touches, in that order.
 
-You can also update this documentation chain based on lessons learned from user feedback: update the lowest-level file that owns the rule or pattern, and avoid repeating the same guidance in multiple places.
+Concatenate all of them; together they form the "doc chain" for a task.
+
+## The placement invariant
+
+Every README must sit at the **lowest point in the tree that still covers
+all the code beneath it**. Before adding or editing guidance, ask:
+
+- **Is this true for everything below this directory, and only things below
+  this directory?** If code in a sibling directory needs the same rule, the
+  guidance is too specific for this level — move it up (or leave it out and
+  let the parent README cover it).
+- **Does this only apply to a subset of what's below this directory?** If
+  so, it's too broad for this level — move it down to the README that
+  actually owns that subset, or add a new lower README if none exists yet.
+
+`AGENTS.md` sits above everything, so anything placed there is implicitly
+claimed to apply repo-wide. Before adding something to `AGENTS.md`, check
+whether it's actually scoped to one crate or subtree — if so, it belongs in
+that subtree's README instead, not at the root.
+
+## Duplication rule
+
+Do not duplicate guidance between a README and any README already above it
+in the same chain (including `AGENTS.md`, which is above everything) — a
+task that loads the lower README always loads the higher one too, so nothing
+is gained and the two copies will drift out of sync. If a lower README needs
+to reference something explained above it, point to the file that owns it
+("see `<path>/README.md` for ...") rather than restating it.
+
+Duplication between two READMEs is only acceptable when they can appear in
+*separate* doc chains — i.e. a task could plausibly load one without the
+other. Example: guidance that applies to a web standard's implementation can
+reasonably appear in both `content/README.md` and another crate's README if
+a task could touch that standard's code in one crate without touching the
+other. When you do duplicate for this reason, keep the duplicate short and
+put the full/definitive version in exactly one file, referenced by name from
+the other.
+
+## Keeping the chain honest over time
+
+When editing a README, check whether the same fact now also lives in a
+README above it in the chain (most commonly `AGENTS.md` itself) — this
+happens easily as guidance gets elaborated locally after being introduced
+briefly at a higher level. If so, collapse to one copy at the correct level
+per the placement invariant above.
 
 ### readme-chain extension
 
@@ -69,18 +113,10 @@ See `.pi/extensions/readme-chain/README.md` for full documentation.
 ## Three-layer architecture
 
 Every Web-exposed feature (DOM, HTML, Streams, WebAssembly) follows the same
-three-layer split.  See **`content/src/js/bindings/README.md`** for the
-definitive breakdown with examples and common mistakes.
-
-| Layer | Location | Signature convention |
-|---|---|---|
-| **Domain** | `content/src/<domain>/` | Methods implement spec algorithms. May import some Boa types when the algorithm requires it (e.g., `Context` for promise creation). |
-| **Web IDL bindings infra** | `content/src/webidl/bindings/` | Generic traits — NOT domain-specific |
-| **JS bindings glue** | `content/src/js/bindings/<domain>/` | `fn(this, args, ctx) -> JsResult<JsValue>` — thin: extract JS args, call domain, wrap |
-
-Code placement is dictated by which spec the algorithm comes from. Web IDL
-conversion algorithms (union, dictionary) go in `content/src/webidl/`. DOM
-algorithms go in `content/src/dom/`. HTML algorithms go in `content/src/html/`.
+three-layer split (domain → Web IDL infra → JS bindings glue), with code
+placement dictated by which spec the algorithm comes from.  See
+`content/src/js/bindings/README.md` for the definitive breakdown with
+examples and common mistakes.
 
 When implementing a spec algorithm, every changed file must satisfy these checks
 before the task is considered done.  See `content/src/js/bindings/README.md`
@@ -211,17 +247,10 @@ shared dependency resolution and incremental compilation.
 
   **Automation always runs on the winit embedder — never the AppKit one.**
   WPT, WebDriver, CDP, and the TLA+ verification scripts route through
-  `winit-embedder` exclusively: `run_cdp`/`run_webdriver` in the root
-  `embedder` crate dispatch to winit unconditionally, and mac-embedder has
-  no automation entry points at all. Headless automation works on any
-  build; **headed** automation (a visible window under CDP/WebDriver) on
-  macOS requires building with `--features winit_embedder` (the winit
-  windowed app is otherwise not compiled, and the command fails with a
-  clear error). The AppKit app itself never pulls winit: on macOS the
-  winit embedder builds headless-only (no `windowed` feature, hence no
-  wgpu/Blitz) unless `winit_embedder` is enabled. The headless build has
-  no graphics dependencies at all — automation screenshots in headless
-  mode are a plain white PNG.
+  `winit-embedder` exclusively.  See `embedder/README.md` ("Windowed
+  backend selection") for which automation entry points dispatch to winit,
+  what the `winit_embedder` feature gates, and why the AppKit app never
+  pulls winit.
 - **Helper processes** (`formal-web-content`, `formal-web-net`, `formal-web-media`, `formal-web-graphics`): spawned by the embedder.
   - `formal-web-graphics` owns per-webview compositors and video/audio playback (media backend).
     It receives `PaintFrame` and `VideoFrame` payloads and sends back composed scenes with
@@ -383,22 +412,6 @@ cargo build --release   # rebuilds EVERY workspace binary
 cargo run --release     # all processes are in sync
 ```
 
-### README pruning
-
-The `js_engine/README.md` (and any other `README.md`) tracks only:
-- Things that **still need to be fixed** (unfixed bugs, pre-existing issues)
-- **Dead-end investigations** for currently-unfixed issues (so future sessions
-  know what was already tried and ruled out)
-
-Do NOT document:
-- Completed fixes (they're in the code and git history)
-- Architecture design notes or historical session logs for fixed issues
-- Infrastructure descriptions for things that already work
-
-The goal is concise, actionable documentation: a future session should be able
-to read the README and know exactly what remains to be done, and what approaches
-have already failed for each remaining issue.
-
 ### Process binary search paths
 
 When the embedder spawns a helper process, it searches the directory
@@ -473,23 +486,10 @@ ever correct.
 
 # GcCell Borrow Discipline
 
-**Never call an engine method (any `ec` operation) while a `GcCell` borrow
-(`borrow`/`borrow_mut` guard) is live — shared or mutable.** An engine call
-may allocate, and an allocation can trigger a GC trace that reads the cell
-while the borrow is live; on the V8 backend a mutable borrow being traced is
-an aliasing violation (undefined behavior). The rule is deliberately
-engine-independent: content code must never depend on which engine
-operations allocate. The approved patterns are:
-
-- Clone the value out of the cell and use the owned value, then write it
-  back (`let mut value = cell.borrow(ec).clone(); ...; cell.set(value, ec);`).
-- Scope the borrow to the section that touches the cell, dropping the guard
-  before any `ec` call.
-
-Do not write new code that hands `ec` to a closure while a cell borrow is
-live (e.g. `with_..._mut(|data, ec| ...)` patterns). See
-`content/README.md` ("GcCell borrow discipline") for the mechanism and the
-remaining exception class.
+Never call an engine method (any `ec` operation) while a `GcCell` borrow
+(`borrow`/`borrow_mut` guard) is live — shared or mutable.  See
+`content/README.md` ("GcCell borrow discipline") for the mechanism, the
+approved patterns, and the remaining exception class.
 
 # Never Assume Test Failures Are Pre-Existing
 
@@ -584,16 +584,27 @@ Repository READMEs track only the current state of the code: architecture,
 conventions, and things that still need fixing. They must never contain
 session logs, histories of what was done, or descriptions of past changes.
 
-Do not document in a README anything that is already obvious from the code
-and its comments.  In particular, the step-by-step split of a spec algorithm
-across processes (which steps run in content, which in the user agent) is
-carried by the `// Step N:` comments and notes on each side — the README must
-not duplicate it.
+A README tracks only:
+- Things that **still need to be fixed** (unfixed bugs, pre-existing issues)
+- **Dead-end investigations** for currently-unfixed issues (so future sessions
+  know what was already tried and ruled out)
+
+Do NOT document:
+- Completed fixes (they're in the code and git history)
+- Architecture design notes or historical session logs for fixed issues
+- Infrastructure descriptions for things that already work
+- Anything already obvious from the code and its comments.  In particular,
+  the step-by-step split of a spec algorithm across processes (which steps
+  run in content, which in the user agent) is carried by the `// Step N:`
+  comments and notes on each side — the README must not duplicate it.
 
 The only past-tense content allowed is a note about a failed fix attempt for
 a still-unfixed issue — the symptom, what was tried, and what was ruled out —
 so a future session knows what not to retry. Once an issue is fixed, its
-notes are removed. "Document only verified facts" applies throughout.
+notes are removed. "Document only verified facts" applies throughout.  The
+goal is concise, actionable documentation: a future session should be able
+to read the README and know exactly what remains to be done, and what
+approaches have already failed for each remaining issue.
 
 # End-of-Task Flow
 
@@ -667,8 +678,8 @@ At the end of each task, run the following steps **in order**:
 
 7. **Prune READMEs** — Strip completed fixes and historical session logs from
    the documentation chain. The README should track only remaining work and
-   dead-end investigations for currently-unfixed issues (see "README pruning"
-   above).
+   dead-end investigations for currently-unfixed issues (see "README
+   Documentation Policy" above).
 
 8. **Promote newly-passing WPT tests to the default selection** — When a
    WPT test was previously disabled or unselected and now passes, make that
