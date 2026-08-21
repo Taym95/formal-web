@@ -53,6 +53,15 @@ exception class is the `with_object_any_mut_with` platform-object closure
 pattern (it hands `&mut dyn Any` and `ec` to the operation; see
 `js_engine/src/v8/README.md`, "Remaining work").
 
+## GcCell interior mutability refactor candidates
+
+Types that currently use `&mut self` for mutation but could use `GcCell` + `&self`:
+
+- **Node** (`content/src/dom`) — `child_node_ids` is read-only; other mutating methods could use GcCell.
+- **Window** (`content/src/html`) — `setTimeout` callbacks stored behind GcCell.
+- **Streams** (`content/src/streams`) — writable/readable stream state machines use `Cell<bool>`/`RefCell`; some could use GcCell for GC-traced callback fields.
+- **AbortSignal** (`content/src/dom`) — already uses `GcCell<AbortSignalState>` at the top level; internal fields like `onabort` could move to GcCell if needed.
+
 ## Known issues
 
 - **Clippy warning backlog.** The content crate has a backlog of pre-existing
@@ -77,75 +86,7 @@ description with examples and common mistakes.
 
 ## Spec Documentation
 
-### Anchor-only doc comments
-
-Every function, struct, associated constant, and constant definition has
-**only** the spec anchor URL in its doc comment. Zero prose — not a single
-explanatory sentence.
-
-```rust
-/// <https://dom.spec.whatwg.org/#concept-event-dispatch>
-pub(crate) fn dispatch_event(ec, path, event) { … }
-```
-
-- Any prose following the anchor is a violation.  The spec IS the documentation.
-- The only exception is a `// Note:` on a separate line below the anchor,
-  and only for genuine spec discrepancies (split-process, browser-engine
-  refactoring).  Such notes must be fewer than ten across the codebase.
-
-### Step comments inside function bodies
-
-Every spec algorithm step has a `// Step N:` comment quoting the **exact spec
-step text verbatim** — not an abbreviation or summary.  Step numbering must
-match the spec exactly.
-
-```rust
-// Step 1: If event's dispatch flag is set, or if its initialized flag is not set,
-//         then throw an "InvalidStateError" DOMException.
-if *event.dispatch_flag.borrow() || !*event.initialized_flag.borrow() {
-    return Err(ec.new_type_error("…"));
-}
-
-// Step 3: Return the result of dispatching event to this.
-crate::dom::dispatch_event(ec, path, event)
-```
-
-- Blank lines separate code BLOCKS, not comments from code. The pattern:
-  ```
-  // Step N: comment
-  code;
-                          ← blank line
-  // Step N+1: comment
-  code;
-  ```
-- NO blank line between the function/block opening `{` and the first step comment.
-- NO blank line between a step comment and its immediately following code.
-- Blank line AFTER the code, before the next step's comment.
-- Use `// TODO: Not yet implemented.` for spec steps that are not yet
-  implemented — every step must be accounted for.
-- For sub-algorithms called by the spec, cross-reference with the anchor URL
-  in a comment (e.g. `// <https://dom.spec.whatwg.org/#concept-event-dispatch>`).
-
-### Function naming and algorithm structure
-
-- Name functions after the spec algorithm they implement (e.g. `flatten_more`
-  for "flatten more options", `convert_js_to_dictionary` for "convert a JavaScript
-  value to dictionary").
-- If you must split a spec algorithm into multiple internal helpers, provide
-  a single public function with the spec's name and explain the split with a
-  `// Note:`.
-- When a function partially implements a spec algorithm, annotate with `// Step N:`
-  for ALL steps of the algorithm. Mark missing steps with `// TODO: Not yet
-  implemented.` See `html/dispatch.rs::steps_to_fire_beforeunload` for the correct pattern.
-
-### `// Note:` for discrepancies only
-
-`// Note:` is for discrepancies between the code and the spec text (e.g. steps
-merged across processes, browser-engine refactoring). Design notes, architecture
-rationales, and implementation plans belong in the README chain, not in Notes.
-
-### Full reference
-
-See `content/src/js/bindings/README.md` for the complete Common Mistakes table
-covering all annotation patterns, three-layer architecture rules, and the
-correct treatment of infrastructure code vs spec algorithms.
+The rules for spec-annotated code — anchor-only doc comments, verbatim
+`// Step N:` step comments, `// Note:` for discrepancies only — live in
+`AGENTS.md` ("Algorithm Implementation"); the definitive reference with the
+complete Common Mistakes table is `content/src/js/bindings/README.md`.

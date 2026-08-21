@@ -90,12 +90,3 @@ path building without going through a JsObject.
 - Do not clone Event or EventTarget and sync back — `GcCell` shares data across clones.
 - Do not put JsObject-only helpers (like `event_target_from_object`) in dispatch.rs — keep domain dispatch pure. Such helpers belong in `platform_objects.rs` or `html/ui_events.rs`.
 
-## GcCell interior mutability pattern elsewhere
-
-Types that currently use `&mut self` for mutation but could use `GcCell` + `&self`:
-
-- **Node** — `child_node_ids` is read-only; other mutating methods could use GcCell.
-- **Window** — `setTimeout` callbacks stored behind GcCell.
-- **Streams** — writable/readable stream state machines use `Cell<bool>`/`RefCell`; some could use GcCell for GC-traced callback fields.
-- **AbortSignal** — already uses `GcCell<AbortSignalState>` at the top level; internal fields like `onabort` could move to GcCell if needed.
-
