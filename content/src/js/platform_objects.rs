@@ -30,9 +30,7 @@ pub(crate) fn init_global_object_slot(
 }
 
 /// <https://html.spec.whatwg.org/#global-object>
-fn global_scope_or_error<'ec>(
-    ec: &'ec dyn ExecutionContext<crate::js::Types>,
-) -> Option<&'ec GlobalScope> {
+fn global_scope_or_error(ec: &dyn ExecutionContext<crate::js::Types>) -> Option<&GlobalScope> {
     let global_obj = ec.realm_global_object();
     ec.with_object_any(&global_obj)
         .and_then(|data| data.downcast_ref::<Window>())
@@ -125,7 +123,16 @@ pub(crate) fn resolve_element_object(
     }
 
     // Create platform object (mutable ec, no GlobalScope borrow active).
-    let object = element_object_from_document(document, node_id, ec)?;
+    let object = element_object_from_document(document.clone(), node_id, ec)?;
+
+    // Compile and activate the element's `on*` content attributes (e.g.
+    // `onload="..."`) now that the platform object exists, so the handlers
+    // fire on the element's events.  Parser-set attributes are covered
+    // because element platform objects are created through this resolver
+    // (and the iframe load event steps resolve the element here before
+    // firing the load event); attributes set later via setAttribute are not
+    // synced yet.
+    sync_event_handler_content_attributes(&document, node_id, &object, ec)?;
 
     // Cache the result (immutable GlobalScope access).
     if let Some(gs) = global_scope_or_error(ec).cloned() {
@@ -180,6 +187,48 @@ pub(crate) fn resolve_or_create_text_node_object(
     }
 
     Ok(object)
+}
+
+/// Filter an element's `on*` content attributes and sync each one to its
+/// event handler: the namespace/name filter and the event handler target
+/// resolution of the sync run here; the remaining steps run in
+/// html::event_handler::sync_event_handler_content_attribute.
+fn sync_event_handler_content_attributes(
+    document: &Rc<RefCell<BaseDocument>>,
+    node_id: usize,
+    object: &JsObject,
+    ec: &mut dyn ExecutionContext<crate::js::Types>,
+) -> Completion<(), crate::js::Types> {
+    let Some(event_target) = event_target_from_js_object(ec, object) else {
+        return Ok(());
+    };
+    // Clone the attributes out of the document borrow before compiling the
+    // handlers (compilation allocates and must not run under the borrow).
+    let attributes: Vec<(String, String)> = document
+        .borrow()
+        .get_node(node_id)
+        .and_then(|node| node.element_data())
+        .map(|element| {
+            element
+                .attrs
+                .iter()
+                .filter(|attribute| attribute.name.ns.is_empty())
+                .filter_map(|attribute| {
+                    let event_type = attribute.name.local.as_ref().strip_prefix("on")?;
+                    Some((event_type.to_owned(), attribute.value.clone()))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    for (event_type, source) in attributes {
+        crate::html::event_handler::sync_event_handler_content_attribute(
+            &event_target,
+            &event_type,
+            Some(&source),
+            ec,
+        )?;
+    }
+    Ok(())
 }
 
 /// Use `try_with_event_target_mut` to set the reflector on the EventTarget

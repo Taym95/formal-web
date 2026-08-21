@@ -15,6 +15,8 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+use crate::content::{MessageId, PortId};
+
 /// A primitive JavaScript value in a portable, serializable form.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum PrimitiveValue {
@@ -100,6 +102,14 @@ pub enum SerializedRecord {
     },
     /// { [[Type]]: "Object" }
     Object(Vec<(Vec<u16>, SerializedRecord)>),
+    /// A back-reference to a record that was serialized earlier in the
+    /// graph, by its memory-map index: a cyclic or shared (DAG) object is
+    /// serialized once and every other occurrence becomes this reference.
+    /// On deserialization the reference resolves to the object already
+    /// built for that record (the port message queue of the structured
+    /// clone memory map keys by this index).
+    /// <https://html.spec.whatwg.org/#structuredserializeinternal> step 2
+    BackReference(usize),
     /// A reference to the transfer-list entry at the given (0-based) index.
     ///
     /// StructuredSerializeWithTransfer step 2.4 places this record in the
@@ -132,6 +142,51 @@ pub enum TransferDataHolder {
         byte_length: u64,
         max_byte_length: Option<u64>,
     },
+    /// { [[Type]]: "MessagePort", [[PortMessageQueue]]: queue,
+    ///   [[RemotePort]]: remotePort }
+    /// A transferred MessagePort (see [`PortTransferData`]): the port id, its
+    /// pending message queue (the tasks that are to fire message events,
+    /// moved with the transfer per the transfer steps), and the id of the
+    /// port it was entangled with, if any (re-entangled on
+    /// transfer-receiving).
+    /// <https://html.spec.whatwg.org/#message-ports:transfer-steps>
+    MessagePort(PortTransferData),
+}
+
+/// The data holder of the MessagePort transfer steps (the dataHolder of
+/// <https://html.spec.whatwg.org/#message-ports:transfer-steps>), carried
+/// as pure IPC-safe data so a transfer can cross processes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PortTransferData {
+    /// The id of the transferred port.
+    pub port_id: PortId,
+    /// The port's pending message queue, moved with the transfer
+    /// (dataHolder.[[PortMessageQueue]]).
+    pub queue: Vec<PortMessagePayload>,
+    /// The port the transferred port was entangled with, if any
+    /// (dataHolder.[[RemotePort]]).
+    pub remote_port: Option<PortId>,
+    /// Routed messages still in flight toward the port (messages posted
+    /// while the port was in transit or completing, not yet delivered to
+    /// its queue).  Moves with the transfer so a direct delivery in the
+    /// receiving process cannot jump ahead of them (the port message
+    /// queue is FIFO).
+    pub in_flight: u32,
+}
+
+/// One queued message on a port message queue (pure data, IPC-safe).
+/// Carries the serialized message produced by the message port post message
+/// steps plus a unique message id for the MessagePortExtraFG TLA trace.
+/// <https://html.spec.whatwg.org/#message-port-post-message-steps>
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PortMessagePayload {
+    /// Unique id of this message, used by the TLA trace to identify the
+    /// message in `MessagePortExtraFG.tla` (the `MessageId` of MessagePortExtraFG.tla).
+    pub message_id: MessageId,
+    /// `serializeWithTransferResult.[[Serialized]]` (step 5).
+    pub serialized: SerializedRecord,
+    /// `serializeWithTransferResult.[[TransferDataHolders]]` (step 5).
+    pub transfer_data_holders: Vec<TransferDataHolder>,
 }
 
 /// Payload of the window post message steps carried between the source

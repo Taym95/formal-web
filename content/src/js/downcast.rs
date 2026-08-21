@@ -8,7 +8,7 @@ use crate::dom::{
 };
 use crate::html::{
     HTMLAnchorElement, HTMLElement, HTMLIFrameElement, HTMLInputElement, HTMLMediaElement,
-    HTMLVideoElement, MessageEvent, Window,
+    HTMLVideoElement, MessageEvent, MessagePort, Window,
 };
 use crate::js::Types;
 use crate::ui_events::{MouseEvent, UIEvent};
@@ -151,6 +151,8 @@ pub(crate) fn try_set_event_target_reflector(
                     ec.store_js_object(&mut node.event_target.reflector, reflector);
                 } else if let Some(target) = data.downcast_mut::<EventTarget>() {
                     ec.store_js_object(&mut target.reflector, reflector);
+                } else if let Some(port) = data.downcast_mut::<MessagePort>() {
+                    ec.store_js_object(&mut port.event_target.reflector, reflector);
                 } else if let Some(signal) = data.downcast_mut::<AbortSignal>() {
                     // AbortSignal exposes its EventTarget through a shared
                     // cell, so its setter borrows the cell (the clone shares
@@ -209,6 +211,8 @@ pub(crate) fn event_target_from_js_object(
             )
         } else if let Some(node) = data.downcast_ref::<Node>() {
             Some(node.event_target.clone())
+        } else if let Some(port) = data.downcast_ref::<MessagePort>() {
+            Some(port.event_target.clone())
         } else if let Some(event_target) = data.downcast_ref::<EventTarget>() {
             Some(event_target.clone())
         } else {
@@ -260,6 +264,8 @@ pub(crate) fn try_with_event_target_mut<R>(
                 result = Ok(f(&mut node.event_target, ec));
             } else if let Some(target) = data.downcast_mut::<EventTarget>() {
                 result = Ok(f(target, ec));
+            } else if let Some(port) = data.downcast_mut::<MessagePort>() {
+                result = Ok(f(&mut port.event_target, ec));
             } else if let Some(signal) = data.downcast_mut::<AbortSignal>() {
                 // The closure receives the execution context that
                 // `with_event_target_mut` passes alongside the borrowed

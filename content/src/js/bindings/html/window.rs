@@ -4,7 +4,7 @@ type JsObject = <crate::js::Types as JsTypes>::JsObject;
 use crate::html::windowproxy::resolve_window;
 use crate::html::{
     PostMessageOptions, Window, WindowOrWorkerGlobalScope,
-    safe_passing_of_structured_data::StructuredCloneOptions,
+    structured_data::safe_passing_of_structured_data::StructuredCloneOptions,
     window_computed_style_properties_for_element,
 };
 use crate::js::bindings::html::global_event_handlers::define_global_event_handlers;
@@ -374,8 +374,13 @@ fn post_message_method(
     args: &[JsValue],
     ec: &mut dyn ExecutionContext<crate::js::Types>,
 ) -> Completion<JsValue, crate::js::Types> {
-    let undefined = ec.value_undefined();
-    let message = args.first().cloned().unwrap_or_else(|| undefined.clone());
+    // <https://webidl.spec.whatwg.org/#es-operations>
+    // The message argument is required; calling with no arguments is a
+    // Web IDL TypeError.
+    let message = args
+        .first()
+        .cloned()
+        .ok_or_else(|| ec.new_type_error("postMessage: message argument is required"))?;
     let options = parse_post_message_options(args, ec)?;
 
     let window = window_domain_from(this, ec)?;
@@ -450,7 +455,10 @@ fn options_dict_transfer(
 }
 
 /// Convert the `transfer` argument (a `sequence<object>`) to a list of
-/// values.
+/// values per Web IDL: an absent or `undefined` value converts to the
+/// default empty sequence, a non-object or non-iterable value throws a
+/// TypeError, and each iterated element must be an object.
+/// <https://webidl.spec.whatwg.org/#es-sequence>
 fn parse_transfer_sequence(
     transfer_value: Option<&JsValue>,
     ec: &mut dyn ExecutionContext<crate::js::Types>,
@@ -458,17 +466,30 @@ fn parse_transfer_sequence(
     let Some(transfer_value) = transfer_value else {
         return Ok(Vec::new());
     };
-    let Some(transfer_object) = crate::js::Types::value_as_object(transfer_value) else {
+    if crate::js::Types::value_is_undefined(transfer_value) {
         return Ok(Vec::new());
-    };
-    let length_key = ec.property_key_from_str("length");
-    let length_value = ExecutionContext::get(ec, transfer_object.clone(), length_key)?;
-    let length = ec.to_length(length_value)?;
-    let mut transfer = Vec::with_capacity(length as usize);
-    for i in 0..length {
-        let index_key = ec.property_key_from_str(&i.to_string());
-        let item = ExecutionContext::get(ec, transfer_object.clone(), index_key)?;
-        transfer.push(item);
+    }
+    if crate::js::Types::value_as_object(transfer_value).is_none() {
+        // Step 1: If V is not an Object, throw a TypeError.
+        return Err(ec.new_type_error("transfer is not an object"));
+    }
+    // Step 2: Let method be ? GetMethod(V, %Symbol.iterator%).
+    // Step 3: If method is undefined, throw a TypeError.
+    // Step 4: Return the result of creating a sequence from V and method.
+    let mut iterator =
+        ec.get_iterator(transfer_value.clone(), js_engine::IteratorKind::Sync, None)?;
+    let mut transfer = Vec::new();
+    loop {
+        let next = ec.iterator_step_value(&mut iterator)?;
+        let Some(next) = next else {
+            break;
+        };
+        // <https://webidl.spec.whatwg.org/#es-object>
+        // Each element converts to the `object` IDL type.
+        if crate::js::Types::value_as_object(&next).is_none() {
+            return Err(ec.new_type_error("transfer element is not an object"));
+        }
+        transfer.push(next);
     }
     Ok(transfer)
 }

@@ -475,13 +475,23 @@ fn trap_get(
         let Some(window_object) = window_object_handle(&backing) else {
             return Ok(ec.value_undefined());
         };
+        let is_post_message = key.as_string().is_some_and(|s| s == "postMessage");
         let prop_key = ec.to_property_key(key)?;
-        let result = {
+        let result = if is_post_message {
+            let proxy_value =
+                <crate::js::Types as JsTypes>::value_from_object(proxy_target.clone());
+            ec.get_v(proxy_value, prop_key)?
+        } else {
             let receiver_value =
                 <crate::js::Types as JsTypes>::value_from_object(window_object.clone());
             ec.get_v(receiver_value, prop_key)?
         };
-        if let Some(wrapped) = wrap_callable_result(&result, window_object, ec) {
+        let receiver = if is_post_message {
+            proxy_target.clone()
+        } else {
+            window_object.clone()
+        };
+        if let Some(wrapped) = wrap_callable_result(&result, receiver, ec) {
             return Ok(wrapped);
         }
         return Ok(result);

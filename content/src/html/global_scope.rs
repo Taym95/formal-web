@@ -7,7 +7,7 @@ use std::{
 
 use super::windowproxy::{WindowProxy, WindowProxyBacking};
 use super::{
-    Window, create_a_new_browsing_context_and_document,
+    ChannelMessaging, Window, create_a_new_browsing_context_and_document,
     environment_settings_object::EnvironmentSettingsObject,
 };
 
@@ -201,6 +201,21 @@ pub struct GlobalScope {
     #[ignore_trace]
     source_navigable_id: Rc<Cell<Option<NavigableId>>>,
 
+    /// <https://html.spec.whatwg.org/#responsible-event-loop>
+    /// The id of this global object's responsible event loop (its relevant
+    /// agent's event loop), set by the content process at document creation.
+    #[ignore_trace]
+    event_loop_id: Rc<Cell<Option<ipc_messages::content::EventLoopId>>>,
+
+    /// Per-realm channel messaging state (ports, message queues, transfer
+    /// state), created lazily on first port use.
+    channel_messaging: GcCell<Option<ChannelMessaging>>,
+
+    /// TLA trace sender for the MessagePort spec, set by the content process
+    /// at document creation (mirrors the `event_sender` wiring).
+    #[ignore_trace]
+    trace_sender: Rc<RefCell<Option<verification::TraceSender>>>,
+
     /// <https://html.spec.whatwg.org/#parent-navigable>
     /// The parent of this document's navigable in the navigable tree.
     /// None indicates a top-level traversable.
@@ -282,6 +297,9 @@ impl GlobalScope {
             current_timer_nesting_level: Cell::new(None),
             timer_host: Rc::new(RefCell::new(None)),
             source_navigable_id: Rc::new(Cell::new(None)),
+            event_loop_id: Rc::new(Cell::new(None)),
+            channel_messaging: gc_cell_new(None, ec),
+            trace_sender: Rc::new(RefCell::new(None)),
             parent_traversable_id: Rc::new(Cell::new(None)),
             top_level_traversable_id: Rc::new(Cell::new(None)),
             document_id: Rc::new(RefCell::new(None)),
@@ -388,6 +406,38 @@ impl GlobalScope {
 
     pub(crate) fn source_navigable_id(&self) -> Option<NavigableId> {
         self.source_navigable_id.get()
+    }
+
+    pub(crate) fn set_event_loop_id(&self, event_loop_id: ipc_messages::content::EventLoopId) {
+        self.event_loop_id.set(Some(event_loop_id));
+    }
+
+    pub(crate) fn event_loop_id(&self) -> Option<ipc_messages::content::EventLoopId> {
+        self.event_loop_id.get()
+    }
+
+    /// Set the TLA trace sender for the MessagePort spec.
+    pub(crate) fn set_trace_sender(&self, sender: Option<verification::TraceSender>) {
+        *self.trace_sender.borrow_mut() = sender;
+    }
+
+    pub(crate) fn trace_sender(&self) -> Option<verification::TraceSender> {
+        self.trace_sender.borrow().clone()
+    }
+
+    /// The per-realm channel messaging state, created on first use.
+    pub(crate) fn channel_messaging(
+        &self,
+        ec: &mut dyn ExecutionContext<Types>,
+    ) -> Option<ChannelMessaging> {
+        let event_loop_id = self.event_loop_id()?;
+        let existing = self.channel_messaging.borrow(ec).clone();
+        if let Some(existing) = existing {
+            return Some(existing);
+        }
+        let created = ChannelMessaging::new(event_loop_id, self.trace_sender(), ec);
+        self.channel_messaging.set(Some(created.clone()), ec);
+        Some(created)
     }
 
     pub(crate) fn document_id(&self) -> Option<DocumentId> {
@@ -1027,7 +1077,6 @@ impl GlobalScope {
     /// execution that might trigger `window.open`.
     /// Note: Only used on JSC backend (Boa creates fresh contexts).
     #[allow(dead_code)]
-
     pub(crate) fn set_video_paint_registry(
         &self,
         registry: Rc<RefCell<HashMap<(DocumentId, usize), VideoPaintId>>>,

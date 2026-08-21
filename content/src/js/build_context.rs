@@ -92,7 +92,7 @@ fn setup_realm(engine: &mut Engine, _document: Rc<RefCell<BaseDocument>>) -> Res
     use crate::html::GlobalScope;
     use crate::html::{
         HTMLAnchorElement, HTMLElement, HTMLIFrameElement, HTMLInputElement, HTMLMediaElement,
-        HTMLVideoElement, Location, MessageEvent, Window, WindowProxy,
+        HTMLVideoElement, Location, MessageChannel, MessageEvent, MessagePort, Window, WindowProxy,
     };
     use crate::streams::{
         ByteLengthQueuingStrategy, CountQueuingStrategy, ReadableByteStreamController,
@@ -163,6 +163,8 @@ fn setup_realm(engine: &mut Engine, _document: Rc<RefCell<BaseDocument>>) -> Res
     reg!(DOMException);
     reg!(Event);
     reg!(MessageEvent);
+    reg!(MessageChannel);
+    reg!(MessagePort);
     reg!(UIEvent);
     reg!(MouseEvent);
     reg!(AbortSignal);
@@ -196,6 +198,7 @@ fn setup_realm(engine: &mut Engine, _document: Rc<RefCell<BaseDocument>>) -> Res
     // Step 6: Wire prototype chains.
     wire_registry_prototype::<crate::js::Types, UIEvent, Event>(engine);
     wire_registry_prototype::<crate::js::Types, MessageEvent, Event>(engine);
+    wire_registry_prototype::<crate::js::Types, MessagePort, EventTarget>(engine);
     wire_registry_prototype::<crate::js::Types, MouseEvent, UIEvent>(engine);
     wire_registry_prototype::<crate::js::Types, AbortSignal, EventTarget>(engine);
     wire_registry_prototype::<crate::js::Types, Node, EventTarget>(engine);
@@ -213,6 +216,7 @@ fn setup_realm(engine: &mut Engine, _document: Rc<RefCell<BaseDocument>>) -> Res
     // inherit from their parent interface object (WebIDL "create an interface
     // object", step 3).
     wire_registry_constructor_prototype::<crate::js::Types, UIEvent, Event>(engine);
+    wire_registry_constructor_prototype::<crate::js::Types, MessagePort, EventTarget>(engine);
     wire_registry_constructor_prototype::<crate::js::Types, MouseEvent, UIEvent>(engine);
     wire_registry_constructor_prototype::<crate::js::Types, AbortSignal, EventTarget>(engine);
     wire_registry_constructor_prototype::<crate::js::Types, Node, EventTarget>(engine);

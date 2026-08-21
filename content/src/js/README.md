@@ -52,6 +52,19 @@ state.  Content code only sees the generic traits from the `js_engine` crate.
   or `rusty_v8`) **or return `JsValue`.**
   The domain layer returns Rust types; the bindings layer converts to JS
   values as late as possible.
+- **Domain code must not store a `GlobalScope` on non-global platform
+  objects.**  A gc struct has no memory of the realm it was created in; the
+  general accessor is `with_global_scope(ec, ...)`, which resolves the
+  *current* realm's global object.  Operations on a platform object always
+  run in its own realm (bindings run in the creation realm; objects created
+  during deserialization are created in the target realm before any use),
+  so the current realm is the object's realm.  Only `Window` stores its
+  `GlobalScope`, because it is the realm's global object.
+- **Domain code returns the platform object struct, not a raw `JsObject`
+  handle, when a record already holds the object.**  The JS handle is only
+  needed at the JS boundary (reflectors, bindings); identity comparisons
+  between platform objects (e.g. "transfer contains targetPort") compare
+  their unique ids instead.
 - Run microtask checkpoints at task boundaries rather than after every
   Rust-to-JavaScript callback.
 - Document process structs against HTML concepts such as

@@ -15,7 +15,32 @@ The verification crate owns trace recording, TLA+ validation, and the shutdown w
 |---|---|---|
 | `Navigation` | UA navigation lifecycle | navigable/navigation state machine |
 | `RenderingOpportunity` | UA `CreateFrame` (the navigable-creation part of the navigation path, traced from `CreateNavigable`/`CreateChildNavigable`) /`NoteRenderingOpportunity`/`FrameNeeded`, content `UpdateTheRendering`, graphics `GraphicsComputed` (traced when the pixels are actually sent) | FrameNeeded-gated render cycle with double buffering: a render starts only when the embedder needs a frame (paced by vsync) AND a rendering opportunity was noted; the paint consumes the composed frames, and the pipeline never holds more than `BufferCount` (2) renders in flight (one displayed, one being rendered) |
-| `MessagePort*` | (not written yet) | — |
+| `MessagePort` | content `NewChannel`/`PostMessage`/`ReceiveMessage`/`Transfer`/`TransferReceive`, UA `RouteMessage`, content `RunTask` (the last two are the implementation-level routing/task events, skipped by the coarse trace consumer) | the cross-process port workflow mapped to the HTML spec's channel messaging steps: channel creation, the FIFO port message queue ordering (each `ReceiveMessage` pop is checked against the abstract queue head), and the transfer/transfer-receive transitions |
+
+### MessagePort scope
+
+The trace consumer replays the recorded events against `MessagePort.tla`,
+which maps one-to-one to the HTML spec's channel messaging steps
+(`NewMessageChannel` = entangle, `PostMessage` = step 7 of the message port
+post message steps, `ReceiveMessage` = the message task firing,
+`Transfer`/`TransferReceive` = the transfer steps).  The fine-grained routing
+queue and per-event-loop task queues of `MessagePortExtraFG.tla` (the
+refinement model; `MessagePortFG.tla` is the finite-state variant) are an
+implementation detail: the abstract `MessagePort` model's per-port queue
+preserves the FIFO ordering the message tasks must respect, and the
+`ReceiveMessage` trace carries the popped message id so the consumer checks
+the pop against the queue head.
+
+`verification/messageport-trace.html` drives the actions in the
+verification session: it creates channels, delivers messages directly, runs
+the multi-transfer ordering flow of
+`Channel_postMessage_with_transfer_incoming_messages.any.js` (messages
+posted at each transfer step are received in post order), and delivers
+through a transferred port.  The content processes trace
+`NewChannel`/`PostMessage`/`ReceiveMessage`/`Transfer`/`TransferReceive`,
+the user agent traces `RouteMessage`, and `RunTask` (the physical task
+handling) is traced by the content processes; the coarse consumer skips the
+latter two event kinds.
 
 ### RenderingOpportunity scope
 

@@ -485,6 +485,7 @@ fn create_a_new_child_navigable(
                 content_frame_id,
                 current_key: String::new(),
                 cross_origin: false,
+                child_document_loaded: false,
             },
         );
         // Register the iframe node -> content navigable mapping on the
@@ -676,6 +677,7 @@ fn run_iframe_load_event_steps(
     Ok(())
 }
 
+/// <https://html.spec.whatwg.org/#completely-finish-loading>
 pub(crate) fn run_iframe_load_event_steps_for_traversable(
     process: &mut ContentProcess,
     traversable_id: NavigableId,
@@ -700,7 +702,71 @@ pub(crate) fn run_iframe_load_event_steps_for_traversable(
         return Ok(());
     };
 
+    // The document finished loading, so per "completely finish loading"
+    // step 4 ("If container is an iframe element, then queue an element
+    // task on the DOM manipulation task source given container to run the
+    // iframe load event steps given container") the iframe load event steps
+    // run on this document's container.  The queued element task runs only
+    // after the container document's parser-blocking scripts have executed
+    // ("the end" step 5 executes the scripts that will execute when the
+    // document has finished parsing).  Here the container's
+    // parser-discovered scripts are deferred to its document load
+    // completion instead, so while the container's load has not completed
+    // yet (pending_document_load is still set) the iframe load event steps
+    // are held back and fired by the container's load completion
+    // (fire_deferred_iframe_load_events) once its scripts have run.
+    let parent_not_loaded = process
+        .documents
+        .get(&parent_document_id)
+        .map(|document| document.pending_document_load.is_some())
+        .unwrap_or(false);
+    if parent_not_loaded {
+        if let Some(content_document) = process.documents.get_mut(&parent_document_id)
+            && let Some(state) = content_document
+                .navigable_container_states
+                .get_mut(&iframe_node_id)
+        {
+            state.child_document_loaded = true;
+        }
+        return Ok(());
+    }
+
     run_iframe_load_event_steps(process, parent_document_id, iframe_node_id)
+}
+
+/// Run the iframe load event steps that child load completions held back
+/// until the parent document's load completion.  This preserves the
+/// ordering that "completely finish loading" step 4 gives via its queued
+/// element task: the iframe load event steps run only after the container
+/// document's parser-discovered scripts, which this implementation defers
+/// to the parent's document load completion ("the end", steps 5-9).  Called
+/// by the parent's load completion.
+pub(crate) fn fire_deferred_iframe_load_events(
+    process: &mut ContentProcess,
+    parent_document_id: DocumentId,
+) -> Result<(), String> {
+    let pending: Vec<usize> = {
+        let Some(content_document) = process.documents.get(&parent_document_id) else {
+            return Ok(());
+        };
+        content_document
+            .navigable_container_states
+            .iter()
+            .filter(|(_, state)| state.child_document_loaded)
+            .map(|(node_id, _)| *node_id)
+            .collect()
+    };
+    for iframe_node_id in pending {
+        if let Some(content_document) = process.documents.get_mut(&parent_document_id)
+            && let Some(state) = content_document
+                .navigable_container_states
+                .get_mut(&iframe_node_id)
+        {
+            state.child_document_loaded = false;
+        }
+        run_iframe_load_event_steps(process, parent_document_id, iframe_node_id)?;
+    }
+    Ok(())
 }
 
 /// <https://html.spec.whatwg.org/#the-iframe-element:html-element-post-connection-steps>
@@ -946,6 +1012,7 @@ fn process_iframe_attributes(
                             content_frame_id,
                             current_key: desired_key.clone(),
                             cross_origin: false,
+                            child_document_loaded: false,
                         },
                     );
                 }
@@ -965,6 +1032,7 @@ fn process_iframe_attributes(
                             content_frame_id,
                             current_key: desired_key.clone(),
                             cross_origin: false,
+                            child_document_loaded: false,
                         },
                     );
                 }
@@ -989,6 +1057,7 @@ fn process_iframe_attributes(
                 content_frame_id,
                 current_key: desired_key.clone(),
                 cross_origin,
+                child_document_loaded: false,
             },
         );
     }

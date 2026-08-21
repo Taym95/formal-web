@@ -173,6 +173,12 @@ fi
 TRACE_PAGE_URL="file://$ROOT/verification/iframe-trace-page.html"
 webdriver_request POST "/session/${SESSION_ID}/url" "{\"url\":\"${TRACE_PAGE_URL}\"}" >/dev/null
 
+# Then navigate to a page exercising the MessagePort workflow (channel
+# creation, routed messaging, and a transfer), so the MessagePortExtraFG
+# trace consumer has events to validate.
+PORT_TRACE_PAGE_URL="file://$ROOT/verification/messageport-trace.html"
+webdriver_request POST "/session/${SESSION_ID}/url" "{\"url\":\"${PORT_TRACE_PAGE_URL}\"}" >/dev/null
+
 echo "waiting for initial page load..."
 for i in {1..100}; do
     if ! kill -0 "$FORMAL_WEB_PID" 2>/dev/null; then
