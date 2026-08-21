@@ -8,7 +8,7 @@ use crate::dom::Event;
 use crate::dom::dispatch_with_path;
 use crate::dom::event::{EventTarget, EventTargetAccess};
 use crate::dom::simple_path;
-use crate::html::safe_passing_of_structured_data::{
+use crate::html::structured_data::safe_passing_of_structured_data::{
     SerializeWithTransferResult, Transferable, structured_deserialize_with_transfer,
     structured_serialize_with_transfer,
 };

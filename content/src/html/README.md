@@ -8,7 +8,12 @@
 - Trigger parser-discovered iframe work from document-load parsing completion.
 - Use the `web_standards` extension (`spec_lookup`) with `https://html.spec.whatwg.org/` to read the HTML spec.
 
-## Structured clone (`safe_passing_of_structured_data.rs`)
+## Structured clone (`structured_data/`)
+
+`structured_data/` splits the safe passing of structured data between the
+generic algorithms (`safe_passing_of_structured_data.rs`) and the
+per-platform-object parts (`messageport.rs`); see its `README.md`.  The
+gotchas below apply to the generic algorithms.
 
 ### String round-tripping — use UTF-16 units, never a display-escaped string
 

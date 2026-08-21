@@ -4,7 +4,7 @@ type JsObject = <crate::js::Types as JsTypes>::JsObject;
 use crate::html::windowproxy::resolve_window;
 use crate::html::{
     PostMessageOptions, Window, WindowOrWorkerGlobalScope,
-    safe_passing_of_structured_data::StructuredCloneOptions,
+    structured_data::safe_passing_of_structured_data::StructuredCloneOptions,
     window_computed_style_properties_for_element,
 };
 use crate::js::bindings::html::global_event_handlers::define_global_event_handlers;

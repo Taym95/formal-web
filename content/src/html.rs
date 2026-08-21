@@ -24,7 +24,7 @@ mod hyperlink_element_utils;
 mod location;
 pub(crate) mod message_event;
 pub(crate) mod messageport;
-pub(crate) mod safe_passing_of_structured_data;
+pub(crate) mod structured_data;
 pub(crate) mod ui_events;
 mod window;
 mod window_or_worker_global_scope;

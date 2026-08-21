@@ -18,7 +18,7 @@ use crate::webidl::bindings::create_interface_instance;
 use crate::webidl::relevant_realm_global_this_value;
 
 use super::resolved_style_properties_for_element;
-use super::safe_passing_of_structured_data::structured_serialize_with_transfer;
+use super::structured_data::safe_passing_of_structured_data::structured_serialize_with_transfer;
 use super::windowproxy::create_window_proxy;
 use super::{GlobalScope, Location, the_rules_for_choosing_a_navigable};
 use js_engine::gc_struct;

@@ -7,7 +7,7 @@ type JsValue = <Types as JsTypes>::JsValue;
 use crate::html::{GlobalScope, TimerHandler, Window};
 use crate::webidl::Callback;
 
-use crate::html::safe_passing_of_structured_data::{self, StructuredCloneOptions};
+use crate::html::structured_data::safe_passing_of_structured_data::{self, StructuredCloneOptions};
 
 /// <https://html.spec.whatwg.org/#windoworworkerglobalscope>
 pub(crate) trait WindowOrWorkerGlobalScope {

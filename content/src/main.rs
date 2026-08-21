@@ -25,7 +25,7 @@ use crate::html::{
     attach_same_origin_child_document_for_traversable, execute_parser_scripts,
     parse_html_into_document, run_dom_post_connection_steps_for_document,
     run_dom_removing_steps_for_document, run_iframe_load_event_steps_for_traversable,
-    safe_passing_of_structured_data::{
+    structured_data::safe_passing_of_structured_data::{
         SerializeWithTransferResult, structured_deserialize_with_transfer,
     },
     windowproxy::WindowProxyBacking,

@@ -19,10 +19,10 @@
 use std::collections::HashMap;
 
 use ipc_messages::safe_passing_of_structured_data::{
-    PortTransferData, PrimitiveValue, SerializedRecord, TransferDataHolder,
+    PrimitiveValue, SerializedRecord, TransferDataHolder,
 };
 
-use crate::html::MessagePort;
+use super::messageport;
 
 use js_engine::{
     Completion, EcmascriptHost, ExecutionContext, JsTypes, enums::TypedArrayElementType,
@@ -853,7 +853,7 @@ pub fn structured_serialize_with_transfer(
 
         // Step 2.1: If transferable has neither an [[ArrayBufferData]] internal slot nor a
         //             [[Detached]] internal slot, then throw.
-        if !has_ab && !has_sab && !is_transferable_platform_object(&object, ec) {
+        if !has_ab && !has_sab && !messageport::is_transferable_platform_object(&object, ec) {
             return Err(crate::webidl::data_clone_error_value(ec));
         }
 
@@ -911,22 +911,12 @@ pub fn structured_serialize_with_transfer(
             // Step 5.2: Otherwise (platform object with a [[Detached]]
             //           internal slot): perform the transfer steps for the
             //           interface identified by interfaceName.
-            let port: MessagePort = ec
-                .with_object_any(&object)
-                .and_then(|data| data.downcast_ref::<MessagePort>().cloned())
-                .ok_or_else(|| crate::webidl::data_clone_error_value(ec))?;
-            // Step 5.2.x: Set transferable.[[Detached]] to true.
-            // Note: The record was removed by the transfer steps, so the
-            // source object's [[Detached]] state is implicit (its record is
-            // gone).
-            let mut data_holder = PortTransferData {
-                port_id: port.port_id,
-                queue: Vec::new(),
-                remote_port: None,
-                in_flight: 0,
-            };
-            port.transfer_steps(&mut data_holder, ec)?;
-            transfer_data_holders.push(TransferDataHolder::MessagePort(data_holder));
+            // Note: Only MessagePort is transferable; the steps run in
+            // messageport::transfer_steps, which reads the port out of its
+            // platform object, builds its data holder, and runs the transfer
+            // steps on it (the port's record leaves this realm there, so the
+            // source object's [[Detached]] state is implicit).
+            transfer_data_holders.push(messageport::transfer_steps(&object, ec)?);
         }
     }
 
@@ -935,18 +925,6 @@ pub fn structured_serialize_with_transfer(
         serialized,
         transfer_data_holders,
     })
-}
-
-/// Whether a transferable is a MessagePort platform object, which has a
-/// [[Detached]] internal slot and therefore satisfies the check of
-/// StructuredSerializeWithTransfer step 2.1.
-fn is_transferable_platform_object(
-    object: &JsObject,
-    ec: &mut dyn ExecutionContext<Types>,
-) -> bool {
-    ec.with_object_any(object)
-        .and_then(|data| data.downcast_ref::<MessagePort>().cloned())
-        .is_some()
 }
 
 // StructuredDeserialize
@@ -1018,7 +996,7 @@ fn structured_deserialize(
             // Create a BigInt wrapper via Object(BigInt(string)).
             let bi_val = ec
                 .string_to_bigint(ec.js_string_from_str(s))
-                .map(|bi| Types::value_from_bigint(bi))
+                .map(Types::value_from_bigint)
                 .unwrap_or_else(|| ec.value_from_number(0.0));
 
             // Use Object() constructor to wrap the BigInt primitive.
@@ -1419,19 +1397,11 @@ pub fn structured_deserialize_with_transfer(
             // Step 3.2: If transferDataHolder.[[Type]] is "MessagePort", then
             //           run the transfer-receiving steps for MessagePort given
             //           dataHolder and a new MessagePort in targetRealm.
-            // Note: The new MessagePort platform object is created in the
-            // target realm (the current realm) first ("a new MessagePort in
-            // targetRealm"), then the transfer-receiving steps
-            // (`Transferable::transfer_receiving_steps`) run on it: they
-            // re-entangle it with the remote port and register it with the
-            // user agent.
+            // Note: The steps run in messageport::transfer_receiving_steps,
+            // which creates the new port in the current (target) realm
+            // first, then runs the transfer-receiving steps on it.
             TransferDataHolder::MessagePort(holder) => {
-                let port = MessagePort::new_port_with_id(holder.port_id, ec)?;
-                port.transfer_receiving_steps(holder, ec)?;
-                let object = port
-                    .object()
-                    .ok_or_else(|| crate::webidl::data_clone_error_value(ec))?;
-                Types::value_from_object(object)
+                messageport::transfer_receiving_steps(holder, ec)?
             }
         };
 
@@ -1508,10 +1478,10 @@ fn unescape_regexp_source(escaped: &str) -> String {
                 Some('u') => {
                     // \u2028 or \u2029
                     let hex: String = chars.by_ref().take(4).collect();
-                    if let Ok(code) = u32::from_str_radix(&hex, 16) {
-                        if let Some(ch) = char::from_u32(code) {
-                            result.push(ch);
-                        }
+                    if let Ok(code) = u32::from_str_radix(&hex, 16)
+                        && let Some(ch) = char::from_u32(code)
+                    {
+                        result.push(ch);
                     }
                 }
                 Some(other) => {
