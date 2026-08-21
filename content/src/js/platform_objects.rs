@@ -190,9 +190,9 @@ pub(crate) fn resolve_or_create_text_node_object(
 }
 
 /// Filter an element's `on*` content attributes and sync each one to its
-/// event handler (attribute change steps, steps 1-2: the namespace/name
-/// filter and the event handler target resolution run here; the remaining
-/// steps run in html::event_handler::sync_event_handler_content_attribute).
+/// event handler: the namespace/name filter and the event handler target
+/// resolution of the sync run here; the remaining steps run in
+/// html::event_handler::sync_event_handler_content_attribute.
 fn sync_event_handler_content_attributes(
     document: &Rc<RefCell<BaseDocument>>,
     node_id: usize,

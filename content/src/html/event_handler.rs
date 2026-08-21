@@ -48,25 +48,78 @@ pub(crate) fn event_handler_idl_attribute_setter(
     // handler processing algorithm against the handler's current value, so
     // re-setting the value never touches the listener. Here the handler
     // callback is registered directly as the event listener, so replacing
-    // the value removes the previous handler's listener and registers the
-    // new one; setting null just removes it.
-    let previous = event_target.event_handler_value(name, ec);
-    if let Some(previous) = previous {
+    // the value removes the previous handler's listener (identified by the
+    // previous value) before the new one is registered.
+    match callback {
+        None => deactivate_event_handler(event_target, name, ec),
+        Some(callback) => {
+            if let Some(previous) = event_target.event_handler_value(name, ec) {
+                event_target.remove_event_listener_entry(name, &previous, false, ec);
+            }
+            event_target.set_event_handler_value(name, Some(callback.clone()), ec);
+            activate_event_handler(event_target, name, &callback, ec);
+        }
+    }
+}
+
+/// <https://html.spec.whatwg.org/#deactivate-an-event-handler>
+fn deactivate_event_handler(
+    event_target: &EventTarget,
+    name: &str,
+    ec: &mut dyn ExecutionContext<Types>,
+) {
+    // Step 1: Let handlerMap be eventTarget's event handler map.
+    // Step 2: Let eventHandler be handlerMap[name].
+    // Step 3: Set eventHandler's value to null.
+    // Step 4: Let listener be eventHandler's listener.
+    // Step 5: If listener is not null, then remove an event listener with
+    //         eventTarget and listener.
+    // Step 6: Set eventHandler's listener to null.
+    // Note: The event handler's listener is not stored separately from its
+    // value (see the note in event_handler_idl_attribute_setter), so the
+    // listener of step 4 is identified by the current value.
+    if let Some(previous) = event_target.event_handler_value(name, ec) {
         event_target.remove_event_listener_entry(name, &previous, false, ec);
     }
-    if let Some(callback) = callback.clone() {
-        event_target.add_event_listener(
-            event_target.clone(),
-            name.to_owned(),
-            Some(callback),
-            false,
-            false,
-            Some(false),
-            None,
-            ec,
-        );
-    }
-    event_target.set_event_handler_value(name, callback, ec);
+    event_target.set_event_handler_value(name, None, ec);
+}
+
+/// <https://html.spec.whatwg.org/#activate-an-event-handler>
+fn activate_event_handler(
+    event_target: &EventTarget,
+    name: &str,
+    callback: &Callback,
+    ec: &mut dyn ExecutionContext<Types>,
+) {
+    // Step 1: Let handlerMap be eventTarget's event handler map.
+    // Step 2: Let eventHandler be handlerMap[name].
+    // Step 3: If eventHandler's listener is not null, then return.
+    // Note: The wrapper listener running the event handler processing
+    // algorithm is not created; the handler callback is registered directly
+    // as the event listener, so the listener identity is the callback itself
+    // and re-activation re-registers it (event_handler_idl_attribute_setter
+    // removes the previous listener first).  Step 3's early return therefore
+    // never applies, and the listener of step 7 is never stored separately
+    // from the value.
+    // Step 4: Let callback be the result of creating a Web IDL EventListener
+    //         instance representing a reference to a function of one argument
+    //         that executes the steps of the event handler processing
+    //         algorithm, given eventTarget, name, and its argument.
+    // Step 5: Let listener be a new event listener whose type is the event
+    //         handler event type corresponding to eventHandler and callback
+    //         is callback.
+    // Step 6: Add an event listener with eventTarget and listener.
+    // Step 7: Set eventHandler's listener to listener.
+    event_target.add_event_listener(
+        event_target.clone(),
+        name.to_owned(),
+        Some(callback.clone()),
+        false,
+        false,
+        Some(false),
+        None,
+        ec,
+    );
 }
 
 /// <https://html.spec.whatwg.org/#getting-the-current-value-of-the-event-handler>
@@ -128,49 +181,35 @@ pub(crate) fn compile_event_handler_content_attribute(
     Ok(Callback::from_object(object, ec))
 }
 
-/// <https://html.spec.whatwg.org/#event-handler-attributes>
+/// Sync an `on*` content attribute with the element's event handler: the
+/// attribute change steps that synchronize between event handler content
+/// attributes and event handlers (an unnamed algorithm in the spec's event
+/// handler section, so there is no anchor to link).  The step-1
+/// namespace/name filter and step-2 target resolution run in the caller
+/// (sync_event_handler_content_attributes).
 pub(crate) fn sync_event_handler_content_attribute(
     event_target: &EventTarget,
     event_type: &str,
     value: Option<&str>,
     ec: &mut dyn ExecutionContext<Types>,
 ) -> Completion<(), Types> {
-    // Step 1: "If namespace is not null, or localName is not the name of an
-    //          event handler content attribute on element, then return."
-    // Note: Ran in the caller (sync_event_handler_content_attributes), which
-    // filters the element's attributes to its `on*` content attributes.
-    // Step 2: "Let eventTarget be the result of determining the target of an
-    //          event handler given element and localName."
-    // Note: Ran in the caller, which resolves the element's EventTarget.
-    // Step 3: "If eventTarget is null, then return."
-    // Step 4: "If value is null, then deactivate an event handler given
-    //          eventTarget and localName."
-    // Step 5: "Otherwise:"
-    // Step 5.1: "If the Should element's inline behavior be blocked by
-    //            Content Security Policy? algorithm returns "Blocked" when
-    //            executed upon element, "script attribute", and value, then
-    //            return."
-    // TODO: Not yet implemented.
-    // Step 5.2: "Let handlerMap be eventTarget's event handler map."
-    // Step 5.3: "Let eventHandler be handlerMap[localName]."
-    // Step 5.4: "Let location be the script location that triggered the
-    //            execution of these steps."
-    // Step 5.5: "Set eventHandler's value to the internal raw uncompiled
-    //            handler value/location."
-    // Note: Instead of storing an internal raw uncompiled handler, the
-    // value is compiled here into a callback (see
-    // compile_event_handler_content_attribute) and the event handler IDL
-    // setter path below sets it as the handler's value, so the compilation
-    // steps 3.7-3.12 of "getting the current value of the event handler"
-    // run at attribute-change time instead of on first get.  When
-    // compilation fails, the error is reported and the handler is left as
-    // it was, mirroring substeps 3.7.1-3.7.4 (set the value to null without
-    // deactivating, report the exception, return null) except that a
-    // previously-set value is not cleared.
-    // Step 5.6: "Activate an event handler given eventTarget and localName."
-    // Note: Steps 5.2-5.6 run through event_handler_idl_attribute_setter,
-    // which sets the handler's value and activates the event handler (or
-    // deactivates it on the step 4 path).
+    // Attribute change steps, step 4: "If value is null, then deactivate an
+    // event handler given eventTarget and localName."
+    // Attribute change steps, step 5.5: "Set eventHandler's value to the
+    // internal raw uncompiled handler value/location."
+    // Note: Instead of storing an internal raw uncompiled handler, the value
+    // is compiled here into a callback (see
+    // compile_event_handler_content_attribute, which runs the compilation
+    // steps 3.7-3.12 of "getting the current value of the event handler" at
+    // attribute-change time).  When compilation fails, the error is
+    // reported and the handler is left as it was, mirroring substeps
+    // 3.7.1-3.7.4 (set the value to null without deactivating, report the
+    // exception, return null) except that a previously-set value is not
+    // cleared.
+    // Attribute change steps, step 4 / step 5.6: deactivate the event
+    // handler for a removed attribute, or set the handler's value and
+    // activate it for a present one; both run through the event handler IDL
+    // setter path.
     let callback = match value {
         Some(source) => match compile_event_handler_content_attribute(source, ec) {
             Ok(callback) => Some(callback),
