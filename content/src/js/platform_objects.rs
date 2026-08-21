@@ -30,9 +30,7 @@ pub(crate) fn init_global_object_slot(
 }
 
 /// <https://html.spec.whatwg.org/#global-object>
-fn global_scope_or_error<'ec>(
-    ec: &'ec dyn ExecutionContext<crate::js::Types>,
-) -> Option<&'ec GlobalScope> {
+fn global_scope_or_error(ec: &dyn ExecutionContext<crate::js::Types>) -> Option<&GlobalScope> {
     let global_obj = ec.realm_global_object();
     ec.with_object_any(&global_obj)
         .and_then(|data| data.downcast_ref::<Window>())
@@ -127,7 +125,6 @@ pub(crate) fn resolve_element_object(
     // Create platform object (mutable ec, no GlobalScope borrow active).
     let object = element_object_from_document(document.clone(), node_id, ec)?;
 
-    // <https://html.spec.whatwg.org/#event-handler-content-attributes>
     // Compile and activate the element's `on*` content attributes (e.g.
     // `onload="..."`) now that the platform object exists, so the handlers
     // fire on the element's events.  Parser-set attributes are covered
@@ -192,9 +189,10 @@ pub(crate) fn resolve_or_create_text_node_object(
     Ok(object)
 }
 
-/// <https://html.spec.whatwg.org/#event-handler-content-attributes>
-/// Activate the event handlers of an element's `on*` content attributes on
-/// the element's event target, compiled from the attribute values.
+/// Filter an element's `on*` content attributes and sync each one to its
+/// event handler (attribute change steps, steps 1-2: the namespace/name
+/// filter and the event handler target resolution run here; the remaining
+/// steps run in html::event_handler::sync_event_handler_content_attribute).
 fn sync_event_handler_content_attributes(
     document: &Rc<RefCell<BaseDocument>>,
     node_id: usize,

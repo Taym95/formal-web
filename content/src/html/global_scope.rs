@@ -201,9 +201,9 @@ pub struct GlobalScope {
     #[ignore_trace]
     source_navigable_id: Rc<Cell<Option<NavigableId>>>,
 
-    /// <https://html.spec.whatwg.org/#concept-agent-event-loop>
-    /// The event loop this realm belongs to (the content process hosting
-    /// the realm), set by the content process at document creation.
+    /// <https://html.spec.whatwg.org/#responsible-event-loop>
+    /// The id of this global object's responsible event loop (its relevant
+    /// agent's event loop), set by the content process at document creation.
     #[ignore_trace]
     event_loop_id: Rc<Cell<Option<ipc_messages::content::EventLoopId>>>,
 
@@ -1077,7 +1077,6 @@ impl GlobalScope {
     /// execution that might trigger `window.open`.
     /// Note: Only used on JSC backend (Boa creates fresh contexts).
     #[allow(dead_code)]
-
     pub(crate) fn set_video_paint_registry(
         &self,
         registry: Rc<RefCell<HashMap<(DocumentId, usize), VideoPaintId>>>,

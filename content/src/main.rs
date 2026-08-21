@@ -152,7 +152,6 @@ pub(crate) type LocalContentStateRef = Arc<Mutex<LocalContentState>>;
 
 /// Tracks the playback state of a video element across paints.
 /// Stored in the paint registry instead of on the element for now.
-
 pub(crate) fn new_document_fetch_id() -> DocumentFetchId {
     DocumentFetchId::new()
 }
@@ -241,9 +240,10 @@ pub(crate) struct NavigableContainerState {
     pub(crate) current_key: String,
     pub(crate) cross_origin: bool,
     /// Whether the child document finished loading before the parent's
-    /// document load completion; when true, the iframe load event is
-    /// deferred and fired by the parent's load completion after its
-    /// deferred scripts have run.
+    /// document load completion ("the end", steps 5-9); when true, the
+    /// iframe load event steps of "completely finish loading" step 4 are
+    /// held back and run after the parent's load completion, once its
+    /// deferred parser scripts have executed.
     pub(crate) child_document_loaded: bool,
 }
 
@@ -843,7 +843,6 @@ impl ContentProcess {
     /// `create_a_new_child_navigable` to create the document in the content
     /// process immediately, since we are already in the correct browsing
     /// context group.
-
     /// <https://html.spec.whatwg.org/multipage/#navigate-html>
     fn continue_document_load(&mut self, document_id: DocumentId) -> Result<(), String> {
         // Set up the shared registry so window.open calls made by the inline

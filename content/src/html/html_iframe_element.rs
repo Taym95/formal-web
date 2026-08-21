@@ -677,6 +677,7 @@ fn run_iframe_load_event_steps(
     Ok(())
 }
 
+/// <https://html.spec.whatwg.org/#completely-finish-loading>
 pub(crate) fn run_iframe_load_event_steps_for_traversable(
     process: &mut ContentProcess,
     traversable_id: NavigableId,
@@ -701,12 +702,19 @@ pub(crate) fn run_iframe_load_event_steps_for_traversable(
         return Ok(());
     };
 
-    // The child document finished loading.  Per the spec this fires the
-    // iframe load event, but the parent's parser-blocking inline scripts
-    // must have run first (they are deferred to the parent's document load
-    // completion here).  When the parent has not finished loading yet, mark
-    // the iframe's load event as pending; the parent's load completion
-    // fires it once its scripts have run.
+    // The document finished loading, so per "completely finish loading"
+    // step 4 ("If container is an iframe element, then queue an element
+    // task on the DOM manipulation task source given container to run the
+    // iframe load event steps given container") the iframe load event steps
+    // run on this document's container.  The queued element task runs only
+    // after the container document's parser-blocking scripts have executed
+    // ("the end" step 5 executes the scripts that will execute when the
+    // document has finished parsing).  Here the container's
+    // parser-discovered scripts are deferred to its document load
+    // completion instead, so while the container's load has not completed
+    // yet (pending_document_load is still set) the iframe load event steps
+    // are held back and fired by the container's load completion
+    // (fire_deferred_iframe_load_events) once its scripts have run.
     let parent_not_loaded = process
         .documents
         .get(&parent_document_id)
@@ -726,10 +734,13 @@ pub(crate) fn run_iframe_load_event_steps_for_traversable(
     run_iframe_load_event_steps(process, parent_document_id, iframe_node_id)
 }
 
-/// Fire the iframe load events that the child's load completion deferred
-/// until the parent's document load completion (so the parent's deferred
-/// parser scripts have run first).  Called by the parent's load
-/// completion.
+/// Run the iframe load event steps that child load completions held back
+/// until the parent document's load completion.  This preserves the
+/// ordering that "completely finish loading" step 4 gives via its queued
+/// element task: the iframe load event steps run only after the container
+/// document's parser-discovered scripts, which this implementation defers
+/// to the parent's document load completion ("the end", steps 5-9).  Called
+/// by the parent's load completion.
 pub(crate) fn fire_deferred_iframe_load_events(
     process: &mut ContentProcess,
     parent_document_id: DocumentId,
