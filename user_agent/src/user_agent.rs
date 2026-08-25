@@ -4689,6 +4689,21 @@ impl UserAgentWorker {
                 // start it now.
                 if self.frame_needed.contains(&webview_id.0) {
                     self.queue_update_the_rendering_for_navigables(webview_id.0);
+                } else if !*animating
+                    && self.queued_rendering_opportunities.keys().any(|candidate| {
+                        self.state.top_level_traversable_id(*candidate) == Some(webview_id.0)
+                    })
+                {
+                    // A static content-only change (a DOM mutation from an
+                    // input event or script that landed while the previous
+                    // frame was in flight) is stranded in
+                    // `queued_rendering_opportunities`: the scene is not
+                    // animating, so nothing re-notes it and the display link
+                    // is stopped. Without a FrameNeeded the queued opportunity
+                    // is never drained, and the change only appears when the
+                    // next unrelated input event happens to request a frame.
+                    // Request a redraw so the next FrameNeeded drains it.
+                    self.host.request_redraw(*webview_id);
                 }
                 self.state
                     .frame_hit_info

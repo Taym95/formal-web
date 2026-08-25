@@ -314,6 +314,25 @@ impl Compositor {
             );
         }
 
+        // Decide whether this frame's content actually changed since the
+        // last stored frame for the same id. A layer whose scene and
+        // viewport are unchanged must keep its last surface (stay clean);
+        // re-storing an identical scene (e.g. a static document that keeps
+        // re-sending a PaintFrame because a video elsewhere drives the
+        // render cycle) would otherwise re-rasterize it and re-present it
+        // every cycle. Layer placement (transform/clip) is recomputed from
+        // `composition` each compose walk, so a placement-only change does
+        // not make the layer's own surface dirty.
+        let scene_changed = self
+            .committed_frames
+            .get(&frame_id)
+            .map(|existing| {
+                existing.scene != scene
+                    || existing.viewport_width != viewport_width
+                    || existing.viewport_height != viewport_height
+            })
+            .unwrap_or(true);
+
         let frame = CachedFrame {
             viewport_width,
             viewport_height,
@@ -323,7 +342,7 @@ impl Compositor {
             composition,
             scene,
             animating: false,
-            dirty: true,
+            dirty: scene_changed,
         };
 
         if self.replace_root_on_next_paint {

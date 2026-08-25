@@ -385,10 +385,13 @@ pub trait SurfaceRenderer {
     /// are skipped and keep their last surface. Returns the layer ids that
     /// were actually re-rendered, so the caller can clear their dirty flags.
     /// The GPU completion is delivered on `ReadbackChannels::render_done_tx`
-    /// as `Self::RenderData`.
+    /// as `Self::RenderData`. When nothing was re-rendered (every layer
+    /// clean), `sender` is used to emit a surface-less `PixelFrameReady` so
+    /// the UA still learns the composition completed.
     fn submit_layers(
         &mut self,
         composed: ComposedScene,
+        sender: &ipc::IpcSender<GraphicsEvent>,
     ) -> Result<Vec<CompositingLayerId>, RenderError>;
 
     /// The GPU completed a frame: deliver

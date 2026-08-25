@@ -253,6 +253,7 @@ impl SurfaceRenderer for CpuRenderer {
     fn submit_layers(
         &mut self,
         composed: ComposedScene,
+        sender: &ipc::IpcSender<GraphicsEvent>,
     ) -> Result<Vec<CompositingLayerId>, RenderError> {
         let ComposedScene {
             webview_id,
@@ -434,9 +435,28 @@ impl SurfaceRenderer for CpuRenderer {
                 shmem_regions: HashMap::new(),
                 metadata,
             });
+        } else {
+            // Nothing was re-rendered this cycle (every layer clean): emit a
+            // surface-less PixelFrameReady so the UA still learns the
+            // composition completed and clears the navigable's pending
+            // update-the-rendering. The embedder keeps its last surfaces.
+            let frame_event = GraphicsEvent::PixelFrameReady {
+                webview_id,
+                layers: topology,
+                animating: metadata.animating,
+                animating_frame_ids: metadata.animating_frame_ids,
+                generation: self.gpu.generation,
+                frame_hit_info: metadata.frame_hit_info,
+                child_viewports: metadata.child_viewports,
+                child_frame_to_webview: metadata.child_frame_to_webview,
+            };
+            if let Err(send_error) = sender.send(frame_event) {
+                error!(
+                    "[gpu-renderer] failed to send empty PixelFrameReady for {:?}: {send_error}",
+                    webview_id
+                );
+            }
         }
-        // If nothing was re-rendered, no readbacks were submitted and no
-        // PixelFrameReady is sent — the embedder keeps its last surfaces.
         Ok(rendered)
     }
 

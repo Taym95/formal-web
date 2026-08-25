@@ -88,6 +88,7 @@ impl SurfaceRenderer for IosurfaceRenderer {
     fn submit_layers(
         &mut self,
         composed: ComposedScene,
+        sender: &ipc::IpcSender<GraphicsEvent>,
     ) -> Result<Vec<CompositingLayerId>, RenderError> {
         let ComposedScene {
             webview_id,
@@ -169,23 +170,47 @@ impl SurfaceRenderer for IosurfaceRenderer {
 
         self.gpu.generation += 1;
         let generation = self.gpu.generation;
-        // If nothing was re-rendered this cycle, skip the notification — the
-        // embedder keeps drawing its last surfaces and the compositor had
-        // nothing new to present.
-        if !rendered.is_empty() {
-            let done = SharedRenderData {
+        if rendered.is_empty() {
+            // Nothing was re-rendered this cycle (every layer clean, e.g. a
+            // static root with a video that produced no new frame): emit a
+            // surface-less PixelFrameReady directly so the UA still learns
+            // the composition completed and clears the navigable's pending
+            // update-the-rendering. The embedder keeps drawing its last
+            // surfaces. No GPU work was submitted, so no poll is needed.
+            let frame_event = GraphicsEvent::PixelFrameReady {
                 webview_id,
-                generation,
                 layers: topology,
-                metadata,
+                animating: metadata.animating,
+                animating_frame_ids: metadata.animating_frame_ids,
+                generation,
+                frame_hit_info: metadata.frame_hit_info,
+                child_viewports: metadata.child_viewports,
+                child_frame_to_webview: metadata.child_frame_to_webview,
             };
-            if let Err(send_error) = self.channels.poll_tx.send(PollRequest {
-                device: self.gpu.device_handle.clone(),
-                submission_index: None,
-                done: Some(done),
-            }) {
-                error!("[gpu-renderer] failed to queue shared render poll: {send_error}");
+            if let Err(send_error) = sender.send(frame_event) {
+                error!(
+                    "[gpu-renderer] failed to send empty PixelFrameReady for {:?}: {send_error}",
+                    webview_id
+                );
             }
+            debug!(
+                "[gpu-renderer] no shared layers rendered gen={}",
+                generation
+            );
+            return Ok(rendered);
+        }
+        let done = SharedRenderData {
+            webview_id,
+            generation,
+            layers: topology,
+            metadata,
+        };
+        if let Err(send_error) = self.channels.poll_tx.send(PollRequest {
+            device: self.gpu.device_handle.clone(),
+            submission_index: None,
+            done: Some(done),
+        }) {
+            error!("[gpu-renderer] failed to queue shared render poll: {send_error}");
         }
         debug!(
             "[gpu-renderer] rendered {} shared layers gen={}",
