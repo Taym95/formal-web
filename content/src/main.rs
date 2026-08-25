@@ -2249,12 +2249,17 @@ impl ContentProcess {
         let video_count = video_node_ids.len();
         let mut embed_sites = Vec::with_capacity(iframe_count + video_count);
 
+        let viewport_scroll = document.viewport_scroll();
         for (paint_order, (iframe_node_id, state)) in iframe_node_ids.into_iter().enumerate() {
             let (x, y, width, height) =
                 match Self::content_box_for_node(document, iframe_node_id, scale) {
                     Some(box_) => box_,
                     None => continue,
                 };
+            debug!(
+                "[layout] iframe node {} embed site: pos=({:.0},{:.0}) size=({:.0},{:.0}) viewport_scroll=({:.0},{:.0})",
+                iframe_node_id, x, y, width, height, viewport_scroll.x, viewport_scroll.y
+            );
             let clip_svg_path = format!("M0,0 L{width},0 L{width},{height} L0,{height} Z");
             embed_sites.push(EmbedSite::Frame(IframeEmbedSite {
                 embed_site_id: EmbedSiteId((iframe_node_id as u64).wrapping_add(1)),
@@ -2298,8 +2303,8 @@ impl ContentProcess {
                 }
             };
             debug!(
-                "[layout] video node {} embed site: pos=({:.0},{:.0}) size=({:.0},{:.0})",
-                video_node_id, x, y, width, height
+                "[layout] video node {} embed site: pos=({:.0},{:.0}) size=({:.0},{:.0}) viewport_scroll=({:.0},{:.0})",
+                video_node_id, x, y, width, height, viewport_scroll.x, viewport_scroll.y
             );
             // Read border-radius from the element's computed style. This defaults to a
             // small rounded radius if available, otherwise 0 (rect clip). For simplicity,

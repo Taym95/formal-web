@@ -2,6 +2,7 @@
 //! thread) hands events to the app's main-thread run loop.
 
 use crate::platform::{clipboard_get_text, clipboard_set_text, window_viewport_snapshot};
+use automation::AutomationCommand;
 use ipc_messages::content::WebviewId;
 use log::error;
 use std::collections::HashMap;
@@ -59,6 +60,13 @@ pub fn send_user_event(event: FormalWebUserEvent) -> Result<(), String> {
     }
 }
 
+pub fn event_loop_is_ready() -> bool {
+    USER_EVENT_SINK
+        .lock()
+        .expect("user event sink mutex poisoned")
+        .is_some()
+}
+
 pub enum FormalWebUserEvent {
     RequestRedraw(WebviewId),
     NewWebContentScene {
@@ -70,15 +78,11 @@ pub enum FormalWebUserEvent {
         #[allow(dead_code)]
         font_data: HashMap<usize, Vec<u8>>,
     },
-    NewWebContentSurface {
+    NewWebContentLayers {
         webview_id: WebviewId,
-        /// The rendered surface frame: how the pixels are delivered (CPU
-        /// shared memory vs. shared IOSurface on macOS) and the payload.
-        frame: ipc_messages::graphics::SurfaceFrame,
-        width: u32,
-        height: u32,
-        #[allow(dead_code)]
-        generation: u64,
+        /// The per-layer frames: topology always, surface only for the
+        /// layers re-rendered this cycle.
+        layers: Vec<ipc_messages::graphics::LayerFrame>,
         /// Whether the composed scene contains animated content (video, CSS
         /// animations) that needs the next frame at display cadence.
         animating: bool,
@@ -88,6 +92,7 @@ pub enum FormalWebUserEvent {
         destination_url: String,
     },
     NavigationCompleted(NavigationCompleted),
+    Automation(AutomationCommand),
     #[allow(dead_code)]
     NewWebview(WebviewId, String),
     /// Opened only by the winit chrome's new-window action; the AppKit
@@ -106,6 +111,9 @@ pub enum FormalWebUserEvent {
         webview_id: WebviewId,
         title: String,
     },
+    /// The app was asked to terminate (e.g. via the CDP `Browser.close`
+    /// command).
+    Exit,
 }
 
 /// Routes `webview::Embedder` callbacks into `FormalWebUserEvent` events on
@@ -193,22 +201,16 @@ impl Embedder for EventLoopEmbedder {
         })
     }
 
-    fn new_web_content_surface(
+    fn new_web_content_layers(
         &self,
         webview_id: WebviewId,
-        frame: ipc_messages::graphics::SurfaceFrame,
-        width: u32,
-        height: u32,
-        generation: u64,
+        layers: Vec<ipc_messages::graphics::LayerFrame>,
         animating: bool,
     ) -> Result<(), String> {
         self.sink
-            .send(FormalWebUserEvent::NewWebContentSurface {
+            .send(FormalWebUserEvent::NewWebContentLayers {
                 webview_id,
-                frame,
-                width,
-                height,
-                generation,
+                layers,
                 animating,
             })
             .map_err(|error| format!("failed to send surface event: {error}"))

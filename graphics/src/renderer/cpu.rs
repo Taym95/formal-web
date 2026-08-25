@@ -5,11 +5,11 @@
 //! `cpu_readback` feature.
 
 use super::{
-    FrameDelivery, FrameMetadata, GpuContext, PollRequest, ReadbackChannels, RenderError,
-    SurfaceBuffers, SurfaceRenderer, SurfaceRingState, frame_metadata, render_size,
+    FrameDelivery, FrameMetadata, GpuContext, MAX_SURFACE_DIMENSION, PollRequest, ReadbackChannels,
+    RenderError, SurfaceBuffers, SurfaceRenderer, SurfaceRingState, frame_metadata,
 };
 use ipc_messages::content::WebviewId;
-use ipc_messages::graphics::{GraphicsEvent, SurfacePayload};
+use ipc_messages::graphics::{CompositingLayerId, GraphicsEvent, LayerTopology, SurfacePayload};
 use log::{debug, error, info};
 use std::collections::HashMap;
 use wgpu::{
@@ -33,20 +33,41 @@ use crate::ComposedScene;
 pub const READBACK_SLOTS: usize = 2;
 
 /// Per-frame data for the CPU readback path: delivered by the readback map
-/// callback when the GPU completes the copy.
+/// callback when the GPU completes the copy. Each message is one layer's
+/// readback; the renderer accumulates them per cycle and emits one
+/// `PixelFrameReady` when the last one lands.
 pub struct CpuRenderData {
     pub webview_id: WebviewId,
     pub generation: u64,
+    pub layer_id: CompositingLayerId,
     pub width: u32,
     pub height: u32,
     pub shmem_index: usize,
     pub readback_index: usize,
     pub result: Result<(), wgpu::BufferAsyncError>,
-    pub metadata: FrameMetadata,
+}
+
+/// Accumulates one render cycle's per-layer readbacks so the CPU path emits a
+/// single `PixelFrameReady` once every layer submitted this cycle has
+/// finished.
+struct CycleAccumulator {
+    webview_id: WebviewId,
+    generation: u64,
+    /// Total layers submitted this cycle (readbacks outstanding).
+    total: usize,
+    /// How many readbacks have completed so far.
+    received: usize,
+    /// Topology in submission order; an entry's `surface` stays `Some` only
+    /// if its readback completed successfully.
+    layers: Vec<LayerTopology>,
+    /// Shared-memory regions collected, keyed by shmem_key, for the send.
+    shmem_regions: HashMap<usize, ipc::IpcSharedRegion>,
+    metadata: FrameMetadata,
 }
 
 /// The CPU readback renderer: a [`GpuContext`] plus the intermediate
-/// texture, the readback staging pool, and the webview's shared-memory ring.
+/// texture, the readback staging pool, the per-layer shared-memory rings,
+/// and the per-cycle accumulator.
 pub struct CpuRenderer {
     gpu: GpuContext,
     channels: ReadbackChannels<CpuRenderData>,
@@ -57,9 +78,13 @@ pub struct CpuRenderer {
     readback_buffers: [Option<(wgpu::Buffer, u32, u32)>; READBACK_SLOTS],
     /// Generation of the frame whose readback is in flight per slot.
     inflight_readbacks: [Option<u64>; READBACK_SLOTS],
-    /// The webview's shared-memory double buffer (two regions), reallocated
+    /// Per-layer shared-memory double buffers (two regions each), reallocated
     /// on resize.
-    buffers: Option<SurfaceBuffers<[ipc::IpcSharedRegion; 2]>>,
+    buffers: HashMap<CompositingLayerId, SurfaceBuffers<[ipc::IpcSharedRegion; 2]>>,
+    /// Per-cycle accumulation: outstanding layer readbacks and the topology
+    /// collected so far, flushed to one PixelFrameReady when the last layer
+    /// readback completes.
+    pending_cycle: Option<CycleAccumulator>,
 }
 
 impl CpuRenderer {
@@ -220,57 +245,31 @@ impl SurfaceRenderer for CpuRenderer {
             render_tex: None,
             readback_buffers: [None, None],
             inflight_readbacks: [None, None],
-            buffers: None,
+            buffers: HashMap::new(),
+            pending_cycle: None,
         })
     }
 
-    fn submit_scene(&mut self, composed: ComposedScene) -> Result<(), RenderError> {
+    fn submit_layers(
+        &mut self,
+        composed: ComposedScene,
+    ) -> Result<Vec<CompositingLayerId>, RenderError> {
         let ComposedScene {
             webview_id,
-            scene,
+            layers,
             frame_hit_info,
             child_viewports,
             child_frame_to_webview,
             animating,
             animating_frame_ids,
         } = composed;
-        let (width, height) = render_size(&frame_hit_info);
         info!(
-            "[render-pipe] Graphics GPU render webview={} {}x{} {} child_frames animating={}",
+            "[render-pipe] Graphics CPU submit layers webview={} layers={} child_frames={} animating={}",
             webview_id.0,
-            width,
-            height,
+            layers.len(),
             child_viewports.len(),
             animating,
         );
-
-        // The intermediate render target must match the current size before
-        // the buffers borrow below.
-        self.ensure_render_tex(width, height);
-
-        // Reuse the per-webview frame buffers across frames, reallocating
-        // only when the viewport size changes.
-        let needs_new = self
-            .buffers
-            .as_ref()
-            .is_none_or(|buffers| buffers.ring().width != width || buffers.ring().height != height);
-        if needs_new {
-            let payload = Self::allocate_shmem(width, height).map_err(|error| {
-                error!(
-                    "[graphics] allocate surface shmem {}x{}: {error}",
-                    width, height
-                );
-                RenderError::Failed
-            })?;
-            self.buffers = Some(SurfaceBuffers::new(
-                SurfaceRingState::new(width, height),
-                payload,
-            ));
-        }
-        let buffers = self.buffers.as_mut().ok_or(RenderError::Failed)?;
-        // Double buffering: render into the buffer the last render did
-        // not use.
-        let buffer_index = buffers.next_buffer();
 
         let metadata = frame_metadata(
             webview_id,
@@ -281,124 +280,164 @@ impl SurfaceRenderer for CpuRenderer {
             animating_frame_ids,
         );
 
-        // Step 1: Vello compute render into the intermediate texture. The
-        // pending video frame imports (macOS) submit first (inside
-        // render_into), then Vello's render — two back-to-back submissions
-        // per composed frame.
-        let (src_tex, _, _) = self.render_tex.as_ref().ok_or(RenderError::Failed)?;
-        if let Err(error) = self.gpu.render_into(&scene, src_tex, width, height) {
-            error!("[gpu-renderer] {error}");
-            return Err(RenderError::Failed);
-        }
+        let mut rendered = Vec::new();
+        let mut topology = Vec::with_capacity(layers.len());
+        let mut total = 0;
 
-        // Step 2: pick the next free readback slot and ensure its staging
-        // buffer matches the current size.
-        let device_handle = &self.gpu.device_handle;
-        let Some(readback_index) =
-            (0..READBACK_SLOTS).find(|index| self.inflight_readbacks[*index].is_none())
-        else {
-            error!(
-                "[gpu-renderer] no free readback slot for {}x{}",
-                width, height
-            );
-            return Err(RenderError::Failed);
-        };
-        let readback_buf = Self::ensure_readback_buffer(
-            &mut self.readback_buffers[readback_index],
-            device_handle,
-            width,
-            height,
-        )
-        .ok_or(RenderError::Failed)?;
-        // bytes_per_row must be a multiple of COPY_BYTES_PER_ROW_ALIGNMENT.
-        let alignment = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
-        let aligned_bytes_per_row = (width * 4).div_ceil(alignment) * alignment;
-        let aligned_size = aligned_bytes_per_row * height;
+        for layer in layers {
+            let Some(ref scene) = layer.render else {
+                // Clean layer: keep its last surface, still report topology.
+                topology.push(layer.into_layer_topology());
+                continue;
+            };
+            let layer_id = layer.layer_id;
+            let width = layer.width.clamp(1, MAX_SURFACE_DIMENSION);
+            let height = layer.height.clamp(1, MAX_SURFACE_DIMENSION);
 
-        let mut encoder = device_handle
-            .device
-            .create_command_encoder(&CommandEncoderDescriptor {
-                label: Some("surface-readback"),
+            // The intermediate render target must match this layer's size
+            // before the buffers borrow below.
+            self.ensure_render_tex(width, height);
+
+            let needs_new = self.buffers.get(&layer_id).is_none_or(|buffers| {
+                buffers.ring().width != width || buffers.ring().height != height
             });
-        let (src_tex, _, _) = self.render_tex.as_ref().ok_or(RenderError::Failed)?;
-        encoder.copy_texture_to_buffer(
-            TexelCopyTextureInfo {
-                texture: src_tex,
-                mip_level: 0,
-                origin: Origin3d::ZERO,
-                aspect: TextureAspect::All,
-            },
-            TexelCopyBufferInfo {
-                buffer: readback_buf,
-                layout: TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(aligned_bytes_per_row),
-                    rows_per_image: Some(height),
-                },
-            },
-            Extent3d {
+            if needs_new {
+                let payload = Self::allocate_shmem(width, height).map_err(|error| {
+                    error!(
+                        "[graphics] allocate surface shmem {}x{}: {error}",
+                        width, height
+                    );
+                    RenderError::Failed
+                })?;
+                self.buffers.insert(
+                    layer_id,
+                    SurfaceBuffers::new(SurfaceRingState::new(width, height), payload),
+                );
+            }
+            let buffer_index = self
+                .buffers
+                .get_mut(&layer_id)
+                .ok_or(RenderError::Failed)?
+                .next_buffer();
+
+            // Vello render into the intermediate texture.
+            let (src_tex, _, _) = self.render_tex.as_ref().ok_or(RenderError::Failed)?;
+            if let Err(error) = self.gpu.render_into(scene, src_tex, width, height) {
+                error!("[gpu-renderer] {error}");
+                return Err(RenderError::Failed);
+            }
+
+            // Submit the readback into a staging buffer.
+            let device_handle = &self.gpu.device_handle;
+            let Some(readback_index) =
+                (0..READBACK_SLOTS).find(|index| self.inflight_readbacks[*index].is_none())
+            else {
+                error!(
+                    "[gpu-renderer] no free readback slot for {}x{}",
+                    width, height
+                );
+                return Err(RenderError::Failed);
+            };
+            let readback_buf = Self::ensure_readback_buffer(
+                &mut self.readback_buffers[readback_index],
+                device_handle,
                 width,
                 height,
-                depth_or_array_layers: 1,
-            },
-        );
+            )
+            .ok_or(RenderError::Failed)?;
+            let alignment = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+            let aligned_bytes_per_row = (width * 4).div_ceil(alignment) * alignment;
+            let aligned_size = aligned_bytes_per_row * height;
 
-        self.gpu.generation += 1;
-        let generation = self.gpu.generation;
-        let webview_id = metadata.webview_id;
-        let shmem_index = buffer_index;
-        let frame_hit_info = metadata.frame_hit_info;
-        let child_viewports = metadata.child_viewports;
-        let child_frame_to_webview = metadata.child_frame_to_webview;
-        let animating = metadata.animating;
-        let animating_frame_ids = metadata.animating_frame_ids;
-        // The map is scheduled to complete after this submission finishes on
-        // the GPU; the callback fires on the poll thread and delivers the
-        // completed frame to the main loop.
-        let render_done_tx = self.channels.render_done_tx.clone();
-        encoder.map_buffer_on_submit(
-            readback_buf,
-            wgpu::MapMode::Read,
-            0..aligned_size as u64,
-            move |result| {
-                if let Err(send_error) = render_done_tx.send(CpuRenderData {
-                    webview_id,
-                    generation,
+            let mut encoder =
+                device_handle
+                    .device
+                    .create_command_encoder(&CommandEncoderDescriptor {
+                        label: Some("surface-readback"),
+                    });
+            let (src_tex, _, _) = self.render_tex.as_ref().ok_or(RenderError::Failed)?;
+            encoder.copy_texture_to_buffer(
+                TexelCopyTextureInfo {
+                    texture: src_tex,
+                    mip_level: 0,
+                    origin: Origin3d::ZERO,
+                    aspect: TextureAspect::All,
+                },
+                TexelCopyBufferInfo {
+                    buffer: readback_buf,
+                    layout: TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(aligned_bytes_per_row),
+                        rows_per_image: Some(height),
+                    },
+                },
+                Extent3d {
                     width,
                     height,
-                    shmem_index,
-                    readback_index,
-                    result,
-                    metadata: FrameMetadata {
-                        webview_id,
-                        frame_hit_info,
-                        child_viewports,
-                        child_frame_to_webview,
-                        animating,
-                        animating_frame_ids,
-                    },
-                }) {
-                    error!("[gpu-renderer] failed to deliver readback ready: {send_error}");
-                }
-            },
-        );
-        let submission_index = self.gpu.device_handle.queue.submit([encoder.finish()]);
-        // Ask the poll thread to block until this submission completes; it
-        // fires the map callback above when the GPU is done.
-        if let Err(send_error) = self.channels.poll_tx.send(PollRequest {
-            device: self.gpu.device_handle.clone(),
-            submission_index: Some(submission_index),
-            done: None,
-        }) {
-            error!("[gpu-renderer] failed to queue poll request: {send_error}");
-        }
-        self.inflight_readbacks[readback_index] = Some(generation);
-        debug!(
-            "[gpu-renderer] submitted {}x{} gen={} readback={}",
-            width, height, generation, readback_index
-        );
+                    depth_or_array_layers: 1,
+                },
+            );
 
-        Ok(())
+            self.gpu.generation += 1;
+            let generation = self.gpu.generation;
+            let shmem_index = buffer_index;
+            // The map is scheduled to complete after this submission finishes
+            // on the GPU; the callback fires on the poll thread and delivers
+            // this layer's completed readback to the main loop.
+            let render_done_tx = self.channels.render_done_tx.clone();
+            encoder.map_buffer_on_submit(
+                readback_buf,
+                wgpu::MapMode::Read,
+                0..aligned_size as u64,
+                move |result| {
+                    if let Err(send_error) = render_done_tx.send(CpuRenderData {
+                        webview_id,
+                        generation,
+                        layer_id,
+                        width,
+                        height,
+                        shmem_index,
+                        readback_index,
+                        result,
+                    }) {
+                        error!("[gpu-renderer] failed to deliver readback ready: {send_error}");
+                    }
+                },
+            );
+            let submission_index = self.gpu.device_handle.queue.submit([encoder.finish()]);
+            // Ask the poll thread to block until this submission completes.
+            if let Err(send_error) = self.channels.poll_tx.send(PollRequest {
+                device: self.gpu.device_handle.clone(),
+                submission_index: Some(submission_index),
+                done: None,
+            }) {
+                error!("[gpu-renderer] failed to queue poll request: {send_error}");
+            }
+            self.inflight_readbacks[readback_index] = Some(generation);
+
+            topology.push(
+                layer.into_layer_topology_with_surface(SurfacePayload::CpuShmem {
+                    shmem_key: generation as usize,
+                }),
+            );
+            rendered.push(layer_id);
+            total += 1;
+        }
+
+        if total > 0 {
+            self.pending_cycle = Some(CycleAccumulator {
+                webview_id,
+                generation: self.gpu.generation,
+                total,
+                received: 0,
+                layers: topology,
+                shmem_regions: HashMap::new(),
+                metadata,
+            });
+        }
+        // If nothing was re-rendered, no readbacks were submitted and no
+        // PixelFrameReady is sent — the embedder keeps its last surfaces.
+        Ok(rendered)
     }
 
     fn handle_render_done(
@@ -409,86 +448,108 @@ impl SurfaceRenderer for CpuRenderer {
         let CpuRenderData {
             webview_id,
             generation,
+            layer_id,
             width,
             height,
             shmem_index,
             readback_index,
             result,
-            metadata,
         } = data;
         let mut delivery = FrameDelivery {
             graphics_computed: false,
         };
+        let Some(cycle) = self.pending_cycle.as_mut() else {
+            error!(
+                "[graphics] readback for unknown cycle {:?} gen={}",
+                webview_id, generation
+            );
+            Self::release_readback(&mut self.inflight_readbacks, readback_index);
+            return delivery;
+        };
+
+        let mut usable = false;
         if let Err(error) = result {
             error!(
                 "[graphics] readback map failed for {:?} gen={}: {error:?}",
                 webview_id, generation
             );
             Self::release_readback(&mut self.inflight_readbacks, readback_index);
-            return delivery;
-        }
-        let Some(buffers) = self.buffers.as_mut() else {
-            error!(
-                "[graphics] no surface buffers for render done {:?}",
-                webview_id
-            );
-            return delivery;
-        };
-        let Some(region) = buffers.payload_mut().get_mut(shmem_index) else {
-            error!(
-                "[graphics] bad shmem index {} for readback {:?} gen={}",
-                shmem_index, webview_id, generation
-            );
-            Self::release_readback(&mut self.inflight_readbacks, readback_index);
-            return delivery;
-        };
-        // SAFETY: this buffer was reserved at submit time and its pixels are
-        // delivered exactly once here, before it is marked pending; no other
-        // party reads or writes these pages in between.
-        let pixel_slice = unsafe { region.as_mut_slice() };
-        if !Self::copy_readback(
-            &mut self.inflight_readbacks,
-            &mut self.readback_buffers,
-            readback_index,
-            pixel_slice,
-            width,
-            height,
-        ) {
-            error!(
-                "[graphics] readback copy failed for {:?} gen={}",
-                webview_id, generation
-            );
-            return delivery;
-        }
-        let shmem_key = generation as usize;
-        let mut shmem_map = HashMap::new();
-        shmem_map.insert(shmem_key, buffers.payload()[shmem_index].clone());
-
-        if sender
-            .send_with_shmem_map(
-                GraphicsEvent::PixelFrameReady {
-                    webview_id,
-                    payload: SurfacePayload::CpuShmem { shmem_key },
-                    animating: metadata.animating,
-                    animating_frame_ids: metadata.animating_frame_ids,
+        } else if let Some(buffers) = self.buffers.get_mut(&layer_id) {
+            if let Some(region) = buffers.payload_mut().get_mut(shmem_index) {
+                // SAFETY: this buffer was reserved at submit time and its
+                // pixels are delivered exactly once here, before it is marked
+                // pending; no other party reads or writes these pages in
+                // between.
+                let pixel_slice = unsafe { region.as_mut_slice() };
+                if Self::copy_readback(
+                    &mut self.inflight_readbacks,
+                    &mut self.readback_buffers,
+                    readback_index,
+                    pixel_slice,
                     width,
                     height,
-                    generation,
-                    frame_hit_info: metadata.frame_hit_info,
-                    child_viewports: metadata.child_viewports,
-                    child_frame_to_webview: metadata.child_frame_to_webview,
-                },
-                shmem_map,
-            )
-            .is_err()
-        {
+                ) {
+                    let shmem_key = generation as usize;
+                    cycle
+                        .shmem_regions
+                        .insert(shmem_key, buffers.payload()[shmem_index].clone());
+                    usable = true;
+                } else {
+                    error!(
+                        "[graphics] readback copy failed for {:?} gen={}",
+                        webview_id, generation
+                    );
+                }
+            } else {
+                error!(
+                    "[graphics] bad shmem index {} for layer {:?} gen={}",
+                    shmem_index, layer_id, generation
+                );
+                Self::release_readback(&mut self.inflight_readbacks, readback_index);
+            }
+        } else {
             error!(
-                "[graphics] failed to send PixelFrameReady for {:?} gen={}",
-                webview_id, generation
+                "[graphics] no surface buffers for layer {:?} gen={}",
+                layer_id, generation
             );
-            return delivery;
+            Self::release_readback(&mut self.inflight_readbacks, readback_index);
         }
-        delivery.graphics_computed = true;
+
+        if !usable {
+            if let Some(layer) = cycle.layers.iter_mut().find(|l| l.layer_id == layer_id) {
+                layer.surface = None;
+            }
+        }
+        cycle.received += 1;
+
+        if cycle.received == cycle.total {
+            let Some(pending) = self.pending_cycle.take() else {
+                return delivery;
+            };
+            if sender
+                .send_with_shmem_map(
+                    GraphicsEvent::PixelFrameReady {
+                        webview_id: pending.webview_id,
+                        layers: pending.layers,
+                        animating: pending.metadata.animating,
+                        animating_frame_ids: pending.metadata.animating_frame_ids,
+                        generation: pending.generation,
+                        frame_hit_info: pending.metadata.frame_hit_info,
+                        child_viewports: pending.metadata.child_viewports,
+                        child_frame_to_webview: pending.metadata.child_frame_to_webview,
+                    },
+                    pending.shmem_regions,
+                )
+                .is_err()
+            {
+                error!(
+                    "[graphics] failed to send PixelFrameReady for {:?}",
+                    pending.webview_id
+                );
+                return delivery;
+            }
+            delivery.graphics_computed = true;
+        }
         delivery
     }
 

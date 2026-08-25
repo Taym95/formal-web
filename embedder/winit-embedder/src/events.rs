@@ -77,14 +77,11 @@ pub enum FormalWebUserEvent {
         font_registrations: Vec<ipc_messages::content::RegisteredFont>,
         font_data: HashMap<usize, Vec<u8>>,
     },
-    NewWebContentSurface {
+    NewWebContentLayers {
         webview_id: WebviewId,
-        /// The rendered surface frame: how the pixels are delivered (CPU
-        /// shared memory vs. shared IOSurface on macOS) and the payload.
-        frame: ipc_messages::graphics::SurfaceFrame,
-        width: u32,
-        height: u32,
-        generation: u64,
+        /// The per-layer frames: topology always, surface only for the
+        /// layers re-rendered this cycle.
+        layers: Vec<ipc_messages::graphics::LayerFrame>,
         /// Whether the composed scene contains animated content (video, CSS
         /// animations) that needs the next frame at display cadence.
         animating: bool,
@@ -198,22 +195,16 @@ impl Embedder for EventLoopEmbedder {
         })
     }
 
-    fn new_web_content_surface(
+    fn new_web_content_layers(
         &self,
         webview_id: WebviewId,
-        frame: ipc_messages::graphics::SurfaceFrame,
-        width: u32,
-        height: u32,
-        generation: u64,
+        layers: Vec<ipc_messages::graphics::LayerFrame>,
         animating: bool,
     ) -> Result<(), String> {
         self.sink
-            .send(FormalWebUserEvent::NewWebContentSurface {
+            .send(FormalWebUserEvent::NewWebContentLayers {
                 webview_id,
-                frame,
-                width,
-                height,
-                generation,
+                layers,
                 animating,
             })
             .map_err(|error| format!("failed to send surface event: {error}"))

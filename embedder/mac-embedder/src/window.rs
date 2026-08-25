@@ -47,6 +47,10 @@ pub(super) fn new_layer_hosted_view(
     );
     // Compositor transparency glitches: the web content is always opaque.
     layer.setOpaque(true);
+    // Clip the per-navigable/per-video sublayers to the web content area so
+    // they cannot overflow onto the chrome (tab strip, address bar) when the
+    // page scrolls them outside the webview's bounds.
+    layer.setMasksToBounds(true);
     // Match the window's backing scale so the contents map 1:1 onto
     // physical pixels on Retina displays.
     layer.setContentsScale(initial_scale_factor);

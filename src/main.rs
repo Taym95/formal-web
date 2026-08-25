@@ -14,6 +14,11 @@ struct Cli {
     #[arg(long, default_value_t = false)]
     headless: bool,
 
+    #[arg(long, value_name = "PORT")]
+    /// Serve a CDP server on this port for the AppKit embedder, so the pi
+    /// browser tooling can take real screenshots of the mac window.
+    cdp_port: Option<u16>,
+
     #[command(subcommand)]
     command: Option<CommandKind>,
 }
@@ -74,7 +79,7 @@ fn main() -> ExitCode {
     }
 
     let result = match command {
-        None => embedder::run_default(cli.verify, cli.headless),
+        None => embedder::run_default(cli.verify, cli.headless, cli.cdp_port),
         Some(CommandKind::WebDriver(args)) => {
             embedder::run_webdriver(args, cli.verify, cli.headless)
         }

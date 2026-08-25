@@ -1,4 +1,4 @@
-use crate::content::{FrameId, PaintFrame, WebviewId};
+use crate::content::{EmbedBackgroundPolicy, FrameId, PaintFrame, WebviewId};
 use crate::media::{MediaPipelineId, VideoPaintId};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -21,6 +21,15 @@ impl Default for CompositorSlotId {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Identifies one compositable layer within a webview: a cross-origin
+/// navigable (iframe) or a `<video>` embed site. Same-origin iframes are
+/// baked into their parent's recorded scene and get no layer of their own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum CompositingLayerId {
+    Navigable(FrameId),
+    Video(VideoPaintId),
 }
 
 // ---------------------------------------------------------------------------
@@ -113,18 +122,19 @@ pub struct FrameHitInfo {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum GraphicsEvent {
-    /// A rendered surface frame is ready for one webview. The pixels are
-    /// delivered according to `payload`:
+    /// A rendered surface frame is ready for one webview. The layers are
+    /// delivered per `LayerTopology`; each layer's pixels travel according to
+    /// its `surface`:
     ///
     /// - `CpuShmem`: bytes live in the IPC shared memory region carried
-    ///   alongside the message; the embedder uploads them in place into its
-    ///   persistent per-webview texture.
+    ///   alongside the message; the embedder uploads them in place.
     /// - `SharedTexture` (macOS): the frame was rendered directly into a
     ///   shared IOSurface; the embedder imports the surface and blits it.
     PixelFrameReady {
         webview_id: WebviewId,
-        /// How the rendered pixels are delivered to the embedder.
-        payload: SurfacePayload,
+        /// The per-layer topology for every live layer, plus the rendered
+        /// surface for each layer that was re-rasterized this cycle.
+        layers: Vec<LayerTopology>,
         /// True when the composed scene contains animated content (video)
         /// that requires the UA to re-note a rendering opportunity even
         /// without user input.
@@ -133,8 +143,6 @@ pub enum GraphicsEvent {
         /// frames) that carry the animating flag; the UA notes rendering
         /// opportunities for these navigables.
         animating_frame_ids: Vec<FrameId>,
-        width: u32,
-        height: u32,
         generation: u64,
         frame_hit_info: Vec<FrameHitInfo>,
         child_viewports: Vec<ChildViewport>,
@@ -150,6 +158,29 @@ pub enum GraphicsEvent {
     },
     /// The graphics process is shutting down.
     ShutdownComplete,
+}
+
+/// One layer's topology, published to the UA per rendered cycle. Topology is
+/// sent for every live layer regardless of dirtiness (geometry can move
+/// independent of content); `surface` is present only when that layer was
+/// actually re-rendered this cycle.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LayerTopology {
+    pub layer_id: CompositingLayerId,
+    pub parent: Option<CompositingLayerId>,
+    /// Affine [a, b, c, d, tx, ty] mapping this layer's local coordinates
+    /// into its parent's local space.
+    pub transform: [f64; 6],
+    /// This layer's visible clip rect in its parent's local space.
+    pub clip_bounds: [f64; 4],
+    pub corner_radius: f64,
+    /// (z_index, paint_order) within the parent, for sibling ordering.
+    pub z_order: (i32, u32),
+    pub background: Option<EmbedBackgroundPolicy>,
+    pub width: u32,
+    pub height: u32,
+    /// Present only for the layers rendered this cycle.
+    pub surface: Option<SurfacePayload>,
 }
 
 /// How a rendered frame's pixels are delivered to the embedder.
@@ -198,6 +229,15 @@ pub enum SurfaceFrame {
         /// Mach port (send right) to the IOSurface, for the fallback lookup.
         port: OsMachPort,
     },
+}
+
+/// A boundary layer frame delivered to the embedder: the wire topology
+/// (`surface` always `None`) plus the actual [`SurfaceFrame`] for the layer,
+/// present only when the layer was re-rendered this cycle.
+#[derive(Debug)]
+pub struct LayerFrame {
+    pub topology: LayerTopology,
+    pub frame: Option<SurfaceFrame>,
 }
 
 /// Viewport data for a child frame (iframe), used by the UA to publish

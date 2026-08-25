@@ -506,6 +506,37 @@ impl CdpConnectionState {
                         .runtime
                         .click(x as f32, y as f32, AUTOMATION_TIMEOUT)
                         .map_err(|error| format!("mouse dispatch failed: {error}"))?;
+                } else if event_type == "mouseWheel" {
+                    let x = request
+                        .params
+                        .get("x")
+                        .and_then(Value::as_f64)
+                        .ok_or_else(|| String::from("`Input.dispatchMouseEvent` requires `x`"))?;
+                    let y = request
+                        .params
+                        .get("y")
+                        .and_then(Value::as_f64)
+                        .ok_or_else(|| String::from("`Input.dispatchMouseEvent` requires `y`"))?;
+                    let delta_x = request
+                        .params
+                        .get("deltaX")
+                        .and_then(Value::as_f64)
+                        .unwrap_or(0.0);
+                    let delta_y = request
+                        .params
+                        .get("deltaY")
+                        .and_then(Value::as_f64)
+                        .unwrap_or(0.0);
+                    state
+                        .runtime
+                        .scroll(
+                            x as f32,
+                            y as f32,
+                            delta_x as f32,
+                            delta_y as f32,
+                            AUTOMATION_TIMEOUT,
+                        )
+                        .map_err(|error| format!("scroll dispatch failed: {error}"))?;
                 }
                 Ok(json!({}))
             }

@@ -140,19 +140,16 @@ pub trait Embedder: Send + Sync {
         font_registrations: Vec<ipc_messages::content::RegisteredFont>,
         font_data: std::collections::HashMap<usize, Vec<u8>>,
     ) -> Result<(), String>;
-    /// Forward a rendered surface frame from the graphics process. `frame`
-    /// identifies how the pixels are delivered (CPU shared memory vs. a
-    /// shared IOSurface on macOS) and carries the delivery payload.
-    /// `animating` reports whether the composed scene contains animated
-    /// content (video, CSS animations) that needs the next frame at display
-    /// cadence.
-    fn new_web_content_surface(
+    /// Forward the per-layer rendered frame from the graphics process. Each
+    /// layer carries its wire `topology` (transform, clip, z-order) plus the
+    /// actual `frame` only when the layer was re-rendered this cycle; a clean
+    /// layer keeps its last surface and carries `frame: None`. `animating`
+    /// reports whether the composed scene contains animated content (video,
+    /// CSS animations) that needs the next frame at display cadence.
+    fn new_web_content_layers(
         &self,
         webview_id: WebviewId,
-        frame: ipc_messages::graphics::SurfaceFrame,
-        width: u32,
-        height: u32,
-        generation: u64,
+        layers: Vec<ipc_messages::graphics::LayerFrame>,
         animating: bool,
     ) -> Result<(), String>;
 }
@@ -4591,55 +4588,56 @@ impl UserAgentWorker {
         match &incoming.payload {
             GraphicsEvent::PixelFrameReady {
                 webview_id,
-                payload,
+                layers,
                 animating,
                 animating_frame_ids,
-                width,
-                height,
-                generation,
+                generation: _,
                 frame_hit_info,
                 child_viewports,
                 child_frame_to_webview,
             } => {
                 debug!(
-                    "[graphics] received surface frame for {:?} ({}x{}, payload={:?})",
+                    "[graphics] received surface frame for {:?} ({} layers)",
                     webview_id,
-                    width,
-                    height,
-                    std::mem::discriminant(payload)
+                    layers.len()
                 );
-                // The CPU path carries the pixel bytes in the shared-memory
-                // map; the zero-copy path (macOS) carries the shared surface's
-                // Mach port in the payload itself.
-                let frame = match payload {
-                    ipc_messages::graphics::SurfacePayload::CpuShmem { shmem_key } => {
-                        let region = incoming
-                            .shmem_regions
-                            .remove(shmem_key)
-                            .unwrap_or_else(|| ipc::IpcSharedRegion::from_bytes(&[]));
-                        ipc_messages::graphics::SurfaceFrame::CpuShmem(region)
-                    }
-                    #[cfg(target_os = "macos")]
-                    ipc_messages::graphics::SurfacePayload::SharedTexture {
-                        texture_id,
-                        surface_id,
-                        port,
-                    } => ipc_messages::graphics::SurfaceFrame::SharedTexture {
-                        texture_id: *texture_id,
-                        surface_id: *surface_id,
-                        port: port.clone(),
-                    },
-                };
+                // Forward every layer's topology plus the surface for the
+                // layers re-rendered this cycle. The embedder keeps the
+                // last surface of a clean layer (frame: None) and only draws
+                // the layers it is told about.
+                let layer_frames: Vec<ipc_messages::graphics::LayerFrame> = layers
+                    .iter()
+                    .map(|topology| {
+                        let mut topology = topology.clone();
+                        let frame = match topology.surface.take() {
+                            Some(ipc_messages::graphics::SurfacePayload::CpuShmem {
+                                shmem_key,
+                            }) => {
+                                let region = incoming
+                                    .shmem_regions
+                                    .remove(&shmem_key)
+                                    .unwrap_or_else(|| ipc::IpcSharedRegion::from_bytes(&[]));
+                                Some(ipc_messages::graphics::SurfaceFrame::CpuShmem(region))
+                            }
+                            #[cfg(target_os = "macos")]
+                            Some(ipc_messages::graphics::SurfacePayload::SharedTexture {
+                                texture_id,
+                                surface_id,
+                                port,
+                            }) => Some(ipc_messages::graphics::SurfaceFrame::SharedTexture {
+                                texture_id,
+                                surface_id,
+                                port,
+                            }),
+                            None => None,
+                        };
+                        ipc_messages::graphics::LayerFrame { topology, frame }
+                    })
+                    .collect();
                 debug!(
-                    "[graphics] received surface frame for {:?} ({}x{}, {}B)",
-                    webview_id,
-                    width,
-                    height,
-                    match &frame {
-                        ipc_messages::graphics::SurfaceFrame::CpuShmem(region) => region.size(),
-                        #[cfg(target_os = "macos")]
-                        ipc_messages::graphics::SurfaceFrame::SharedTexture { .. } => 0,
-                    }
+                    "[graphics] forwarded {} layers for {:?}",
+                    layer_frames.len(),
+                    webview_id
                 );
 
                 // When the top-level traversable's composed scene completes,
@@ -4698,15 +4696,11 @@ impl UserAgentWorker {
                 self.state
                     .child_frame_to_webview
                     .insert(*webview_id, child_frame_to_webview.clone());
-                if let Err(e) = self.host.new_web_content_surface(
-                    *webview_id,
-                    frame,
-                    *width,
-                    *height,
-                    *generation,
-                    *animating,
-                ) {
-                    error!("[graphics] forward surface: {e}");
+                if let Err(e) =
+                    self.host
+                        .new_web_content_layers(*webview_id, layer_frames, *animating)
+                {
+                    error!("[graphics] forward layers: {e}");
                 }
 
                 // Publish child viewports so child traversables know their

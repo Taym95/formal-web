@@ -8,13 +8,13 @@ use ipc_messages::content::{
     EmbedBackgroundPolicy, EmbedSite, FontTransportReceiver, FrameCompositionMetadata, FrameId,
     IframeEmbedSite, PaintFrame, RecordedScene,
 };
-use ipc_messages::graphics::FrameHitInfo;
+use ipc_messages::graphics::{CompositingLayerId, FrameHitInfo, LayerTopology, SurfacePayload};
 
 use crate::ComposedScene;
 use ipc_messages::media::VideoPaintId;
-use kurbo::{Affine, Rect, RoundedRect, Shape};
+use kurbo::{Affine, Rect, Shape};
 use log::{error, info, trace};
-use peniko::{Color, Fill, ImageAlphaType, ImageBrushRef, ImageData, ImageFormat};
+use peniko::{ImageAlphaType, ImageBrushRef, ImageData, ImageFormat};
 use std::collections::{HashMap, HashSet};
 use std::env;
 
@@ -46,6 +46,80 @@ struct NavigableContainerLayout {
     child_local_from_parent: Affine,
 }
 
+/// How a layer sits within its parent's coordinate space, computed by the
+/// parent when it walks an embed site and passed down to the child's compose
+/// call so the layer list is built at the same point as the merged scene.
+#[derive(Clone)]
+struct LayerPlacement {
+    /// local_from_parent: maps this layer's local coordinates into its
+    /// parent's local space. Identity for the root.
+    transform: Affine,
+    /// This layer's visible clip rect in its parent's local space.
+    clip_bounds: Rect,
+    corner_radius: f64,
+    /// (z_index, paint_order) within the parent, for sibling ordering.
+    z_order: (i32, u32),
+    background: Option<EmbedBackgroundPolicy>,
+}
+
+/// One per-layer work item produced by the compose walk. Each layer owns its
+/// own content scene; the embedder places/orders it by the transform, clip,
+/// and z-order fields. `render` is `Some` when this layer's content changed
+/// and must be re-rasterized; `None` for a clean layer that keeps its last
+/// surface.
+#[derive(Clone)]
+pub struct LayerUpdate {
+    pub layer_id: CompositingLayerId,
+    pub parent: Option<CompositingLayerId>,
+    pub transform: Affine,
+    pub clip_bounds: Rect,
+    pub corner_radius: f64,
+    pub z_order: (i32, u32),
+    pub background: Option<EmbedBackgroundPolicy>,
+    /// The layer's content size in its own local space (the surface size).
+    pub width: u32,
+    pub height: u32,
+    pub render: Option<RenderScene>,
+}
+
+impl LayerUpdate {
+    /// The wire topology for this layer, without a rendered surface.
+    pub fn into_layer_topology(&self) -> LayerTopology {
+        let transform = self.transform.as_coeffs();
+        LayerTopology {
+            layer_id: self.layer_id,
+            parent: self.parent,
+            transform: [
+                transform[0],
+                transform[1],
+                transform[2],
+                transform[3],
+                transform[4],
+                transform[5],
+            ],
+            clip_bounds: [
+                self.clip_bounds.x0,
+                self.clip_bounds.y0,
+                self.clip_bounds.x1,
+                self.clip_bounds.y1,
+            ],
+            corner_radius: self.corner_radius,
+            z_order: self.z_order,
+            background: self.background,
+            width: self.width,
+            height: self.height,
+            surface: None,
+        }
+    }
+
+    /// The wire topology for this layer, attaching a rendered surface.
+    pub fn into_layer_topology_with_surface(&self, surface: SurfacePayload) -> LayerTopology {
+        let mut topology = self.into_layer_topology();
+        topology.surface = Some(surface);
+        topology
+    }
+}
+
 #[derive(Clone)]
 struct CachedFrame {
     viewport_width: u32,
@@ -59,6 +133,11 @@ struct CachedFrame {
     /// frames still being produced, CSS animations). The composed scene
     /// aggregates it so the UA keeps noting rendering opportunities.
     animating: bool,
+    /// Set whenever store_frame() stores a new scene for this frame;
+    /// cleared once this frame's own layer has been re-rendered. Not part
+    /// of reset_composed_frame_state(), which clears geometry (parent,
+    /// viewport, child layout) — content dirtiness is a separate axis.
+    dirty: bool,
 }
 
 /// The content of a decoded video frame: CPU bytes (cross-platform) or a
@@ -81,6 +160,10 @@ pub struct CompositorVideoFrame {
     pub width: u32,
     pub height: u32,
     pub content: VideoFrameContent,
+    /// Set when this frame is a fresh decode (a new frame arrived for the
+    /// paint id); cleared once the video's layer has been re-rendered.
+    /// Mirrors CachedFrame::dirty on the video axis.
+    pub dirty: bool,
 }
 
 /// The per-webview compositor: receives PaintFrames and VideoFrames,
@@ -167,6 +250,27 @@ impl Compositor {
         self.video_frames.remove(&paint_id);
     }
 
+    /// Clear the dirty flag for the layers that were actually re-rendered this
+    /// cycle. Called by the event loop after `submit_layers` succeeds; a layer
+    /// whose content no longer changed keeps its last surface on the next
+    /// cycles, which is what lets clean layers skip Vello work.
+    pub fn mark_layers_rendered(&mut self, rendered: &[CompositingLayerId]) {
+        for layer_id in rendered {
+            match layer_id {
+                CompositingLayerId::Navigable(frame_id) => {
+                    if let Some(frame) = self.committed_frames.get_mut(frame_id) {
+                        frame.dirty = false;
+                    }
+                }
+                CompositingLayerId::Video(paint_id) => {
+                    if let Some(frame) = self.video_frames.get_mut(paint_id) {
+                        frame.dirty = false;
+                    }
+                }
+            }
+        }
+    }
+
     pub fn note_child_navigation_finalized(&mut self, frame_id: FrameId) {
         if Some(frame_id) == self.root_frame_id {
             self.note_navigation_finalized();
@@ -219,6 +323,7 @@ impl Compositor {
             composition,
             scene,
             animating: false,
+            dirty: true,
         };
 
         if self.replace_root_on_next_paint {
@@ -394,16 +499,23 @@ impl Compositor {
         self.composing_animating_frames.clear();
         self.reset_composed_frame_state();
         self.prepare_root_frame(root_frame_id)?;
+        let root_placement = self.root_layer_placement(root_frame_id)?;
         let mut stack = HashSet::from([root_frame_id]);
-        let scene = self.compose_frame(root_frame_id, &mut stack, Affine::IDENTITY);
+        let mut layers = Vec::new();
+        self.compose_layers(
+            root_frame_id,
+            &mut stack,
+            Affine::IDENTITY,
+            root_placement,
+            &mut layers,
+        )?;
         self.resolved_tree_dirty = false;
 
-        let scene = scene?;
         let frame_hit_info = self.build_frame_hit_info(webview_id);
 
         Some(ComposedScene {
             webview_id,
-            scene,
+            layers,
             frame_hit_info,
             child_viewports: HashMap::new(),
             child_frame_to_webview: HashMap::new(),
@@ -529,10 +641,19 @@ impl Compositor {
                 .is_none();
         if refresh_needed && let Some(root_frame_id) = self.root_frame_id {
             self.reset_composed_frame_state();
-            if self.prepare_root_frame(root_frame_id).is_some() {
+            if self.prepare_root_frame(root_frame_id).is_some()
+                && let Some(root_placement) = self.root_layer_placement(root_frame_id)
+            {
                 let mut stack = HashSet::from([root_frame_id]);
+                let mut scratch_layers = Vec::new();
                 if self
-                    .compose_frame(root_frame_id, &mut stack, Affine::IDENTITY)
+                    .compose_layers(
+                        root_frame_id,
+                        &mut stack,
+                        Affine::IDENTITY,
+                        root_placement,
+                        &mut scratch_layers,
+                    )
                     .is_none()
                 {
                     error!(
@@ -553,12 +674,14 @@ impl Compositor {
         viewports
     }
 
-    fn compose_frame(
+    fn compose_layers(
         &mut self,
         frame_id: FrameId,
         stack: &mut HashSet<FrameId>,
         frame_local_to_root: Affine,
-    ) -> Option<RenderScene> {
+        placement: LayerPlacement,
+        layers: &mut Vec<LayerUpdate>,
+    ) -> Option<()> {
         if input_debug_enabled() {
             trace!("[input-debug][compositor] composing frame {}", frame_id.0);
         }
@@ -569,13 +692,18 @@ impl Compositor {
             .resolved_viewport
             .clone()?;
 
-        let (embed_sites, decoded_scene) = {
-            let frame = self.committed_frames.get(&frame_id)?;
-            let embed_sites = frame.composition.embed_sites.clone();
-            let scene = frame.scene.clone().into_scene(&self.font_receiver);
-
-            (embed_sites, scene)
-        };
+        let frame = self.committed_frames.get(&frame_id)?;
+        if input_debug_enabled() {
+            trace!(
+                "[input-debug][compositor] frame {} dirty={}",
+                frame_id.0, frame.dirty
+            );
+        }
+        let embed_sites = frame.composition.embed_sites.clone();
+        let frame_dirty = frame.dirty;
+        let frame_width = frame.viewport_width;
+        let frame_height = frame.viewport_height;
+        let frame_parent = frame.parent_frame_id;
 
         // Aggregate the animating flag across the composed frames: the
         // composed scene reports it so the UA keeps noting rendering
@@ -589,6 +717,33 @@ impl Compositor {
             self.composing_animating = true;
             self.composing_animating_frames.push(frame_id);
         }
+
+        // Decode this frame's own scene only when dirty; a clean layer keeps
+        // its last surface and skips the Vello rasterization entirely.
+        let render = if frame_dirty {
+            let frame = self.committed_frames.get(&frame_id)?;
+            Some(frame.scene.clone().into_scene(&self.font_receiver))
+        } else {
+            None
+        };
+
+        // This frame is its own compositing layer. The parent-relative
+        // placement was computed by the parent (or is the root's own
+        // viewport) and passed in; it positions this layer's content within
+        // the layer tree. Same-origin iframes are baked into their parent's
+        // scene and never reach here with their own layer.
+        layers.push(LayerUpdate {
+            layer_id: CompositingLayerId::Navigable(frame_id),
+            parent: frame_parent.map(CompositingLayerId::Navigable),
+            transform: placement.transform,
+            clip_bounds: placement.clip_bounds,
+            corner_radius: placement.corner_radius,
+            z_order: placement.z_order,
+            background: placement.background,
+            width: frame_width,
+            height: frame_height,
+            render,
+        });
 
         let bg_map: HashMap<_, _> = embed_sites
             .iter()
@@ -604,17 +759,11 @@ impl Compositor {
             .collect();
         paint_items.sort_by_key(|(z, p, _)| (*z, *p));
 
-        let mut composed_scene = RenderScene::with_tolerance(decoded_scene.tolerance);
-
-        for command in decoded_scene.commands {
-            composed_scene.commands.push(command);
-        }
-
-        for (_, _, site) in paint_items {
+        for (z, paint_order, site) in paint_items {
             match site {
                 EmbedSite::Frame(iframe_site) => {
                     let child_frame_id = iframe_site.child_frame_id;
-                    let Some(child_local_to_root) = self.record_child_frame_layout(
+                    let Some((child_local_to_root, child_layout)) = self.record_child_frame_layout(
                         frame_id,
                         &parent_viewport,
                         frame_local_to_root,
@@ -627,38 +776,27 @@ impl Compositor {
                         continue;
                     }
 
-                    if let Some(child_scene) =
-                        self.compose_frame(child_frame_id, stack, child_local_to_root)
-                    {
-                        let clip = Self::embed_local_clip(iframe_site);
-                        let transform = Affine::new(iframe_site.layout.transform);
-                        let child_transform = self
-                            .child_scene_transform(&clip, child_frame_id)
-                            .map(|scene_transform| transform * scene_transform)
-                            .unwrap_or(transform);
-                        if matches!(
-                            bg_map.get(&iframe_site.embed_site_id),
-                            Some(EmbedBackgroundPolicy::OpaqueWhite)
-                        ) {
-                            composed_scene.fill(
-                                Fill::NonZero,
-                                transform,
-                                Color::WHITE,
-                                None,
-                                &clip,
-                            );
-                        }
-                        composed_scene.push_clip_layer(transform, &clip);
-                        composed_scene.append_scene(child_scene, child_transform);
-                        composed_scene.pop_layer();
-                        if input_debug_enabled() {
-                            trace!(
-                                "[input-debug][compositor] composed iframe site {} with child frame {}",
-                                iframe_site.embed_site_id.0, child_frame_id.0
-                            );
-                        }
-                    }
+                    let clip = Self::embed_local_clip(iframe_site);
+                    let transform = Affine::new(iframe_site.layout.transform);
+                    let child_transform = self
+                        .child_scene_transform(&clip, child_frame_id)
+                        .map(|scene_transform| transform * scene_transform)
+                        .unwrap_or(transform);
+                    let child_placement = LayerPlacement {
+                        transform: child_transform,
+                        clip_bounds: child_layout.clip_bounds,
+                        corner_radius: 0.0,
+                        z_order: (z, paint_order),
+                        background: bg_map.get(&iframe_site.embed_site_id).copied(),
+                    };
 
+                    self.compose_layers(
+                        child_frame_id,
+                        stack,
+                        child_local_to_root,
+                        child_placement,
+                        layers,
+                    );
                     stack.remove(&child_frame_id);
                 }
                 EmbedSite::Video(video_data) => {
@@ -671,6 +809,12 @@ impl Compositor {
                         }
                         continue;
                     };
+                    if input_debug_enabled() {
+                        trace!(
+                            "[input-debug][compositor] video paint_id={:?} dirty={}",
+                            video_data.paint_id, video_frame.dirty
+                        );
+                    }
                     let transform = Affine::new(video_data.layout.transform);
 
                     let tx = transform.as_coeffs()[4];
@@ -681,15 +825,8 @@ impl Compositor {
                         video_data.layout.clip_bounds[2] - tx,
                         video_data.layout.clip_bounds[3] - ty,
                     );
-                    let rounded_clip: Option<RoundedRect> = if video_data.clip_radius > 0.0 {
-                        Some(RoundedRect::from_rect(clip_rect, video_data.clip_radius))
-                    } else {
-                        None
-                    };
-                    let local_clip = clip_rect;
-
-                    let local_w = local_clip.width();
-                    let local_h = local_clip.height();
+                    let local_w = clip_rect.width();
+                    let local_h = clip_rect.height();
                     let scale_x = if video_frame.width > 0 {
                         local_w / video_frame.width as f64
                     } else {
@@ -702,37 +839,61 @@ impl Compositor {
                     };
                     let video_transform = Affine::new([scale_x, 0.0, 0.0, scale_y, tx, ty]);
 
-                    match rounded_clip {
-                        Some(ref rc) => composed_scene.push_clip_layer(transform, rc),
-                        None => composed_scene.push_clip_layer(transform, &local_clip),
+                    // The video embed site is its own layer: a one-node scene
+                    // drawing the decoded frame at identity, placed by
+                    // `video_transform` (which scales the frame to the clip
+                    // rect and positions it at the video's origin).
+                    let render = if video_frame.dirty {
+                        let mut video_scene = RenderScene::new();
+                        match &video_frame.content {
+                            VideoFrameContent::Bytes(pixel_bytes) => {
+                                let image_data = ImageData {
+                                    data: peniko::Blob::from(pixel_bytes.to_vec()),
+                                    format: ImageFormat::Rgba8,
+                                    alpha_type: ImageAlphaType::Alpha,
+                                    width: video_frame.width,
+                                    height: video_frame.height,
+                                };
+                                video_scene
+                                    .draw_image(ImageBrushRef::from(&image_data), Affine::IDENTITY);
+                            }
+                            #[cfg(target_os = "macos")]
+                            VideoFrameContent::Texture(image_data) => {
+                                // The texture is sampled by the graphics
+                                // Vello renderer via its override_image
+                                // registration; the scene just references
+                                // the fake image data.
+                                video_scene
+                                    .draw_image(ImageBrushRef::from(image_data), Affine::IDENTITY);
+                            }
+                        }
+                        Some(video_scene)
+                    } else {
+                        None
                     };
-                    match &video_frame.content {
-                        VideoFrameContent::Bytes(pixel_bytes) => {
-                            let image_data = ImageData {
-                                data: peniko::Blob::from(pixel_bytes.to_vec()),
-                                format: ImageFormat::Rgba8,
-                                alpha_type: ImageAlphaType::Alpha,
-                                width: video_frame.width,
-                                height: video_frame.height,
-                            };
-                            composed_scene
-                                .draw_image(ImageBrushRef::from(&image_data), video_transform);
-                        }
-                        #[cfg(target_os = "macos")]
-                        VideoFrameContent::Texture(image_data) => {
-                            // The texture is sampled by the graphics Vello
-                            // renderer via its override_image registration;
-                            // the scene just references the fake image data.
-                            composed_scene
-                                .draw_image(ImageBrushRef::from(image_data), video_transform);
-                        }
-                    }
-                    composed_scene.pop_layer();
+
+                    layers.push(LayerUpdate {
+                        layer_id: CompositingLayerId::Video(video_data.paint_id),
+                        parent: Some(CompositingLayerId::Navigable(frame_id)),
+                        transform: video_transform,
+                        clip_bounds: Rect::new(
+                            video_data.layout.clip_bounds[0],
+                            video_data.layout.clip_bounds[1],
+                            video_data.layout.clip_bounds[2],
+                            video_data.layout.clip_bounds[3],
+                        ),
+                        corner_radius: video_data.clip_radius,
+                        z_order: (z, paint_order),
+                        background: None,
+                        width: video_frame.width,
+                        height: video_frame.height,
+                        render,
+                    });
                 }
             }
         }
 
-        Some(composed_scene)
+        Some(())
     }
 
     fn embed_local_clip(iframe_site: &IframeEmbedSite) -> Rect {
@@ -772,13 +933,31 @@ impl Compositor {
         ))
     }
 
+    /// The root frame's own layer placement: identity transform, padded to
+    /// its own viewport as the clip, no corner radius, no background.
+    fn root_layer_placement(&self, root_frame_id: FrameId) -> Option<LayerPlacement> {
+        let frame = self.committed_frames.get(&root_frame_id)?;
+        Some(LayerPlacement {
+            transform: Affine::IDENTITY,
+            clip_bounds: Rect::new(
+                0.0,
+                0.0,
+                f64::from(frame.viewport_width),
+                f64::from(frame.viewport_height),
+            ),
+            corner_radius: 0.0,
+            z_order: (0, 0),
+            background: None,
+        })
+    }
+
     fn record_child_frame_layout(
         &mut self,
         parent_frame_id: FrameId,
         parent_viewport: &ResolvedViewport,
         parent_local_to_root: Affine,
         iframe_site: &IframeEmbedSite,
-    ) -> Option<Affine> {
+    ) -> Option<(Affine, NavigableContainerLayout)> {
         let Some(layout) = self.navigable_container_layout(parent_local_to_root, iframe_site)
         else {
             if input_debug_enabled() {
@@ -822,7 +1001,7 @@ impl Compositor {
         }
 
         if let Some(frame) = self.committed_frames.get_mut(&parent_frame_id) {
-            frame.child_frames.push(layout);
+            frame.child_frames.push(layout.clone());
         }
 
         if let Some(resolved_viewport) = self.frame_viewport(iframe_site.child_frame_id)
@@ -832,7 +1011,7 @@ impl Compositor {
             child_frame.resolved_viewport = Some(resolved_viewport);
         }
 
-        Some(child_local_to_root)
+        Some((child_local_to_root, layout))
     }
 
     fn navigable_container_layout(

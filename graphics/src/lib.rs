@@ -13,7 +13,7 @@ compile_error!(
 use std::collections::{HashMap, HashSet};
 
 use crate::renderer::{ReadbackChannels, SurfaceRenderer};
-use compositor::{Compositor, CompositorVideoFrame};
+use compositor::{Compositor, CompositorVideoFrame, LayerUpdate};
 use crossbeam_channel::{select, tick};
 use ipc_messages::content::{FrameId, WebviewId};
 use ipc_messages::graphics::{FrameHitInfo, GraphicsCommand, GraphicsEvent};
@@ -27,7 +27,10 @@ use verification::TLATracer;
 #[derive(Clone)]
 pub struct ComposedScene {
     pub webview_id: WebviewId,
-    pub scene: anyrender::Scene,
+    /// The per-layer decomposition of this webview's composition. Each layer
+    /// is its own surface; `render` is `Some` for layers re-rasterized this
+    /// cycle (dirty), `None` for clean layers that keep their last surface.
+    pub layers: Vec<LayerUpdate>,
     pub frame_hit_info: Vec<FrameHitInfo>,
     /// Viewport data for child frames, keyed by child webview_id.
     /// Populated during compose_scene from the compositor's visible_frame_viewports.
@@ -261,6 +264,7 @@ fn handle_media_event<R: SurfaceRenderer>(
                 width: video_frame.width,
                 height: video_frame.height,
                 content: compositor::VideoFrameContent::Bytes(pixel_bytes),
+                dirty: true,
             };
             if let Some(slot) = webviews.get_mut(&webview_id) {
                 // Store the video frame. It will be included in the next normal
@@ -324,6 +328,7 @@ fn handle_media_event<R: SurfaceRenderer>(
                 width: frame.width,
                 height: frame.height,
                 content: compositor::VideoFrameContent::Texture(resource_id),
+                dirty: true,
             };
             slot.compositor.update_video_frame(cf);
             maybe_compose(
@@ -673,11 +678,14 @@ fn maybe_compose<R: SurfaceRenderer>(
     // top-level frame. Content knows what's animating (video, CSS animations)
     // and sets this; the composed scene reports it so the UA keeps re-noting
     // rendering opportunities. Graphics just passes it through.
-    if let Err(error) = slot.renderer.submit_scene(composed) {
-        error!(
-            "[graphics] submit composed scene failed for {:?}: {error:?}",
-            webview_id
-        );
+    match slot.renderer.submit_layers(composed) {
+        Ok(rendered) => slot.compositor.mark_layers_rendered(&rendered),
+        Err(error) => {
+            error!(
+                "[graphics] submit composed scene failed for {:?}: {error:?}",
+                webview_id
+            );
+        }
     }
 }
 
