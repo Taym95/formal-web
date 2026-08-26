@@ -63,6 +63,22 @@ The verification session (`verify-specs.sh`) navigates to
 `verification/iframe-trace-page.html`, which embeds a cross-site `file://`
 iframe, so the child rendering path is actually traced and validated.
 
+### RenderingOpportunity remaining work
+
+The model abstracts all opportunity notes into `NoteRenderingOpportunity` and
+relies on `FrameNeeded` fairness to eventually service a batched opportunity,
+so it does not distinguish a cross-origin content change arriving out of band
+(the graphics-side `CompositionChanged` that re-notes a non-top-level frame)
+from any other note. That is fine for the physical-rendering simplification,
+but it means the model cannot express the recovery for the stranded-opportunity
+race: the UA's `queue_update_the_rendering_for_navigables` used to bail the
+whole hierarchy batch when the top-level already had an update in flight,
+leaving a static child's change un-drained until an unrelated input event.
+The code now drains each navigable independently (so a child is serviced even
+when the top-level is in flight); expressing that recovery in the model would
+need a distinct `CompositionChanged`-style note event and a `request_redraw`
+recovery action, and is deferred.
+
 ### Adding a spec
 
 1. Write `{Name}.tla` (the model) and `{Name}Trace.tla` (the trace consumer) plus `{Name}.cfg` / `{Name}Trace.cfg` in `verification/tla_specs/`. Discovery is automatic from the flat `.tla` files.

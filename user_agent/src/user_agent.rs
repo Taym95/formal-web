@@ -3629,20 +3629,27 @@ impl UserAgentWorker {
         self.handle_set_traversable_viewport(traversable_id, snapshot, 0.0, 0.0);
     }
 
-    /// sending a per-traversable viewport update to the owning event loop.
+    /// Send a per-traversable viewport update to the owning event loop.
+    ///
+    /// Returns `true` when the update was delivered to a registered
+    /// `traversable_handle` (callers use this to decide whether a computed
+    /// child viewport was reliably received); `false` when the traversable's
+    /// content process has not registered a handle yet. The viewport is still
+    /// recorded in `traversable_viewports` in both cases so the event-loop
+    /// migration path can re-send it once the handle registers.
     fn handle_set_traversable_viewport(
         &mut self,
         traversable_id: NavigableId,
         snapshot: (u32, u32, f32, ColorScheme),
         offset_x: f32,
         offset_y: f32,
-    ) {
+    ) -> bool {
         self.state
             .traversable_viewports
             .insert(traversable_id, (snapshot, offset_x, offset_y));
 
         let Some(handle) = self.state.traversable_handles.get(&traversable_id).copied() else {
-            return;
+            return false;
         };
         let Some(agent) = self
             .state
@@ -3650,7 +3657,7 @@ impl UserAgentWorker {
             .values()
             .find(|agent| agent.event_loop_id == handle)
         else {
-            return;
+            return false;
         };
         let command = traversable_viewport_command(traversable_id, snapshot, offset_x, offset_y);
         let _ = agent
@@ -3659,6 +3666,7 @@ impl UserAgentWorker {
         // The UA notes a rendering opportunity so the content process will
         // receive UpdateTheRendering and repaint with the new viewport.
         self.note_rendering_opportunity(traversable_id);
+        true
     }
 
     /// Report a navigation completion to the host for a top-level
@@ -3715,9 +3723,14 @@ impl UserAgentWorker {
     /// Queue update the rendering for every navigable of
     /// `traversable_id` that has a batched rendering opportunity.
     fn queue_update_the_rendering_for_navigables(&mut self, traversable_id: NavigableId) {
-        if self.pending_update_the_rendering.contains(&traversable_id) {
-            return;
-        }
+        // Drain each candidate independently. A candidate that is already
+        // pending is a no-op (the per-navigable guard in
+        // `queue_update_the_rendering` handles it), so a child iframe's queued
+        // opportunity is drained even when the top-level traversable's own
+        // update is still in flight. The old batch-level early return on
+        // `pending_update_the_rendering` left a static child's change stranded
+        // in `queued_rendering_opportunities` until an unrelated input event
+        // happened to request a frame.
         for candidate in self
             .queued_rendering_opportunities
             .keys()
@@ -4735,13 +4748,24 @@ impl UserAgentWorker {
                         if self.state.published_child_viewports.get(&child_wv) == Some(&key) {
                             continue;
                         }
-                        self.state.published_child_viewports.insert(child_wv, key);
-                        self.handle_set_traversable_viewport(
+                        // Always record the viewport so the child's event-loop
+                        // migration path can re-send it once its handle registers,
+                        // but only mark it *published* when the push actually
+                        // reached a registered traversable handle. Marking it
+                        // published before delivery means a child whose content
+                        // process had not registered yet (the common cross-origin
+                        // iframe bootstrap) swallows the correct size forever: the
+                        // key is stable for a static iframe box, so the size is
+                        // never re-sent and the child paints at its fallback
+                        // dimensions until something changes the key (a resize).
+                        if self.handle_set_traversable_viewport(
                             child_traversable_id,
                             (cw.max(1), ch.max(1), scale, cs.clone()),
                             offset_x,
                             offset_y,
-                        );
+                        ) {
+                            self.state.published_child_viewports.insert(child_wv, key);
+                        }
                     }
                 }
             }
