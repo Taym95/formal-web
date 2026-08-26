@@ -17,9 +17,9 @@ use crate::platform::{
     normalize_browser_destination, read_clipboard_text, startup_destination_url,
     update_window_viewport_snapshot, write_clipboard_text,
 };
-use automation::{AutomationController, AutomationHost, AutomationSnapshot};
-use automation::AutomationVisibleFrameViewport;
 use crate::window::{new_layer_hosted_view, present_shared_surface};
+use automation::AutomationVisibleFrameViewport;
+use automation::{AutomationController, AutomationHost, AutomationSnapshot};
 use block2::RcBlock;
 use ipc_channel::platform::deallocate_mach_port;
 use ipc_messages::content::WebviewId;
@@ -33,13 +33,13 @@ use objc2::{DefinedClass, MainThreadOnly, msg_send, sel};
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSBitmapImageFileType,
     NSBitmapImageRepPropertyKey, NSButton, NSButtonType, NSCellImagePosition, NSColor,
-    NSControlTextEditingDelegate, NSFont, NSImage, NSImageSymbolConfiguration,
-    NSImageSymbolScale, NSLineBreakMode, NSMenu, NSMenuItem, NSTextField, NSTextFieldBezelStyle,
-    NSTextFieldDelegate, NSToolbar, NSToolbarDelegate, NSToolbarDisplayMode,
-    NSToolbarFlexibleSpaceItemIdentifier, NSToolbarItem, NSToolbarItemGroup,
-    NSToolbarItemGroupControlRepresentation, NSToolbarItemIdentifier, NSView,
-    NSVisualEffectBlendingMode, NSVisualEffectMaterial, NSVisualEffectState, NSVisualEffectView,
-    NSWindow, NSWindowDelegate, NSWindowStyleMask, NSWindowTitleVisibility, NSWindowToolbarStyle,
+    NSControlTextEditingDelegate, NSFont, NSImage, NSImageSymbolConfiguration, NSImageSymbolScale,
+    NSLineBreakMode, NSMenu, NSMenuItem, NSTextField, NSTextFieldBezelStyle, NSTextFieldDelegate,
+    NSToolbar, NSToolbarDelegate, NSToolbarDisplayMode, NSToolbarFlexibleSpaceItemIdentifier,
+    NSToolbarItem, NSToolbarItemGroup, NSToolbarItemGroupControlRepresentation,
+    NSToolbarItemIdentifier, NSView, NSVisualEffectBlendingMode, NSVisualEffectMaterial,
+    NSVisualEffectState, NSVisualEffectView, NSWindow, NSWindowDelegate, NSWindowStyleMask,
+    NSWindowTitleVisibility, NSWindowToolbarStyle,
 };
 use objc2_app_kit::{NSEvent, NSEventMask, NSEventModifierFlags, NSEventType, NSFontWeightMedium};
 use objc2_core_foundation::CFRetained;
@@ -63,8 +63,8 @@ use verification::TraceSender;
 use webview::WebviewProvider;
 use webview::{
     BlitzPointerEvent, BlitzPointerId, BlitzWheelDelta, BlitzWheelEvent, ColorScheme,
-    MouseEventButton, MouseEventButtons, NavigationCompleted, NavigationCompletion,
-    PointerCoords, PointerDetails, UiEvent,
+    MouseEventButton, MouseEventButtons, NavigationCompleted, NavigationCompletion, PointerCoords,
+    PointerDetails, UiEvent,
 };
 
 const INITIAL_WINDOW_WIDTH: f64 = 1200.0;
@@ -576,9 +576,7 @@ impl MacApp {
         // unchanged.
         if let Some(port) = cdp_port {
             let runtime = automation::automation_bridge(
-                |command| {
-                    crate::events::send_user_event(FormalWebUserEvent::Automation(command))
-                },
+                |command| crate::events::send_user_event(FormalWebUserEvent::Automation(command)),
                 || crate::events::send_user_event(FormalWebUserEvent::Exit),
                 crate::events::event_loop_is_ready,
             );
@@ -586,7 +584,10 @@ impl MacApp {
                 format!("failed to start the CDP server for the AppKit embedder: {error}")
             })?;
             app.cdp_server = Some(server);
-            info!("[mac-embedder] CDP server listening on 127.0.0.1:{} (AppKit embedder)", port);
+            info!(
+                "[mac-embedder] CDP server listening on 127.0.0.1:{} (AppKit embedder)",
+                port
+            );
         }
 
         // Activate the app (required when launching unbundled) and start
@@ -2913,10 +2914,7 @@ impl MacApp {
             let frame_y = web_bounds.size.height - clip[3] * scale_y;
             sublayer.setFrame(NSRect::new(
                 NSPoint::new(clip[0] * scale_x, frame_y),
-                NSSize::new(
-                    (clip[2] - clip[0]) * scale_x,
-                    (clip[3] - clip[1]) * scale_y,
-                ),
+                NSSize::new((clip[2] - clip[0]) * scale_x, (clip[3] - clip[1]) * scale_y),
             ));
             sublayer.setCornerRadius(layer.topology.corner_radius);
             sublayer.setMasksToBounds(layer.topology.corner_radius > 0.0);
@@ -2934,10 +2932,7 @@ impl MacApp {
                     .as_ref()
                     .map(|_| (layer.topology.width, layer.topology.height)),
                 (clip[0] * scale_x, frame_y),
-                (
-                    (clip[2] - clip[0]) * scale_x,
-                    (clip[3] - clip[1]) * scale_y,
-                ),
+                ((clip[2] - clip[0]) * scale_x, (clip[3] - clip[1]) * scale_y,),
             );
 
             // Contents: only when re-rendered; a clean layer (frame: None)
@@ -3111,7 +3106,13 @@ impl AutomationHost for MacApp {
         Ok(())
     }
 
-    fn automation_scroll(&mut self, x: f32, y: f32, delta_x: f32, delta_y: f32) -> Result<(), String> {
+    fn automation_scroll(
+        &mut self,
+        x: f32,
+        y: f32,
+        delta_x: f32,
+        delta_y: f32,
+    ) -> Result<(), String> {
         let provider = self
             .provider
             .as_ref()
@@ -3160,7 +3161,9 @@ impl MacApp {
     /// The webview id of the active tab in the active window, if any.
     fn active_tab_webview_id(&self) -> Option<WebviewId> {
         let window_id = self.active_window_id?;
-        self.windows.get(&window_id).and_then(|window| window.active_tab)
+        self.windows
+            .get(&window_id)
+            .and_then(|window| window.active_tab)
     }
 
     /// Build pointer coordinates for an automation event from viewport

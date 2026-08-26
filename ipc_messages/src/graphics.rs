@@ -156,6 +156,13 @@ pub enum GraphicsEvent {
         webview_id: WebviewId,
         video_paint_id: VideoPaintId,
     },
+    /// A cross-origin child frame's content changed (a source the top-level
+    /// content process does not itself drive). The UA notes a rendering
+    /// opportunity for the parent traversable so its render cycle re-composes
+    /// and includes the child's latest frame — without this, the child's
+    /// change sits in the parent's compositor until an unrelated input event
+    /// drives a top-level render.
+    CompositionChanged { webview_id: WebviewId },
     /// The graphics process is shutting down.
     ShutdownComplete,
 }

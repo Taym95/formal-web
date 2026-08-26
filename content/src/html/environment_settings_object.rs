@@ -307,6 +307,17 @@ impl EnvironmentSettingsObject {
         serde_json::from_str(&json_string).map_err(|error| format!("failed to parse JSON: {error}"))
     }
 
+    /// Whether the global scope has queued animation frame callbacks that
+    /// will run at the next rendering opportunity. A script-driven animation
+    /// loop keeps the document dirty, so `update_the_rendering` must render
+    /// even when the DOM itself did not change (e.g. a canvas drawing loop).
+    pub(crate) fn has_pending_animation_frame_callbacks(&mut self) -> bool {
+        crate::js::platform_objects::has_pending_animation_frame_callbacks(
+            &mut self.realm_execution_context,
+        )
+        .unwrap_or(false)
+    }
+
     /// <https://html.spec.whatwg.org/#run-the-animation-frame-callbacks>
     pub(crate) fn run_animation_frame_callbacks(&mut self, now: f64) -> Result<(), String> {
         let callbacks = crate::js::platform_objects::take_animation_frame_callbacks(

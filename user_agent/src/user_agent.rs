@@ -4767,6 +4767,21 @@ impl UserAgentWorker {
                         })
                     });
             }
+            GraphicsEvent::CompositionChanged { webview_id } => {
+                // A cross-origin iframe's content changed (or a video frame
+                // arrived) without the top-level content process driving a
+                // render. Note a rendering opportunity for the traversable so
+                // its render cycle re-composes and includes the latest
+                // embedded frame. `note_rendering_opportunity` batches the
+                // note and requests a redraw when the embedder is not already
+                // painting, so a static parent gets one repaint per content
+                // change instead of deferring to the next unrelated input.
+                info!(
+                    "[render-pipe] UA composition changed webview={:?}",
+                    webview_id
+                );
+                self.note_rendering_opportunity(webview_id.0);
+            }
             GraphicsEvent::ShutdownComplete => {
                 debug!("[graphics] graphics process shutdown complete");
             }

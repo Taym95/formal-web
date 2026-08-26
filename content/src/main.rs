@@ -59,8 +59,8 @@ use ipc_messages::content::{
     FetchRequest as ContentFetchRequest, FetchResponse as ContentFetchResponse,
     FontTransportSender, FrameCompositionMetadata, FrameId, IframeEmbedSite,
     LoadedDocumentResponse, NavigableId, NavigationId, PaintFrame, PortId, PortTaskKind,
-    ScriptEvaluationResult, TitleChanged, TraversableViewport, ViewportSnapshot, WebviewId,
-    WindowTimerKey,
+    PreparedScene, RecordedScene, ScriptEvaluationResult, TitleChanged, TraversableViewport,
+    ViewportSnapshot, WebviewId, WindowTimerKey,
 };
 use ipc_messages::media::{VideoEmbedData, VideoPaintId};
 use ipc_messages::safe_passing_of_structured_data::PostMessageRequest;
@@ -70,7 +70,10 @@ use std::{
     collections::{HashMap, HashSet},
     env,
     rc::Rc,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 use url::Url;
@@ -169,18 +172,35 @@ fn new_clipboard_cache() -> ClipboardCache {
 struct ContentShellProvider {
     event_sender: ipc::IpcSender<ContentEvent>,
     clipboard_cache: ClipboardCache,
+    /// Per-document flag: set when blitz asks for a repaint (a resource
+    /// loaded, an event mutated the DOM, the viewport changed). Content reads
+    /// it in `update_the_rendering` to decide whether to re-run blitz
+    /// (resolve + paint) — a static document that keeps re-sending an
+    /// identical scene during a video-driven render cycle skips the blitz
+    /// work entirely. `Arc<AtomicBool>` so the `ShellProvider` (which blitz
+    /// requires to be `Send + Sync`) can share it with the `ContentDocument`.
+    needs_paint: Arc<AtomicBool>,
 }
 
 impl ContentShellProvider {
-    fn new(event_sender: ipc::IpcSender<ContentEvent>, clipboard_cache: ClipboardCache) -> Self {
+    fn new(
+        event_sender: ipc::IpcSender<ContentEvent>,
+        clipboard_cache: ClipboardCache,
+        needs_paint: Arc<AtomicBool>,
+    ) -> Self {
         Self {
             event_sender,
             clipboard_cache,
+            needs_paint,
         }
     }
 }
 
 impl ShellProvider for ContentShellProvider {
+    fn request_redraw(&self) {
+        self.needs_paint.store(true, Ordering::Relaxed);
+    }
+
     fn get_clipboard_text(&self) -> Result<String, ClipboardError> {
         // First try the prefetched cache (populated by the embedder before
         // dispatching paste events via DispatchEventEntry.prefetched_clipboard_text).
@@ -354,6 +374,24 @@ pub(crate) struct ContentDocument {
     navigable_container_states: HashMap<usize, NavigableContainerState>,
     viewport_offset_x: f32,
     viewport_offset_y: f32,
+    /// Set whenever the document may have changed and needs a blitz render
+    /// (a script ran, an event was dispatched, a resource loaded, or blitz
+    /// requested a repaint). Cleared after a render is produced. `update_the_rendering`
+    /// skips the blitz resolve + paint when this is clear and the document is
+    /// not animating — so a static document that keeps being asked to render
+    /// (e.g. a video elsewhere drives the render cycle) does not re-run blitz
+    /// on an unchanged scene.
+    needs_paint: Arc<AtomicBool>,
+    /// The last recorded scene, reused verbatim on a clean render cycle so the
+    /// graphics process keeps the content layer clean (an unchanged scene is
+    /// not re-rasterized) instead of re-painting an unchanged document. Fonts
+    /// are not re-sent on a clean cycle (they are already registered on the
+    /// graphics side).
+    last_scene: Option<RecordedScene>,
+    /// The last frame composition metadata, reused when the scene is clean
+    /// (embed sites, viewport, and frame id are unchanged when nothing dirtied
+    /// the document).
+    last_composition: Option<FrameCompositionMetadata>,
 }
 
 #[derive(Clone)]
@@ -528,6 +566,7 @@ impl ContentProcess {
         traversable_id: NavigableId,
         document_id: DocumentId,
         base_url: Option<String>,
+        needs_paint: Arc<AtomicBool>,
     ) -> DocumentConfig {
         DocumentConfig {
             viewport: self
@@ -544,6 +583,7 @@ impl ContentProcess {
             shell_provider: Some(Arc::new(ContentShellProvider::new(
                 self.event_sender.clone(),
                 self.clipboard_cache.clone(),
+                needs_paint,
             ))),
             html_parser_provider: Some(Arc::new(JsHtmlParserProvider)),
             ..DocumentConfig::default()
@@ -590,6 +630,10 @@ impl ContentProcess {
             return Ok(());
         };
 
+        // A viewport change resizes the document surface; mark it dirty so the
+        // next update-the-rendering re-paints instead of reusing the stale-size
+        // cached scene.
+        document.needs_paint.store(true, Ordering::Relaxed);
         document
             .document
             .borrow_mut()
@@ -825,6 +869,9 @@ impl ContentProcess {
                     navigable_container_states: HashMap::new(),
                     viewport_offset_x: 0.0,
                     viewport_offset_y: 0.0,
+                    needs_paint: Arc::new(AtomicBool::new(false)),
+                    last_scene: None,
+                    last_composition: None,
                 },
             );
             self.active_documents_by_traversable
@@ -997,10 +1044,12 @@ impl ContentProcess {
     ) -> Result<(), String> {
         let viewport_state = self.document_viewport_state(traversable_id);
         let frame_id = frame_id.unwrap_or_else(FrameId::new);
+        let needs_paint = Arc::new(AtomicBool::new(false));
         let document = Rc::new(RefCell::new(BaseDocument::new(self.document_config(
             traversable_id,
             document_id,
             None,
+            needs_paint.clone(),
         ))));
         let mut settings = self.create_environment_settings_object(
             Rc::clone(&document),
@@ -1059,6 +1108,9 @@ impl ContentProcess {
                     .as_ref()
                     .map(|viewport| viewport.offset_y)
                     .unwrap_or(0.0),
+                needs_paint,
+                last_scene: None,
+                last_composition: None,
             },
         );
         self.active_documents_by_traversable
@@ -1089,7 +1141,14 @@ impl ContentProcess {
         traversable_id: NavigableId,
         document_id: DocumentId,
         final_url: &str,
-    ) -> Result<(Rc<RefCell<BaseDocument>>, EnvironmentSettingsObject), String> {
+    ) -> Result<
+        (
+            Rc<RefCell<BaseDocument>>,
+            EnvironmentSettingsObject,
+            Arc<AtomicBool>,
+        ),
+        String,
+    > {
         // Step 1: "Let browsingContext be the result of obtaining a browsing context to use for
         // a navigation response given navigationParams."
         // Note: Ran in the user agent: `UserAgent::initialise_the_document_object` resolved
@@ -1179,10 +1238,12 @@ impl ContentProcess {
         // Note: The document and settings object are returned to the caller
         // (`create_loaded_document`), which continues navigate-html with the parse.
         let creation_url = Url::parse(final_url).map_err(|error| error.to_string())?;
+        let needs_paint = Arc::new(AtomicBool::new(false));
         let document = Rc::new(RefCell::new(BaseDocument::new(self.document_config(
             traversable_id,
             document_id,
             Some(final_url.to_string()),
+            needs_paint.clone(),
         ))));
         // Steps 7.5, 7.6 and 7.10 run in `create_environment_settings_object` for the
         // otherwise branch; for the step-6 branch they already ran when the reused realm was
@@ -1220,7 +1281,7 @@ impl ContentProcess {
             );
         }
 
-        Ok((document, settings))
+        Ok((document, settings, needs_paint))
     }
 
     /// <https://html.spec.whatwg.org/#initialise-the-document-object> — step 6
@@ -1285,7 +1346,7 @@ impl ContentProcess {
         // `Self::initialise_the_document_object`; the user-agent-side steps (browsing context
         // and agent selection) ran in `UserAgent::initialise_the_document_object` before this
         // command was dispatched.
-        let (document, settings) =
+        let (document, settings, needs_paint) =
             self.initialise_the_document_object(traversable_id, document_id, &final_url)?;
 
         let parser_scripts = {
@@ -1335,6 +1396,9 @@ impl ContentProcess {
                     .as_ref()
                     .map(|viewport| viewport.offset_y)
                     .unwrap_or(0.0),
+                needs_paint,
+                last_scene: None,
+                last_composition: None,
             },
         );
         // Make the document addressable immediately so the shared
@@ -1432,6 +1496,7 @@ impl ContentProcess {
             warn!("failed to set up new document registry: {error}");
         }
 
+        self.mark_traversable_dirty(traversable_id);
         let document_id = *self
             .active_documents_by_traversable
             .get(&traversable_id)
@@ -1463,6 +1528,7 @@ impl ContentProcess {
             warn!("failed to set up new document registry: {error}");
         }
 
+        self.mark_traversable_dirty(traversable_id);
         let document_id = *self
             .active_documents_by_traversable
             .get(&traversable_id)
@@ -1676,6 +1742,9 @@ impl ContentProcess {
                 warn!("failed to set up new document registry for UI event: {error}");
             }
 
+            // Dispatch may mutate the document; mark it so the next
+            // update-the-rendering re-runs blitz.
+            self.mark_document_dirty(document_id);
             let Some(document) = self.documents.get_mut(&document_id) else {
                 continue;
             };
@@ -1728,6 +1797,9 @@ impl ContentProcess {
         if request.target_origin != "*" && request.target_origin != target_origin {
             return Ok(());
         }
+
+        // The message handler may mutate the target document.
+        self.mark_traversable_dirty(request.target_navigable_id);
 
         // Set up the shared registry so window.open calls made while the
         // message handlers run can register new documents.
@@ -2033,7 +2105,7 @@ impl ContentProcess {
             navigable_id, document_id,
         ));
         let video_paint_registry = Rc::clone(&self.video_paint_registry);
-        let paint_frame = {
+        let (paint_frame, shmem_map) = {
             let document = self
                 .documents
                 .get_mut(&document_id)
@@ -2055,63 +2127,51 @@ impl ContentProcess {
 
             // Step 14: "For each `doc` of `docs`, run the animation frame callbacks for `doc`, passing in the relative high resolution time given `frameTimestamp` and `doc`'s relevant global object as the timestamp."
             // Note: The content process collapses `docs` to the single active document for this content process.
+            let had_pending_r_af = document.settings.has_pending_animation_frame_callbacks();
             document
                 .settings
                 .run_animation_frame_callbacks(frame_timestamp_ms)?;
 
             let animation_time = frame_timestamp_ms / 1000.0;
-            {
-                let mut document_guard = document.document.borrow_mut();
 
-                // Step 16.2.1: "Recalculate styles and update layout for `doc`."
-                // `resolve` advances style, layout, and resource-driven document updates.
-                document_guard.resolve(animation_time);
-            }
+            // Decide whether to run blitz. A static document that is asked to
+            // render only because an external animation (a video frame arriving
+            // at the graphics process) keeps the render cycle alive skips the
+            // blitz resolve + paint and reuses its last scene, so the graphics
+            // process keeps the content layer clean instead of re-rasterizing an
+            // unchanged scene every cycle.
+            let should_render = {
+                let needs_paint = document.needs_paint.load(Ordering::Relaxed);
+                let document_guard = document.document.borrow();
+                needs_paint
+                    || had_pending_r_af
+                    || document_guard.is_animating()
+                    // A fresh document has never painted; fail open so the first
+                    // frame always runs blitz and populates the cache.
+                    || document.last_scene.is_none()
+            };
 
-            info!(
-                "[render-pipe] Content render navigable={} document={} iframes={} video_registry_entries={}",
-                navigable_id,
-                document_id,
-                document.navigable_container_states.len(),
-                video_paint_registry.borrow().len()
-            );
-            let paint_frame = {
+            if !should_render {
+                // Clean render: reuse the last recorded scene and composition.
+                // No blitz work, no font re-send, and the graphics process
+                // keeps this frame's layer clean (the scene is byte-identical).
+                // The render cycle still completes, so a new video frame is
+                // composed against the unchanged content layer.
+                info!(
+                    "[render-pipe] Content clean render navigable={} document={} (skipping blitz)",
+                    navigable_id, document_id
+                );
+                let recorded_scene = document.last_scene.clone().ok_or_else(|| {
+                    format!(
+                        "content render: no cached scene for clean cycle document={document_id}"
+                    )
+                })?;
+                let composition = document.last_composition.clone().ok_or_else(|| {
+                    format!("content render: no cached composition for clean cycle document={document_id}")
+                })?;
                 let document_guard = document.document.borrow();
                 let viewport = document_guard.viewport().clone();
                 let (width, height) = viewport.window_size;
-                let mut scene = RenderScene::new();
-                let composition = Self::build_frame_composition_metadata(
-                    document_id,
-                    &document_guard,
-                    &document.navigable_container_states,
-                    viewport.scale_f64(),
-                    &mut video_paint_registry.borrow_mut(),
-                );
-
-                // Step 22: "For each `doc` of `docs`, update the rendering or user interface of `doc` and its node navigable to reflect the current state."
-                // Note: This implementation collapses the HTML rendering task to a single active document and records the painted scene for the embedder.
-                paint_scene(
-                    &mut scene,
-                    &document_guard,
-                    viewport.scale_f64(),
-                    width,
-                    height,
-                    0,
-                    0,
-                );
-                let mut next_shmem_key = 0usize;
-                let scene =
-                    self.font_sender
-                        .prepare_scene(self.font_namespace, scene, &mut next_shmem_key);
-                log_render_state_debug(format!(
-                    "emit paint navigable={} document={} size=({}, {})",
-                    navigable_id, document_id, width, height,
-                ));
-                // Set animating=true when this document has animated content:
-                // video elements still producing frames, or blitz is animating
-                // (CSS animations/transitions, same-origin subdocuments,
-                // scroll animations). Graphics forwards this to the UA which
-                // keeps re-noting rendering opportunities to drive animation.
                 let has_video = video_paint_registry
                     .borrow()
                     .keys()
@@ -2120,16 +2180,15 @@ impl ContentProcess {
                         *doc_id == document_id && !ended
                     });
                 let animating = has_video || document_guard.is_animating();
-                info!(
-                    "[render-pipe] Content paint_frame ready navigable={} frame={} size=({},{}) has_video={} animating={} embed_sites={}",
-                    navigable_id,
-                    document.frame_id.0,
-                    width,
-                    height,
-                    has_video,
-                    animating,
-                    composition.embed_sites.len()
-                );
+                // Re-send the recorded scene without font data: the fonts are
+                // already registered on the graphics side, and re-sending them
+                // would reuse stale shared-memory keys.
+                let scene = PreparedScene {
+                    scene: recorded_scene,
+                    registered_fonts: Vec::new(),
+                    font_shmem: HashMap::new(),
+                };
+                let mut next_shmem_key = 0usize;
                 let (paint_frame, shmem_data) = PaintFrame::new(
                     WebviewId(navigable_id),
                     document.frame_id,
@@ -2141,8 +2200,98 @@ impl ContentProcess {
                     animating,
                 )?;
                 (paint_frame, shmem_data)
-            };
-            paint_frame
+            } else {
+                {
+                    let mut document_guard = document.document.borrow_mut();
+
+                    // Step 16.2.1: "Recalculate styles and update layout for `doc`."
+                    // `resolve` advances style, layout, and resource-driven document updates.
+                    document_guard.resolve(animation_time);
+                }
+
+                info!(
+                    "[render-pipe] Content render navigable={} document={} iframes={} video_registry_entries={}",
+                    navigable_id,
+                    document_id,
+                    document.navigable_container_states.len(),
+                    video_paint_registry.borrow().len()
+                );
+                let (paint_frame, shmem_data, recorded_scene, composition) = {
+                    let document_guard = document.document.borrow();
+                    let viewport = document_guard.viewport().clone();
+                    let (width, height) = viewport.window_size;
+                    let mut scene = RenderScene::new();
+                    let composition = Self::build_frame_composition_metadata(
+                        document_id,
+                        &document_guard,
+                        &document.navigable_container_states,
+                        viewport.scale_f64(),
+                        &mut video_paint_registry.borrow_mut(),
+                    );
+
+                    // Step 22: "For each `doc` of `docs`, update the rendering or user interface of `doc` and its node navigable to reflect the current state."
+                    // Note: This implementation collapses the HTML rendering task to a single active document and records the painted scene for the embedder.
+                    paint_scene(
+                        &mut scene,
+                        &document_guard,
+                        viewport.scale_f64(),
+                        width,
+                        height,
+                        0,
+                        0,
+                    );
+                    let mut next_shmem_key = 0usize;
+                    let prepared = self.font_sender.prepare_scene(
+                        self.font_namespace,
+                        scene,
+                        &mut next_shmem_key,
+                    );
+                    log_render_state_debug(format!(
+                        "emit paint navigable={} document={} size=({}, {})",
+                        navigable_id, document_id, width, height,
+                    ));
+                    // Set animating=true when this document has animated content:
+                    // video elements still producing frames, or blitz is animating
+                    // (CSS animations/transitions, same-origin subdocuments,
+                    // scroll animations). Graphics forwards this to the UA which
+                    // keeps re-noting rendering opportunities to drive animation.
+                    let has_video =
+                        video_paint_registry
+                            .borrow()
+                            .keys()
+                            .any(|(doc_id, node_id)| {
+                                let ended = self.ended_video_nodes.contains(&(*doc_id, *node_id));
+                                *doc_id == document_id && !ended
+                            });
+                    let animating = has_video || document_guard.is_animating();
+                    info!(
+                        "[render-pipe] Content paint_frame ready navigable={} frame={} size=({},{}) has_video={} animating={} embed_sites={}",
+                        navigable_id,
+                        document.frame_id.0,
+                        width,
+                        height,
+                        has_video,
+                        animating,
+                        composition.embed_sites.len()
+                    );
+                    let recorded_scene = prepared.scene.clone();
+                    let (paint_frame, shmem_data) = PaintFrame::new(
+                        WebviewId(navigable_id),
+                        document.frame_id,
+                        width,
+                        height,
+                        composition.clone(),
+                        prepared,
+                        &mut next_shmem_key,
+                        animating,
+                    )?;
+                    (paint_frame, shmem_data, recorded_scene, composition)
+                };
+                document.last_scene = Some(recorded_scene);
+                document.last_composition = Some(composition);
+                document.needs_paint.store(false, Ordering::Relaxed);
+                (paint_frame, shmem_data)
+            }
         };
 
         verification::tla_log!(
@@ -2151,8 +2300,6 @@ impl ContentProcess {
             "UpdateTheRendering",
             navigable_id
         );
-
-        let (paint_frame, shmem_map) = paint_frame;
 
         // Send the PaintFrame directly to the graphics process for composition.
         if let Some(graphics_sender) = &self.graphics_sender {
@@ -2766,6 +2913,25 @@ impl ContentProcess {
         Ok(())
     }
 
+    /// Mark a document as needing a render. Called whenever content runs a
+    /// script or dispatches an event that may mutate the document, so
+    /// `update_the_rendering` re-runs blitz. A render cycle driven solely by
+    /// external animation (a video frame arriving at the graphics process)
+    /// does not call this, so a static document that keeps being asked to
+    /// render skips the blitz resolve + paint on an unchanged scene.
+    fn mark_document_dirty(&self, document_id: DocumentId) {
+        if let Some(document) = self.documents.get(&document_id) {
+            document.needs_paint.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Mark the active document for a traversable as needing a render.
+    fn mark_traversable_dirty(&self, traversable_id: NavigableId) {
+        if let Some(document_id) = self.active_documents_by_traversable.get(&traversable_id) {
+            self.mark_document_dirty(*document_id);
+        }
+    }
+
     fn handle_command_inner(&mut self, command: Command) -> Result<bool, String> {
         match command {
             SetViewport(viewport) => {
@@ -2900,6 +3066,8 @@ impl ContentProcess {
                 timer_key,
                 nesting_level,
             } => {
+                // The timer callback may mutate the document.
+                self.mark_document_dirty(document_id);
                 self.run_window_timer(document_id, timer_id, timer_key, nesting_level)?;
                 Ok(true)
             }

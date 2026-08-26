@@ -6,6 +6,7 @@ use std::{
     cell::RefCell,
     collections::{HashMap, HashSet},
     rc::Rc,
+    sync::{Arc, atomic::AtomicBool},
 };
 
 use blitz_dom::BaseDocument;
@@ -226,10 +227,12 @@ fn attach_iframe_subdocument_from_html(
     else {
         return Ok(());
     };
+    let needs_paint = Arc::new(AtomicBool::new(false));
     let sub_document = Rc::new(RefCell::new(BaseDocument::new(process.document_config(
         traversable_id,
         parent_document_id,
         Some(base_url),
+        needs_paint.clone(),
     ))));
     {
         let mut sub_document_guard = sub_document.borrow_mut();
@@ -428,7 +431,11 @@ fn create_a_new_child_navigable(
             parent_origin,
         )?;
 
-    // Register the document in ContentProcess immediately.
+    // Register the document in ContentProcess immediately. A fresh dirty
+    // flag: this child navigable's render is driven by content command
+    // handlers (event/script dispatch); resource-load re-notes via the
+    // shell provider are not connected for dynamically-created documents.
+    let needs_paint = Arc::new(AtomicBool::new(false));
     process.documents.insert(
         new_document_id,
         ContentDocument {
@@ -442,6 +449,9 @@ fn create_a_new_child_navigable(
             navigable_container_states: HashMap::new(),
             viewport_offset_x: 0.0,
             viewport_offset_y: 0.0,
+            needs_paint,
+            last_scene: None,
+            last_composition: None,
         },
     );
     process

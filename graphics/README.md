@@ -245,36 +245,27 @@ uses stock vello 0.9.0 with the two-submit layout.)
 
 ## Open risks and questions
 
-- **The `animating` flag is a coarse signal for animation flow (follow-up).**
-  Content sets `PaintFrame.animating = has_video || document.is_animating()`
-  (a non-ended video element, or blitz reporting active CSS
-  animations/transitions, animating same-origin subdocuments, or scroll
-  animations), which the UA uses to keep re-noting rendering opportunities.
-  The video part still drives the render cycle even when the video is not
-  producing frames (failed/blocked load, ended-but-not-marked, muted
-  autoplay blocked): the content re-renders the same scene, the graphics
-  process re-composes an identical frame, and the embedder repaints
-  identical pixels — observed as the same content frame id re-rendered
-  continuously at ~30fps. Planned follow-up:
+- **Video still drives the render cycle via the coarse `animating` flag
+  (follow-up).** Content still sets `PaintFrame.animating = has_video ||
+  document.is_animating()`, so a page with any non-ended video keeps the
+  render cycle alive even when the video is not producing frames (failed/
+  blocked load, ended-but-not-marked, muted autoplay blocked). The content
+  process now *skips blitz* on a clean cycle — a document that was not
+  mutated reuses its last recorded scene instead of re-running resolve + paint
+  (see `content/src/main.rs` `update_the_rendering`), and the graphics process
+  keeps the content layer clean (the reused scene compares byte-identical).
+  The remaining waste is the render cycle itself (compose + forward) running
+  at vsync. Remaining follow-up:
   - Set `animating` only when the document has a **pending rAF callback**
     (script-driven animation) or blitz is genuinely advancing CSS
-    animations.
-  - Handle video-driven continuous flow separately: either a dedicated
-    flag, or — preferred — have the graphics process (which receives both
-    the media backend's video frames and content's `PaintFrame`) produce a
-    new surface texture only when the composition actually changed (a new
-    video frame arrived since the last composition, or a new content
-    frame). The media backend delivers frames to the graphics compositor
-    directly (`MediaBackendEvent::Frame`/`PixelBufferFrame`), so graphics
-    is the natural place to gate on "a proper video frame".
-  - Constraint: compositions must stay tied to render cycles (the
-    "never compose independently from the video handler" rule, to keep the
-    RenderingOpportunity TLA pipeline model valid). A
-    video-frame arrival should therefore re-note a rendering opportunity
-    through the UA (e.g. a `VideoFrameReady` trace event), and the
-    composition itself still happens on the top-level `PaintFrame` within the
-    cycle.
-- **Composition waits for the latest embedded frames.** A top-level
+    animations, and handle video-driven flow separately: a
+    video-frame arrival should re-note a rendering opportunity through the
+    UA, and the composition still happens on the top-level `PaintFrame`
+    within the cycle (the "never compose independently from the video
+    handler" rule, to keep the RenderingOpportunity TLA pipeline model
+    valid).
+- **Composition waits for the latest embedded frames, and a changed child
+  re-notes the parent.** A top-level
   `PaintFrame` arriving at the graphics process before a child (cross-origin
   iframe) `PaintFrame` — the two are produced in parallel content processes —
   marks the composition pending and defers it until every embedded frame it

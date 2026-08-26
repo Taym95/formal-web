@@ -488,7 +488,7 @@ fn handle_command<B: MediaBackend + 'static, R: SurfaceRenderer>(
                     return false;
                 }
             };
-            slot.compositor.store_frame(
+            let frame_dirty = slot.compositor.store_frame(
                 frame_id,
                 viewport_width,
                 viewport_height,
@@ -511,6 +511,30 @@ fn handle_command<B: MediaBackend + 'static, R: SurfaceRenderer>(
                 // top-level frame references has arrived, so a child frame
                 // racing behind it is still included (never dropped).
                 slot.compositor.mark_composition_pending();
+            } else {
+                // A cross-origin iframe's content changed: re-note a
+                // rendering opportunity for the parent traversable so its
+                // render cycle re-composes and includes the child's new
+                // frame. Without this, the child's change sits in the
+                // parent's compositor until an unrelated input event happens
+                // to drive a top-level render. Only re-note when the child's
+                // content actually changed, so a duplicate child frame (a
+                // static child re-sending during a video-driven cycle) does
+                // not spin the parent.
+                if frame_dirty {
+                    info!(
+                        "[render-pipe] Graphics child frame changed parent={:?} frame={}",
+                        webview_id.0, frame_id.0
+                    );
+                    if let Err(send_error) = composed_scene_sender.send(
+                        ipc_messages::graphics::GraphicsEvent::CompositionChanged { webview_id },
+                    ) {
+                        error!(
+                            "[graphics] failed to send CompositionChanged for {:?}: {send_error}",
+                            webview_id
+                        );
+                    }
+                }
             }
             maybe_compose(
                 webviews,

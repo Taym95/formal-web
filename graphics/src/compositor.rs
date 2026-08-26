@@ -292,6 +292,13 @@ impl Compositor {
         self.resolved_tree_dirty = true;
     }
 
+    /// Store a content frame. Returns whether this frame's content is dirty
+    /// (its scene or viewport changed since the last stored frame for the same
+    /// id). The caller uses the dirty signal for a non-root (child) frame to
+    /// re-note a rendering opportunity for the parent, so a cross-origin
+    /// iframe whose content changed gets re-composed without waiting for an
+    /// unrelated input event.
+    #[must_use]
     pub fn store_frame(
         &mut self,
         frame_id: FrameId,
@@ -300,7 +307,7 @@ impl Compositor {
         composition: FrameCompositionMetadata,
         scene: RecordedScene,
         is_root_candidate: bool,
-    ) {
+    ) -> bool {
         if input_debug_enabled() {
             let summary = scene.summary();
             trace!(
@@ -365,7 +372,7 @@ impl Compositor {
                 );
             }
             self.resolved_tree_dirty = true;
-            return;
+            return scene_changed;
         }
 
         // Always update root_frame_id when a root candidate arrives,
@@ -384,6 +391,7 @@ impl Compositor {
 
         self.committed_frames.insert(frame_id, frame);
         self.resolved_tree_dirty = true;
+        scene_changed
     }
 
     /// Decode a content PaintFrame into a recorded scene, registering its
