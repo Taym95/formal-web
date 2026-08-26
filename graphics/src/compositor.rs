@@ -6,7 +6,7 @@ use anyrender::{PaintScene, Scene as RenderScene};
 use ipc::IpcSharedRegion;
 use ipc_messages::content::{
     EmbedBackgroundPolicy, EmbedSite, FontTransportReceiver, FrameCompositionMetadata, FrameId,
-    IframeEmbedSite, PaintFrame, RecordedScene,
+    IframeEmbedSite, PaintFrame, RecordedScene, serialize_scene_to_vec,
 };
 use ipc_messages::graphics::{CompositingLayerId, FrameHitInfo, LayerTopology, SurfacePayload};
 
@@ -129,6 +129,15 @@ struct CachedFrame {
     child_frames: Vec<NavigableContainerLayout>,
     composition: FrameCompositionMetadata,
     scene: RecordedScene,
+    /// A deterministic fingerprint of the serialized scene. RecordedScene's
+    /// derived `PartialEq` is unreliable: `Paint::Custom` compares by Arc
+    /// pointer and float fields use `==`, so a `NaN` (or a pointer that
+    /// differs across a serialization round-trip) makes two byte-identical
+    /// scenes unequal, re-rasterizing an unchanged layer on every cycle.
+    /// Comparing the serialized bytes instead treats identical bits (NaN
+    /// included) as equal, so a layer whose recorded content did not change
+    /// stays clean.
+    scene_digest: u64,
     /// True when this frame's document contains animated content (video
     /// frames still being produced, CSS animations). The composed scene
     /// aggregates it so the UA keeps noting rendering opportunities.
@@ -330,11 +339,35 @@ impl Compositor {
         // every cycle. Layer placement (transform/clip) is recomputed from
         // `composition` each compose walk, so a placement-only change does
         // not make the layer's own surface dirty.
+        // Decide whether this frame's content actually changed since the
+        // last stored frame for the same id. A layer whose scene and
+        // viewport are unchanged must keep its last surface (stay clean);
+        // re-storing an identical scene (e.g. a static document that keeps
+        // re-sending a PaintFrame because a video elsewhere drives the
+        // render cycle) would otherwise re-rasterize it and re-present it
+        // every cycle. Layer placement (transform/clip) is recomputed from
+        // `composition` each compose walk, so a placement-only change does
+        // not make the layer's own surface dirty.
+        //
+        // Compare a digest of the serialized scene rather than the scene's
+        // derived `PartialEq`: the recorded scene can contain a float `NaN`
+        // (or a `Paint::Custom` whose Arc pointer differs across a
+        // round-trip), which makes two byte-identical scenes compare
+        // unequal and re-rasterize an unchanged layer every cycle.
+        let scene_digest = {
+            let bytes = serialize_scene_to_vec(&scene).unwrap_or_default();
+            let mut h = 0xcbf29ce484222325u64; // FNV-1a offset basis
+            for b in &bytes {
+                h ^= u64::from(*b);
+                h = h.wrapping_mul(0x100000001b3);
+            }
+            h
+        };
         let scene_changed = self
             .committed_frames
             .get(&frame_id)
             .map(|existing| {
-                existing.scene != scene
+                existing.scene_digest != scene_digest
                     || existing.viewport_width != viewport_width
                     || existing.viewport_height != viewport_height
             })
@@ -348,6 +381,7 @@ impl Compositor {
             child_frames: Vec::new(),
             composition,
             scene,
+            scene_digest,
             animating: false,
             dirty: scene_changed,
         };
