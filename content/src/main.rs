@@ -1800,6 +1800,17 @@ impl ContentProcess {
 
         // The message handler may mutate the target document.
         self.mark_traversable_dirty(request.target_navigable_id);
+        // Request a rendering opportunity from the UA so the target's render
+        // cycle is driven and it receives UpdateTheRendering: the handler runs
+        // here (in the target's content process) and mutates the document, but
+        // without this note the UA never knows to re-render the navigable, so
+        // a cross-origin iframe's change waits for an unrelated input event to
+        // come through before it appears.
+        if let Err(error) = self.event_sender.send(ContentEvent::RenderingOpRequested(
+            request.target_navigable_id,
+        )) {
+            error!("failed to request rendering op for postMessage: {error}");
+        }
 
         // Set up the shared registry so window.open calls made while the
         // message handlers run can register new documents.
@@ -2022,6 +2033,10 @@ impl ContentProcess {
         let Some(document_id) = self.find_port_document(port_id) else {
             return Ok(());
         };
+        let traversable_id = self
+            .documents
+            .get(&document_id)
+            .map(|document| document.traversable_id);
         let time_millis = self
             .documents
             .get(&document_id)
@@ -2041,6 +2056,19 @@ impl ContentProcess {
             port.run_message_task(time_millis, ec)
         })
         .map_err(|error| format!("port message task failed: {}", error.display()))?;
+
+        // The message task's handler may have mutated the target document; mark
+        // it dirty and request a rendering opportunity from the UA so the
+        // target's render cycle is driven, instead of the change waiting for an
+        // unrelated input event to come through.
+        self.mark_document_dirty(document_id);
+        if let Some(traversable_id) = traversable_id
+            && let Err(error) = self
+                .event_sender
+                .send(ContentEvent::RenderingOpRequested(traversable_id))
+        {
+            error!("failed to request rendering op for port message task: {error}");
+        }
         Ok(())
     }
 
