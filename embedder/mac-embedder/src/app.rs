@@ -2186,13 +2186,13 @@ impl MacApp {
     }
 
     /// Close a tab: drop its window state, surfaces, and chrome buttons,
-    /// then activate a neighbour. Closing the last tab closes the window
-    /// (which exits the app when it was the only window). The underlying
-    /// traversable in the user agent is not destroyed — the user agent has
-    /// no webview teardown path yet, the same situation as closing a
-    /// window.
+    /// then show the rightmost remaining tab. Closing the last tab closes
+    /// the window (which exits the app when it was the only window). The
+    /// underlying traversable in the user agent is not destroyed — the
+    /// user agent has no webview teardown path yet, the same situation as
+    /// closing a window.
     fn close_tab(&mut self, window_id: WindowId, webview_id: WebviewId) {
-        let (empty, window) = {
+        let (empty, closed_active, window) = {
             let Some(window_state) = self.windows.get_mut(&window_id) else {
                 return;
             };
@@ -2205,17 +2205,14 @@ impl MacApp {
             if let Some(index) = index {
                 window_state.tab_order.remove(index);
             }
-            if window_state.active_tab == Some(webview_id) {
-                // Prefer the tab that slid into the closed tab's slot, then
-                // the tab before it.
-                window_state.active_tab = window_state
-                    .tab_order
-                    .get(index.unwrap_or(0))
-                    .copied()
-                    .or_else(|| window_state.tab_order.last().copied());
+            // Show the rightmost remaining tab when the active one closes.
+            let closed_active = window_state.active_tab == Some(webview_id);
+            if closed_active {
+                window_state.active_tab = window_state.tab_order.last().copied();
             }
             (
                 window_state.tab_order.is_empty(),
+                closed_active,
                 window_state.window.clone(),
             )
         };
@@ -2225,6 +2222,23 @@ impl MacApp {
         }
         self.refresh_chrome(window_id);
         self.update_provider_viewport(window_id);
+        if closed_active {
+            // Present the new active tab's surface right away and request a
+            // frame, so the closed tab's webview does not stay on screen
+            // until the user picks another tab.
+            let active = self
+                .windows
+                .get(&window_id)
+                .and_then(|window_state| window_state.active_tab);
+            if let Some(window_state) = self.windows.get_mut(&window_id) {
+                Self::present_active_surface(window_state);
+            }
+            if let Some(provider) = self.provider.as_ref()
+                && let Some(active) = active
+            {
+                let _ = provider.frame_needed(active);
+            }
+        }
     }
 
     fn action_navigate(&mut self, input: String) {
