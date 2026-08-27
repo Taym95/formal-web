@@ -140,19 +140,16 @@ pub trait Embedder: Send + Sync {
         font_registrations: Vec<ipc_messages::content::RegisteredFont>,
         font_data: std::collections::HashMap<usize, Vec<u8>>,
     ) -> Result<(), String>;
-    /// Forward a rendered surface frame from the graphics process. `frame`
-    /// identifies how the pixels are delivered (CPU shared memory vs. a
-    /// shared IOSurface on macOS) and carries the delivery payload.
-    /// `animating` reports whether the composed scene contains animated
-    /// content (video, CSS animations) that needs the next frame at display
-    /// cadence.
-    fn new_web_content_surface(
+    /// Forward the per-layer rendered frame from the graphics process. Each
+    /// layer carries its wire `topology` (transform, clip, z-order) plus the
+    /// actual `frame` only when the layer was re-rendered this cycle; a clean
+    /// layer keeps its last surface and carries `frame: None`. `animating`
+    /// reports whether the composed scene contains animated content (video,
+    /// CSS animations) that needs the next frame at display cadence.
+    fn new_web_content_layers(
         &self,
         webview_id: WebviewId,
-        frame: ipc_messages::graphics::SurfaceFrame,
-        width: u32,
-        height: u32,
-        generation: u64,
+        layers: Vec<ipc_messages::graphics::LayerFrame>,
         animating: bool,
     ) -> Result<(), String>;
 }
@@ -3632,20 +3629,27 @@ impl UserAgentWorker {
         self.handle_set_traversable_viewport(traversable_id, snapshot, 0.0, 0.0);
     }
 
-    /// sending a per-traversable viewport update to the owning event loop.
+    /// Send a per-traversable viewport update to the owning event loop.
+    ///
+    /// Returns `true` when the update was delivered to a registered
+    /// `traversable_handle` (callers use this to decide whether a computed
+    /// child viewport was reliably received); `false` when the traversable's
+    /// content process has not registered a handle yet. The viewport is still
+    /// recorded in `traversable_viewports` in both cases so the event-loop
+    /// migration path can re-send it once the handle registers.
     fn handle_set_traversable_viewport(
         &mut self,
         traversable_id: NavigableId,
         snapshot: (u32, u32, f32, ColorScheme),
         offset_x: f32,
         offset_y: f32,
-    ) {
+    ) -> bool {
         self.state
             .traversable_viewports
             .insert(traversable_id, (snapshot, offset_x, offset_y));
 
         let Some(handle) = self.state.traversable_handles.get(&traversable_id).copied() else {
-            return;
+            return false;
         };
         let Some(agent) = self
             .state
@@ -3653,7 +3657,7 @@ impl UserAgentWorker {
             .values()
             .find(|agent| agent.event_loop_id == handle)
         else {
-            return;
+            return false;
         };
         let command = traversable_viewport_command(traversable_id, snapshot, offset_x, offset_y);
         let _ = agent
@@ -3662,6 +3666,7 @@ impl UserAgentWorker {
         // The UA notes a rendering opportunity so the content process will
         // receive UpdateTheRendering and repaint with the new viewport.
         self.note_rendering_opportunity(traversable_id);
+        true
     }
 
     /// Report a navigation completion to the host for a top-level
@@ -3718,9 +3723,14 @@ impl UserAgentWorker {
     /// Queue update the rendering for every navigable of
     /// `traversable_id` that has a batched rendering opportunity.
     fn queue_update_the_rendering_for_navigables(&mut self, traversable_id: NavigableId) {
-        if self.pending_update_the_rendering.contains(&traversable_id) {
-            return;
-        }
+        // Drain each candidate independently. A candidate that is already
+        // pending is a no-op (the per-navigable guard in
+        // `queue_update_the_rendering` handles it), so a child iframe's queued
+        // opportunity is drained even when the top-level traversable's own
+        // update is still in flight. The old batch-level early return on
+        // `pending_update_the_rendering` left a static child's change stranded
+        // in `queued_rendering_opportunities` until an unrelated input event
+        // happened to request a frame.
         for candidate in self
             .queued_rendering_opportunities
             .keys()
@@ -4591,55 +4601,56 @@ impl UserAgentWorker {
         match &incoming.payload {
             GraphicsEvent::PixelFrameReady {
                 webview_id,
-                payload,
+                layers,
                 animating,
                 animating_frame_ids,
-                width,
-                height,
-                generation,
+                generation: _,
                 frame_hit_info,
                 child_viewports,
                 child_frame_to_webview,
             } => {
                 debug!(
-                    "[graphics] received surface frame for {:?} ({}x{}, payload={:?})",
+                    "[graphics] received surface frame for {:?} ({} layers)",
                     webview_id,
-                    width,
-                    height,
-                    std::mem::discriminant(payload)
+                    layers.len()
                 );
-                // The CPU path carries the pixel bytes in the shared-memory
-                // map; the zero-copy path (macOS) carries the shared surface's
-                // Mach port in the payload itself.
-                let frame = match payload {
-                    ipc_messages::graphics::SurfacePayload::CpuShmem { shmem_key } => {
-                        let region = incoming
-                            .shmem_regions
-                            .remove(shmem_key)
-                            .unwrap_or_else(|| ipc::IpcSharedRegion::from_bytes(&[]));
-                        ipc_messages::graphics::SurfaceFrame::CpuShmem(region)
-                    }
-                    #[cfg(target_os = "macos")]
-                    ipc_messages::graphics::SurfacePayload::SharedTexture {
-                        texture_id,
-                        surface_id,
-                        port,
-                    } => ipc_messages::graphics::SurfaceFrame::SharedTexture {
-                        texture_id: *texture_id,
-                        surface_id: *surface_id,
-                        port: port.clone(),
-                    },
-                };
+                // Forward every layer's topology plus the surface for the
+                // layers re-rendered this cycle. The embedder keeps the
+                // last surface of a clean layer (frame: None) and only draws
+                // the layers it is told about.
+                let layer_frames: Vec<ipc_messages::graphics::LayerFrame> = layers
+                    .iter()
+                    .map(|topology| {
+                        let mut topology = topology.clone();
+                        let frame = match topology.surface.take() {
+                            Some(ipc_messages::graphics::SurfacePayload::CpuShmem {
+                                shmem_key,
+                            }) => {
+                                let region = incoming
+                                    .shmem_regions
+                                    .remove(&shmem_key)
+                                    .unwrap_or_else(|| ipc::IpcSharedRegion::from_bytes(&[]));
+                                Some(ipc_messages::graphics::SurfaceFrame::CpuShmem(region))
+                            }
+                            #[cfg(target_os = "macos")]
+                            Some(ipc_messages::graphics::SurfacePayload::SharedTexture {
+                                texture_id,
+                                surface_id,
+                                port,
+                            }) => Some(ipc_messages::graphics::SurfaceFrame::SharedTexture {
+                                texture_id,
+                                surface_id,
+                                port,
+                            }),
+                            None => None,
+                        };
+                        ipc_messages::graphics::LayerFrame { topology, frame }
+                    })
+                    .collect();
                 debug!(
-                    "[graphics] received surface frame for {:?} ({}x{}, {}B)",
-                    webview_id,
-                    width,
-                    height,
-                    match &frame {
-                        ipc_messages::graphics::SurfaceFrame::CpuShmem(region) => region.size(),
-                        #[cfg(target_os = "macos")]
-                        ipc_messages::graphics::SurfaceFrame::SharedTexture { .. } => 0,
-                    }
+                    "[graphics] forwarded {} layers for {:?}",
+                    layer_frames.len(),
+                    webview_id
                 );
 
                 // When the top-level traversable's composed scene completes,
@@ -4691,6 +4702,21 @@ impl UserAgentWorker {
                 // start it now.
                 if self.frame_needed.contains(&webview_id.0) {
                     self.queue_update_the_rendering_for_navigables(webview_id.0);
+                } else if !*animating
+                    && self.queued_rendering_opportunities.keys().any(|candidate| {
+                        self.state.top_level_traversable_id(*candidate) == Some(webview_id.0)
+                    })
+                {
+                    // A static content-only change (a DOM mutation from an
+                    // input event or script that landed while the previous
+                    // frame was in flight) is stranded in
+                    // `queued_rendering_opportunities`: the scene is not
+                    // animating, so nothing re-notes it and the display link
+                    // is stopped. Without a FrameNeeded the queued opportunity
+                    // is never drained, and the change only appears when the
+                    // next unrelated input event happens to request a frame.
+                    // Request a redraw so the next FrameNeeded drains it.
+                    self.host.request_redraw(*webview_id);
                 }
                 self.state
                     .frame_hit_info
@@ -4698,15 +4724,11 @@ impl UserAgentWorker {
                 self.state
                     .child_frame_to_webview
                     .insert(*webview_id, child_frame_to_webview.clone());
-                if let Err(e) = self.host.new_web_content_surface(
-                    *webview_id,
-                    frame,
-                    *width,
-                    *height,
-                    *generation,
-                    *animating,
-                ) {
-                    error!("[graphics] forward surface: {e}");
+                if let Err(e) =
+                    self.host
+                        .new_web_content_layers(*webview_id, layer_frames, *animating)
+                {
+                    error!("[graphics] forward layers: {e}");
                 }
 
                 // Publish child viewports so child traversables know their
@@ -4726,13 +4748,24 @@ impl UserAgentWorker {
                         if self.state.published_child_viewports.get(&child_wv) == Some(&key) {
                             continue;
                         }
-                        self.state.published_child_viewports.insert(child_wv, key);
-                        self.handle_set_traversable_viewport(
+                        // Always record the viewport so the child's event-loop
+                        // migration path can re-send it once its handle registers,
+                        // but only mark it *published* when the push actually
+                        // reached a registered traversable handle. Marking it
+                        // published before delivery means a child whose content
+                        // process had not registered yet (the common cross-origin
+                        // iframe bootstrap) swallows the correct size forever: the
+                        // key is stable for a static iframe box, so the size is
+                        // never re-sent and the child paints at its fallback
+                        // dimensions until something changes the key (a resize).
+                        if self.handle_set_traversable_viewport(
                             child_traversable_id,
                             (cw.max(1), ch.max(1), scale, cs.clone()),
                             offset_x,
                             offset_y,
-                        );
+                        ) {
+                            self.state.published_child_viewports.insert(child_wv, key);
+                        }
                     }
                 }
             }
@@ -4757,6 +4790,21 @@ impl UserAgentWorker {
                             },
                         })
                     });
+            }
+            GraphicsEvent::CompositionChanged { webview_id } => {
+                // A cross-origin iframe's content changed (or a video frame
+                // arrived) without the top-level content process driving a
+                // render. Note a rendering opportunity for the traversable so
+                // its render cycle re-composes and includes the latest
+                // embedded frame. `note_rendering_opportunity` batches the
+                // note and requests a redraw when the embedder is not already
+                // painting, so a static parent gets one repaint per content
+                // change instead of deferring to the next unrelated input.
+                info!(
+                    "[render-pipe] UA composition changed webview={:?}",
+                    webview_id
+                );
+                self.note_rendering_opportunity(webview_id.0);
             }
             GraphicsEvent::ShutdownComplete => {
                 debug!("[graphics] graphics process shutdown complete");

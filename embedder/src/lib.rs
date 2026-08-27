@@ -13,9 +13,14 @@ pub struct AppRunOptions {
     pub startup_url: Option<String>,
     pub window_title: Option<String>,
     pub trace_sender: Option<TraceSender>,
+    /// When set, start a CDP server on this port. The AppKit embedder uses
+    /// it to expose real-pixel screenshots (and navigation/evaluation) to
+    /// the pi browser tooling; the winit automation entry points use the
+    /// `cdp` subcommand instead.
+    pub cdp_port: Option<u16>,
 }
 
-pub fn run_default(verify: bool, headless: bool) -> Result<(), String> {
+pub fn run_default(verify: bool, headless: bool, cdp_port: Option<u16>) -> Result<(), String> {
     let verification_run = if verify {
         Some(
             VerificationRun::start()
@@ -28,6 +33,7 @@ pub fn run_default(verify: bool, headless: bool) -> Result<(), String> {
 
     let result = run_app_with_options(AppRunOptions {
         headless,
+        cdp_port,
         trace_sender,
         ..AppRunOptions::default()
     });
@@ -43,7 +49,12 @@ pub fn run_app_with_options(options: AppRunOptions) -> Result<(), String> {
     if options.headless {
         winit_embedder::run_headless_app(trace_sender, options.startup_url, options.window_title)
     } else {
-        run_headed_app(trace_sender, options.startup_url, options.window_title)
+        run_headed_app(
+            trace_sender,
+            options.startup_url,
+            options.window_title,
+            options.cdp_port,
+        )
     }
 }
 
@@ -52,8 +63,9 @@ fn run_headed_app(
     trace_sender: Option<TraceSender>,
     startup_url: Option<String>,
     window_title: Option<String>,
+    cdp_port: Option<u16>,
 ) -> Result<(), String> {
-    mac_embedder::run_windowed_app(trace_sender, startup_url, window_title)
+    mac_embedder::run_windowed_app(trace_sender, startup_url, window_title, cdp_port)
 }
 
 #[cfg(any(not(target_os = "macos"), feature = "winit_embedder"))]
@@ -61,7 +73,9 @@ fn run_headed_app(
     trace_sender: Option<TraceSender>,
     startup_url: Option<String>,
     window_title: Option<String>,
+    cdp_port: Option<u16>,
 ) -> Result<(), String> {
+    let _ = cdp_port;
     winit_embedder::run_windowed_app(trace_sender, startup_url, window_title)
 }
 

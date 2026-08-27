@@ -13,7 +13,7 @@ compile_error!(
 use std::collections::{HashMap, HashSet};
 
 use crate::renderer::{ReadbackChannels, SurfaceRenderer};
-use compositor::{Compositor, CompositorVideoFrame};
+use compositor::{Compositor, CompositorVideoFrame, LayerUpdate};
 use crossbeam_channel::{select, tick};
 use ipc_messages::content::{FrameId, WebviewId};
 use ipc_messages::graphics::{FrameHitInfo, GraphicsCommand, GraphicsEvent};
@@ -27,7 +27,10 @@ use verification::TLATracer;
 #[derive(Clone)]
 pub struct ComposedScene {
     pub webview_id: WebviewId,
-    pub scene: anyrender::Scene,
+    /// The per-layer decomposition of this webview's composition. Each layer
+    /// is its own surface; `render` is `Some` for layers re-rasterized this
+    /// cycle (dirty), `None` for clean layers that keep their last surface.
+    pub layers: Vec<LayerUpdate>,
     pub frame_hit_info: Vec<FrameHitInfo>,
     /// Viewport data for child frames, keyed by child webview_id.
     /// Populated during compose_scene from the compositor's visible_frame_viewports.
@@ -135,6 +138,7 @@ pub fn run_graphics_process<B: MediaBackend + 'static, R: SurfaceRenderer>(
                 &mut finished_videos,
                 &mut tla_tracer,
                 &channels,
+                &event_sender,
             );
         }
     }
@@ -192,6 +196,7 @@ pub fn run_graphics_process<B: MediaBackend + 'static, R: SurfaceRenderer>(
                     &mut finished_videos,
                     &mut tla_tracer,
                     &channels,
+                    &event_sender,
                 ) {
                     break;
                 }
@@ -205,6 +210,7 @@ pub fn run_graphics_process<B: MediaBackend + 'static, R: SurfaceRenderer>(
                     &event_sender,
                     &child_webview_to_parent,
                     &mut finished_videos,
+                    &mut tla_tracer,
                 );
             }
             recv(sample_tick) -> _ => {
@@ -243,6 +249,7 @@ fn handle_media_event<R: SurfaceRenderer>(
     composed_scene_sender: &ipc::IpcSender<GraphicsEvent>,
     child_webview_to_parent: &HashMap<WebviewId, (WebviewId, FrameId)>,
     finished_videos: &mut HashSet<VideoPaintId>,
+    tla_tracer: &mut TLATracer,
 ) {
     match event {
         MediaBackendEvent::Frame(mut video_frame) => {
@@ -261,6 +268,7 @@ fn handle_media_event<R: SurfaceRenderer>(
                 width: video_frame.width,
                 height: video_frame.height,
                 content: compositor::VideoFrameContent::Bytes(pixel_bytes),
+                dirty: true,
             };
             if let Some(slot) = webviews.get_mut(&webview_id) {
                 // Store the video frame. It will be included in the next normal
@@ -279,6 +287,8 @@ fn handle_media_event<R: SurfaceRenderer>(
                 webview_id,
                 &expected_videos(pipeline_webview_map, finished_videos),
                 child_webview_to_parent,
+                composed_scene_sender,
+                tla_tracer,
             );
         }
         // AVFoundation video frames arrive as GPU pixel buffers and are
@@ -324,6 +334,7 @@ fn handle_media_event<R: SurfaceRenderer>(
                 width: frame.width,
                 height: frame.height,
                 content: compositor::VideoFrameContent::Texture(resource_id),
+                dirty: true,
             };
             slot.compositor.update_video_frame(cf);
             maybe_compose(
@@ -331,6 +342,8 @@ fn handle_media_event<R: SurfaceRenderer>(
                 webview_id,
                 &expected_videos(pipeline_webview_map, finished_videos),
                 child_webview_to_parent,
+                composed_scene_sender,
+                tla_tracer,
             );
         }
         MediaBackendEvent::Eos { pipeline_id } => {
@@ -353,6 +366,8 @@ fn handle_media_event<R: SurfaceRenderer>(
                     webview_id,
                     &expected_videos(pipeline_webview_map, finished_videos),
                     child_webview_to_parent,
+                    composed_scene_sender,
+                    tla_tracer,
                 );
             }
         }
@@ -370,6 +385,8 @@ fn handle_media_event<R: SurfaceRenderer>(
                     webview_id,
                     &expected_videos(pipeline_webview_map, finished_videos),
                     child_webview_to_parent,
+                    composed_scene_sender,
+                    tla_tracer,
                 );
             }
         }
@@ -396,6 +413,7 @@ fn handle_command<B: MediaBackend + 'static, R: SurfaceRenderer>(
     finished_videos: &mut HashSet<VideoPaintId>,
     tla_tracer: &mut TLATracer,
     channels: &ReadbackChannels<R::RenderData>,
+    composed_scene_sender: &ipc::IpcSender<GraphicsEvent>,
 ) -> bool {
     match cmd {
         GraphicsCommand::RegisterWebview { webview_id } => {
@@ -429,6 +447,8 @@ fn handle_command<B: MediaBackend + 'static, R: SurfaceRenderer>(
                     parent_webview_id,
                     &expected_videos(pipeline_webview_map, finished_videos),
                     child_webview_to_parent,
+                    composed_scene_sender,
+                    tla_tracer,
                 );
             }
         }
@@ -468,7 +488,7 @@ fn handle_command<B: MediaBackend + 'static, R: SurfaceRenderer>(
                     return false;
                 }
             };
-            slot.compositor.store_frame(
+            let frame_dirty = slot.compositor.store_frame(
                 frame_id,
                 viewport_width,
                 viewport_height,
@@ -491,12 +511,38 @@ fn handle_command<B: MediaBackend + 'static, R: SurfaceRenderer>(
                 // top-level frame references has arrived, so a child frame
                 // racing behind it is still included (never dropped).
                 slot.compositor.mark_composition_pending();
+            } else {
+                // A cross-origin iframe's content changed: re-note a
+                // rendering opportunity for the parent traversable so its
+                // render cycle re-composes and includes the child's new
+                // frame. Without this, the child's change sits in the
+                // parent's compositor until an unrelated input event happens
+                // to drive a top-level render. Only re-note when the child's
+                // content actually changed, so a duplicate child frame (a
+                // static child re-sending during a video-driven cycle) does
+                // not spin the parent.
+                if frame_dirty {
+                    info!(
+                        "[render-pipe] Graphics child frame changed parent={:?} frame={}",
+                        webview_id.0, frame_id.0
+                    );
+                    if let Err(send_error) = composed_scene_sender.send(
+                        ipc_messages::graphics::GraphicsEvent::CompositionChanged { webview_id },
+                    ) {
+                        error!(
+                            "[graphics] failed to send CompositionChanged for {:?}: {send_error}",
+                            webview_id
+                        );
+                    }
+                }
             }
             maybe_compose(
                 webviews,
                 webview_id,
                 &expected_videos(pipeline_webview_map, finished_videos),
                 child_webview_to_parent,
+                composed_scene_sender,
+                tla_tracer,
             );
         }
         GraphicsCommand::RemoveVideoFrame {
@@ -600,6 +646,8 @@ fn handle_command<B: MediaBackend + 'static, R: SurfaceRenderer>(
                     webview_id,
                     &expected_videos(pipeline_webview_map, finished_videos),
                     child_webview_to_parent,
+                    composed_scene_sender,
+                    tla_tracer,
                 );
             }
         }
@@ -636,6 +684,8 @@ fn maybe_compose<R: SurfaceRenderer>(
     webview_id: WebviewId,
     expected_videos: &HashSet<VideoPaintId>,
     child_webview_to_parent: &HashMap<WebviewId, (WebviewId, FrameId)>,
+    composed_scene_sender: &ipc::IpcSender<GraphicsEvent>,
+    tla_tracer: &mut TLATracer,
 ) {
     let Some(slot) = webviews.get_mut(&webview_id) else {
         return;
@@ -673,11 +723,29 @@ fn maybe_compose<R: SurfaceRenderer>(
     // top-level frame. Content knows what's animating (video, CSS animations)
     // and sets this; the composed scene reports it so the UA keeps re-noting
     // rendering opportunities. Graphics just passes it through.
-    if let Err(error) = slot.renderer.submit_scene(composed) {
-        error!(
-            "[graphics] submit composed scene failed for {:?}: {error:?}",
-            webview_id
-        );
+    match slot.renderer.submit_layers(composed, composed_scene_sender) {
+        Ok(rendered) => {
+            slot.compositor.mark_layers_rendered(&rendered);
+            if rendered.is_empty() {
+                // Every layer stayed clean (no surface re-produced): the
+                // renderer still emits a surface-less PixelFrameReady so the
+                // UA clears the navigable's pending update-the-rendering.
+                // Trace the render as computed here, since the empty cycle
+                // does not flow through `handle_render_done`.
+                verification::tla_log!(
+                    *tla_tracer,
+                    -> "RenderingOpportunity",
+                    "GraphicsComputed",
+                    webview_id.0
+                );
+            }
+        }
+        Err(error) => {
+            error!(
+                "[graphics] submit composed scene failed for {:?}: {error:?}",
+                webview_id
+            );
+        }
     }
 }
 

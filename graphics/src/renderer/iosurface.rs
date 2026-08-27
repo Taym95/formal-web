@@ -4,41 +4,43 @@
 //! IPC pixel bytes.
 
 use super::{
-    FrameDelivery, FrameMetadata, GpuContext, PollRequest, ReadbackChannels, RenderError,
-    SurfaceBuffers, SurfaceRenderer, SurfaceRingState, frame_metadata, render_size,
+    FrameDelivery, FrameMetadata, GpuContext, MAX_SURFACE_DIMENSION, PollRequest, ReadbackChannels,
+    RenderError, SurfaceBuffers, SurfaceRenderer, SurfaceRingState, frame_metadata,
 };
 use crate::iosurface::{IosurfaceTexture, create_shared_texture};
 use ipc_messages::content::WebviewId;
-use ipc_messages::graphics::{GraphicsEvent, SurfacePayload};
+use ipc_messages::graphics::{CompositingLayerId, GraphicsEvent, LayerTopology, SurfacePayload};
 use ipc_messages::media::VideoPaintId;
 use log::{debug, error, info};
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_core_video::CVPixelBuffer;
 use objc2_metal::MTLDevice;
+use std::collections::HashMap;
 
 use crate::ComposedScene;
 
 /// Per-frame data for the zero-copy path: delivered by the poll thread once
-/// the render into the shared texture completes (the embedder's blit of the
-/// shared surface is then GPU-safe).
+/// the render into the shared textures completes (the embedder's blit of the
+/// shared surfaces is then GPU-safe).
 pub struct SharedRenderData {
     pub webview_id: WebviewId,
     pub generation: u64,
-    pub width: u32,
-    pub height: u32,
-    pub buffer_index: usize,
+    /// The per-layer topology for this cycle; `surface` is present only for
+    /// layers re-rendered this cycle.
+    pub layers: Vec<LayerTopology>,
     pub metadata: FrameMetadata,
 }
 
-/// The zero-copy IOSurface renderer: a [`GpuContext`] plus the webview's
-/// shared IOSurface double buffer and the shared-texture id counter.
+/// The zero-copy IOSurface renderer: a [`GpuContext`] plus the per-layer
+/// shared IOSurface double buffers and the shared-texture id counter.
 pub struct IosurfaceRenderer {
     gpu: GpuContext,
     channels: ReadbackChannels<SharedRenderData>,
-    /// The webview's shared IOSurface double buffer (two textures),
-    /// reallocated on resize.
-    buffers: Option<SurfaceBuffers<[IosurfaceTexture; 2]>>,
+    /// Per-layer shared IOSurface double buffers (two textures each),
+    /// reallocated on resize. A layer that no longer changes sits in its own
+    /// ring and is touched by nobody.
+    buffers: HashMap<CompositingLayerId, SurfaceBuffers<[IosurfaceTexture; 2]>>,
     /// Monotonic identity for shared IOSurface textures; changes on resize.
     texture_id_counter: u64,
 }
@@ -78,57 +80,32 @@ impl SurfaceRenderer for IosurfaceRenderer {
         Ok(Self {
             gpu: GpuContext::new()?,
             channels,
-            buffers: None,
+            buffers: HashMap::new(),
             texture_id_counter: 1,
         })
     }
 
-    fn submit_scene(&mut self, composed: ComposedScene) -> Result<(), RenderError> {
+    fn submit_layers(
+        &mut self,
+        composed: ComposedScene,
+        sender: &ipc::IpcSender<GraphicsEvent>,
+    ) -> Result<Vec<CompositingLayerId>, RenderError> {
         let ComposedScene {
             webview_id,
-            scene,
+            layers,
             frame_hit_info,
             child_viewports,
             child_frame_to_webview,
             animating,
             animating_frame_ids,
         } = composed;
-        let (width, height) = render_size(&frame_hit_info);
         info!(
-            "[render-pipe] Graphics GPU render webview={} {}x{} {} child_frames animating={}",
+            "[render-pipe] Graphics GPU submit layers webview={} layers={} child_frames={} animating={}",
             webview_id.0,
-            width,
-            height,
+            layers.len(),
             child_viewports.len(),
             animating,
         );
-
-        // Reuse the per-webview frame buffers across frames, reallocating
-        // only when the viewport size changes.
-        let needs_new = self
-            .buffers
-            .as_ref()
-            .is_none_or(|buffers| buffers.ring().width != width || buffers.ring().height != height);
-        if needs_new {
-            let first_texture_id = self.texture_id_counter;
-            let payload = Self::allocate_textures(self, width, height, first_texture_id)
-                .ok_or_else(|| {
-                    error!(
-                        "[graphics] allocate shared textures {}x{}: failed",
-                        width, height
-                    );
-                    RenderError::Failed
-                })?;
-            self.texture_id_counter += 2;
-            self.buffers = Some(SurfaceBuffers::new(
-                SurfaceRingState::new(width, height),
-                payload,
-            ));
-        }
-        let buffers = self.buffers.as_mut().ok_or(RenderError::Failed)?;
-        // Double buffering: render into the buffer the last render did
-        // not use.
-        let buffer_index = buffers.next_buffer();
 
         let metadata = frame_metadata(
             webview_id,
@@ -139,26 +116,93 @@ impl SurfaceRenderer for IosurfaceRenderer {
             animating_frame_ids,
         );
 
-        // The shared target texture comes from the webview's IOSurface ring,
-        // selected by `buffer_index`. The pending video frame imports
-        // (macOS) submit first (inside render_into), then Vello's render —
-        // two back-to-back submissions per composed frame.
-        let target = &buffers.payload()[buffer_index].texture;
-        if let Err(error) = self.gpu.render_into(&scene, target, width, height) {
-            error!("[gpu-renderer] {error}");
-            return Err(RenderError::Failed);
+        let mut rendered = Vec::new();
+        let mut topology = Vec::with_capacity(layers.len());
+
+        for layer in layers {
+            let Some(ref scene) = layer.render else {
+                // Clean layer: keep its last surface, still report topology.
+                topology.push(layer.into_layer_topology());
+                continue;
+            };
+            let layer_id = layer.layer_id;
+            let width = layer.width.clamp(1, MAX_SURFACE_DIMENSION);
+            let height = layer.height.clamp(1, MAX_SURFACE_DIMENSION);
+            let needs_new = self.buffers.get(&layer_id).is_none_or(|buffers| {
+                buffers.ring().width != width || buffers.ring().height != height
+            });
+            if needs_new {
+                let first_texture_id = self.texture_id_counter;
+                let payload = Self::allocate_textures(self, width, height, first_texture_id)
+                    .ok_or_else(|| {
+                        error!(
+                            "[graphics] allocate shared textures {}x{}: failed",
+                            width, height
+                        );
+                        RenderError::Failed
+                    })?;
+                self.texture_id_counter += 2;
+                self.buffers.insert(
+                    layer_id,
+                    SurfaceBuffers::new(SurfaceRingState::new(width, height), payload),
+                );
+            }
+            let buffer_index = self
+                .buffers
+                .get_mut(&layer_id)
+                .ok_or(RenderError::Failed)?
+                .next_buffer();
+            let target = &self.buffers[&layer_id].payload()[buffer_index].texture;
+            if let Err(error) = self.gpu.render_into(scene, target, width, height) {
+                error!("[gpu-renderer] layer render failed: {error}");
+                return Err(RenderError::Failed);
+            }
+            let tex = &self.buffers[&layer_id].payload()[buffer_index];
+            topology.push(
+                layer.into_layer_topology_with_surface(SurfacePayload::SharedTexture {
+                    texture_id: tex.texture_id,
+                    surface_id: tex.surface_id(),
+                    port: tex.port_for_frame(),
+                }),
+            );
+            rendered.push(layer_id);
         }
 
         self.gpu.generation += 1;
         let generation = self.gpu.generation;
-        // Both submissions above are enqueued; waiting for "all
-        // submitted work" (submission_index: None) covers it.
+        if rendered.is_empty() {
+            // Nothing was re-rendered this cycle (every layer clean, e.g. a
+            // static root with a video that produced no new frame): emit a
+            // surface-less PixelFrameReady directly so the UA still learns
+            // the composition completed and clears the navigable's pending
+            // update-the-rendering. The embedder keeps drawing its last
+            // surfaces. No GPU work was submitted, so no poll is needed.
+            let frame_event = GraphicsEvent::PixelFrameReady {
+                webview_id,
+                layers: topology,
+                animating: metadata.animating,
+                animating_frame_ids: metadata.animating_frame_ids,
+                generation,
+                frame_hit_info: metadata.frame_hit_info,
+                child_viewports: metadata.child_viewports,
+                child_frame_to_webview: metadata.child_frame_to_webview,
+            };
+            if let Err(send_error) = sender.send(frame_event) {
+                error!(
+                    "[gpu-renderer] failed to send empty PixelFrameReady for {:?}: {send_error}",
+                    webview_id
+                );
+            }
+            debug!(
+                "[gpu-renderer] no shared layers rendered gen={}",
+                generation
+            );
+            return Ok(rendered);
+        }
         let done = SharedRenderData {
             webview_id,
             generation,
-            width,
-            height,
-            buffer_index,
+            layers: topology,
             metadata,
         };
         if let Err(send_error) = self.channels.poll_tx.send(PollRequest {
@@ -169,11 +213,12 @@ impl SurfaceRenderer for IosurfaceRenderer {
             error!("[gpu-renderer] failed to queue shared render poll: {send_error}");
         }
         debug!(
-            "[gpu-renderer] rendered into shared texture {}x{} gen={} buffer={}",
-            width, height, generation, buffer_index
+            "[gpu-renderer] rendered {} shared layers gen={}",
+            rendered.len(),
+            generation
         );
 
-        Ok(())
+        Ok(rendered)
     }
 
     fn handle_render_done(
@@ -184,43 +229,18 @@ impl SurfaceRenderer for IosurfaceRenderer {
         let SharedRenderData {
             webview_id,
             generation,
-            width,
-            height,
-            buffer_index,
+            layers,
             metadata,
         } = data;
         let mut delivery = FrameDelivery {
             graphics_computed: false,
         };
-        let Some(buffers) = self.buffers.as_mut() else {
-            error!(
-                "[graphics] no surface buffers for render done {:?}",
-                webview_id
-            );
-            return delivery;
-        };
-        let Some(texture) = buffers.payload().get(buffer_index) else {
-            error!(
-                "[graphics] bad buffer index {} for render done {:?} gen={}",
-                buffer_index, webview_id, generation
-            );
-            return delivery;
-        };
-        let texture_id = texture.texture_id;
-        let surface_id = texture.surface_id();
-        let port = texture.port_for_frame();
 
         let frame_event = GraphicsEvent::PixelFrameReady {
             webview_id,
-            payload: SurfacePayload::SharedTexture {
-                texture_id,
-                surface_id,
-                port,
-            },
+            layers,
             animating: metadata.animating,
             animating_frame_ids: metadata.animating_frame_ids,
-            width,
-            height,
             generation,
             frame_hit_info: metadata.frame_hit_info,
             child_viewports: metadata.child_viewports,

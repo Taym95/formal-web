@@ -422,4 +422,43 @@ export function registerTools(pi: any) {
       })();
     },
   });
+
+  pi.registerTool({
+    name: "browser_scroll",
+    label: "Browser: scroll",
+    description: "Scroll the page by sending a native mouse wheel event at the given viewport coordinates.",
+    promptSnippet: "Scroll the page with a native wheel event.",
+    promptGuidelines: ["Use browser_scroll to scroll the page natively (mirrors a physical scroll wheel), for testing scroll-triggered rendering or fixed-layer behavior."],
+    parameters: toolSchema({
+      x: { type: "number", description: "Viewport X coordinate for the wheel event (default: half the viewport width)." },
+      y: { type: "number", description: "Viewport Y coordinate for the wheel event (default: half the viewport height)." },
+      deltaX: { type: "number", description: "Horizontal scroll delta in pixels (default 0)." },
+      deltaY: { type: "number", description: "Vertical scroll delta in pixels (positive scrolls down)." },
+    }, ["deltaY"]),
+    async execute(_id: string, params: { x?: number; y?: number; deltaX?: number; deltaY: number }) {
+      return await withReconnect(async () => {
+        const client = await getClient();
+        // Default to the viewport centre so the page (not chrome) receives the
+        // wheel event; formal-web routes ScrollWheel to the web content there.
+        const viewport = await jsEval<{ w: number; h: number }>(
+          client,
+          "({ w: window.innerWidth, h: window.innerHeight })"
+        );
+        const x = params.x ?? (viewport?.w ?? 0) / 2;
+        const y = params.y ?? (viewport?.h ?? 0) / 2;
+        await client.send("Input.dispatchMouseEvent", {
+          type: "mouseWheel",
+          x,
+          y,
+          deltaX: params.deltaX ?? 0,
+          deltaY: params.deltaY,
+        });
+        await new Promise((resolve) => setTimeout(resolve, 120));
+        return {
+          content: [{ type: "text", text: truncate(`Scrolled at (${x.toFixed(0)}, ${y.toFixed(0)}) deltaX=${params.deltaX ?? 0} deltaY=${params.deltaY}`) }],
+          details: { x, y, deltaX: params.deltaX ?? 0, deltaY: params.deltaY },
+        };
+      })();
+    },
+  });
 }

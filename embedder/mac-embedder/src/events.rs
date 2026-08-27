@@ -2,10 +2,11 @@
 //! thread) hands events to the app's main-thread run loop.
 
 use crate::platform::{clipboard_get_text, clipboard_set_text, window_viewport_snapshot};
+use automation::AutomationCommand;
 use ipc_messages::content::WebviewId;
 use log::error;
 use std::collections::HashMap;
-use std::sync::{Arc, LazyLock, Mutex, mpsc};
+use std::sync::{Arc, mpsc};
 use std::time::Duration;
 use webview::{ColorScheme, Embedder, NavigationCompleted};
 
@@ -34,51 +35,13 @@ impl UserEventSink for MacEventSink {
     }
 }
 
-static USER_EVENT_SINK: LazyLock<Mutex<Option<Arc<dyn UserEventSink>>>> =
-    LazyLock::new(|| Mutex::new(None));
-
-pub fn install_user_event_sink(sink: Arc<dyn UserEventSink>) {
-    *USER_EVENT_SINK
-        .lock()
-        .expect("user event sink mutex poisoned") = Some(sink);
-}
-
-pub fn clear_user_event_sink() {
-    *USER_EVENT_SINK
-        .lock()
-        .expect("user event sink mutex poisoned") = None;
-}
-
-pub fn send_user_event(event: FormalWebUserEvent) -> Result<(), String> {
-    let guard = USER_EVENT_SINK
-        .lock()
-        .expect("user event sink mutex poisoned");
-    match guard.as_ref() {
-        Some(sink) => sink.send(event),
-        None => Err(String::from("user event sink is not installed")),
-    }
-}
-
 pub enum FormalWebUserEvent {
     RequestRedraw(WebviewId),
-    NewWebContentScene {
+    NewWebContentLayers {
         webview_id: WebviewId,
-        #[allow(dead_code)]
-        scene_bytes: Vec<u8>,
-        #[allow(dead_code)]
-        font_registrations: Vec<ipc_messages::content::RegisteredFont>,
-        #[allow(dead_code)]
-        font_data: HashMap<usize, Vec<u8>>,
-    },
-    NewWebContentSurface {
-        webview_id: WebviewId,
-        /// The rendered surface frame: how the pixels are delivered (CPU
-        /// shared memory vs. shared IOSurface on macOS) and the payload.
-        frame: ipc_messages::graphics::SurfaceFrame,
-        width: u32,
-        height: u32,
-        #[allow(dead_code)]
-        generation: u64,
+        /// The per-layer frames: topology always, surface only for the
+        /// layers re-rendered this cycle.
+        layers: Vec<ipc_messages::graphics::LayerFrame>,
         /// Whether the composed scene contains animated content (video, CSS
         /// animations) that needs the next frame at display cadence.
         animating: bool,
@@ -88,12 +51,8 @@ pub enum FormalWebUserEvent {
         destination_url: String,
     },
     NavigationCompleted(NavigationCompleted),
-    #[allow(dead_code)]
+    Automation(AutomationCommand),
     NewWebview(WebviewId, String),
-    /// Opened only by the winit chrome's new-window action; the AppKit
-    /// chrome creates windows directly.
-    #[allow(dead_code)]
-    CreateWindow,
     ClipboardRead {
         reply: mpsc::Sender<Result<String, String>>,
     },
@@ -106,6 +65,9 @@ pub enum FormalWebUserEvent {
         webview_id: WebviewId,
         title: String,
     },
+    /// The app was asked to terminate (e.g. via the CDP `Browser.close`
+    /// command).
+    Exit,
 }
 
 /// Routes `webview::Embedder` callbacks into `FormalWebUserEvent` events on
@@ -167,48 +129,40 @@ impl Embedder for EventLoopEmbedder {
     }
 
     fn clipboard_get_text(&self, timeout: Duration) -> Result<String, String> {
-        clipboard_get_text(timeout)
+        clipboard_get_text(self.sink.as_ref(), timeout)
     }
 
     fn clipboard_set_text(&self, text: String, timeout: Duration) -> Result<(), String> {
-        clipboard_set_text(text, timeout)
+        clipboard_set_text(self.sink.as_ref(), text, timeout)
     }
 
     fn title_changed(&self, webview_id: WebviewId, title: String) -> Result<(), String> {
-        send_user_event(FormalWebUserEvent::TitleChanged { webview_id, title })
+        self.sink
+            .send(FormalWebUserEvent::TitleChanged { webview_id, title })
     }
 
     fn new_web_content_scene(
         &self,
-        webview_id: WebviewId,
-        scene_bytes: Vec<u8>,
-        font_registrations: Vec<ipc_messages::content::RegisteredFont>,
-        font_data: HashMap<usize, Vec<u8>>,
+        _webview_id: WebviewId,
+        _scene_bytes: Vec<u8>,
+        _font_registrations: Vec<ipc_messages::content::RegisteredFont>,
+        _font_data: HashMap<usize, Vec<u8>>,
     ) -> Result<(), String> {
-        self.sink.send(FormalWebUserEvent::NewWebContentScene {
-            webview_id,
-            scene_bytes,
-            font_registrations,
-            font_data,
-        })
+        // The scene is presented via the IOSurface surface path
+        // (`new_web_content_layers`); the scene-bytes payload is unused.
+        Ok(())
     }
 
-    fn new_web_content_surface(
+    fn new_web_content_layers(
         &self,
         webview_id: WebviewId,
-        frame: ipc_messages::graphics::SurfaceFrame,
-        width: u32,
-        height: u32,
-        generation: u64,
+        layers: Vec<ipc_messages::graphics::LayerFrame>,
         animating: bool,
     ) -> Result<(), String> {
         self.sink
-            .send(FormalWebUserEvent::NewWebContentSurface {
+            .send(FormalWebUserEvent::NewWebContentLayers {
                 webview_id,
-                frame,
-                width,
-                height,
-                generation,
+                layers,
                 animating,
             })
             .map_err(|error| format!("failed to send surface event: {error}"))

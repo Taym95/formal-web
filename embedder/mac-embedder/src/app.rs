@@ -11,6 +11,8 @@
 //! display refresh rate, and the link runs only while the composed scene is
 //! animating.
 
+mod automation_host;
+
 use crate::events::{EventLoopEmbedder, FormalWebUserEvent, UserEventSink};
 use crate::input;
 use crate::platform::{
@@ -18,6 +20,7 @@ use crate::platform::{
     update_window_viewport_snapshot, write_clipboard_text,
 };
 use crate::window::{new_layer_hosted_view, present_shared_surface};
+use automation::AutomationController;
 use block2::RcBlock;
 use ipc_channel::platform::deallocate_mach_port;
 use ipc_messages::content::WebviewId;
@@ -29,22 +32,23 @@ use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, ProtocolObject, Sel};
 use objc2::{DefinedClass, MainThreadOnly, msg_send, sel};
 use objc2_app_kit::{
-    NSApplication, NSApplicationActivationPolicy, NSButton, NSButtonType, NSCellImagePosition,
-    NSColor, NSControlTextEditingDelegate, NSFont, NSImage, NSImageSymbolConfiguration,
-    NSImageSymbolScale, NSLineBreakMode, NSMenu, NSMenuItem, NSTextField, NSTextFieldBezelStyle,
-    NSTextFieldDelegate, NSToolbar, NSToolbarDelegate, NSToolbarDisplayMode,
-    NSToolbarFlexibleSpaceItemIdentifier, NSToolbarItem, NSToolbarItemGroup,
-    NSToolbarItemGroupControlRepresentation, NSToolbarItemIdentifier, NSView,
-    NSVisualEffectBlendingMode, NSVisualEffectMaterial, NSVisualEffectState, NSVisualEffectView,
-    NSWindow, NSWindowDelegate, NSWindowStyleMask, NSWindowTitleVisibility, NSWindowToolbarStyle,
+    NSApplication, NSApplicationActivationPolicy, NSBitmapImageFileType,
+    NSBitmapImageRepPropertyKey, NSButton, NSButtonType, NSCellImagePosition, NSColor,
+    NSControlTextEditingDelegate, NSFont, NSImage, NSImageSymbolConfiguration, NSImageSymbolScale,
+    NSLineBreakMode, NSMenu, NSMenuItem, NSTextField, NSTextFieldBezelStyle, NSTextFieldDelegate,
+    NSToolbar, NSToolbarDelegate, NSToolbarDisplayMode, NSToolbarFlexibleSpaceItemIdentifier,
+    NSToolbarItem, NSToolbarItemGroup, NSToolbarItemGroupControlRepresentation,
+    NSToolbarItemIdentifier, NSView, NSVisualEffectBlendingMode, NSVisualEffectMaterial,
+    NSVisualEffectState, NSVisualEffectView, NSWindow, NSWindowDelegate, NSWindowStyleMask,
+    NSWindowTitleVisibility, NSWindowToolbarStyle,
 };
 use objc2_app_kit::{NSEvent, NSEventMask, NSEventModifierFlags, NSEventType, NSFontWeightMedium};
 use objc2_core_foundation::CFRetained;
 use objc2_core_video::{CVDisplayLink, CVOptionFlags, CVReturn, CVTimeStamp, kCVReturnSuccess};
 use objc2_foundation::NSInteger;
 use objc2_foundation::{
-    MainThreadMarker, NSArray, NSNotification, NSObject, NSObjectProtocol, NSPoint, NSRange,
-    NSRect, NSSet, NSSize, NSString, ns_string,
+    MainThreadMarker, NSArray, NSDictionary, NSNotification, NSObject, NSObjectProtocol, NSPoint,
+    NSRange, NSRect, NSSet, NSSize, NSString, ns_string,
 };
 use objc2_io_surface::IOSurfaceRef;
 use objc2_quartz_core::{CAAutoresizingMask, CALayer};
@@ -53,12 +57,13 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::ptr::NonNull;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use uuid::Uuid;
 use verification::TraceSender;
 use webview::WebviewProvider;
 use webview::{
     BlitzPointerEvent, BlitzPointerId, BlitzWheelEvent, ColorScheme, MouseEventButtons,
-    NavigationCompleted, NavigationCompletion, UiEvent,
+    NavigationCompleted, NavigationCompletion, PointerCoords, UiEvent,
 };
 
 const INITIAL_WINDOW_WIDTH: f64 = 1200.0;
@@ -472,6 +477,12 @@ struct MacWindow {
     tab_order: Vec<WebviewId>,
     active_tab: Option<WebviewId>,
     surfaces: HashMap<WebviewId, SurfaceState>,
+    /// Sublayers under `web_layer`, one per child (non-root) compositing
+    /// layer of the active webview's composition: cross-origin iframe
+    /// navigables and `<video>` embed sites. The root navigable itself is
+    /// presented on `web_layer`, not as one of these.
+    sublayers:
+        HashMap<ipc_messages::graphics::CompositingLayerId, Retained<objc2_quartz_core::CALayer>>,
     keyboard_modifiers: KeyboardModifiers,
     buttons: MouseEventButtons,
     /// Content view size in points (the window's content area).
@@ -497,6 +508,8 @@ pub(crate) struct MacApp {
     display_link_context: Option<Box<DisplayLinkContext>>,
     display_link_running: bool,
     event_monitor: Option<Retained<AnyObject>>,
+    automation: AutomationController,
+    cdp_server: Option<automation::CdpServerHandle>,
     exiting: bool,
 }
 
@@ -508,6 +521,7 @@ impl MacApp {
         trace_sender: Option<TraceSender>,
         startup_url: Option<String>,
         window_title: Option<String>,
+        cdp_port: Option<u16>,
     ) -> Result<(), String> {
         let ns_app = NSApplication::sharedApplication(mtm);
         ns_app.setActivationPolicy(NSApplicationActivationPolicy::Regular);
@@ -525,6 +539,8 @@ impl MacApp {
             display_link_context: None,
             display_link_running: false,
             event_monitor: None,
+            automation: AutomationController::default(),
+            cdp_server: None,
             exiting: false,
         };
         let app_ptr = &mut app as *mut MacApp;
@@ -533,12 +549,16 @@ impl MacApp {
             *app.delegate.ivars().app.get() = app_ptr;
         }
 
-        // The sink must be installed before the user agent starts, so the
+        // The sink must be created before the user agent starts, so the
         // UA's initial events reach the app.
         let sink: Arc<dyn UserEventSink> = Arc::new(crate::events::MacEventSink {
             handle: app.handle.expect("app handle must be installed"),
         });
-        crate::events::install_user_event_sink(sink.clone());
+        // The CDP server runs on its own thread; it posts commands through a
+        // clone of the sink and gates on `runtime_ready` (true here, cleared
+        // when the run loop exits).
+        let cdp_sink = sink.clone();
+        let runtime_ready = Arc::new(AtomicBool::new(true));
         let embedder = Arc::new(EventLoopEmbedder::new(sink));
         let provider = WebviewProvider::new(embedder, trace_sender)?;
         app.provider = Some(provider);
@@ -553,6 +573,29 @@ impl MacApp {
         let window_id = app.create_window(&title, &destination)?;
         app.active_window_id = Some(window_id);
 
+        // The CDP server runs on its own thread; each command is routed to
+        // the app's main-thread event loop via the user-event sink. It is
+        // only started when a port is requested, so a plain app launch is
+        // unchanged.
+        if let Some(port) = cdp_port {
+            let sink_for_commands = cdp_sink.clone();
+            let sink_for_exit = cdp_sink.clone();
+            let ready = Arc::clone(&runtime_ready);
+            let runtime = automation::automation_bridge(
+                move |command| sink_for_commands.send(FormalWebUserEvent::Automation(command)),
+                move || sink_for_exit.send(FormalWebUserEvent::Exit),
+                move || ready.load(Ordering::Relaxed),
+            );
+            let server = automation::CdpServerHandle::start(port, runtime).map_err(|error| {
+                format!("failed to start the CDP server for the AppKit embedder: {error}")
+            })?;
+            app.cdp_server = Some(server);
+            info!(
+                "[mac-embedder] CDP server listening on 127.0.0.1:{} (AppKit embedder)",
+                port
+            );
+        }
+
         // Activate the app (required when launching unbundled) and start
         // the run loop; the display link and the event sink drive the rest.
         #[allow(deprecated)]
@@ -562,7 +605,7 @@ impl MacApp {
         ns_app.run();
         info!("[mac-embedder] NSApplication run loop ended");
 
-        crate::events::clear_user_event_sink();
+        runtime_ready.store(false, Ordering::Relaxed);
         update_window_viewport_snapshot(None);
         Ok(())
     }
@@ -579,6 +622,7 @@ impl MacApp {
             // addLocalMonitor call.
             unsafe { NSEvent::removeMonitor(&monitor) };
         }
+        self.cdp_server = None;
         self.provider = None;
         update_window_viewport_snapshot(None);
         self.ns_app.terminate(None);
@@ -2311,6 +2355,7 @@ impl MacApp {
             hovered_tab: None,
             address_field_focused: false,
             surfaces: HashMap::new(),
+            sublayers: HashMap::new(),
             keyboard_modifiers: KeyboardModifiers::default(),
             buttons: MouseEventButtons::None,
             content_size: (INITIAL_WINDOW_WIDTH, INITIAL_WINDOW_HEIGHT),
@@ -2610,32 +2655,40 @@ impl MacApp {
                     self.refresh_chrome(window_id);
                 }
             }
-            FormalWebUserEvent::CreateWindow => {
-                let _ = self.create_window("formal-web", "about:blank");
-            }
             FormalWebUserEvent::ClipboardRead { reply } => {
                 let _ = reply.send(read_clipboard_text());
             }
             FormalWebUserEvent::ClipboardWrite { text, reply } => {
                 let _ = reply.send(write_clipboard_text(text));
             }
-            FormalWebUserEvent::NewWebContentScene { webview_id, .. } => {
-                // The IOSurface surface path replaces the scene-bytes path.
-                debug!(
-                    "[mac-embedder] NewWebContentScene ignored (surface path) webview={webview_id:?}"
-                );
-            }
-            FormalWebUserEvent::NewWebContentSurface {
+            FormalWebUserEvent::NewWebContentLayers {
                 webview_id,
-                frame,
-                width,
-                height,
+                layers,
                 animating,
-                ..
             } => {
-                self.handle_new_surface(webview_id, frame, width, height, animating);
+                self.handle_new_layers(webview_id, layers, animating);
             }
+            FormalWebUserEvent::Automation(command) => {
+                self.with_automation(|automation, app| {
+                    automation.handle_command(app, command);
+                });
+            }
+            FormalWebUserEvent::Exit => self.post_exit(),
         }
+    }
+
+    /// Run a closure with the automation controller temporarily moved out
+    /// of `self`, so the command handler can borrow both the controller and
+    /// the app (which implements `AutomationHost`) without a double borrow
+    /// of `self`.
+    fn with_automation<R>(
+        &mut self,
+        f: impl FnOnce(&mut AutomationController, &mut Self) -> R,
+    ) -> R {
+        let mut automation = std::mem::take(&mut self.automation);
+        let result = f(&mut automation, self);
+        self.automation = automation;
+        result
     }
 
     fn handle_navigation_completed(&mut self, completion: NavigationCompleted) {
@@ -2704,12 +2757,10 @@ impl MacApp {
         }
     }
 
-    fn handle_new_surface(
+    fn handle_new_layers(
         &mut self,
         webview_id: WebviewId,
-        frame: SurfaceFrame,
-        width: u32,
-        height: u32,
+        layers: Vec<ipc_messages::graphics::LayerFrame>,
         animating: bool,
     ) {
         let Some(window_id) = self.window_for_webview(webview_id) else {
@@ -2720,71 +2771,276 @@ impl MacApp {
             return;
         };
         let is_active = window_state.active_tab == Some(webview_id);
-        // The zero-copy delivery path: the frame was rendered directly into
-        // a shared IOSurface by the graphics process; the embedder imports
-        // the surface and hands it to CoreAnimation.
-        let SurfaceFrame::SharedTexture {
-            surface_id, port, ..
-        } = frame
-        else {
-            error!(
-                "[mac-embedder] received a CPU surface for webview={webview_id:?}; the AppKit embedder only supports the zero-copy shared-surface path"
-            );
-            return;
-        };
-        // Look the surface up by its global ID first: a surface object
-        // imported from its Mach port (`IOSurfaceLookupFromMachPort`)
-        // cannot be composited by CoreAnimation, while a by-ID lookup
-        // (`IOSurfaceLookup`) of the same surface composites correctly.
-        // Fall back to the port when the ID is not resolvable (e.g. a
-        // producer that did not mark the surface global).
-        let surface = IOSurfaceRef::lookup(surface_id).or_else(|| {
-            let port_name = port.into_name();
-            let surface = IOSurfaceRef::lookup_from_mach_port(port_name);
-            deallocate_mach_port(port_name);
-            surface
-        });
-        let Some(surface) = surface else {
-            error!(
-                "[mac-embedder] IOSurfaceLookup failed for webview={webview_id:?} id={surface_id}"
-            );
-            return;
-        };
-        let surface_state = SurfaceState {
-            surface,
-            width,
-            padded_width: padded_surface_width(width),
-            animating,
-        };
-        if is_active {
-            present_shared_surface(
-                &window_state.web_layer,
-                &surface_state.surface,
-                surface_state.width,
-                surface_state.padded_width,
-                window_state.scale,
-            );
-        }
-        window_state.surfaces.insert(webview_id, surface_state);
-        info!(
-            "[mac-embedder] surface webview={webview_id:?} {}x{} animating={animating} active={is_active}",
-            width, height
+        let scale = window_state.scale;
+
+        // The compositor reports each layer's clip/transform in the root
+        // navigable's local (pixel) coordinate space — the root surface is
+        // 2400x1448 — while the web_layer and its sublayers live in window
+        // point space (the window content size). Scale sublayer geometry by
+        // (web_layer / root) so sublayers land where the root content is
+        // drawn.
+        let root_geometry = layers.iter().find(|layer| layer.topology.parent.is_none());
+        let (root_w, root_h) = root_geometry
+            .map(|layer| {
+                (
+                    f64::from(layer.topology.width),
+                    f64::from(layer.topology.height),
+                )
+            })
+            .unwrap_or((1.0, 1.0));
+        let web_bounds = window_state.web_layer.bounds();
+        let scale_x = web_bounds.size.width / root_w.max(1.0);
+        let scale_y = web_bounds.size.height / root_h.max(1.0);
+        debug!(
+            "[mac-embedder] handle_layers webview={:?} root_size=({:.0}x{:.0}) web_layer_bounds=({:.0}x{:.0}) scale=({:.4},{:.4})",
+            webview_id,
+            root_w,
+            root_h,
+            web_bounds.size.width,
+            web_bounds.size.height,
+            scale_x,
+            scale_y,
         );
 
+        // The root navigable is presented on the existing web_layer, not as
+        // a sublayer. Present the new surface only when this cycle
+        // re-rendered it; a clean root keeps its last contents.
+        let root = layers.iter().find(|layer| layer.topology.parent.is_none());
+        if let Some(root) = root
+            && let Some(frame) = &root.frame
+        {
+            let width = root.topology.width;
+            let height = root.topology.height;
+            // The zero-copy delivery path: the frame was rendered directly
+            // into a shared IOSurface by the graphics process; the embedder
+            // imports the surface and hands it to CoreAnimation.
+            let SurfaceFrame::SharedTexture {
+                surface_id, port, ..
+            } = frame
+            else {
+                error!(
+                    "[mac-embedder] received a CPU surface for webview={webview_id:?}; the AppKit embedder only supports the zero-copy shared-surface path"
+                );
+                return;
+            };
+            // Look the surface up by its global ID first: a surface object
+            // imported from its Mach port (`IOSurfaceLookupFromMachPort`)
+            // cannot be composited by CoreAnimation, while a by-ID lookup
+            // (`IOSurfaceLookup`) of the same surface composites correctly.
+            // Fall back to the port when the ID is not resolvable.
+            let surface = IOSurfaceRef::lookup(*surface_id).or_else(|| {
+                let port_name = port.clone().into_name();
+                let surface = IOSurfaceRef::lookup_from_mach_port(port_name);
+                deallocate_mach_port(port_name);
+                surface
+            });
+            let Some(surface) = surface else {
+                error!(
+                    "[mac-embedder] IOSurfaceLookup failed for webview={webview_id:?} id={surface_id}"
+                );
+                return;
+            };
+            let surface_state = SurfaceState {
+                surface,
+                width,
+                padded_width: padded_surface_width(width),
+                animating,
+            };
+            if is_active {
+                present_shared_surface(
+                    &window_state.web_layer,
+                    &surface_state.surface,
+                    surface_state.width,
+                    surface_state.padded_width,
+                    window_state.scale,
+                );
+            }
+            window_state.surfaces.insert(webview_id, surface_state);
+            info!(
+                "[mac-embedder] surface webview={webview_id:?} {}x{} animating={animating} active={is_active}",
+                width, height
+            );
+        }
+
+        // Child layers (cross-origin iframe navigables, video embed sites)
+        // become sublayers under web_layer (or their parent's sublayer). One
+        // transaction disables implicit animations for all moves/appearances.
+        objc2_quartz_core::CATransaction::begin();
+        objc2_quartz_core::CATransaction::setDisableActions(true);
+        let mut seen = HashSet::new();
+        for layer in &layers {
+            let layer_id = layer.topology.layer_id;
+            if layer.topology.parent.is_none() {
+                continue; // root handled above
+            }
+            seen.insert(layer_id);
+
+            // Resolve the parent CALayer: another sublayer if present, else
+            // the web_layer (the root navigable). Retained clone ends the
+            // sublayers borrow before the entry below.
+            let parent_layer = layer
+                .topology
+                .parent
+                .and_then(|parent_id| window_state.sublayers.get(&parent_id).cloned())
+                .unwrap_or_else(|| window_state.web_layer.clone());
+
+            if !window_state.sublayers.contains_key(&layer_id) {
+                let sublayer = CALayer::layer();
+                sublayer.setOpaque(true);
+                sublayer.setContentsScale(scale);
+                parent_layer.addSublayer(&sublayer);
+                window_state.sublayers.insert(layer_id, sublayer);
+            }
+            let Some(sublayer) = window_state.sublayers.get(&layer_id) else {
+                continue;
+            };
+
+            // Geometry: the layer's frame is its visible clip rect in its
+            // parent's space, converted from root-pixel space to web_layer
+            // point space; contents scale to fill (default
+            // contentsGravity = resize), matching the producer's placement.
+            //
+            // The clip is reported in the root navigable's top-down pixel
+            // space, while the web_layer (a layer-hosting view's backing
+            // layer) has a bottom-up (y-up) coordinate space. Mapping the
+            // top-down clip straight into the y-up frame would mirror the
+            // sublayer vertically: it would sit above its element and move
+            // opposite the page on scroll. Flip the y origin so sublayers
+            // land on their element and track the page.
+            let clip = &layer.topology.clip_bounds;
+            let frame_y = web_bounds.size.height - clip[3] * scale_y;
+            sublayer.setFrame(NSRect::new(
+                NSPoint::new(clip[0] * scale_x, frame_y),
+                NSSize::new((clip[2] - clip[0]) * scale_x, (clip[3] - clip[1]) * scale_y),
+            ));
+            sublayer.setCornerRadius(layer.topology.corner_radius);
+            sublayer.setMasksToBounds(layer.topology.corner_radius > 0.0);
+            let (z_index, paint_order) = layer.topology.z_order;
+            sublayer.setZPosition((z_index as f64) * 10000.0 + (paint_order as f64));
+            debug!(
+                "[mac-embedder] sublayer {:?} parent={:?} frame={} clip={:?} z={:?} surface_size={:?} frame_pos={:?} frame_size={:?}",
+                layer.topology.layer_id,
+                layer.topology.parent,
+                layer.frame.is_some(),
+                layer.topology.clip_bounds,
+                layer.topology.z_order,
+                layer
+                    .frame
+                    .as_ref()
+                    .map(|_| (layer.topology.width, layer.topology.height)),
+                (clip[0] * scale_x, frame_y),
+                ((clip[2] - clip[0]) * scale_x, (clip[3] - clip[1]) * scale_y,),
+            );
+
+            // Contents: only when re-rendered; a clean layer (frame: None)
+            // keeps its last surface untouched.
+            if let Some(frame) = &layer.frame {
+                let SurfaceFrame::SharedTexture {
+                    surface_id, port, ..
+                } = frame
+                else {
+                    continue;
+                };
+                let surface = IOSurfaceRef::lookup(*surface_id).or_else(|| {
+                    let port_name = port.clone().into_name();
+                    let surface = IOSurfaceRef::lookup_from_mach_port(port_name);
+                    deallocate_mach_port(port_name);
+                    surface
+                });
+                if let Some(surface) = surface {
+                    let padded_width = padded_surface_width(layer.topology.width);
+                    // SAFETY: the sublayer retains the surface; the surface
+                    // is a valid Objective-C object (an IOSurface).
+                    let _: () = unsafe { msg_send![&**sublayer, setContents: &*surface] };
+                    sublayer.setContentsRect(NSRect::new(
+                        NSPoint::new(0.0, 0.0),
+                        NSSize::new(
+                            f64::from(layer.topology.width) / f64::from(padded_width.max(1)),
+                            1.0,
+                        ),
+                    ));
+                }
+            }
+        }
+        // Drop sublayers whose layer no longer exists this cycle (navigable
+        // torn down, video ended) — mirrors mark_child_frame_removed.
+        let stale: Vec<_> = window_state
+            .sublayers
+            .iter()
+            .filter(|(id, _)| !seen.contains(id))
+            .map(|(id, _)| *id)
+            .collect();
+        for id in stale {
+            if let Some(layer) = window_state.sublayers.remove(&id) {
+                debug!("[mac-embedder] remove sublayer {:?}", id);
+                layer.removeFromSuperlayer();
+            }
+        }
+        objc2_quartz_core::CATransaction::commit();
+
         // Pacing: animated content runs the display link; a static scene is
-        // presented once and only re-renders on demand (input, navigation,
-        // resize, or the UA's request-redraw note), so the next frame is not
-        // requested here.  Requesting one unconditionally would turn every
-        // surface into a frame request: with any queued rendering opportunity
-        // (a mouse move, a viewport update) the UA re-renders, producing
-        // another surface, another frame request — a render loop that never
-        // stops while opportunities keep arriving.
+        // presented once and only re-renders on demand.
         if animating {
             self.start_display_link();
         } else {
             self.stop_display_link();
         }
     }
+}
+
+impl MacApp {
+    /// The webview id of the active tab in the active window, if any.
+    fn active_tab_webview_id(&self) -> Option<WebviewId> {
+        let window_id = self.active_window_id?;
+        self.windows
+            .get(&window_id)
+            .and_then(|window| window.active_tab)
+    }
+
+    /// Build pointer coordinates for an automation event from viewport
+    /// (CSS-pixel) coordinates, matching the winit automation host.
+    fn automation_coords(&self, x: f32, y: f32) -> PointerCoords {
+        PointerCoords {
+            screen_x: x,
+            screen_y: y,
+            client_x: x,
+            client_y: y,
+            page_x: x,
+            page_y: y,
+        }
+    }
+}
+
+/// Capture the web content view (its layer tree: the root navigable on
+/// `web_layer` plus the per-navigable/per-video sublayers) as a PNG.
+/// Runs on the main thread; the view must be in a window.
+fn capture_web_view_png(web_view: &NSView) -> Result<Vec<u8>, String> {
+    let bounds = web_view.bounds();
+    if bounds.size.width <= 0.0 || bounds.size.height <= 0.0 {
+        return Err(String::from("web content view has zero size"));
+    }
+    let bitmap = web_view
+        .bitmapImageRepForCachingDisplayInRect(bounds)
+        .ok_or_else(|| String::from("failed to allocate the screenshot bitmap"))?;
+    web_view.cacheDisplayInRect_toBitmapImageRep(bounds, &bitmap);
+    let properties = NSDictionary::<NSBitmapImageRepPropertyKey, AnyObject>::new();
+    // SAFETY: the properties dictionary is empty, so there is no key/value
+    // type mismatch for the `representationUsingType` call.
+    let data = unsafe {
+        bitmap.representationUsingType_properties(NSBitmapImageFileType::PNG, &properties)
+    }
+    .ok_or_else(|| String::from("failed to encode the screenshot as PNG"))?;
+    let mut buffer = vec![0u8; data.length() as usize];
+    // SAFETY: `buffer` is exactly `data.length()` bytes and `getBytes_length`
+    // writes exactly that many.
+    unsafe {
+        data.getBytes_length(
+            NonNull::new(buffer.as_mut_ptr().cast::<c_void>())
+                .expect("screenshot buffer is non-null"),
+            buffer.len() as _,
+        );
+    }
+    Ok(buffer)
 }
 
 /// Round a surface width up to a multiple of 64, the Metal constraint for
@@ -2807,8 +3063,9 @@ pub fn run_windowed_app(
     trace_sender: Option<TraceSender>,
     startup_url: Option<String>,
     window_title: Option<String>,
+    cdp_port: Option<u16>,
 ) -> Result<(), String> {
     let mtm = MainThreadMarker::new()
         .ok_or_else(|| String::from("the macOS embedder must run on the main thread"))?;
-    MacApp::run(mtm, trace_sender, startup_url, window_title)
+    MacApp::run(mtm, trace_sender, startup_url, window_title, cdp_port)
 }

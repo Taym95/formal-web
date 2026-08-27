@@ -1406,13 +1406,22 @@ impl ApplicationHandler<FormalWebUserEvent> for WindowedApp {
                     Self::request_window_redraw(state);
                 }
             }
-            FormalWebUserEvent::NewWebContentSurface {
-                webview_id,
-                frame,
-                width,
-                height,
-                ..
+            FormalWebUserEvent::NewWebContentLayers {
+                webview_id, layers, ..
             } => {
+                // Temporary: draw only the root navigable layer until the
+                // per-layer quad path lands (step 7).
+                let Some(root) = layers
+                    .into_iter()
+                    .find(|layer| layer.topology.parent.is_none())
+                else {
+                    return;
+                };
+                let Some(frame) = root.frame else {
+                    return;
+                };
+                let width = root.topology.width;
+                let height = root.topology.height;
                 let Some(window_id) = Self::window_for_webview(self, webview_id) else {
                     info!(
                         "[render-pipe] Embedder no window for webview={:?}",

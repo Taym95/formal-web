@@ -2,7 +2,7 @@
 //! encoding, startup URL resolution, URL normalization, and the current
 //! window viewport snapshot.
 
-use crate::events::{FormalWebUserEvent, send_user_event};
+use crate::events::{FormalWebUserEvent, UserEventSink};
 use std::sync::{LazyLock, Mutex, mpsc};
 use std::time::Duration;
 use webview::ColorScheme;
@@ -25,9 +25,9 @@ pub fn write_clipboard_text(text: String) -> Result<(), String> {
         .map_err(|error| format!("failed to write clipboard text: {error}"))
 }
 
-pub fn clipboard_get_text(timeout: Duration) -> Result<String, String> {
+pub fn clipboard_get_text(sink: &dyn UserEventSink, timeout: Duration) -> Result<String, String> {
     let (reply, receiver) = mpsc::channel();
-    send_user_event(FormalWebUserEvent::ClipboardRead { reply })?;
+    sink.send(FormalWebUserEvent::ClipboardRead { reply })?;
     receiver.recv_timeout(timeout).map_err(|error| {
         format!(
             "timed out after {} ms waiting for clipboard text: {error}",
@@ -36,9 +36,13 @@ pub fn clipboard_get_text(timeout: Duration) -> Result<String, String> {
     })?
 }
 
-pub fn clipboard_set_text(text: String, timeout: Duration) -> Result<(), String> {
+pub fn clipboard_set_text(
+    sink: &dyn UserEventSink,
+    text: String,
+    timeout: Duration,
+) -> Result<(), String> {
     let (reply, receiver) = mpsc::channel();
-    send_user_event(FormalWebUserEvent::ClipboardWrite { text, reply })?;
+    sink.send(FormalWebUserEvent::ClipboardWrite { text, reply })?;
     receiver.recv_timeout(timeout).map_err(|error| {
         format!(
             "timed out after {} ms waiting to write clipboard text: {error}",

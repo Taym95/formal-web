@@ -15,7 +15,7 @@
 
 use anyrender::PaintScene;
 use ipc_messages::content::{FrameId, WebviewId};
-use ipc_messages::graphics::{ChildViewport, FrameHitInfo, GraphicsEvent};
+use ipc_messages::graphics::{ChildViewport, CompositingLayerId, FrameHitInfo, GraphicsEvent};
 use ipc_messages::media::VideoPaintId;
 use kurbo::Affine;
 use std::collections::HashMap;
@@ -337,25 +337,6 @@ impl<P> SurfaceBuffers<P> {
 /// textures). Far above any real display size (8K is 7680×4320).
 pub(crate) const MAX_SURFACE_DIMENSION: u32 = 8192;
 
-/// The render size for a composed scene: the root frame's viewport, clamped
-/// to at least 1×1 so a frame is always produced (a skipped frame would
-/// leave the UA's rendering cycle open and stall all future renders), and to
-/// at most [`MAX_SURFACE_DIMENSION`] so content-claimed dimensions cannot
-/// drive unbounded allocations in this process.
-pub(crate) fn render_size(frame_hit_info: &[FrameHitInfo]) -> (u32, u32) {
-    let width = frame_hit_info
-        .first()
-        .map(|h| h.viewport_width)
-        .unwrap_or(0)
-        .clamp(1, MAX_SURFACE_DIMENSION);
-    let height = frame_hit_info
-        .first()
-        .map(|h| h.viewport_height)
-        .unwrap_or(0)
-        .clamp(1, MAX_SURFACE_DIMENSION);
-    (width, height)
-}
-
 /// Build the frame metadata delivered with the completed frame, converting
 /// the child viewport map to the wire `ChildViewport` list.
 pub(crate) fn frame_metadata(
@@ -399,11 +380,19 @@ pub trait SurfaceRenderer {
     where
         Self: Sized;
 
-    /// Submit `composed` for rendering. The renderer derives the render
-    /// size, (re)allocates its surface buffers on resize, picks the
-    /// alternating buffer, and submits the render. The GPU completion is
-    /// delivered on `ReadbackChannels::render_done_tx` as `Self::RenderData`.
-    fn submit_scene(&mut self, composed: ComposedScene) -> Result<(), RenderError>;
+    /// Submit `composed` for per-layer rendering. Each layer with a `render`
+    /// scene is rasterized into its own surface; clean layers (render `None`)
+    /// are skipped and keep their last surface. Returns the layer ids that
+    /// were actually re-rendered, so the caller can clear their dirty flags.
+    /// The GPU completion is delivered on `ReadbackChannels::render_done_tx`
+    /// as `Self::RenderData`. When nothing was re-rendered (every layer
+    /// clean), `sender` is used to emit a surface-less `PixelFrameReady` so
+    /// the UA still learns the composition completed.
+    fn submit_layers(
+        &mut self,
+        composed: ComposedScene,
+        sender: &ipc::IpcSender<GraphicsEvent>,
+    ) -> Result<Vec<CompositingLayerId>, RenderError>;
 
     /// The GPU completed a frame: deliver
     /// the frame to the embedder. The run loop emits the `GraphicsComputed`

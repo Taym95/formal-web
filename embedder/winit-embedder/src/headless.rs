@@ -358,8 +358,14 @@ impl ApplicationHandler<FormalWebUserEvent> for HeadlessEmbedderApp {
                     }
                 }
             }
-            FormalWebUserEvent::NewWebContentSurface { webview_id, .. } => {
-                debug!("[embedder] headless NewWebContentSurface {:?}", webview_id);
+            FormalWebUserEvent::NewWebContentLayers {
+                webview_id, layers, ..
+            } => {
+                debug!(
+                    "[embedder] headless NewWebContentLayers {:?} ({} layers)",
+                    webview_id,
+                    layers.len()
+                );
                 // Headless has no display pacing; request the next frame
                 // immediately.
                 if let Some(provider) = self.provider.as_ref()

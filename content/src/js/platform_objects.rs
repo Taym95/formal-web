@@ -109,6 +109,14 @@ pub(crate) fn take_animation_frame_callbacks(
     })
 }
 
+pub(crate) fn has_pending_animation_frame_callbacks(
+    ec: &mut dyn ExecutionContext<crate::js::Types>,
+) -> Completion<bool, crate::js::Types> {
+    with_global_scope(ec, |global_scope, ec| {
+        Ok(global_scope.has_pending_animation_frame_callbacks(ec))
+    })
+}
+
 pub(crate) fn resolve_element_object(
     node_id: usize,
     ec: &mut dyn ExecutionContext<crate::js::Types>,

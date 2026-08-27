@@ -1115,6 +1115,18 @@ impl GlobalScope {
             .retain(|entry| entry.handle != handle);
     }
 
+    /// Whether any animation frame callbacks are queued (a pending skeleton
+    /// or rAF that will be run at the next rendering opportunity). Used by
+    /// `update_the_rendering` to decide whether a render must run even when
+    /// the document is otherwise clean — a script-driven animation loop keeps
+    /// re-registering callbacks right after they run.
+    pub(crate) fn has_pending_animation_frame_callbacks(
+        &self,
+        ec: &mut dyn ExecutionContext<Types>,
+    ) -> bool {
+        !self.animation_frame_callbacks.borrow(ec).is_empty()
+    }
+
     /// <https://html.spec.whatwg.org/#run-the-animation-frame-callbacks>
     pub(crate) fn take_animation_frame_callbacks(
         &self,
