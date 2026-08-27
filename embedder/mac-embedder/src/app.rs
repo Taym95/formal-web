@@ -2235,8 +2235,9 @@ impl MacApp {
             }
             if let Some(provider) = self.provider.as_ref()
                 && let Some(active) = active
+                && let Err(error) = provider.frame_needed(active)
             {
-                let _ = provider.frame_needed(active);
+                error!("[mac-embedder] frame needed: {error}");
             }
         }
     }
