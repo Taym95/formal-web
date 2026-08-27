@@ -11,6 +11,8 @@
 //! display refresh rate, and the link runs only while the composed scene is
 //! animating.
 
+mod automation_host;
+
 use crate::events::{EventLoopEmbedder, FormalWebUserEvent, UserEventSink};
 use crate::input;
 use crate::platform::{
@@ -18,8 +20,7 @@ use crate::platform::{
     update_window_viewport_snapshot, write_clipboard_text,
 };
 use crate::window::{new_layer_hosted_view, present_shared_surface};
-use automation::AutomationVisibleFrameViewport;
-use automation::{AutomationController, AutomationHost, AutomationSnapshot};
+use automation::AutomationController;
 use block2::RcBlock;
 use ipc_channel::platform::deallocate_mach_port;
 use ipc_messages::content::WebviewId;
@@ -51,20 +52,18 @@ use objc2_foundation::{
 };
 use objc2_io_surface::IOSurfaceRef;
 use objc2_quartz_core::{CAAutoresizingMask, CALayer};
-use serde_json::Value;
 use std::cell::UnsafeCell;
 use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::ptr::NonNull;
 use std::sync::Arc;
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
 use uuid::Uuid;
 use verification::TraceSender;
 use webview::WebviewProvider;
 use webview::{
-    BlitzPointerEvent, BlitzPointerId, BlitzWheelDelta, BlitzWheelEvent, ColorScheme,
-    MouseEventButton, MouseEventButtons, NavigationCompleted, NavigationCompletion, PointerCoords,
-    PointerDetails, UiEvent,
+    BlitzPointerEvent, BlitzPointerId, BlitzWheelEvent, ColorScheme, MouseEventButtons,
+    NavigationCompleted, NavigationCompletion, PointerCoords, UiEvent,
 };
 
 const INITIAL_WINDOW_WIDTH: f64 = 1200.0;
@@ -550,12 +549,16 @@ impl MacApp {
             *app.delegate.ivars().app.get() = app_ptr;
         }
 
-        // The sink must be installed before the user agent starts, so the
+        // The sink must be created before the user agent starts, so the
         // UA's initial events reach the app.
         let sink: Arc<dyn UserEventSink> = Arc::new(crate::events::MacEventSink {
             handle: app.handle.expect("app handle must be installed"),
         });
-        crate::events::install_user_event_sink(sink.clone());
+        // The CDP server runs on its own thread; it posts commands through a
+        // clone of the sink and gates on `runtime_ready` (true here, cleared
+        // when the run loop exits).
+        let cdp_sink = sink.clone();
+        let runtime_ready = Arc::new(AtomicBool::new(true));
         let embedder = Arc::new(EventLoopEmbedder::new(sink));
         let provider = WebviewProvider::new(embedder, trace_sender)?;
         app.provider = Some(provider);
@@ -575,10 +578,13 @@ impl MacApp {
         // only started when a port is requested, so a plain app launch is
         // unchanged.
         if let Some(port) = cdp_port {
+            let sink_for_commands = cdp_sink.clone();
+            let sink_for_exit = cdp_sink.clone();
+            let ready = Arc::clone(&runtime_ready);
             let runtime = automation::automation_bridge(
-                |command| crate::events::send_user_event(FormalWebUserEvent::Automation(command)),
-                || crate::events::send_user_event(FormalWebUserEvent::Exit),
-                crate::events::event_loop_is_ready,
+                move |command| sink_for_commands.send(FormalWebUserEvent::Automation(command)),
+                move || sink_for_exit.send(FormalWebUserEvent::Exit),
+                move || ready.load(Ordering::Relaxed),
             );
             let server = automation::CdpServerHandle::start(port, runtime).map_err(|error| {
                 format!("failed to start the CDP server for the AppKit embedder: {error}")
@@ -599,7 +605,7 @@ impl MacApp {
         ns_app.run();
         info!("[mac-embedder] NSApplication run loop ended");
 
-        crate::events::clear_user_event_sink();
+        runtime_ready.store(false, Ordering::Relaxed);
         update_window_viewport_snapshot(None);
         Ok(())
     }
@@ -2649,20 +2655,11 @@ impl MacApp {
                     self.refresh_chrome(window_id);
                 }
             }
-            FormalWebUserEvent::CreateWindow => {
-                let _ = self.create_window("formal-web", "about:blank");
-            }
             FormalWebUserEvent::ClipboardRead { reply } => {
                 let _ = reply.send(read_clipboard_text());
             }
             FormalWebUserEvent::ClipboardWrite { text, reply } => {
                 let _ = reply.send(write_clipboard_text(text));
-            }
-            FormalWebUserEvent::NewWebContentScene { webview_id, .. } => {
-                // The IOSurface surface path replaces the scene-bytes path.
-                debug!(
-                    "[mac-embedder] NewWebContentScene ignored (surface path) webview={webview_id:?}"
-                );
             }
             FormalWebUserEvent::NewWebContentLayers {
                 webview_id,
@@ -2987,172 +2984,6 @@ impl MacApp {
             self.start_display_link();
         } else {
             self.stop_display_link();
-        }
-    }
-}
-
-impl AutomationHost for MacApp {
-    fn automation_snapshot(&mut self) -> AutomationSnapshot {
-        let webview_id = self.active_tab_webview_id();
-        let tab = webview_id.and_then(|webview_id| {
-            self.active_window_id
-                .and_then(|window_id| self.windows.get(&window_id))
-                .and_then(|window_state| window_state.tabs.get(&webview_id))
-        });
-        let current_url = tab.and_then(|tab| tab.committed_url.clone());
-        let displayed_url = tab.map(|tab| tab.display_url()).unwrap_or_default();
-        AutomationSnapshot {
-            webview_id,
-            current_url,
-            displayed_url,
-            navigable_id: None,
-            has_top_level_traversable: webview_id.is_some(),
-        }
-    }
-
-    fn automation_visible_frame_viewports(
-        &mut self,
-    ) -> Result<Vec<AutomationVisibleFrameViewport>, String> {
-        Ok(Vec::new())
-    }
-
-    fn automation_screenshot(&mut self) -> Result<Vec<u8>, String> {
-        let Some(window_id) = self.active_window_id else {
-            return Err(String::from("no active window"));
-        };
-        let Some(window_state) = self.windows.get(&window_id) else {
-            return Err(String::from("active window state missing"));
-        };
-        capture_web_view_png(&window_state.web_view)
-    }
-
-    fn begin_automation_navigation(&mut self, url: String) -> Result<(), String> {
-        let Some(window_id) = self.active_window_id else {
-            return Err(String::from("no active window"));
-        };
-        let webview_id = self
-            .windows
-            .get(&window_id)
-            .and_then(|window_state| window_state.active_tab);
-        let Some(provider) = self.provider.as_ref() else {
-            return Err(String::from("no provider"));
-        };
-        provider.navigate(webview_id, &url)?;
-        if let Some(window_state) = self.windows.get_mut(&window_id)
-            && let Some(webview_id) = webview_id
-            && let Some(tab) = window_state.tabs.get_mut(&webview_id)
-        {
-            tab.pending_url = Some(url);
-        }
-        Ok(())
-    }
-
-    fn automation_click(&mut self, x: f32, y: f32) -> Result<(), String> {
-        let provider = self
-            .provider
-            .as_ref()
-            .ok_or_else(|| String::from("no provider"))?;
-        let webview_id = self
-            .active_tab_webview_id()
-            .ok_or_else(|| String::from("no active webview"))?;
-        let mods = KeyboardModifiers::default();
-        let coords = self.automation_coords(x, y);
-        let mut buttons: MouseEventButtons = MouseEventButtons::None;
-        provider.send_ui_event(
-            webview_id,
-            UiEvent::PointerMove(BlitzPointerEvent {
-                id: BlitzPointerId::Mouse,
-                is_primary: true,
-                coords,
-                button: Default::default(),
-                buttons,
-                mods,
-                details: PointerDetails::default(),
-            }),
-        )?;
-        buttons |= MouseEventButton::Main.into();
-        provider.send_ui_event(
-            webview_id,
-            UiEvent::PointerDown(BlitzPointerEvent {
-                id: BlitzPointerId::Mouse,
-                is_primary: true,
-                coords,
-                button: MouseEventButton::Main,
-                buttons,
-                mods,
-                details: PointerDetails::default(),
-            }),
-        )?;
-        buttons.remove(MouseEventButton::Main.into());
-        provider.send_ui_event(
-            webview_id,
-            UiEvent::PointerUp(BlitzPointerEvent {
-                id: BlitzPointerId::Mouse,
-                is_primary: true,
-                coords,
-                button: MouseEventButton::Main,
-                buttons,
-                mods,
-                details: PointerDetails::default(),
-            }),
-        )
-    }
-
-    fn automation_click_element(&mut self, selector: String) -> Result<(), String> {
-        match self.provider.as_ref().zip(self.active_tab_webview_id()) {
-            Some((provider, webview_id)) => provider.click_element(webview_id, selector)?,
-            None => return Err(String::from("no webview")),
-        }
-        Ok(())
-    }
-
-    fn automation_scroll(
-        &mut self,
-        x: f32,
-        y: f32,
-        delta_x: f32,
-        delta_y: f32,
-    ) -> Result<(), String> {
-        let provider = self
-            .provider
-            .as_ref()
-            .ok_or_else(|| String::from("no provider"))?;
-        let webview_id = self
-            .active_tab_webview_id()
-            .ok_or_else(|| String::from("no active webview"))?;
-        let mods = KeyboardModifiers::default();
-        let coords = self.automation_coords(x, y);
-        provider.send_ui_event(
-            webview_id,
-            UiEvent::PointerMove(BlitzPointerEvent {
-                id: BlitzPointerId::Mouse,
-                is_primary: true,
-                coords,
-                button: Default::default(),
-                buttons: MouseEventButtons::None,
-                mods,
-                details: PointerDetails::default(),
-            }),
-        )?;
-        provider.send_ui_event(
-            webview_id,
-            UiEvent::Wheel(BlitzWheelEvent {
-                delta: BlitzWheelDelta::Pixels(f64::from(delta_x), f64::from(delta_y)),
-                coords,
-                buttons: MouseEventButtons::None,
-                mods,
-            }),
-        )
-    }
-
-    fn automation_evaluate_script(
-        &mut self,
-        source: String,
-        timeout: Duration,
-    ) -> Result<Value, String> {
-        match self.provider.as_ref().zip(self.active_tab_webview_id()) {
-            Some((provider, webview_id)) => provider.evaluate_script(webview_id, source, timeout),
-            None => Err(String::from("no webview")),
         }
     }
 }

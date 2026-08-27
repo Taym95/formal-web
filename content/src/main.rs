@@ -177,8 +177,15 @@ struct ContentShellProvider {
     /// it in `update_the_rendering` to decide whether to re-run blitz
     /// (resolve + paint) — a static document that keeps re-sending an
     /// identical scene during a video-driven render cycle skips the blitz
-    /// work entirely. `Arc<AtomicBool>` so the `ShellProvider` (which blitz
-    /// requires to be `Send + Sync`) can share it with the `ContentDocument`.
+    /// work entirely.
+    ///
+    /// The `Arc<AtomicBool>` (rather than an `Rc<RefCell<bool>>` or a single
+    /// `bool`) is a blitz shell-provider constraint, not our own cross-thread
+    /// sharing: blitz's `ShellProvider` trait is `Send + Sync`, so this
+    /// `ContentShellProvider` must be `Send + Sync`, which forces the flag to
+    /// be a thread-safe shared value. It is shared between the
+    /// `ContentShellProvider` that blitz calls `request_redraw()` on and the
+    /// `ContentDocument` that `update_the_rendering` reads.
     needs_paint: Arc<AtomicBool>,
 }
 
